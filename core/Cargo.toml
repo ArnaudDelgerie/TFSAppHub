@@ -10,3 +10,13 @@ edition = "2021"
 # here is testable headless and reusable by a non-Tauri host, and a `tauri`
 # line added below would turn a real boundary back into a mere directory.
 [dependencies]
+# `setpgid` in the spawn-time process-group helper, `getpgid` behind the
+# group/pid signalling decision, and the non-blocking `flock` plus the
+# self-pipe (`pipe`/`read`/`write`/`signal`) the sidecar liveness lock and the
+# signal forwarding are built on — all in `process.rs`.
+libc.workspace = true
+
+[dev-dependencies]
+# Throwaway pid-file/lock-file/log directories for the ported unit tests, so
+# none of them writes anywhere but a temp dir it owns.
+tempfile = "3"
