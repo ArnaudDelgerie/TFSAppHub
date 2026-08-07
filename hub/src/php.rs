@@ -127,8 +127,17 @@ fn write_shim(path: &Path, frankenphp: &Path) -> Result<(), PhpError> {
          exec {quoted} php-cli \"$@\"\n"
     );
 
-    fs::write(path, script).map_err(io_error(path))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(io_error(path))?;
+    // Written beside the target and renamed over it, not written in place. Two
+    // installs can genuinely overlap, and an in-place rewrite gives the other
+    // one a window in which the file it is about to execute is open for writing
+    // — which the kernel answers with ETXTBSY, an error whose text ("Text file
+    // busy") explains nothing to whoever meets it. A rename swaps whole inodes,
+    // so a concurrent execution keeps running the generation it started with.
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, script).map_err(io_error(&temporary))?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))
+        .map_err(io_error(&temporary))?;
+    fs::rename(&temporary, path).map_err(io_error(path))?;
     Ok(())
 }
 

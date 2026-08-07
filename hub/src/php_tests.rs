@@ -20,7 +20,21 @@ fn shim_output(arguments: &[&str], interpreter_name: &str) -> String {
     let shim = root.path().join("bin/php");
     write_shim(&shim, &interpreter).expect("a written shim");
 
-    let output = Command::new(&shim)
+    // The executable bit is what lets Composer spawn this by name, so it is
+    // asserted rather than assumed…
+    assert!(
+        fs::metadata(&shim).expect("a shim").permissions().mode() & 0o111 != 0,
+        "the shim has to be executable"
+    );
+    // …but the shim is then run *through* `sh` rather than exec'd directly.
+    // This test binary is multithreaded, and a fork from any other test holds a
+    // copy of every open file descriptor until it reaches `execve` — including
+    // the write handle a sibling thread has on its own freshly written shim.
+    // Exec'ing into that window earns an ETXTBSY ("Text file busy") that has
+    // nothing to do with the code under test. Nothing about the argument
+    // handling below depends on which of the two ways the script was started.
+    let output = Command::new("sh")
+        .arg(&shim)
         .args(arguments)
         .output()
         .expect("the shim runs");

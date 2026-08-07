@@ -155,6 +155,21 @@ impl Paths {
             .join(safe_segment("app identifier", identifier)?))
     }
 
+    /// `<OS data dir>/<identifier>/` — WebKitGTK's own per-`identifier` website
+    /// data (CONTRACT.md §5/§6).
+    ///
+    /// A **sibling** of `TFSApp/`, not a child of it: WebKit derives it from
+    /// the GTK application id, which plan 003 sets to the app's `identifier`,
+    /// and it has never heard of this project's vendor folder. Named here so
+    /// that the one command which has to clean it up — `remove --purge` — reads
+    /// it from the same place as every other path instead of rebuilding it, and
+    /// so nobody later "fixes" it into the vendor dir.
+    pub fn webkit_data_dir(&self, identifier: &str) -> Result<PathBuf, PathsError> {
+        Ok(self
+            .data_dir_base
+            .join(safe_segment("app identifier", identifier)?))
+    }
+
     /// [`Paths::app_data_dir`], created if missing and `0700` on every call.
     ///
     /// Both halves match the station's `packaged_data_dir` deliberately. The

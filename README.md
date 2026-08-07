@@ -17,10 +17,13 @@ collapse to 1, `composer install` *is* the compatibility manifest — it runs wi
 the very interpreter that will later serve the app — and per-app update falls out
 of `git fetch` for free.
 
-Status: **skeleton.** The workspace builds and the quality gate is in place; no
-`install` and no `open` yet — the two commands above are what this is heading
-towards, not what it does today. The design record and the plan queue live under
-the git-ignored `.project/`.
+Status: **it installs, it does not open yet.** `install` snapshots a local
+project, resolves its dependencies with the bundled PHP, runs its lifecycle
+commands and registers it; `list` and `remove` complete the loop. `open` — a
+real window on a running app — is the next plan, so the second command above is
+still what this is heading towards. Git sources are recognised and refused with
+a message saying so, rather than pretended. The design record and the plan queue
+live under the git-ignored `.project/`.
 
 ## Build
 

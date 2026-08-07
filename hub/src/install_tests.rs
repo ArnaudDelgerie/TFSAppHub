@@ -446,10 +446,17 @@ fn an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order() {
         r#"{"pre-install": ["doctrine:migrations:migrate"], "post-install": ["about"]}"#,
     );
 
-    let id = super::install(&paths, &source.path().display().to_string(), None, None)
-        .expect("it installs");
+    let id = super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        "0.1.0",
+    )
+    .expect("it installs");
 
-    assert_eq!(id, "demo");
+    assert_eq!(id.as_deref(), Some("demo"));
     let app_dir = paths.app_dir("demo").expect("an app dir");
     // Composer ran with the bundled PHP — the point of the whole module.
     assert!(app_dir.join("vendor/autoload.php").is_file());
@@ -475,8 +482,15 @@ fn a_failing_hook_leaves_no_directory_and_nothing_registered() {
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), r#"{"pre-install": ["boom"]}"#);
 
-    let error = super::install(&paths, &source.path().display().to_string(), None, None)
-        .expect_err("the hook fails, so the install must");
+    let error = super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        "0.1.0",
+    )
+    .expect_err("the hook fails, so the install must");
 
     assert!(matches!(error, InstallError::Php(_)), "{error}");
     // Named, because the terminal above it is full of the app's own output and

@@ -36,13 +36,21 @@ use crate::{
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
     paths::{Paths, PathsError},
     php::{self, PhpError, Toolchain},
-    registry::{self, Registry, RegistryError},
+    platform::{self, PlatformError},
+    prompt,
+    registry::{self, Registry, RegistryEntry, RegistryError, State},
     source::{self, SourceError},
 };
 
 /// The whole command: install `source`, or say why not. Returns the process's
 /// exit code.
-pub fn run(source: &str, id: Option<&str>, reference: Option<&str>) -> i32 {
+pub fn run(
+    source: &str,
+    id: Option<&str>,
+    reference: Option<&str>,
+    assume_yes: bool,
+    hub_version: &str,
+) -> i32 {
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
         Err(error) => {
@@ -51,11 +59,14 @@ pub fn run(source: &str, id: Option<&str>, reference: Option<&str>) -> i32 {
         }
     };
 
-    match install(&paths, source, id, reference) {
-        Ok(id) => {
-            println!("Installed {id}.");
+    match install(&paths, source, id, reference, assume_yes, hub_version) {
+        Ok(Some(id)) => {
+            println!("Installed {id}. `tfsapp-hub list` shows it.");
             EXIT_OK
         }
+        // Declining is not a failure of the command, but the app is not
+        // installed either — a script reading 0 would conclude it is.
+        Ok(None) => EXIT_FAILED,
         Err(error) => {
             eprintln!("tfsapp-hub: {error}");
             EXIT_FAILED
@@ -73,7 +84,9 @@ fn install(
     source: &str,
     id: Option<&str>,
     reference: Option<&str>,
-) -> Result<String, InstallError> {
+    assume_yes: bool,
+    hub_version: &str,
+) -> Result<Option<String>, InstallError> {
     let resolved = source::resolve(&source::classify(source), reference)?;
     let loaded = validate(&resolved.root)?;
     // Before anything is written, so a typo in a key is read next to the source
@@ -90,19 +103,19 @@ fn install(
     check_id_free(&installed, paths, &id)?;
     check_port_free(&installed, manifest.app_port)?;
 
-    // Resolved before the copy: no interpreter and no Composer means the
-    // install cannot finish, and finding that out after the copy would leave
-    // the user to clean up a tree the hub could have known it would not use.
+    // Resolved before the copy — and before the question, since an install
+    // nothing could finish is not worth asking about. The fingerprint comes
+    // from the same interpreter that is about to run the app's PHP, which is
+    // exactly what the registry has to record.
     let toolchain = php::toolchain(paths)?;
-
-    println!(
-        "Installing {id} ({} {}) from {}",
-        manifest.product_name,
-        manifest.app_version,
-        resolved.root.display()
-    );
+    let platform = platform::probe(&toolchain.frankenphp)?.fingerprint();
 
     let app_dir = paths.app_dir(&id)?;
+    announce(&id, manifest, &resolved, &app_dir, paths)?;
+    if !prompt::confirmed(assume_yes) {
+        println!("Aborted — nothing was installed.");
+        return Ok(None);
+    }
     snapshot(&resolved.root, &app_dir)?;
 
     // Everything from here runs the app's own PHP, so everything from here can
@@ -113,7 +126,65 @@ fn install(
         return Err(error);
     }
 
-    Ok(id)
+    // Last, and under the registry's own lock: an entry written any earlier
+    // would name a `ready` app whose dependencies had not resolved yet, and
+    // there is no state in the registry for "installed, but do not run it".
+    let now = registry::now_timestamp();
+    let entry = RegistryEntry {
+        id: id.clone(),
+        identifier: manifest.identifier.clone(),
+        source: resolved.source,
+        app_version: manifest.app_version.clone(),
+        source_revision: resolved.revision,
+        app_port: manifest.app_port,
+        platform: platform.clone(),
+        state: State::Ready,
+        installed_at: now.clone(),
+        updated_at: now,
+        unknown: serde_json::Map::new(),
+    };
+    registry::update(paths, |registry| {
+        registry.stamp(hub_version, platform);
+        registry.upsert(entry);
+    })?;
+
+    Ok(Some(id))
+}
+
+/// Say what is about to happen, in the terms the user will have to reason about
+/// afterwards: the app, where it comes from, where it lands, and where its data
+/// will live.
+///
+/// The warning is not boilerplate and must not be softened. Installing runs the
+/// app's own PHP on this machine — Composer's resolution, every script it
+/// fires, the app's own install commands — and there is no sandbox anywhere in
+/// this hub. The honest comparison is `composer require`, which is the same
+/// trust a developer already gives daily; saying so is more useful than a
+/// warning nobody believes.
+fn announce(
+    id: &str,
+    manifest: &Manifest,
+    resolved: &source::Resolved,
+    app_dir: &Path,
+    paths: &Paths,
+) -> Result<(), InstallError> {
+    println!(
+        "Install {} {} as \"{id}\":",
+        manifest.product_name, manifest.app_version
+    );
+    println!("  from      {}", resolved.root.display());
+    println!("  into      {}", app_dir.display());
+    println!(
+        "  data dir  {}",
+        paths.app_data_dir(&manifest.identifier)?.display()
+    );
+    println!();
+    println!(
+        "This runs the app's own PHP on your machine: Composer's dependency\n\
+         resolution, the scripts it fires, and the app's own install commands.\n\
+         There is no sandbox — it is the same trust you give `composer require`."
+    );
+    Ok(())
 }
 
 /// Bring the copied tree to a state the app can run from: its dependencies,
@@ -421,6 +492,7 @@ pub enum InstallError {
     Registry(RegistryError),
     Env(EnvError),
     Php(PhpError),
+    Platform(PlatformError),
     /// The derived or given `id` cannot name a directory or be typed as one
     /// word.
     UnusableId {
@@ -469,6 +541,7 @@ impl fmt::Display for InstallError {
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Env(error) => write!(formatter, "{error}"),
             Self::Php(error) => write!(formatter, "{error}"),
+            Self::Platform(error) => write!(formatter, "{error}"),
             Self::UnusableId { id, derived } => {
                 let source = match derived {
                     true => format!(
@@ -535,6 +608,7 @@ impl std::error::Error for InstallError {
             Self::Registry(error) => Some(error),
             Self::Env(error) => Some(error),
             Self::Php(error) => Some(error),
+            Self::Platform(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -574,6 +648,12 @@ impl From<EnvError> for InstallError {
 impl From<PhpError> for InstallError {
     fn from(error: PhpError) -> Self {
         Self::Php(error)
+    }
+}
+
+impl From<PlatformError> for InstallError {
+    fn from(error: PlatformError) -> Self {
+        Self::Platform(error)
     }
 }
 

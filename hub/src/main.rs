@@ -14,7 +14,9 @@ mod manifest;
 mod paths;
 mod php;
 mod platform;
+mod prompt;
 mod registry;
+mod remove;
 mod source;
 
 use cli::{Command, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE};
@@ -82,8 +84,24 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             source,
             id,
             reference,
-        } => install::run(&source, id.as_deref(), reference.as_deref()),
+            assume_yes,
+        } => install::run(
+            &source,
+            id.as_deref(),
+            reference.as_deref(),
+            assume_yes,
+            // The same package info `--version` prints, threaded in rather than
+            // read from `CARGO_PKG_VERSION` here: the registry records which
+            // hub wrote it, and two ways of asking that question are one too
+            // many.
+            &context.package_info().version.to_string(),
+        ),
         Command::List => list::run(),
+        Command::Remove {
+            id,
+            purge,
+            assume_yes,
+        } => remove::run(&id, purge, assume_yes),
         Command::Platform => print_platform(),
         Command::OpenIdentity {
             identifier,
