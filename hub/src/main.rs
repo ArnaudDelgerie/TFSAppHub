@@ -7,6 +7,7 @@
 
 mod cli;
 mod identity;
+mod install;
 mod list;
 mod manifest;
 mod paths;
