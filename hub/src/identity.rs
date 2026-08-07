@@ -99,17 +99,116 @@ fn set_prgname(identifier: &str) {
 /// refusing to launch over a picture would be the wrong trade. It comes out as
 /// a generic window icon, which is exactly what the user would have got had
 /// the app declared no icon at all.
+///
+/// An icon larger than X11 will carry is downscaled rather than dropped, and
+/// the fallback is announced — see [`fit_to_limit`].
 pub fn load_icon(path: &std::path::Path) -> Option<tauri::image::Image<'static>> {
-    match tauri::image::Image::from_path(path) {
-        Ok(image) => Some(image),
+    let decoded = match tauri::image::Image::from_path(path) {
+        Ok(image) => image,
         Err(error) => {
             eprintln!(
                 "tfsapp-hub: opening without a window icon — cannot read {}: {error}",
                 path.display()
             );
-            None
+            return None;
+        }
+    };
+
+    let (width, height) = (decoded.width(), decoded.height());
+    // Copied out rather than borrowed: `Image::rgba(&'a self)` ties the borrow
+    // to the image's own lifetime parameter, which cannot be `'static` for a
+    // local. The copy is one icon, once, at launch.
+    let rgba = decoded.rgba().to_vec();
+
+    let (rgba, fitted_width, fitted_height) = fit_to_limit(rgba, width, height, MAX_ICON_WORDS);
+    if (fitted_width, fitted_height) != (width, height) {
+        eprintln!(
+            "tfsapp-hub: window icon {} is {width}×{height}, larger than X11 will carry — \
+             using it at {fitted_width}×{fitted_height}. The file itself is untouched.",
+            path.display()
+        );
+    }
+
+    Some(tauri::image::Image::new_owned(
+        rgba,
+        fitted_width,
+        fitted_height,
+    ))
+}
+
+/// The most an X11 window icon can be.
+///
+/// GDK writes `_NET_WM_ICON` as an array of `2 + width * height` words (the two
+/// being the dimensions) and refuses to write it at all past
+/// `GDK_SELECTION_MAX_SIZE`, which caps at 262144 words. It refuses in silence:
+/// no warning, no error, the property is simply never set and the window comes
+/// up with the window manager's generic icon. A 512×512 PNG — the size the
+/// hub's own icon happens to be — needs 262146 words and misses by two.
+///
+/// Measured on this binary under `GDK_BACKEND=x11` (plan 003 step 4): at
+/// 512×512 `xprop _NET_WM_ICON` reports `not found`, at 256×256 it reports
+/// `256, 256, …`.
+const MAX_ICON_WORDS: u64 = 262_144;
+
+/// Whether `_NET_WM_ICON` can hold an icon of these dimensions.
+fn fits(width: u32, height: u32, max_words: u64) -> bool {
+    2 + u64::from(width) * u64::from(height) <= max_words
+}
+
+/// Downscale `rgba` until it fits `max_words`, returning it with its new
+/// dimensions. Already-fitting icons and degenerate ones are returned as they
+/// came.
+///
+/// Downscaling rather than dropping is the family rule for a value a host
+/// cannot honour: fall back to the nearest one it can, and say so. Silence
+/// would leave an app author believing they ship an icon they do not.
+///
+/// The resample is a box average over integer blocks — no dependency needed,
+/// since `Image::from_path` has already handed us decoded RGBA. The block size
+/// is the smallest that fits, so as much resolution as possible survives:
+/// 512×512 halves to 256×256, 1024×1024 thirds to 342×342 rather than
+/// quartering to 256×256. When the block divides the dimensions exactly every
+/// output pixel is a whole block's average; where it does not, the last row and
+/// column average the smaller block that is actually there. Alpha is
+/// averaged alongside the colour channels rather than premultiplied, which can
+/// darken a hard transparent edge slightly; for a window icon that is not worth
+/// a dependency.
+fn fit_to_limit(rgba: Vec<u8>, width: u32, height: u32, max_words: u64) -> (Vec<u8>, u32, u32) {
+    if width == 0 || height == 0 || fits(width, height, max_words) {
+        return (rgba, width, height);
+    }
+
+    // Terminates: at `factor == max(width, height)` the target is 1×1.
+    let mut factor = 2;
+    while !fits(width.div_ceil(factor), height.div_ceil(factor), max_words) {
+        factor += 1;
+    }
+
+    let (target_width, target_height) = (width.div_ceil(factor), height.div_ceil(factor));
+    let mut fitted = Vec::with_capacity((target_width as usize) * (target_height as usize) * 4);
+    for target_y in 0..target_height {
+        for target_x in 0..target_width {
+            let (from_x, from_y) = (target_x * factor, target_y * factor);
+            let (to_x, to_y) = ((from_x + factor).min(width), (from_y + factor).min(height));
+
+            let mut channels = [0u64; 4];
+            for y in from_y..to_y {
+                for x in from_x..to_x {
+                    let at = ((y as usize) * (width as usize) + (x as usize)) * 4;
+                    for (channel, sum) in channels.iter_mut().enumerate() {
+                        *sum += u64::from(rgba[at + channel]);
+                    }
+                }
+            }
+
+            let sampled = u64::from((to_x - from_x) * (to_y - from_y));
+            for sum in channels {
+                fitted.push((sum / sampled) as u8);
+            }
         }
     }
+
+    (fitted, target_width, target_height)
 }
 
 #[cfg(test)]
