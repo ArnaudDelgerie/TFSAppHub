@@ -7,6 +7,7 @@
 mod identity;
 mod manifest;
 mod paths;
+mod platform;
 mod registry;
 
 use identity::Identity;
@@ -14,6 +15,12 @@ use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 const OPEN_USAGE: &str =
     "usage: tfsapp-hub open --identity <identifier> [--name <product name>] [--icon <path.png>]";
+
+/// Temporary and hidden — the double underscore says so, and nothing prints it
+/// in a usage line. It exists so the `platform` fingerprint can be eyeballed
+/// against the bundled binary's real `php -m` before anything depends on it,
+/// and it goes away once an installed app records one and `list` can show it.
+const PLATFORM_SUBCOMMAND: &str = "__platform";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -33,6 +40,10 @@ fn main() {
         return;
     }
 
+    if args.first().map(String::as_str) == Some(PLATFORM_SUBCOMMAND) {
+        std::process::exit(print_platform());
+    }
+
     if args.first().map(String::as_str) == Some("open") {
         let identity = parse_open(&args[1..]).unwrap_or_else(|error| {
             eprintln!("tfsapp-hub: {error}");
@@ -50,6 +61,42 @@ fn main() {
         package_info.version,
         tfsapp_core::version()
     );
+}
+
+/// Print what the bundled FrankenPHP says it is, and the fingerprint derived
+/// from it. Returns the process exit code.
+///
+/// The extension list is printed in full alongside the hash: the point of this
+/// command is to be checkable against `frankenphp php-cli -m` by eye, and a
+/// 64-character hash on its own is checkable against nothing.
+fn print_platform() -> i32 {
+    let binary = match platform::hub_frankenphp() {
+        Ok(binary) => binary,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return 1;
+        }
+    };
+
+    match platform::probe(&binary) {
+        Ok(probe) => {
+            let fingerprint = probe.fingerprint();
+            println!("interpreter: {}", binary.display());
+            println!("php:         {}", probe.php_version);
+            println!(
+                "extensions:  {} — {}",
+                probe.extensions.len(),
+                probe.extensions.join(", ")
+            );
+            println!("hash:        {}", fingerprint.extensions_hash);
+            println!("platform:    {fingerprint}");
+            0
+        }
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            1
+        }
+    }
 }
 
 /// Temporary argv parsing for `open`, deliberately minimal: the identity of an

@@ -1,0 +1,141 @@
+use super::{bundled_frankenphp, parse_probe, probe, PlatformError};
+
+const REAL_OUTPUT: &str = "8.5\nCore,date,json,pcre,SPL,standard,PDO,sqlite3";
+
+#[test]
+fn the_two_printed_lines_become_a_probe() {
+    let probed = parse_probe(REAL_OUTPUT).expect("it reads");
+
+    assert_eq!(probed.php_version, "8.5");
+    // Sorted here rather than in PHP, because the sort is part of the
+    // fingerprint's definition.
+    assert_eq!(
+        probed.extensions,
+        ["Core", "PDO", "SPL", "date", "json", "pcre", "sqlite3", "standard"]
+    );
+}
+
+#[test]
+fn a_trailing_newline_changes_nothing() {
+    assert_eq!(
+        parse_probe(&format!("{REAL_OUTPUT}\n")).expect("it reads"),
+        parse_probe(REAL_OUTPUT).expect("it reads")
+    );
+}
+
+#[test]
+fn the_order_php_listed_them_in_does_not_reach_the_fingerprint() {
+    // The property the whole thing rests on: the same interpreter must
+    // fingerprint identically twice, and `get_loaded_extensions()` promises
+    // nothing about order.
+    let one = parse_probe("8.5\njson,Core,SPL").expect("it reads");
+    let other = parse_probe("8.5\nSPL,json,Core").expect("it reads");
+
+    assert_eq!(one.fingerprint(), other.fingerprint());
+}
+
+#[test]
+fn one_extension_more_is_a_different_platform() {
+    // The case that matters: a hub update that drops or adds an extension is
+    // exactly what can make an installed app's composer.lock unsatisfiable.
+    let before = parse_probe("8.5\njson,Core,SPL").expect("it reads");
+    let after = parse_probe("8.5\njson,Core,SPL,intl").expect("it reads");
+
+    assert_ne!(before.fingerprint(), after.fingerprint());
+}
+
+#[test]
+fn a_php_minor_bump_is_a_different_platform() {
+    let before = parse_probe("8.4\njson,Core,SPL").expect("it reads");
+    let after = parse_probe("8.5\njson,Core,SPL").expect("it reads");
+
+    assert_ne!(before.fingerprint(), after.fingerprint());
+    assert_eq!(
+        before.fingerprint().extensions_hash,
+        after.fingerprint().extensions_hash
+    );
+}
+
+#[test]
+fn the_hash_is_a_full_hex_sha_256() {
+    let fingerprint = parse_probe(REAL_OUTPUT).expect("it reads").fingerprint();
+
+    assert_eq!(fingerprint.extensions_hash.len(), 64);
+    assert!(fingerprint
+        .extensions_hash
+        .chars()
+        .all(|character| character.is_ascii_hexdigit()));
+}
+
+#[test]
+fn a_patch_release_is_not_a_new_platform() {
+    // major.minor is the granularity composer.lock's platform requirements are
+    // written at, which is why the probe never asks for PHP_VERSION.
+    assert!(parse_probe("8.5.8\njson,Core").is_err());
+}
+
+#[test]
+fn an_unreadable_answer_says_what_it_got() {
+    for (output, why) in [
+        ("", "empty"),
+        ("Segmentation fault", "not a version"),
+        ("8\njson,Core", "no minor"),
+        ("8.5", "no extension line"),
+        ("8.5\n", "an empty extension line"),
+    ] {
+        let error = parse_probe(output)
+            .err()
+            .unwrap_or_else(|| panic!("{why} must not parse"));
+
+        assert!(matches!(error, PlatformError::Unreadable { .. }), "{why}");
+        // The raw answer is quoted back, because the interesting failures are
+        // the ones nobody predicted.
+        assert!(error.to_string().contains("It answered"), "{error}");
+    }
+}
+
+#[test]
+fn the_bundled_interpreter_answers_for_itself() {
+    // The only test that runs the real binary, and it is skipped rather than
+    // failed when it is absent: `make check` must stay green on a fresh clone
+    // where `make sidecar` has never run, and the 170 MB download is not
+    // something a unit test should trigger. The manual counterpart is
+    // `tfsapp-hub __platform`, eyeballed against the binary's own `php -m`.
+    let binary = bundled_frankenphp();
+    if !binary.is_file() {
+        eprintln!(
+            "skipped: {} is not there — run `make sidecar` to cover this one",
+            binary.display()
+        );
+        return;
+    }
+
+    let probed = probe(&binary).expect("the bundled FrankenPHP answers");
+
+    assert!(
+        probed.php_version.starts_with('8'),
+        "{}",
+        probed.php_version
+    );
+    // Whatever else it ships, a PHP that can run Symfony has these.
+    for expected in ["Core", "SPL", "json"] {
+        assert!(
+            probed.extensions.iter().any(|name| name == expected),
+            "{expected} missing from {:?}",
+            probed.extensions
+        );
+    }
+    assert_eq!(probed.fingerprint(), probed.fingerprint());
+}
+
+#[test]
+fn running_something_that_is_not_an_interpreter_fails_loudly() {
+    let error = probe(std::path::Path::new("/nonexistent/frankenphp"))
+        .expect_err("there is nothing to run");
+
+    assert!(matches!(error, PlatformError::Unstartable { .. }));
+    assert!(
+        error.to_string().contains("/nonexistent/frankenphp"),
+        "{error}"
+    );
+}
