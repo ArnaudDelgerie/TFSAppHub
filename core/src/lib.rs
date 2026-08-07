@@ -11,10 +11,12 @@
 //! nothing in this crate needs `#[allow(dead_code)]` while its consumer is
 //! still being written.
 
+pub mod app_secret;
 pub mod health;
 pub mod log;
 pub mod ports;
 pub mod process;
+pub mod sidecar;
 
 /// This crate's version, as recorded by Cargo.
 ///

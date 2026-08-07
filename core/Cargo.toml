@@ -24,6 +24,10 @@ serde_json.workspace = true
 # API the station parses with it belongs to the update check, which stays in
 # `hub/`.
 ureq.workspace = true
+# Generate a per-installation APP_SECRET (CONTRACT.md §6), in `app_secret.rs`.
+# Not shared with `hub/`: generation lives here, and 007's keyring-backed
+# resolution calls down to `random_secret_hex` rather than rolling its own.
+getrandom = "0.2"
 
 [dev-dependencies]
 # Throwaway pid-file/lock-file/log directories for the ported unit tests, so

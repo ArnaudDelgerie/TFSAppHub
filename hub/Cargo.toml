@@ -54,8 +54,6 @@ flate2 = "1"
 # directly, with the "formatting" feature, for `export`'s RFC-3339
 # exported_at manifest timestamp.
 time = { version = "0.3", features = ["formatting"] }
-# Generate a per-installation APP_SECRET.
-getrandom = "0.2"
 # Shared with `core/` — see the root Cargo.toml for what each is for.
 serde.workspace = true
 serde_json.workspace = true
