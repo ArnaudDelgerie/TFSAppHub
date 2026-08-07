@@ -28,6 +28,11 @@ ureq.workspace = true
 # Not shared with `hub/`: generation lives here, and 007's keyring-backed
 # resolution calls down to `random_secret_hex` rather than rolling its own.
 getrandom = "0.2"
+# The URL type `browser.rs` opens in the system browser. The station writes
+# `tauri::Url`, which is a re-export of exactly this crate — depending on it
+# directly is what keeps the boundary above real rather than nominal. Already
+# in Cargo.lock as a transitive dependency, so this adds nothing to the tree.
+url = "2"
 
 [dev-dependencies]
 # Throwaway pid-file/lock-file/log directories for the ported unit tests, so

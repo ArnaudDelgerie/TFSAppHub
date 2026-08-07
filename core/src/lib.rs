@@ -12,6 +12,7 @@
 //! still being written.
 
 pub mod app_secret;
+pub mod browser;
 pub mod health;
 pub mod log;
 pub mod ports;
