@@ -3,10 +3,16 @@
 # app contract both hosts share.
 #
 # Usage:
-#   make sidecar
+#   make resources
 #   make check
 
-.PHONY: sidecar check
+.PHONY: resources sidecar composer check
+
+# Everything the hub ships that is not built from source. Both halves are
+# runtime prerequisites, not packaging ones: the hub installs and runs every
+# app with its own PHP and its own Composer, so `install` does nothing without
+# them.
+resources: sidecar composer
 
 # Download the FrankenPHP sidecar binary once into hub/resources. Idempotent:
 # skips the download if the binary is already present. Unlike the station, this
@@ -14,6 +20,12 @@
 # with this interpreter, so nothing works without it.
 sidecar:
 	build/scripts/download-frankenphp-sidecar.sh
+
+# Download composer.phar once into hub/resources, likewise idempotent. Run
+# under the bundled FrankenPHP, never under a host PHP — which is what makes an
+# app's dependency tree resolve against the interpreter that will serve it.
+composer:
+	build/scripts/download-composer.sh
 
 # Run cargo fmt --check, then clippy, then unit tests, then shellcheck over
 # build/scripts/*.sh — same four gates and same order as the station's, cheapest

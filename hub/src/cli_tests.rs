@@ -235,7 +235,6 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
     for line in [
         "--update",
         "--rollback",
-        "install ../TFSAppTest",
         "open demo",
         "update demo",
         "remove demo",
@@ -249,7 +248,7 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         );
     }
 
-    for line in ["--version", "--help", "list"] {
+    for line in ["--version", "--help", "list", "install ../TFSAppTest"] {
         assert!(command(line).is_implemented(), "{line:?} works today");
     }
 }

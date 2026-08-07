@@ -25,20 +25,21 @@ the git-ignored `.project/`.
 ## Build
 
 ```sh
-make sidecar   # fetch the pinned FrankenPHP binary into hub/resources (once)
+make resources # fetch the pinned FrankenPHP and composer.phar into hub/resources (once)
 make check     # cargo fmt --check, clippy -D warnings, unit tests, shellcheck
 ```
 
-`make sidecar` is not only a packaging step: the hub installs *and* runs every
-app with that interpreter, so no system-wide PHP is required — and nothing works
-without it.
+`make resources` is not only a packaging step: the hub installs *and* runs every
+app with that interpreter and that Composer, so no system-wide PHP is required —
+and nothing works without them. (`make sidecar` and `make composer` fetch one
+half each, if you want them separately.)
 
 ### Prerequisites
 
 - **Rust** + the Tauri CLI (`cargo install tauri-cli`, or `cargo tauri` v2).
 - Linux build deps for Tauri v2 / WebKitGTK (`libwebkit2gtk-4.1-dev`,
   `libgtk-3-dev`, `libdbus-1-dev`, `build-essential`, `curl`, …).
-- **curl** (to fetch the FrankenPHP sidecar).
+- **curl** (to fetch the FrankenPHP sidecar and composer.phar).
 - **rustfmt** and **clippy** (`rustup component add rustfmt clippy`) and
   **shellcheck** — needed for `make check`. A missing Rust component fails with
   rustup's own `rustup component add …` message.

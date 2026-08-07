@@ -366,3 +366,131 @@ fn a_pinned_port_nothing_can_bind_is_refused() {
         "{error}"
     );
 }
+
+/// A fixture app whose `bin/console` records what it was asked to do, and fails
+/// on the word `boom` — enough to watch the pipeline run and to watch it undo
+/// itself, without a real Symfony project.
+fn runnable_app_tree(root: &Path, commands: &str) {
+    fs::create_dir_all(root).expect("a project root");
+    fs::write(
+        root.join("tfsapp.config.json"),
+        format!(
+            r#"{{
+              "product_name": "Demo App",
+              "identifier": "dev.local.demo",
+              "project_name": "demo",
+              "app_version": "0.6.0",
+              "commands": {commands}
+            }}"#
+        ),
+    )
+    .expect("a manifest");
+    fs::write(root.join("composer.json"), "{}").expect("a composer.json");
+
+    fs::create_dir_all(root.join("bin")).expect("a bin dir");
+    fs::write(
+        root.join("bin/console"),
+        r#"<?php
+        $arguments = array_slice($argv, 1);
+        // The §3 environment has to have reached this process: a hook that
+        // wrote its trace anywhere else would be running against the wrong
+        // data dir, which is the failure this fixture exists to catch.
+        file_put_contents(
+            getenv('APP_LOG_DIR') . '/hooks.log',
+            implode(' ', $arguments) . "\n",
+            FILE_APPEND
+        );
+        exit(in_array('boom', $arguments, true) ? 1 : 0);
+        "#,
+    )
+    .expect("a console");
+
+    fs::create_dir_all(root.join("public")).expect("a public dir");
+    fs::write(root.join("public/index.php"), "<?php").expect("a front controller");
+}
+
+/// The bundled interpreter and Composer, or a reason to skip.
+///
+/// Skipped rather than failed when they are absent, exactly as
+/// `platform_tests` skips the interpreter probe: `make check` has to stay green
+/// on a fresh clone where `make resources` has never run, and a 170 MB download
+/// is not something a unit test should trigger.
+fn resources_present() -> bool {
+    let missing: Vec<_> = [
+        crate::platform::bundled_frankenphp(),
+        crate::php::bundled_composer(),
+    ]
+    .into_iter()
+    .filter(|path| !path.is_file())
+    .collect();
+
+    for path in &missing {
+        eprintln!(
+            "skipped: {} is not there — run `make resources` to cover this one",
+            path.display()
+        );
+    }
+    missing.is_empty()
+}
+
+#[test]
+fn an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    runnable_app_tree(
+        source.path(),
+        r#"{"pre-install": ["doctrine:migrations:migrate"], "post-install": ["about"]}"#,
+    );
+
+    let id = super::install(&paths, &source.path().display().to_string(), None, None)
+        .expect("it installs");
+
+    assert_eq!(id, "demo");
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    // Composer ran with the bundled PHP — the point of the whole module.
+    assert!(app_dir.join("vendor/autoload.php").is_file());
+    // …and the hooks ran, in the contract's order, against the app's own data
+    // dir rather than anywhere the hub happened to be standing.
+    let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
+    assert_eq!(
+        fs::read_to_string(log).expect("a hook trace"),
+        "doctrine:migrations:migrate\nabout\n"
+    );
+}
+
+#[test]
+fn a_failing_hook_leaves_no_directory_and_nothing_registered() {
+    // The restartability rule, measured: an app whose install failed halfway
+    // must not exist at all, or the next attempt meets a tree nobody wrote and
+    // the collision check refuses it forever.
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    runnable_app_tree(source.path(), r#"{"pre-install": ["boom"]}"#);
+
+    let error = super::install(&paths, &source.path().display().to_string(), None, None)
+        .expect_err("the hook fails, so the install must");
+
+    assert!(matches!(error, InstallError::Php(_)), "{error}");
+    // Named, because the terminal above it is full of the app's own output and
+    // the user needs to know which line of it mattered.
+    assert!(error.to_string().contains("boom"), "{error}");
+    assert!(
+        !paths.app_dir("demo").expect("an app dir").exists(),
+        "the copied tree has to be gone"
+    );
+    assert!(
+        crate::registry::load(&paths)
+            .expect("a readable registry")
+            .apps
+            .is_empty(),
+        "nothing may be registered before the hooks succeed"
+    );
+}

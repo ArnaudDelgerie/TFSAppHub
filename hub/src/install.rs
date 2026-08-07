@@ -25,22 +25,138 @@
 //! pointing at a tree whose `composer install` failed would be a `ready` app
 //! that cannot run.
 
-// The pipeline is assembled step by step across this plan, and until [`run`]
-// exists the module's own tests are its only callers. Removed as soon as the
-// CLI routes `install` here, rather than left to linger.
-#![allow(dead_code)]
-
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
 };
 
 use crate::{
+    app_env::{self, EnvError},
+    cli::{EXIT_FAILED, EXIT_OK},
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
     paths::{Paths, PathsError},
-    registry::{Registry, RegistryError},
-    source::SourceError,
+    php::{self, PhpError, Toolchain},
+    registry::{self, Registry, RegistryError},
+    source::{self, SourceError},
 };
+
+/// The whole command: install `source`, or say why not. Returns the process's
+/// exit code.
+pub fn run(source: &str, id: Option<&str>, reference: Option<&str>) -> i32 {
+    let paths = match Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+
+    match install(&paths, source, id, reference) {
+        Ok(id) => {
+            println!("Installed {id}.");
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            EXIT_FAILED
+        }
+    }
+}
+
+/// The pipeline, in order. Returns the `id` the app was installed under.
+///
+/// Takes its `Paths` rather than resolving them, which is what lets the whole
+/// pipeline — copy, Composer, hooks, cleanup — run against a throwaway root in
+/// a test instead of the developer's real `~/.local/share/TFSApp/`.
+fn install(
+    paths: &Paths,
+    source: &str,
+    id: Option<&str>,
+    reference: Option<&str>,
+) -> Result<String, InstallError> {
+    let resolved = source::resolve(&source::classify(source), reference)?;
+    let loaded = validate(&resolved.root)?;
+    // Before anything is written, so a typo in a key is read next to the source
+    // it came from rather than after a hundred megabytes of copying.
+    loaded.report_warnings();
+    let manifest = &loaded.manifest;
+
+    let id = resolve_id(id, manifest)?;
+    // One read of the registry for both gates. The window between this read and
+    // the write at the end is real but narrow, and the write itself takes the
+    // lock — two racing installs cannot corrupt the file, at worst the second
+    // one's collision check was a moment stale.
+    let installed = registry::load(paths)?;
+    check_id_free(&installed, paths, &id)?;
+    check_port_free(&installed, manifest.app_port)?;
+
+    // Resolved before the copy: no interpreter and no Composer means the
+    // install cannot finish, and finding that out after the copy would leave
+    // the user to clean up a tree the hub could have known it would not use.
+    let toolchain = php::toolchain(paths)?;
+
+    println!(
+        "Installing {id} ({} {}) from {}",
+        manifest.product_name,
+        manifest.app_version,
+        resolved.root.display()
+    );
+
+    let app_dir = paths.app_dir(&id)?;
+    snapshot(&resolved.root, &app_dir)?;
+
+    // Everything from here runs the app's own PHP, so everything from here can
+    // fail in ways the hub does not control. One place to undo the copy, rather
+    // than an `if` after each step.
+    if let Err(error) = prepare(paths, &toolchain, manifest, &app_dir) {
+        let _ = fs::remove_dir_all(&app_dir);
+        return Err(error);
+    }
+
+    Ok(id)
+}
+
+/// Bring the copied tree to a state the app can run from: its dependencies,
+/// then its own install-time lifecycle commands.
+///
+/// **Which hooks run here, and why these.** The hub's `install` *is* the
+/// contract's install event (CONTRACT.md §6): the app is arriving on this
+/// machine for the first time under this host, so `pre-install` and
+/// `post-install` are the two lists that apply. `pre-update`/`post-update`
+/// belong to `update <id>`, which is a later plan's command.
+///
+/// The station runs `post-install` after `/healthz` answers `200`, because over
+/// there the install event happens *during a launch* and there is a sidecar up
+/// by then. Here there is not: install is its own moment, with no window and no
+/// server. For the ordinary contents of that hook — a cache warm, an `about` —
+/// it makes no difference; for one that expects to reach its own app over HTTP
+/// it does. Logged as friction #6 in `.project/contract-amendments.md` rather
+/// than papered over.
+fn prepare(
+    paths: &Paths,
+    toolchain: &Toolchain,
+    manifest: &Manifest,
+    app_dir: &Path,
+) -> Result<(), InstallError> {
+    let environment = app_env::resolve(paths, manifest, app_dir)?;
+    // Named before the first command runs, because the next thing on screen is
+    // a migration writing a database into it — under `identifier`, which is
+    // what makes it the same data dir a packaged install of this app uses.
+    println!("Its data lives in {}", environment.data_dir.display());
+
+    toolchain.composer_install(app_dir, &environment.vars)?;
+
+    for command in manifest
+        .commands
+        .pre_install
+        .iter()
+        .chain(&manifest.commands.post_install)
+    {
+        toolchain.console(app_dir, &environment.vars, command)?;
+    }
+
+    Ok(())
+}
 
 /// Paths, relative to the project root, the snapshot never copies.
 ///
@@ -303,6 +419,8 @@ pub enum InstallError {
     Manifest(ManifestError),
     Paths(PathsError),
     Registry(RegistryError),
+    Env(EnvError),
+    Php(PhpError),
     /// The derived or given `id` cannot name a directory or be typed as one
     /// word.
     UnusableId {
@@ -349,6 +467,8 @@ impl fmt::Display for InstallError {
             Self::Manifest(error) => write!(formatter, "{error}"),
             Self::Paths(error) => write!(formatter, "{error}"),
             Self::Registry(error) => write!(formatter, "{error}"),
+            Self::Env(error) => write!(formatter, "{error}"),
+            Self::Php(error) => write!(formatter, "{error}"),
             Self::UnusableId { id, derived } => {
                 let source = match derived {
                     true => format!(
@@ -413,6 +533,8 @@ impl std::error::Error for InstallError {
             Self::Manifest(error) => Some(error),
             Self::Paths(error) => Some(error),
             Self::Registry(error) => Some(error),
+            Self::Env(error) => Some(error),
+            Self::Php(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -440,6 +562,18 @@ impl From<PathsError> for InstallError {
 impl From<RegistryError> for InstallError {
     fn from(error: RegistryError) -> Self {
         Self::Registry(error)
+    }
+}
+
+impl From<EnvError> for InstallError {
+    fn from(error: EnvError) -> Self {
+        Self::Env(error)
+    }
+}
+
+impl From<PhpError> for InstallError {
+    fn from(error: PhpError) -> Self {
+        Self::Php(error)
     }
 }
 

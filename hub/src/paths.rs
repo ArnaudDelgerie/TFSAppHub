@@ -49,6 +49,13 @@ pub const HUB_DIR: &str = "hub";
 /// Where installed snapshots live, one directory per `id`.
 pub const APPS_DIR: &str = "apps";
 
+/// The hub's own executables, as opposed to any app's.
+pub const BIN_DIR: &str = "bin";
+
+/// The `php` shim's name — the name is the point, since it exists to be found
+/// by anything looking for a PHP interpreter (see `php.rs`).
+pub const PHP_SHIM_FILE: &str = "php";
+
 /// The registry file's name under the hub root.
 pub const REGISTRY_FILE: &str = "registry.json";
 
@@ -112,6 +119,17 @@ impl Paths {
     /// makes it possible.
     pub fn app_dir(&self, id: &str) -> Result<PathBuf, PathsError> {
         Ok(self.apps_root().join(safe_segment("app id", id)?))
+    }
+
+    /// `<OS data dir>/TFSApp/hub/bin/php` — the shim that keeps an app's own
+    /// PHP subprocesses on the bundled interpreter (see `php.rs`).
+    ///
+    /// Under the hub's root rather than anywhere on the user's `PATH`: it is
+    /// the hub's plumbing, exported only to the commands the hub itself starts,
+    /// and a `php` appearing in someone's shell because they installed an app
+    /// would be an unpleasant surprise.
+    pub fn php_shim_path(&self) -> PathBuf {
+        self.hub_root().join(BIN_DIR).join(PHP_SHIM_FILE)
     }
 
     /// `<OS data dir>/TFSApp/hub/registry.json`.

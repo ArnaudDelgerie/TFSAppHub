@@ -5,12 +5,14 @@
 // work belongs in that command's module, which is what let the station's
 // `cli.rs` stay at ~215 lines across sixty plans.
 
+mod app_env;
 mod cli;
 mod identity;
 mod install;
 mod list;
 mod manifest;
 mod paths;
+mod php;
 mod platform;
 mod registry;
 mod source;
@@ -76,6 +78,11 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             println!("{} {}", package_info.name, package_info.version);
             EXIT_OK
         }
+        Command::Install {
+            source,
+            id,
+            reference,
+        } => install::run(&source, id.as_deref(), reference.as_deref()),
         Command::List => list::run(),
         Command::Platform => print_platform(),
         Command::OpenIdentity {

@@ -124,7 +124,7 @@ pub const SURFACE: &[Spec] = &[
         form: "install <source> [--as <id>] [--ref <tag|branch|sha>]",
         summary: "Install an app from a local directory or a git URL.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "list",
