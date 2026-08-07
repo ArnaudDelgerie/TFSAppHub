@@ -55,6 +55,14 @@ pub const PLATFORM_SUBCOMMAND: &str = "__platform";
 /// by hand rather than only by its unit tests.
 pub const OPEN_IDENTITY_SUBCOMMAND: &str = "__open";
 
+/// Which level of subject a form acts on — the grammar's whole content, and
+/// the two groups `--help` prints under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Hub,
+    App,
+}
+
 /// Whether the hub can honour a form today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Availability {
@@ -70,6 +78,10 @@ pub struct Spec {
     /// The usage line, without the binary's own name. `--help` prints it as it
     /// stands; a usage error prints `usage: tfsapp-hub {form}`.
     pub form: &'static str,
+    /// One line, in `--help`'s right-hand column. Written for someone who has
+    /// not read the plans: what the command does, not how.
+    pub summary: &'static str,
+    pub level: Level,
     pub availability: Availability,
 }
 
@@ -82,71 +94,99 @@ pub const SURFACE: &[Spec] = &[
     Spec {
         name: "--version",
         form: "--version",
+        summary: "Print the hub's version.",
+        level: Level::Hub,
         availability: Availability::Implemented,
     },
     Spec {
         name: "--help",
         form: "--help",
+        summary: "Print this message.",
+        level: Level::Hub,
         availability: Availability::Implemented,
     },
     Spec {
         name: "--update",
         form: "--update [--yes]",
+        summary: "Update the hub itself to the latest release.",
+        level: Level::Hub,
         availability: Availability::NotYet,
     },
     Spec {
         name: "--rollback",
         form: "--rollback [--yes]",
+        summary: "Undo the last hub update.",
+        level: Level::Hub,
         availability: Availability::NotYet,
     },
     Spec {
         name: "install",
         form: "install <source> [--as <id>] [--ref <tag|branch|sha>]",
+        summary: "Install an app from a local directory or a git URL.",
+        level: Level::App,
         availability: Availability::NotYet,
     },
     Spec {
         name: "list",
         form: "list",
+        summary: "List the installed apps.",
+        level: Level::App,
         availability: Availability::Implemented,
     },
     Spec {
         name: "open",
         form: "open <id>",
+        summary: "Open an installed app's window.",
+        level: Level::App,
         availability: Availability::NotYet,
     },
     Spec {
         name: "update",
         form: "update <id> [--ref <tag|branch|sha>] [--force]",
+        summary: "Re-resolve an app's source and update it.",
+        level: Level::App,
         availability: Availability::NotYet,
     },
     Spec {
         name: "remove",
         form: "remove <id> [--purge]",
+        summary: "Uninstall an app; --purge also drops its data.",
+        level: Level::App,
         availability: Availability::NotYet,
     },
     Spec {
         name: "export",
         form: "export <id> <path>",
+        summary: "Write an app's data to <path>.tar.gz.",
+        level: Level::App,
         availability: Availability::NotYet,
     },
     Spec {
         name: "import",
         form: "import <id> <path> [--force]",
+        summary: "Seed an app's data from a .tar.gz written by export.",
+        level: Level::App,
         availability: Availability::NotYet,
     },
     Spec {
         name: "run",
         form: "run <id> <alias> [args...]",
+        summary: "Run an app-declared command in the foreground.",
+        level: Level::App,
         availability: Availability::NotYet,
     },
     Spec {
         name: "run",
         form: "run --stop <id>",
+        summary: "Stop whatever run command that app is running.",
+        level: Level::App,
         availability: Availability::NotYet,
     },
     Spec {
         name: "run",
         form: "run --replace <id> <alias> [args...]",
+        summary: "Stop an active run command, then start <alias> in its place.",
+        level: Level::App,
         availability: Availability::NotYet,
     },
 ];
@@ -155,6 +195,52 @@ pub const SURFACE: &[Spec] = &[
 /// deliberately have none.
 pub fn spec(name: &str) -> Option<&'static Spec> {
     SURFACE.iter().find(|spec| spec.name == name)
+}
+
+/// The marker a form that no plan has implemented yet carries in `--help`.
+///
+/// Printed rather than hidden, and in the same words the refusal uses: a user
+/// who reads the help must be able to tell what the hub can do today from what
+/// it is going to do, without typing it to find out.
+pub const NOT_YET_MARKER: &str = "(not implemented yet)";
+
+/// The column `--help` starts its summaries in. A form longer than that gets
+/// its summary on the next line rather than pushing every other summary right.
+const SUMMARY_COLUMN: usize = 26;
+
+/// `--help`, rendered from [`SURFACE`].
+///
+/// Rendered rather than written out, so the grammar cannot be extended and the
+/// help forgotten — the failure mode a hand-maintained help text has every
+/// time. The rule itself leads, because it is the one thing that makes the
+/// rest of the list predictable instead of memorised.
+pub fn help_text() -> String {
+    let mut text = String::from(
+        "tfsapp-hub — install and run several Symfony apps from one binary.\n\n  \
+         --flags act on the hub. Bare words act on an app.\n",
+    );
+
+    for (level, heading) in [(Level::Hub, "The hub itself:"), (Level::App, "An app:")] {
+        text.push_str(&format!("\n{heading}\n"));
+
+        for spec in SURFACE.iter().filter(|spec| spec.level == level) {
+            let form = format!("  {}", spec.form);
+            let summary = match spec.availability {
+                Availability::Implemented => spec.summary.to_string(),
+                Availability::NotYet => format!("{} {NOT_YET_MARKER}", spec.summary),
+            };
+
+            match form.len() < SUMMARY_COLUMN {
+                true => text.push_str(&format!("{form:SUMMARY_COLUMN$}{summary}\n")),
+                false => text.push_str(&format!(
+                    "{form}\n{blank:SUMMARY_COLUMN$}{summary}\n",
+                    blank = ""
+                )),
+            }
+        }
+    }
+
+    text
 }
 
 /// One recognised invocation. Every field a later plan will need is parsed

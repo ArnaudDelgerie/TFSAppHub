@@ -1,4 +1,6 @@
-use super::{parse, Availability, Command, RunInvocation, UsageError, SURFACE};
+use super::{
+    help_text, parse, Availability, Command, RunInvocation, UsageError, NOT_YET_MARKER, SURFACE,
+};
 
 /// Every test spells its invocation the way a user types it. Splitting on
 /// whitespace is enough because no form in the grammar takes an argument
@@ -317,4 +319,94 @@ fn the_hidden_subcommands_stay_reachable_and_unlisted() {
             spec.name
         );
     }
+}
+
+#[test]
+fn the_help_describes_every_form_the_grammar_has() {
+    // The point of rendering the help from the surface table rather than
+    // writing it out: a command added to the grammar and forgotten in the help
+    // fails here instead of shipping undocumented.
+    let help = help_text();
+
+    for spec in SURFACE {
+        assert!(
+            help.contains(spec.form),
+            "{:?} is missing from --help:\n{help}",
+            spec.form
+        );
+        assert!(
+            help.contains(spec.summary),
+            "{:?} has no summary in --help:\n{help}",
+            spec.form
+        );
+    }
+}
+
+#[test]
+fn the_help_leads_with_the_rule_and_groups_by_subject() {
+    let help = help_text();
+
+    // The rule is what makes the rest of the list predictable rather than
+    // memorised, so it comes before any of it.
+    let rule = "--flags act on the hub. Bare words act on an app.";
+    let hub_heading = help.find("The hub itself:").expect("a hub group");
+    let app_heading = help.find("An app:").expect("an app group");
+    assert!(
+        help.find(rule).expect("the rule") < hub_heading,
+        "the rule comes first:\n{help}"
+    );
+    assert!(hub_heading < app_heading, "hub before app:\n{help}");
+
+    // Each form sits under the level it acts on — the rule stated a second
+    // time, in layout.
+    for spec in SURFACE {
+        let at = help.find(spec.form).expect("a form");
+        let expected = match spec.level {
+            super::Level::Hub => hub_heading,
+            super::Level::App => app_heading,
+        };
+        assert!(
+            at > expected,
+            "{:?} is grouped under the wrong subject:\n{help}",
+            spec.form
+        );
+    }
+}
+
+#[test]
+fn the_help_says_which_commands_do_not_work_yet() {
+    // A help text that lists a command the hub refuses, without saying so, is
+    // worse than one that omits it: the user types it and gets an error for
+    // something they were just told they could do.
+    let help = help_text();
+
+    for line in help.lines() {
+        for spec in SURFACE {
+            if !line.contains(spec.summary) {
+                continue;
+            }
+            let marked = line.contains(NOT_YET_MARKER);
+            assert_eq!(
+                marked,
+                spec.availability == Availability::NotYet,
+                "{:?}'s line disagrees with its availability: {line:?}",
+                spec.form
+            );
+        }
+    }
+}
+
+#[test]
+fn the_version_has_one_source_and_it_is_cargo_toml() {
+    // `--version` prints `tauri::Context`'s package info, which falls back to
+    // Cargo.toml only while `tauri.conf.json` declares no `version` of its own.
+    // A version added there would silently become a second one to keep in step
+    // — including with the release tag `--update` will compare against.
+    let config: serde_json::Value =
+        serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json parses");
+
+    assert!(
+        config.get("version").is_none(),
+        "tauri.conf.json must not declare a version — Cargo.toml is the source"
+    );
 }

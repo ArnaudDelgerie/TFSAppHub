@@ -60,7 +60,14 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
     }
 
     match command {
-        Command::Help => print_forms(),
+        Command::Help => {
+            print!("{}", cli::help_text());
+            EXIT_OK
+        }
+        // Name and version both come from the package info Tauri assembles at
+        // build time, which — with no `version` in `tauri.conf.json` to shadow
+        // it — is the hub's own `Cargo.toml`. One version, one source, and the
+        // one `--update` will compare against a release tag.
         Command::Version => {
             let package_info = context.package_info();
             println!("{} {}", package_info.name, package_info.version);
@@ -100,15 +107,6 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             EXIT_FAILED
         }
     }
-}
-
-/// The grammar, one form per line. Plan 005 step 2 replaces this with the
-/// grouped, annotated help text; until then it is what `--help` has to say.
-fn print_forms() -> i32 {
-    for spec in cli::SURFACE {
-        println!("  tfsapp-hub {}", spec.form);
-    }
-    EXIT_OK
 }
 
 /// Print what the bundled FrankenPHP says it is, and the fingerprint derived
