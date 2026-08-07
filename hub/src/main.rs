@@ -98,7 +98,23 @@ fn open(identity: Identity, mut context: tauri::Context) {
     // what this call leaves behind.
     identity::apply(&identity, &mut context);
 
+    let relaunched = identity.identifier.clone();
     tauri::Builder::default()
+        // Registered before every other plugin, per the plugin's own guidance,
+        // and after the identity mutation above — which is what makes its key
+        // this app's identifier rather than the hub's. Two different apps of
+        // the one binary therefore never collide on it, and a second launch of
+        // *this* app reaches the closure below instead of booting a second
+        // process against the same data dir.
+        //
+        // Logging is all it does for now. The real behaviour — opening another
+        // window on the sidecar already running, the station's plan 007
+        // semantics — needs a sidecar, and there is none until plan 007.
+        .plugin(tauri_plugin_single_instance::init(
+            move |_app, args, cwd| {
+                println!("tfsapp-hub: {relaunched}: relaunched with {args:?} from {cwd}");
+            },
+        ))
         .setup(move |app| {
             let mut window =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
