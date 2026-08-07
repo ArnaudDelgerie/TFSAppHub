@@ -37,4 +37,4 @@ url = "2"
 [dev-dependencies]
 # Throwaway pid-file/lock-file/log directories for the ported unit tests, so
 # none of them writes anywhere but a temp dir it owns.
-tempfile = "3"
+tempfile.workspace = true

@@ -21,6 +21,11 @@ dirs = "6"
 # Compare an app's recorded `app_version` against the installed one; also the
 # type `tauri`'s own PackageInfo.version already uses.
 semver = "1"
+# Throwaway roots for the unit tests on both sides of the boundary: `core/`'s
+# pid/lock/log directories, `hub/`'s temporary data dirs for paths, manifests
+# and the registry. A dev-dependency in both crates, pinned here for the same
+# reason as the rest — one version of one crate across the workspace.
+tempfile = "3"
 # Blocking HTTP client. `core/` polls the app's `/healthz`; `hub/` also reads
 # the GitHub release API for its own update check, and opts into the "json"
 # feature there — features add up, so pinning the version once here still

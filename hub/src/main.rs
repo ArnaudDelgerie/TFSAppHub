@@ -5,12 +5,22 @@
 // and the app the window actually serves in plan 007.
 
 mod identity;
+mod manifest;
+mod paths;
+mod platform;
+mod registry;
 
 use identity::Identity;
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 const OPEN_USAGE: &str =
     "usage: tfsapp-hub open --identity <identifier> [--name <product name>] [--icon <path.png>]";
+
+/// Temporary and hidden — the double underscore says so, and nothing prints it
+/// in a usage line. It exists so the `platform` fingerprint can be eyeballed
+/// against the bundled binary's real `php -m` before anything depends on it,
+/// and it goes away once an installed app records one and `list` can show it.
+const PLATFORM_SUBCOMMAND: &str = "__platform";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -28,6 +38,10 @@ fn main() {
         let package_info = context.package_info();
         println!("{} {}", package_info.name, package_info.version);
         return;
+    }
+
+    if args.first().map(String::as_str) == Some(PLATFORM_SUBCOMMAND) {
+        std::process::exit(print_platform());
     }
 
     if args.first().map(String::as_str) == Some("open") {
@@ -49,10 +63,47 @@ fn main() {
     );
 }
 
+/// Print what the bundled FrankenPHP says it is, and the fingerprint derived
+/// from it. Returns the process exit code.
+///
+/// The extension list is printed in full alongside the hash: the point of this
+/// command is to be checkable against `frankenphp php-cli -m` by eye, and a
+/// 64-character hash on its own is checkable against nothing.
+fn print_platform() -> i32 {
+    let binary = match platform::hub_frankenphp() {
+        Ok(binary) => binary,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return 1;
+        }
+    };
+
+    match platform::probe(&binary) {
+        Ok(probe) => {
+            let fingerprint = probe.fingerprint();
+            println!("interpreter: {}", binary.display());
+            println!("php:         {}", probe.php_version);
+            println!(
+                "extensions:  {} — {}",
+                probe.extensions.len(),
+                probe.extensions.join(", ")
+            );
+            println!("hash:        {}", fingerprint.extensions_hash);
+            println!("platform:    {fingerprint}");
+            0
+        }
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            1
+        }
+    }
+}
+
 /// Temporary argv parsing for `open`, deliberately minimal: the identity of an
-/// app is going to come from its manifest and the registry (plan 004), read by
-/// the real dispatcher (plan 005) behind a plain `open <id>` (plan 007). Until
-/// any of that exists, argv is the only source of an identity there is.
+/// app comes from its manifest and the registry (plan 004, `manifest::Manifest::
+/// identity`), to be read by the real dispatcher (plan 005) behind a plain
+/// `open <id>` (plan 007). Until an app is installed there is nothing to
+/// resolve, so argv stays the only source of an identity here.
 fn parse_open(args: &[String]) -> Result<Identity, String> {
     let mut identifier = None;
     let mut product_name = None;

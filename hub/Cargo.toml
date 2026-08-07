@@ -41,9 +41,12 @@ tiny_http = "0.12"
 # new crate, since serde/serde_json are already direct dependencies below.
 # Polling an app's /healthz is `core/`'s job, not this crate's.
 ureq = { workspace = true, features = ["json"] }
-# SHA-256 of a downloaded AppImage, for the integrity check of the hub's own
-# self-update against the release's SHA256SUMS.txt. Its `Sha256` implements
-# `io::Write`, so a large AppImage is streamed, never buffered.
+# SHA-256, in two unrelated places. The integrity check of the hub's own
+# self-update against the release's SHA256SUMS.txt — its `Sha256` implements
+# `io::Write`, so a large AppImage is streamed, never buffered. And the
+# `platform` fingerprint's hash of the bundled interpreter's sorted
+# extension list, which is a comparison key and explicitly not a security
+# claim (see `platform.rs`).
 sha2 = "0.10"
 # `export`/`import`'s curated .tar.gz archive. flate2 keeps its default
 # pure-Rust `miniz_oxide` backend (no `zlib`/`zlib-ng` feature), so no new
@@ -59,6 +62,12 @@ serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
 semver.workspace = true
+
+[dev-dependencies]
+# Throwaway data-dir roots for the state layer's tests (plan 004): every one of
+# them resolves its paths against a temp dir it owns, so the suite never reads
+# or writes the developer's real `~/.local/share/TFSApp/`.
+tempfile.workspace = true
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
