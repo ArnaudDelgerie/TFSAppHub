@@ -28,9 +28,9 @@
 //! actually want to reason about, and a second version number invites
 //! migration machinery that nothing has asked for yet.
 
-// Written for real by the installer (plan 006) and read by `list` (005) and
-// `open` (007); until those land, this module's own tests are its only
-// callers. Remove the allow with the first real consumer.
+// `list` (plan 005) reads the registry; writing one is the installer's job
+// (006), and until it lands `save`/`update`/`upsert` have this module's own
+// tests as their only callers. Remove the allow with the first real writer.
 #![allow(dead_code)]
 
 use std::{
@@ -137,6 +137,30 @@ pub struct Source {
     /// and `reference` in Rust, where `ref` is a keyword.
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
+    /// What that selector *is*, recorded by whoever resolved it.
+    ///
+    /// A bare string cannot say whether `main` names a branch or a tag, and
+    /// that is precisely the question `list`'s `unpinned` marker answers — the
+    /// trust posture defaults to a tag or a commit and allows a branch only if
+    /// it is reported as unpinned (design source: `004-app-sources-and-
+    /// versioning.md` §6). Recorded now, while nothing is installed anywhere,
+    /// rather than retrofitted later into users' registries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_kind: Option<ReferenceKind>,
+}
+
+/// What a source's `ref` selects.
+///
+/// Only `Branch` carries a consequence today — it is the one that moves under
+/// an installed app, and so the one `list` marks unpinned. The other two are
+/// spelled out rather than left as "not a branch" so a reader of the file can
+/// tell a resolver that knew a tag from one that recorded nothing.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferenceKind {
+    Tag,
+    Commit,
+    Branch,
 }
 
 /// The source kinds the hub anticipates.
@@ -167,6 +191,19 @@ pub enum State {
     /// current PHP. Recoverable by rolling the hub back or by updating the app,
     /// never by pretending otherwise.
     Broken,
+}
+
+impl fmt::Display for State {
+    /// The same spelling the file uses, so a `list` line and `registry.json`
+    /// never disagree about what an app's state is called.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let word = match self {
+            Self::Ready => "ready",
+            Self::NeedsRevalidation => "needs-revalidation",
+            Self::Broken => "broken",
+        };
+        formatter.write_str(word)
+    }
 }
 
 /// The platform an app was installed against.

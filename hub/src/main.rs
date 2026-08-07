@@ -7,10 +7,12 @@
 
 mod cli;
 mod identity;
+mod list;
 mod manifest;
 mod paths;
 mod platform;
 mod registry;
+mod source;
 
 use cli::{Command, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE};
 use identity::Identity;
@@ -73,6 +75,7 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             println!("{} {}", package_info.name, package_info.version);
             EXIT_OK
         }
+        Command::List => list::run(),
         Command::Platform => print_platform(),
         Command::OpenIdentity {
             identifier,
