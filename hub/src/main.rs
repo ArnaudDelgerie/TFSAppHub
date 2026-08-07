@@ -7,6 +7,7 @@
 mod identity;
 mod manifest;
 mod paths;
+mod registry;
 
 use identity::Identity;
 use tauri::{WebviewUrl, WebviewWindowBuilder};

@@ -219,6 +219,43 @@ pub fn try_lock_file(path: &Path) -> std::io::Result<Option<File>> {
     }
 }
 
+/// Take an exclusive lock on `path` (created if missing), **waiting** for it
+/// rather than failing when someone else holds it. Hold the returned file for
+/// as long as the lock must be held; it releases on drop, and on process death
+/// even an ungraceful one.
+///
+/// The blocking counterpart of [`try_lock_file`], and the difference is a
+/// difference of question. The sidecar lock asks "is another launcher live?" —
+/// where waiting would be wrong, since the answer is the point. A serialiser
+/// asks "is anyone else mid-write?", where the only sensible answer is to wait
+/// out a write that takes milliseconds. The hub's registry is the first caller:
+/// two `install`s can genuinely overlap, and refusing the second because the
+/// first was one step ahead would be a worse outcome than a short wait.
+///
+/// `flock` is per open file description, so this serialises across processes
+/// *and* across threads that each opened the file — which is what the
+/// concurrent-writer tests exercise.
+pub fn lock_file_exclusive(path: &Path) -> std::io::Result<File> {
+    // Same rationale as `try_lock_file`: the handle carries the lock and never
+    // the content, so it is never truncated.
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    // Retries on EINTR: a signal arriving mid-wait must not look like a
+    // failure to lock, or an install would abort on an unrelated SIGCHLD.
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 /// Poll `path`'s flock (plan 057, `run --stop`/`--replace`) on a short
 /// interval until it is free or `timeout` elapses. `Ok(true)` means the lock
 /// was observed free before the deadline — the momentary lock this function

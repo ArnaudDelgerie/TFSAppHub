@@ -72,6 +72,42 @@ fn is_owner_live_false_again_after_lock_released() {
     assert!(!is_owner_live(&pid_file).unwrap());
 }
 
+// --- lock_file_exclusive -----------------------------------------------------
+
+#[test]
+fn lock_file_exclusive_takes_a_free_lock_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("registry.lock");
+
+    let _held = lock_file_exclusive(&path).unwrap();
+
+    assert!(try_lock_file(&path).unwrap().is_none());
+}
+
+#[test]
+fn lock_file_exclusive_waits_for_the_holder_instead_of_failing() {
+    // The difference from `try_lock_file` that makes it worth having: a second
+    // writer arriving mid-write must queue, not give up. The holder is a
+    // separate process, since flock is per open file description.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("registry.lock");
+    let holder = spawn_lock_holder(&path);
+
+    let waiting = {
+        let path = path.clone();
+        thread::spawn(move || lock_file_exclusive(&path).map(|_| ()))
+    };
+    thread::sleep(Duration::from_millis(50));
+    assert!(!waiting.is_finished(), "it must still be waiting");
+
+    kill_and_wait(holder);
+
+    waiting
+        .join()
+        .expect("the waiter did not panic")
+        .expect("the lock is taken once the holder is gone");
+}
+
 // --- wait_for_lock_release ---------------------------------------------------
 
 /// Spawn a controlled child that holds an exclusive flock on `path` until
