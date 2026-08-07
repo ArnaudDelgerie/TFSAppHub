@@ -17,8 +17,36 @@ collapse to 1, `composer install` *is* the compatibility manifest — it runs wi
 the very interpreter that will later serve the app — and per-app update falls out
 of `git fetch` for free.
 
-Status: **bootstrap, no working code yet.** The design record and the plan queue
-live under the git-ignored `.project/`.
+Status: **skeleton.** The workspace builds and the quality gate is in place; no
+`install` and no `open` yet — the two commands above are what this is heading
+towards, not what it does today. The design record and the plan queue live under
+the git-ignored `.project/`.
+
+## Build
+
+```sh
+make sidecar   # fetch the pinned FrankenPHP binary into hub/resources (once)
+make check     # cargo fmt --check, clippy -D warnings, unit tests, shellcheck
+```
+
+`make sidecar` is not only a packaging step: the hub installs *and* runs every
+app with that interpreter, so no system-wide PHP is required — and nothing works
+without it.
+
+### Prerequisites
+
+- **Rust** + the Tauri CLI (`cargo install tauri-cli`, or `cargo tauri` v2).
+- Linux build deps for Tauri v2 / WebKitGTK (`libwebkit2gtk-4.1-dev`,
+  `libgtk-3-dev`, `libdbus-1-dev`, `build-essential`, `curl`, …).
+- **curl** (to fetch the FrankenPHP sidecar).
+- **rustfmt** and **clippy** (`rustup component add rustfmt clippy`) and
+  **shellcheck** — needed for `make check`. A missing Rust component fails with
+  rustup's own `rustup component add …` message.
+- **`gnome-keyring`** (the `gnome-keyring-daemon` binary) and **`dbus`**
+  (`dbus-run-session`) — **test-only**, needed for `make check`. They stand up
+  an *ephemeral*, throwaway Secret Service the test suite runs against, so it
+  never touches your real login keyring. Neither is the GNOME desktop, and
+  neither is a runtime dependency of the packaged hub.
 
 ## Relationship to TFSAppWorkstation
 
