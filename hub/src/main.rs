@@ -5,6 +5,7 @@
 // and the app the window actually serves in plan 007.
 
 mod identity;
+mod manifest;
 mod paths;
 
 use identity::Identity;
@@ -51,9 +52,10 @@ fn main() {
 }
 
 /// Temporary argv parsing for `open`, deliberately minimal: the identity of an
-/// app is going to come from its manifest and the registry (plan 004), read by
-/// the real dispatcher (plan 005) behind a plain `open <id>` (plan 007). Until
-/// any of that exists, argv is the only source of an identity there is.
+/// app comes from its manifest and the registry (plan 004, `manifest::Manifest::
+/// identity`), to be read by the real dispatcher (plan 005) behind a plain
+/// `open <id>` (plan 007). Until an app is installed there is nothing to
+/// resolve, so argv stays the only source of an identity here.
 fn parse_open(args: &[String]) -> Result<Identity, String> {
     let mut identifier = None;
     let mut product_name = None;
