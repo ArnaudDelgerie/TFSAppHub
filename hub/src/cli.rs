@@ -121,10 +121,10 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "install",
-        form: "install <source> [--as <id>] [--ref <tag|branch|sha>]",
+        form: "install <source> [--as <id>] [--ref <tag|branch|sha>] [--yes]",
         summary: "Install an app from a local directory or a git URL.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "list",
@@ -149,10 +149,10 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "remove",
-        form: "remove <id> [--purge]",
+        form: "remove <id> [--purge] [--yes]",
         summary: "Uninstall an app; --purge also drops its data.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "export",
@@ -262,6 +262,10 @@ pub enum Command {
         /// installer to derive one from the manifest.
         id: Option<String>,
         reference: Option<String>,
+        /// `--yes`: skip the confirmation. The two commands that touch a user's
+        /// machine irreversibly ask first, and both take the same escape for a
+        /// script — the spelling the station's own lifecycle flags established.
+        assume_yes: bool,
     },
     List,
     Open {
@@ -275,6 +279,7 @@ pub enum Command {
     Remove {
         id: String,
         purge: bool,
+        assume_yes: bool,
     },
     Export {
         id: String,
@@ -410,12 +415,13 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             assume_yes: assume_yes("--rollback", rest)?,
         }),
         "install" => {
-            let mut options = options("install", rest, &["--as", "--ref"], &[])?;
+            let mut options = options("install", rest, &["--as", "--ref"], &["--yes", "-y"])?;
             let source = options.exactly_one("install", "a source")?;
             Ok(Command::Install {
                 source,
                 id: options.value("--as"),
                 reference: options.value("--ref"),
+                assume_yes: options.assume_yes(),
             })
         }
         "list" => {
@@ -437,10 +443,11 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             })
         }
         "remove" => {
-            let mut options = options("remove", rest, &[], &["--purge"])?;
+            let mut options = options("remove", rest, &[], &["--purge", "--yes", "-y"])?;
             Ok(Command::Remove {
                 id: options.exactly_one("remove", "an app id")?,
                 purge: options.flag("--purge"),
+                assume_yes: options.assume_yes(),
             })
         }
         "export" => {
@@ -592,6 +599,12 @@ impl Options {
 
     fn flag(&self, flag: &str) -> bool {
         self.flags.contains(&flag)
+    }
+
+    /// `--yes` or its `-y` short form, which the hub-level lifecycle flags
+    /// already accept — one spelling for one meaning across the grammar.
+    fn assume_yes(&self) -> bool {
+        self.flag("--yes") || self.flag("-y")
     }
 
     fn exactly_one(&mut self, name: &'static str, expected: &str) -> Result<String, UsageError> {

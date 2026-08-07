@@ -54,14 +54,16 @@ fn bare_words_route_to_an_app() {
             source: "../TFSAppTest".to_string(),
             id: None,
             reference: None,
+            assume_yes: false,
         }
     );
     assert_eq!(
-        command("install https://example.test/app.git --as demo --ref v1.4.0"),
+        command("install https://example.test/app.git --as demo --ref v1.4.0 --yes"),
         Command::Install {
             source: "https://example.test/app.git".to_string(),
             id: Some("demo".to_string()),
             reference: Some("v1.4.0".to_string()),
+            assume_yes: true,
         }
     );
     assert_eq!(command("list"), Command::List);
@@ -92,13 +94,15 @@ fn bare_words_route_to_an_app() {
         Command::Remove {
             id: "demo".to_string(),
             purge: false,
+            assume_yes: false,
         }
     );
     assert_eq!(
-        command("remove demo --purge"),
+        command("remove demo --purge -y"),
         Command::Remove {
             id: "demo".to_string(),
             purge: true,
+            assume_yes: true,
         }
     );
     assert_eq!(
@@ -235,10 +239,8 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
     for line in [
         "--update",
         "--rollback",
-        "install ../TFSAppTest",
         "open demo",
         "update demo",
-        "remove demo",
         "export demo /tmp/demo",
         "import demo /tmp/demo.tar.gz",
         "run demo console",
@@ -249,7 +251,13 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         );
     }
 
-    for line in ["--version", "--help", "list"] {
+    for line in [
+        "--version",
+        "--help",
+        "list",
+        "install ../TFSAppTest",
+        "remove demo",
+    ] {
         assert!(command(line).is_implemented(), "{line:?} works today");
     }
 }

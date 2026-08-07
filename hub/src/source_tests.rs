@@ -1,6 +1,9 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-use super::{current_revision, tree_hash, Revision};
+use super::{classify, current_revision, resolve, tree_hash, Origin, Revision, SourceError};
 use crate::registry::{Source, SourceKind};
 
 fn project(root: &Path) {
@@ -128,4 +131,94 @@ fn a_git_source_is_unreachable_until_something_resolves_one() {
     };
 
     assert_eq!(current_revision(&source), Revision::Unreachable);
+}
+
+#[test]
+fn a_string_is_classified_without_touching_the_disk() {
+    // The test is on the string on purpose: a URL that names no directory must
+    // be reported as a git source nobody can use yet, never as a missing local
+    // path — the two errors send a reader in opposite directions.
+    for remote in [
+        "https://github.com/example/demo.git",
+        "git@github.com:example/demo",
+        "ssh://git@example.test/demo",
+        "/does/not/exist.git",
+    ] {
+        assert_eq!(
+            classify(remote),
+            Origin::Git(remote.to_string()),
+            "{remote}"
+        );
+    }
+
+    for local in ["../TFSAppTest", "/home/arnaud/Dev/Demo", "."] {
+        assert_eq!(classify(local), Origin::LocalPath(PathBuf::from(local)));
+    }
+}
+
+#[test]
+fn a_local_directory_resolves_to_an_absolute_path_and_its_revision() {
+    // Absolute and cleaned, because the recorded location is re-read much later
+    // by a `list` or an `update` run from some other working directory — where
+    // neither a relative path nor one full of `..` still means anything.
+    let root = tempfile::tempdir().expect("a temp dir");
+    project(root.path());
+    let roundabout = root.path().join("src").join("..");
+
+    let resolved =
+        resolve(&classify(&roundabout.display().to_string()), None).expect("it resolves");
+
+    assert!(resolved.root.is_absolute(), "{}", resolved.root.display());
+    assert_eq!(
+        resolved.source.location,
+        root.path()
+            .canonicalize()
+            .expect("a real root")
+            .display()
+            .to_string()
+    );
+    assert_eq!(resolved.source.kind, SourceKind::LocalPath);
+    assert_eq!(resolved.source.reference, None);
+    assert_eq!(
+        Revision::At(resolved.revision.clone()),
+        current_revision(&resolved.source)
+    );
+}
+
+#[test]
+fn a_source_that_cannot_be_installed_says_which_kind_of_problem_it_is() {
+    let root = tempfile::tempdir().expect("a temp dir");
+    project(root.path());
+
+    let error = resolve(&classify("/no/such/project"), None).expect_err("it is missing");
+    assert!(matches!(error, SourceError::Missing { .. }), "{error}");
+
+    let file = root.path().join("tfsapp.config.json");
+    let error = resolve(&classify(&file.display().to_string()), None)
+        .expect_err("a manifest is not a project root");
+    assert!(
+        matches!(error, SourceError::NotADirectory { .. }),
+        "{error}"
+    );
+
+    // Recognised, anticipated, and not available: the message says what to do
+    // instead rather than looking like a typo.
+    let error = resolve(&classify("https://example.test/demo.git"), None)
+        .expect_err("git sources wait for their own plan");
+    assert!(
+        matches!(error, SourceError::GitNotImplemented { .. }),
+        "{error}"
+    );
+
+    // `--ref` selects a revision, and a directory has none — accepting it
+    // silently would record a selector that resolved nothing.
+    let error = resolve(
+        &classify(&root.path().display().to_string()),
+        Some("v1.4.0"),
+    )
+    .expect_err("a directory has no ref");
+    assert!(
+        matches!(error, SourceError::ReferenceOnLocalPath { .. }),
+        "{error}"
+    );
 }

@@ -17,28 +17,32 @@ collapse to 1, `composer install` *is* the compatibility manifest — it runs wi
 the very interpreter that will later serve the app — and per-app update falls out
 of `git fetch` for free.
 
-Status: **skeleton.** The workspace builds and the quality gate is in place; no
-`install` and no `open` yet — the two commands above are what this is heading
-towards, not what it does today. The design record and the plan queue live under
-the git-ignored `.project/`.
+Status: **it installs, it does not open yet.** `install` snapshots a local
+project, resolves its dependencies with the bundled PHP, runs its lifecycle
+commands and registers it; `list` and `remove` complete the loop. `open` — a
+real window on a running app — is the next plan, so the second command above is
+still what this is heading towards. Git sources are recognised and refused with
+a message saying so, rather than pretended. The design record and the plan queue
+live under the git-ignored `.project/`.
 
 ## Build
 
 ```sh
-make sidecar   # fetch the pinned FrankenPHP binary into hub/resources (once)
+make resources # fetch the pinned FrankenPHP and composer.phar into hub/resources (once)
 make check     # cargo fmt --check, clippy -D warnings, unit tests, shellcheck
 ```
 
-`make sidecar` is not only a packaging step: the hub installs *and* runs every
-app with that interpreter, so no system-wide PHP is required — and nothing works
-without it.
+`make resources` is not only a packaging step: the hub installs *and* runs every
+app with that interpreter and that Composer, so no system-wide PHP is required —
+and nothing works without them. (`make sidecar` and `make composer` fetch one
+half each, if you want them separately.)
 
 ### Prerequisites
 
 - **Rust** + the Tauri CLI (`cargo install tauri-cli`, or `cargo tauri` v2).
 - Linux build deps for Tauri v2 / WebKitGTK (`libwebkit2gtk-4.1-dev`,
   `libgtk-3-dev`, `libdbus-1-dev`, `build-essential`, `curl`, …).
-- **curl** (to fetch the FrankenPHP sidecar).
+- **curl** (to fetch the FrankenPHP sidecar and composer.phar).
 - **rustfmt** and **clippy** (`rustup component add rustfmt clippy`) and
   **shellcheck** — needed for `make check`. A missing Rust component fails with
   rustup's own `rustup component add …` message.

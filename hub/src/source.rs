@@ -13,13 +13,17 @@
 //! report a difference it did not measure — a false "changed" would send a
 //! developer looking for an edit they never made.
 //!
-//! The resolver half — `resolve(source) -> PathBuf`, which fetches a git source
-//! into a local directory — belongs to the installer (plan 006) and to the git
-//! sources plan after it. This module deliberately stops at *observing* a
-//! source, so `list` never fetches anything.
+//! The resolver half — [`resolve`], which turns a `<source>` argument into a
+//! local directory the installer can copy — lands here too (plan 006), and it
+//! is the *only* half that may fetch anything. [`current_revision`] never does:
+//! `list` must stay a read of what is already on this machine.
+
+// The observing half has `list` as its caller; the resolving half waits for the
+// installer's own pipeline, later in this same plan. Removed then.
+#![allow(dead_code)]
 
 use std::{
-    fs, io,
+    fmt, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -32,8 +36,12 @@ use crate::registry::{Source, SourceKind};
 /// Dependency trees and build output, none of it the developer's source: they
 /// would make the hash both enormous and noisy — `var/cache` alone changes on
 /// every request the app serves, which would report "changed since install"
-/// forever. Top-level only, so a legitimately named `src/var/` still counts.
-const EXCLUDED_FROM_HASH: &[&str] = &[".git", "vendor", "var", "node_modules"];
+/// forever. `tfsapp_build/` is the same story one host over: it holds the
+/// station's `make build` AppImage, ~170 MB of output that changes on every
+/// build, and hashing it would report "changed since install" for a build that
+/// touched no source at all. Top-level only, so a legitimately named `src/var/`
+/// still counts.
+const EXCLUDED_FROM_HASH: &[&str] = &[".git", "vendor", "var", "node_modules", "tfsapp_build"];
 
 /// Where a source stands now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +67,142 @@ pub fn current_revision(source: &Source) -> Revision {
         // only), and asking a remote for its head would put a network call
         // inside `list`. The git sources plan gives this arm a real answer.
         SourceKind::Git => Revision::Unreachable,
+    }
+}
+
+/// What a `<source>` argument names, decided from the string alone.
+///
+/// An enum from day one, with the git variant left **unimplemented rather than
+/// unanticipated**: the git sources plan then reduces to "fetch a remote into a
+/// local directory" in front of a pipeline that already works, and neither the
+/// registry's shape nor the installer's steps have to move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    LocalPath(PathBuf),
+    Git(String),
+}
+
+/// Which kind of source `spec` is, without touching the filesystem.
+///
+/// The test is on the *string*, not on what exists on disk: a URL that happens
+/// to name no directory must still be reported as a git source someone cannot
+/// use yet, never as a missing local path — the two errors send a reader in
+/// opposite directions. Anything that is not recognisably a remote is a local
+/// path, so a plain relative directory needs no scheme and no flag.
+pub fn classify(spec: &str) -> Origin {
+    let remote = spec.contains("://") || spec.starts_with("git@") || spec.ends_with(".git");
+    match remote {
+        true => Origin::Git(spec.to_string()),
+        false => Origin::LocalPath(PathBuf::from(spec)),
+    }
+}
+
+/// A source turned into a directory on this machine, plus what the registry
+/// has to record about where it came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resolved {
+    /// The directory holding the app's tree, ready to be copied. For a local
+    /// path this *is* the source; for a git source it will be a checkout.
+    pub root: PathBuf,
+    /// What `update` needs to resolve this same source again.
+    pub source: Source,
+    /// The tree as it stood at this moment — the value `list` later compares
+    /// against to say "changed since install".
+    pub revision: String,
+}
+
+/// Turn `origin` into a directory, or say why it cannot be one.
+///
+/// The local variant resolves to an **absolute** path, deliberately: the
+/// recorded `location` is re-read much later, by a `list` or an `update` run
+/// from some other working directory, and a relative path recorded from today's
+/// cwd would silently point at nothing.
+pub fn resolve(origin: &Origin, reference: Option<&str>) -> Result<Resolved, SourceError> {
+    match origin {
+        Origin::LocalPath(path) => {
+            if let Some(reference) = reference {
+                return Err(SourceError::ReferenceOnLocalPath {
+                    reference: reference.to_string(),
+                });
+            }
+
+            let root = fs::canonicalize(path).map_err(|source| match source.kind() {
+                io::ErrorKind::NotFound => SourceError::Missing { path: path.clone() },
+                _ => SourceError::Unreadable {
+                    path: path.clone(),
+                    source,
+                },
+            })?;
+            if !root.is_dir() {
+                return Err(SourceError::NotADirectory { path: root });
+            }
+
+            let revision = tree_hash(&root).map_err(|source| SourceError::Unreadable {
+                path: root.clone(),
+                source,
+            })?;
+
+            Ok(Resolved {
+                source: Source {
+                    kind: SourceKind::LocalPath,
+                    location: root.display().to_string(),
+                    // A plain directory has no selector and nothing that
+                    // selected it: recording either would be inventing a
+                    // provenance nobody asked for.
+                    reference: None,
+                    reference_kind: None,
+                },
+                root,
+                revision,
+            })
+        }
+        Origin::Git(url) => Err(SourceError::GitNotImplemented { url: url.clone() }),
+    }
+}
+
+/// Why a source could not be turned into a directory.
+#[derive(Debug)]
+pub enum SourceError {
+    Missing { path: PathBuf },
+    NotADirectory { path: PathBuf },
+    Unreadable { path: PathBuf, source: io::Error },
+    ReferenceOnLocalPath { reference: String },
+    GitNotImplemented { url: String },
+}
+
+impl fmt::Display for SourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing { path } => write!(formatter, "no such directory: {}", path.display()),
+            Self::NotADirectory { path } => write!(
+                formatter,
+                "{} is not a directory — a local source is the project root, the \
+                 directory holding tfsapp.config.json",
+                path.display()
+            ),
+            Self::Unreadable { path, source } => {
+                write!(formatter, "cannot read {}: {source}", path.display())
+            }
+            Self::ReferenceOnLocalPath { reference } => write!(
+                formatter,
+                "--ref {reference} selects a revision of a git source; a local \
+                 directory is installed as it stands"
+            ),
+            Self::GitNotImplemented { url } => write!(
+                formatter,
+                "{url} is a git source, and the hub cannot resolve one yet. \
+                 Clone it yourself and install the clone's directory."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unreadable { source, .. } => Some(source),
+            _ => None,
+        }
     }
 }
 
