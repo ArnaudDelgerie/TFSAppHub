@@ -1,26 +1,22 @@
-// The hub binary. Plan 001 leaves it at the minimum that compiles and answers
-// `--version`; plan 003 adds a temporary `open --identity <id>` form that opens
-// one window under a runtime identity. The CLI grammar it grows into —
-// `--flags` act on the hub, bare words act on an app — arrives in plan 005,
-// and the app the window actually serves in plan 007.
+// The hub binary: parse argv, route to one command, exit with its code. The
+// grammar itself — `--flags` act on the hub, bare words act on an app — and
+// every form it accepts live in `cli.rs`; this file is the routing table and
+// the handlers thin enough to have no module of their own. A command's real
+// work belongs in that command's module, which is what let the station's
+// `cli.rs` stay at ~215 lines across sixty plans.
 
+mod cli;
 mod identity;
+mod list;
 mod manifest;
 mod paths;
 mod platform;
 mod registry;
+mod source;
 
+use cli::{Command, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE};
 use identity::Identity;
 use tauri::{WebviewUrl, WebviewWindowBuilder};
-
-const OPEN_USAGE: &str =
-    "usage: tfsapp-hub open --identity <identifier> [--name <product name>] [--icon <path.png>]";
-
-/// Temporary and hidden — the double underscore says so, and nothing prints it
-/// in a usage line. It exists so the `platform` fingerprint can be eyeballed
-/// against the bundled binary's real `php -m` before anything depends on it,
-/// and it goes away once an installed app records one and `list` can show it.
-const PLATFORM_SUBCOMMAND: &str = "__platform";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -29,38 +25,91 @@ fn main() {
     // info — the same source `--update` will later compare against a release
     // tag. It also keeps the Tauri codegen path exercised by an ordinary
     // `cargo build`.
-    // Annotated because the fall-through branch below hands the context to no
+    // Annotated because the branches below hand the context to no
     // `tauri::Builder`: without a Builder to pin the runtime, `Context<R>`'s
     // default `R = Wry` is not enough for inference.
     let context: tauri::Context = tauri::generate_context!();
 
-    if args.iter().any(|arg| arg == "--version") {
-        let package_info = context.package_info();
-        println!("{} {}", package_info.name, package_info.version);
-        return;
-    }
+    std::process::exit(dispatch(&args, context));
+}
 
-    if args.first().map(String::as_str) == Some(PLATFORM_SUBCOMMAND) {
-        std::process::exit(print_platform());
-    }
-
-    if args.first().map(String::as_str) == Some("open") {
-        let identity = parse_open(&args[1..]).unwrap_or_else(|error| {
+/// Route one parsed command, and answer with the process's exit code.
+///
+/// Split out of `main` so every branch has one obvious value, and so the
+/// "recognised but not implemented yet" outcome is a return rather than an
+/// `exit` buried in a handler.
+fn dispatch(args: &[String], context: tauri::Context) -> i32 {
+    let command = match cli::parse(args) {
+        Ok(command) => command,
+        Err(error) => {
             eprintln!("tfsapp-hub: {error}");
-            eprintln!("{OPEN_USAGE}");
-            std::process::exit(2);
-        });
-        open(identity, context);
-        return;
+            eprintln!("{}", error.hint());
+            return EXIT_USAGE;
+        }
+    };
+
+    // The surface table is the authority on what the hub can do today, so a
+    // form it marks unavailable is answered here rather than reaching a route
+    // that does not exist. Saying "not implemented yet" is the whole point: an
+    // unknown-command error would send a user hunting for a typo that is not
+    // there, and its own exit code says that nothing they type will fix it.
+    if !command.is_implemented() {
+        eprintln!(
+            "tfsapp-hub: {} is recognised but not implemented yet.",
+            command.name()
+        );
+        return EXIT_UNIMPLEMENTED;
     }
 
-    let package_info = context.package_info();
-    println!(
-        "{} {} (core {})",
-        package_info.name,
-        package_info.version,
-        tfsapp_core::version()
-    );
+    match command {
+        Command::Help => {
+            print!("{}", cli::help_text());
+            EXIT_OK
+        }
+        // Name and version both come from the package info Tauri assembles at
+        // build time, which — with no `version` in `tauri.conf.json` to shadow
+        // it — is the hub's own `Cargo.toml`. One version, one source, and the
+        // one `--update` will compare against a release tag.
+        Command::Version => {
+            let package_info = context.package_info();
+            println!("{} {}", package_info.name, package_info.version);
+            EXIT_OK
+        }
+        Command::List => list::run(),
+        Command::Platform => print_platform(),
+        Command::OpenIdentity {
+            identifier,
+            product_name,
+            icon_path,
+        } => {
+            open(
+                Identity {
+                    // Defaulting to the identifier rather than to some
+                    // prettified form of it: the window title is the only place
+                    // plan 003's manual checks can read which identity a given
+                    // window carries, so a lossless default is worth more here
+                    // than a nice one. Plan 007 replaces it with the manifest's
+                    // own field.
+                    product_name: product_name.unwrap_or_else(|| identifier.clone()),
+                    icon_path: icon_path.map(std::path::PathBuf::from),
+                    identifier,
+                },
+                context,
+            );
+            EXIT_OK
+        }
+        // Unreachable while the table above and this match agree, which is
+        // exactly what makes it worth keeping: a command marked implemented
+        // with no route here is a bug in one of the two, and it should say so
+        // rather than fall through to something plausible.
+        other => {
+            eprintln!(
+                "tfsapp-hub: {} is marked implemented but has no route — this is a bug.",
+                other.name()
+            );
+            EXIT_FAILED
+        }
+    }
 }
 
 /// Print what the bundled FrankenPHP says it is, and the fingerprint derived
@@ -74,7 +123,7 @@ fn print_platform() -> i32 {
         Ok(binary) => binary,
         Err(error) => {
             eprintln!("tfsapp-hub: {error}");
-            return 1;
+            return EXIT_FAILED;
         }
     };
 
@@ -90,53 +139,13 @@ fn print_platform() -> i32 {
             );
             println!("hash:        {}", fingerprint.extensions_hash);
             println!("platform:    {fingerprint}");
-            0
+            EXIT_OK
         }
         Err(error) => {
             eprintln!("tfsapp-hub: {error}");
-            1
+            EXIT_FAILED
         }
     }
-}
-
-/// Temporary argv parsing for `open`, deliberately minimal: the identity of an
-/// app comes from its manifest and the registry (plan 004, `manifest::Manifest::
-/// identity`), to be read by the real dispatcher (plan 005) behind a plain
-/// `open <id>` (plan 007). Until an app is installed there is nothing to
-/// resolve, so argv stays the only source of an identity here.
-fn parse_open(args: &[String]) -> Result<Identity, String> {
-    let mut identifier = None;
-    let mut product_name = None;
-    let mut icon_path = None;
-    let mut index = 0;
-
-    while index < args.len() {
-        let flag = args[index].as_str();
-        let slot = match flag {
-            "--identity" => &mut identifier,
-            "--name" => &mut product_name,
-            "--icon" => &mut icon_path,
-            other => return Err(format!("unknown argument {other}")),
-        };
-        *slot = Some(
-            args.get(index + 1)
-                .ok_or_else(|| format!("{flag} needs a value"))?
-                .clone(),
-        );
-        index += 2;
-    }
-
-    let identifier = identifier.ok_or_else(|| "open needs --identity".to_string())?;
-    Ok(Identity {
-        // Defaulting to the identifier rather than to some prettified form of
-        // it: the window title is the only place plan 003's manual checks can
-        // read which identity a given window carries, so a lossless default is
-        // worth more here than a nice one. Plan 004 replaces it with the
-        // manifest's own field.
-        product_name: product_name.unwrap_or_else(|| identifier.clone()),
-        icon_path: icon_path.map(std::path::PathBuf::from),
-        identifier,
-    })
 }
 
 /// Open one window under `identity`. The window lands on the checked-in

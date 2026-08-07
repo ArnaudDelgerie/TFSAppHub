@@ -27,9 +27,10 @@
 //! resolved once. Tests build one on a temp dir; the hub builds one from
 //! [`Paths::resolve`].
 
-// Consumed by the CLI dispatcher (plan 005), the installer (006) and `open`
-// (007); until those land, this module's own tests are its only callers.
-// Remove the allow with the first real consumer rather than letting it linger.
+// `list` (plan 005) resolves the hub root and the registry path through this
+// module; the app-directory and data-directory halves wait for the installer
+// (006) and `open` (007), with this module's own tests as their only callers
+// until then. Remove the allow when those land, rather than letting it linger.
 #![allow(dead_code)]
 
 use std::{fmt, fs, io, path::PathBuf};

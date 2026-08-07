@@ -1,6 +1,6 @@
 use super::{
-    load, now_timestamp, save, update, Platform, Registry, RegistryEntry, RegistryError, Source,
-    SourceKind, State,
+    load, now_timestamp, save, update, Platform, ReferenceKind, Registry, RegistryEntry,
+    RegistryError, Source, SourceKind, State,
 };
 use crate::paths::Paths;
 
@@ -25,6 +25,7 @@ fn entry(id: &str) -> RegistryEntry {
             kind: SourceKind::LocalPath,
             location: format!("/home/arnaud/Dev/{id}"),
             reference: None,
+            reference_kind: None,
         },
         app_version: "0.6.0".to_string(),
         source_revision: "sha256:deadbeef".to_string(),
@@ -48,6 +49,7 @@ fn a_registry_survives_a_write_and_a_read() {
             kind: SourceKind::Git,
             location: "https://github.com/example/app".to_string(),
             reference: Some("v1.4.0".to_string()),
+            reference_kind: Some(ReferenceKind::Tag),
         },
         app_port: None,
         state: State::NeedsRevalidation,
@@ -110,6 +112,7 @@ fn the_file_on_disk_uses_the_names_the_design_settled_on() {
             kind: SourceKind::Git,
             location: "https://github.com/example/app".to_string(),
             reference: Some("v1.4.0".to_string()),
+            reference_kind: Some(ReferenceKind::Tag),
         },
         ..entry("tfsapp-test")
     });
@@ -120,6 +123,9 @@ fn the_file_on_disk_uses_the_names_the_design_settled_on() {
     assert_eq!(app["source"]["kind"].as_str(), Some("git"));
     // `ref` in the file, `reference` in Rust, where `ref` is a keyword.
     assert_eq!(app["source"]["ref"].as_str(), Some("v1.4.0"));
+    // What that ref *is*, which is the question `list`'s unpinned marker asks
+    // and a bare string cannot answer.
+    assert_eq!(app["source"]["reference_kind"].as_str(), Some("tag"));
     assert_eq!(app["state"].as_str(), Some("needs-revalidation"));
     assert_eq!(json["hub_version"].as_str(), Some("0.1.0"));
     assert_eq!(json["platform"]["php_version"].as_str(), Some("8.5"));
@@ -144,6 +150,7 @@ fn a_local_source_writes_its_kind_and_no_ref() {
         Some("local-path")
     );
     assert!(json["apps"][0]["source"].get("ref").is_none());
+    assert!(json["apps"][0]["source"].get("reference_kind").is_none());
 }
 
 #[test]
