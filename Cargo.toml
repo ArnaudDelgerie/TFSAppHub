@@ -21,3 +21,8 @@ dirs = "6"
 # Compare an app's recorded `app_version` against the installed one; also the
 # type `tauri`'s own PackageInfo.version already uses.
 semver = "1"
+# Blocking HTTP client. `core/` polls the app's `/healthz`; `hub/` also reads
+# the GitHub release API for its own update check, and opts into the "json"
+# feature there — features add up, so pinning the version once here still
+# leaves each crate saying what *it* needs.
+ureq = "2"

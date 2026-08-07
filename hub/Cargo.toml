@@ -37,10 +37,10 @@ gtk = "0.18"
 keyring = { version = "3", features = ["sync-secret-service"] }
 # Loopback HTTP bridge for actions.secrets.bridge.
 tiny_http = "0.12"
-# Poll the Symfony /healthz endpoint before opening the WebView; "json" parses
-# the GitHub API response for the hub's own update check — no new crate, since
-# serde/serde_json are already direct dependencies below.
-ureq = { version = "2", features = ["json"] }
+# "json" parses the GitHub API response for the hub's own update check — no
+# new crate, since serde/serde_json are already direct dependencies below.
+# Polling an app's /healthz is `core/`'s job, not this crate's.
+ureq = { workspace = true, features = ["json"] }
 # SHA-256 of a downloaded AppImage, for the integrity check of the hub's own
 # self-update against the release's SHA256SUMS.txt. Its `Sha256` implements
 # `io::Write`, so a large AppImage is streamed, never buffered.

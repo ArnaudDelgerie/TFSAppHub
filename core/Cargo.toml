@@ -15,6 +15,15 @@ edition = "2021"
 # self-pipe (`pipe`/`read`/`write`/`signal`) the sidecar liveness lock and the
 # signal forwarding are built on — all in `process.rs`.
 libc.workspace = true
+# Parse the data dir's own `data/config.json` — `port_override` (CONTRACT.md
+# §6) is what `ports.rs` resolves a static port against.
+serde.workspace = true
+serde_json.workspace = true
+# Poll the app's `/healthz` before its window opens (CONTRACT.md §4), in
+# `health.rs`. The "json" feature is not needed down here — the GitHub release
+# API the station parses with it belongs to the update check, which stays in
+# `hub/`.
+ureq.workspace = true
 
 [dev-dependencies]
 # Throwaway pid-file/lock-file/log directories for the ported unit tests, so
