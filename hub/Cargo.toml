@@ -60,6 +60,12 @@ serde_json.workspace = true
 dirs.workspace = true
 semver.workspace = true
 
+[dev-dependencies]
+# Throwaway data-dir roots for the state layer's tests (plan 004): every one of
+# them resolves its paths against a temp dir it owns, so the suite never reads
+# or writes the developer's real `~/.local/share/TFSApp/`.
+tempfile.workspace = true
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

@@ -1,0 +1,235 @@
+//! Where the hub keeps things.
+//!
+//! Two roots, deliberately siblings rather than nested (design source:
+//! `../TFSAppWorkstation/.project/hub/004-app-sources-and-versioning.md` §1):
+//!
+//! ```text
+//! <OS data dir>/TFSApp/hub/apps/<id>/     the installed snapshot — what actually runs
+//! <OS data dir>/TFSApp/hub/registry.json  what is installed, from where, at what version
+//! <OS data dir>/TFSApp/<identifier>/      the app's own data dir, unchanged from the station
+//! ```
+//!
+//! The last line is the load-bearing one. It derives from `identifier` alone —
+//! not from the hub, not from `id`, not from where the binary lives — which is
+//! exactly the station's `packaged::packaged_data_dir`. That is what makes the
+//! migration scenario hold by construction: a user of a packaged AppImage who
+//! installs the same app in the hub opens it and finds the same DB, the same
+//! `APP_SECRET`, the same sessions. The hub must never invent its own layout
+//! for installed *app data*; its own root holds the installed source and the
+//! registry, and nothing else.
+//!
+//! Hence the two distinct keys per app, which this module keeps apart on
+//! purpose: the hub-local `id` is a CLI handle and names a directory under the
+//! hub's root; the app's `identifier` comes from its own `tfsapp.config.json`
+//! and names the data dir, the keyring namespace and the window identity.
+//!
+//! Nothing here is global state: every path hangs off a [`Paths`] whose base is
+//! resolved once. Tests build one on a temp dir; the hub builds one from
+//! [`Paths::resolve`].
+
+// Consumed by the CLI dispatcher (plan 005), the installer (006) and `open`
+// (007); until those land, this module's own tests are its only callers.
+// Remove the allow with the first real consumer rather than letting it linger.
+#![allow(dead_code)]
+
+use std::{fmt, fs, io, path::PathBuf};
+
+/// The vendor folder under the OS data dir that groups every TFSApp's data
+/// directory (station CONTRACT.md §6). Same constant, same spelling and same
+/// position as the station's `config::DATA_DIR_VENDOR` — the two hosts share
+/// this directory, so a divergence here is a divergence in user data.
+pub const DATA_DIR_VENDOR: &str = "TFSApp";
+
+/// The hub's own root, a sibling of every app data dir rather than a parent of
+/// them: `<OS data dir>/TFSApp/hub/`. A packaged app knows nothing of this
+/// directory, and must not have to.
+pub const HUB_DIR: &str = "hub";
+
+/// Where installed snapshots live, one directory per `id`.
+pub const APPS_DIR: &str = "apps";
+
+/// The registry file's name under the hub root.
+pub const REGISTRY_FILE: &str = "registry.json";
+
+/// The registry's lock file, kept beside it rather than being the file itself
+/// so the lock's lifetime never depends on the registry being rewritten — the
+/// same separation `core`'s `process::lock_path` makes for the sidecar pid
+/// file, and for the same reason: an atomic write replaces the target inode,
+/// which would drop an flock taken on it.
+pub const REGISTRY_LOCK_FILE: &str = "registry.lock";
+
+/// Every path the hub resolves, hanging off one base — the OS data dir.
+///
+/// The base is a field rather than a call so the whole module is testable
+/// against a temp dir. Real callers use [`Paths::resolve`], which reads the
+/// same `dirs::data_dir()` the station's `packaged_data_dir` reads (and which
+/// `app.path().data_dir()` wraps), so both hosts land on the same bytes.
+pub struct Paths {
+    data_dir_base: PathBuf,
+}
+
+impl Paths {
+    /// Resolve from the OS data dir, without an `AppHandle`: the hub needs
+    /// paths in `main()`, before `tauri::Builder` — and therefore GTK —
+    /// exists.
+    pub fn resolve() -> Result<Self, PathsError> {
+        Ok(Self {
+            data_dir_base: dirs::data_dir().ok_or(PathsError::NoDataDir)?,
+        })
+    }
+
+    /// Build on an arbitrary base. For tests, and for nothing else.
+    pub fn rooted_at(data_dir_base: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir_base: data_dir_base.into(),
+        }
+    }
+
+    /// `<OS data dir>/TFSApp/` — shared with every packaged app, so the hub
+    /// creates it if needed but never claims it, cleans it, or chmods it.
+    pub fn vendor_dir(&self) -> PathBuf {
+        self.data_dir_base.join(DATA_DIR_VENDOR)
+    }
+
+    /// `<OS data dir>/TFSApp/hub/`.
+    pub fn hub_root(&self) -> PathBuf {
+        self.vendor_dir().join(HUB_DIR)
+    }
+
+    /// `<OS data dir>/TFSApp/hub/apps/`.
+    pub fn apps_root(&self) -> PathBuf {
+        self.hub_root().join(APPS_DIR)
+    }
+
+    /// `<OS data dir>/TFSApp/hub/apps/<id>/` — the installed snapshot, the
+    /// stable real path the app runs from.
+    ///
+    /// Stable and real is not incidental: it is what removes the cause of the
+    /// station's wipe-cache-per-launch, where a random `/tmp/.mount_*` FUSE
+    /// path baked itself into the compiled Symfony container. Claiming a warm
+    /// cache needs its own measurement and its own plan; this function only
+    /// makes it possible.
+    pub fn app_dir(&self, id: &str) -> Result<PathBuf, PathsError> {
+        Ok(self.apps_root().join(safe_segment("app id", id)?))
+    }
+
+    /// `<OS data dir>/TFSApp/hub/registry.json`.
+    pub fn registry_path(&self) -> PathBuf {
+        self.hub_root().join(REGISTRY_FILE)
+    }
+
+    /// `<OS data dir>/TFSApp/hub/registry.lock`.
+    pub fn registry_lock_path(&self) -> PathBuf {
+        self.hub_root().join(REGISTRY_LOCK_FILE)
+    }
+
+    /// `<OS data dir>/TFSApp/<identifier>/` — the app's own data dir, byte for
+    /// byte the path the station's `packaged_data_dir` resolves.
+    ///
+    /// Pure: it neither creates nor chmods, so callers that only need to *name*
+    /// the directory (a `list` line, a removal plan) cause no side effect on an
+    /// app that is not being launched. [`Paths::create_app_data_dir`] is the
+    /// half that touches the disk.
+    pub fn app_data_dir(&self, identifier: &str) -> Result<PathBuf, PathsError> {
+        Ok(self
+            .vendor_dir()
+            .join(safe_segment("app identifier", identifier)?))
+    }
+
+    /// [`Paths::app_data_dir`], created if missing and `0700` on every call.
+    ///
+    /// Both halves match the station's `packaged_data_dir` deliberately. The
+    /// permissions are re-applied rather than only set at creation because the
+    /// directory holds the app's SQLite DB and its generated `APP_SECRET`
+    /// (CONTRACT.md §6): an installation created by an older host, or
+    /// recreated by hand, gets tightened on its next use instead of staying
+    /// lax forever. Only the `<identifier>` directory is touched — the
+    /// `TFSApp/` vendor dir above it is shared across apps and left alone.
+    pub fn create_app_data_dir(&self, identifier: &str) -> Result<PathBuf, PathsError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = self.app_data_dir(identifier)?;
+        fs::create_dir_all(&data_dir).map_err(|source| PathsError::Io {
+            path: data_dir.clone(),
+            source,
+        })?;
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            PathsError::Io {
+                path: data_dir.clone(),
+                source,
+            }
+        })?;
+        Ok(data_dir)
+    }
+}
+
+/// Accept `value` as a single path component, or say why not.
+///
+/// Deliberately minimal — empty, `.`, `..`, and anything carrying a separator
+/// or a NUL. It rejects exactly the values that would let a manifest, or a
+/// mistyped CLI argument, name a directory outside the root it was meant to
+/// stay in, and nothing else.
+///
+/// Being no stricter than that is a contract rule, not taste: the hub must
+/// never *refuse* what the station accepts, and the station accepts any
+/// `identifier` string its `packaged_data_dir` can join. A value refused here
+/// would already be broken over there — `dev.local/../../evil` does not name
+/// one data dir on either host. A tighter charset for the hub-local `id`
+/// (which the hub itself generates) may come with the installer; it must never
+/// spread to `identifier`, which is the app's to choose.
+fn safe_segment<'a>(kind: &'static str, value: &'a str) -> Result<&'a str, PathsError> {
+    let unsafe_segment = value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains('\0');
+
+    if unsafe_segment {
+        return Err(PathsError::UnsafeSegment {
+            kind,
+            value: value.to_string(),
+        });
+    }
+    Ok(value)
+}
+
+#[derive(Debug)]
+pub enum PathsError {
+    /// `dirs::data_dir()` came back empty — no `$HOME`, no `XDG_DATA_HOME`.
+    NoDataDir,
+    /// A value that was going to name a directory cannot be one component.
+    UnsafeSegment { kind: &'static str, value: String },
+    /// Creating or tightening a directory failed; carries which one.
+    Io { path: PathBuf, source: io::Error },
+}
+
+impl fmt::Display for PathsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoDataDir => write!(
+                formatter,
+                "cannot resolve the OS data directory — is HOME set?"
+            ),
+            Self::UnsafeSegment { kind, value } => write!(
+                formatter,
+                "invalid {kind} {value:?}: it names a directory, so it cannot be empty, \
+                 \".\", \"..\", or contain a path separator"
+            ),
+            Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for PathsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "paths_tests.rs"]
+mod tests;

@@ -3753,6 +3753,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-single-instance",
+ "tempfile",
  "tfsapp-core",
  "time",
  "tiny_http",

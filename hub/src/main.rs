@@ -5,6 +5,7 @@
 // and the app the window actually serves in plan 007.
 
 mod identity;
+mod paths;
 
 use identity::Identity;
 use tauri::{WebviewUrl, WebviewWindowBuilder};
