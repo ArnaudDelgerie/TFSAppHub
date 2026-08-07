@@ -1,0 +1,13 @@
+# Local design record — plans, process docs and notes. Not versioned for now,
+# same convention as TFSAppWorkstation (see .project/plan/000-index.md).
+.project/
+
+# Rust / Tauri build artifacts
+target/
+hub/gen/
+
+# FrankenPHP sidecar binary, fetched by `make sidecar` (not committed)
+hub/resources/
+
+# Node
+node_modules/
