@@ -1,0 +1,23 @@
+[workspace]
+members = ["core", "hub"]
+resolver = "2"
+
+# Dependencies shared by both crates, pinned once here so `core/` and `hub/`
+# can never drift onto two versions of the same crate. Each member opts in
+# with `<name>.workspace = true` and keeps its own comment saying why *it*
+# needs the crate — the habit the station's Cargo.toml established.
+[workspace.dependencies]
+# The `tfsapp.config.json` contract (station CONTRACT.md §5) is parsed on both
+# sides of the boundary: `core/` for the process-level fields, `hub/` for the
+# identity and registry ones.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Non-blocking flock() and process-group signalling in `core/`'s supervision
+# half.
+libc = "0.2"
+# Resolve the OS data dir without an AppHandle — `core/` has no Tauri to ask,
+# and `hub/` needs it before `tauri::Builder` exists.
+dirs = "6"
+# Compare an app's recorded `app_version` against the installed one; also the
+# type `tauri`'s own PackageInfo.version already uses.
+semver = "1"

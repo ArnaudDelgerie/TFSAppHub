@@ -1,0 +1,70 @@
+[package]
+name = "tfsapp-hub"
+version = "0.1.0"
+description = "One binary that installs and runs several Symfony desktop apps from their installed source."
+authors = ["TFSAppHub"]
+edition = "2021"
+
+[dependencies]
+# The identity-agnostic half (process supervision, ports, health, logs). The
+# dependency only ever points this way: `core/` knows nothing of the hub.
+tfsapp-core = { path = "../core" }
+# The desktop half. `image-png` is required by plan 003's runtime identity:
+# each opened app sets its own window icon from its `icon_path`, decoded at
+# runtime from PNG — the station bakes its icon at build time instead and so
+# needs no image feature at all.
+tauri = { version = "2", features = ["image-png"] }
+# Registered for future frontend/JS use via @tauri-apps/plugin-dialog.
+tauri-plugin-dialog = "2"
+# Second-launch guard: focuses the already-open window instead of booting a
+# second FrankenPHP against the same data dir. Per *app*, not per process —
+# plan 003 gives each opened app its own single-instance identity.
+tauri-plugin-single-instance = "2.4.3"
+# Blocking native popup for guards that must run before `tauri::Builder`
+# claims GTK, called directly rather than through tauri-plugin-dialog.
+# default-features off + explicit "gtk3" to match tauri-plugin-dialog's own
+# choice of rfd backend — rfd's build script panics if both "gtk3" and
+# "xdg-portal" end up enabled.
+rfd = { version = "0.16", default-features = false, features = ["gtk3"] }
+# Already a transitive dependency via wry — declared directly, matching the
+# version Cargo.lock already resolves, for the GTK settings the hub sets on
+# the app window (uniform greyscale text antialiasing, and plan 003's per-app
+# application id).
+gtk = "0.18"
+# OS keyring (Secret Service on Linux) for APP_SECRET storage — station
+# CONTRACT.md §6. Adds no new system dependency: libdbus-1-dev is already a
+# Linux build prerequisite via tao/dbus.
+keyring = { version = "3", features = ["sync-secret-service"] }
+# Loopback HTTP bridge for actions.secrets.bridge.
+tiny_http = "0.12"
+# Poll the Symfony /healthz endpoint before opening the WebView; "json" parses
+# the GitHub API response for the hub's own update check — no new crate, since
+# serde/serde_json are already direct dependencies below.
+ureq = { version = "2", features = ["json"] }
+# SHA-256 of a downloaded AppImage, for the integrity check of the hub's own
+# self-update against the release's SHA256SUMS.txt. Its `Sha256` implements
+# `io::Write`, so a large AppImage is streamed, never buffered.
+sha2 = "0.10"
+# `export`/`import`'s curated .tar.gz archive. flate2 keeps its default
+# pure-Rust `miniz_oxide` backend (no `zlib`/`zlib-ng` feature), so no new
+# system dependency is added purely for gzip.
+tar = "0.4"
+flate2 = "1"
+# Already a transitive dependency (via tauri's `cookie` crate) — declared
+# directly, with the "formatting" feature, for `export`'s RFC-3339
+# exported_at manifest timestamp.
+time = { version = "0.3", features = ["formatting"] }
+# Generate a per-installation APP_SECRET.
+getrandom = "0.2"
+# Shared with `core/` — see the root Cargo.toml for what each is for.
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+semver.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
