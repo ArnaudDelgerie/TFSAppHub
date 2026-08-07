@@ -143,6 +143,48 @@ pub fn check_id_free(registry: &Registry, paths: &Paths, id: &str) -> Result<(),
     Ok(())
 }
 
+/// Refuse an install whose manifest pins a port another installed app has
+/// already claimed.
+///
+/// This is `build-app.sh`'s build-time port validation becoming a runtime
+/// concern, which is the whole difference the hub makes: over there one build
+/// produced one app and the only question was whether the number was a plausible
+/// port. Here N apps share one machine and one registry, so the question becomes
+/// *whose* port it is — and it can only be asked at install, because that is the
+/// first moment both apps exist in one place.
+///
+/// Only static-versus-static collides. A dynamic port (the default, and what
+/// every app that declares no `app_port` gets) is picked free at launch, so it
+/// can neither claim nor lose a number here. That leaves one real race the hub
+/// does not chase: a dynamic app could pick, at launch, the number a *closed*
+/// static app has reserved. It is a launch-time conflict with a launch-time
+/// answer, not something an install can prevent.
+pub fn check_port_free(registry: &Registry, app_port: Option<u16>) -> Result<(), InstallError> {
+    let Some(port) = app_port else {
+        return Ok(());
+    };
+
+    // `app_port` is typed `u16`, so the manifest parse already refused anything
+    // above 65535 or negative; zero is the one value left that parses and
+    // cannot be bound — it means "any free port" to the OS, which is the
+    // opposite of what pinning one is for.
+    if port == 0 {
+        return Err(InstallError::UnusablePort { port });
+    }
+
+    match registry
+        .apps
+        .iter()
+        .find(|entry| entry.app_port == Some(port))
+    {
+        Some(entry) => Err(InstallError::PortTaken {
+            port,
+            id: entry.id.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Read `root`'s manifest and check the tree is an app the hub can install.
 ///
 /// The `app_version` semver check is the hub's half of the station's
@@ -276,6 +318,15 @@ pub enum InstallError {
     DirectoryInTheWay {
         path: PathBuf,
     },
+    /// Another installed app pinned this port first.
+    PortTaken {
+        port: u16,
+        id: String,
+    },
+    /// A pinned port that no process could ever bind.
+    UnusablePort {
+        port: u16,
+    },
     MissingFile {
         path: PathBuf,
         why: &'static str,
@@ -324,6 +375,17 @@ impl fmt::Display for InstallError {
                  was probably interrupted. Remove that directory by hand and try again; \
                  the hub will not copy over a tree it cannot account for.",
                 path.display()
+            ),
+            Self::PortTaken { port, id } => write!(
+                formatter,
+                "this app pins port {port} in its {MANIFEST_FILE}, and {id} already \
+                 claimed it. Two apps cannot pin one port: drop \"app_port\" from one \
+                 of them to give it a fresh port on every launch, or change the number."
+            ),
+            Self::UnusablePort { port } => write!(
+                formatter,
+                "\"app_port\" is {port} in the app's {MANIFEST_FILE} — a pinned port has \
+                 to be one a process can bind, between 1 and 65535 (CONTRACT.md §2)."
             ),
             Self::MissingFile { path, why } => {
                 write!(formatter, "{} is missing — {why}.", path.display())

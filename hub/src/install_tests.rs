@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{check_id_free, resolve_id, snapshot, validate, InstallError};
+use super::{check_id_free, check_port_free, resolve_id, snapshot, validate, InstallError};
 use crate::{
     paths::Paths,
     registry::{now_timestamp, Platform, Registry, RegistryEntry, Source, SourceKind, State},
@@ -314,6 +314,55 @@ fn the_snapshot_refuses_to_write_over_an_existing_tree() {
 
     assert!(
         matches!(error, InstallError::DirectoryInTheWay { .. }),
+        "{error}"
+    );
+}
+
+/// A registry holding one app, pinning `app_port` or not.
+fn registry_with(id: &str, app_port: Option<u16>) -> Registry {
+    let mut registry = Registry::default();
+    registry.upsert(RegistryEntry {
+        app_port,
+        ..registered(id, "/home/arnaud/Dev/Demo")
+    });
+    registry
+}
+
+#[test]
+fn two_apps_cannot_pin_one_port() {
+    // The generalisation of `build-app.sh`'s build-time port check: over there
+    // one build made one app, here N apps share one machine, so the question
+    // stops being "is this a plausible port" and becomes "whose port is it".
+    let registry = registry_with("first", Some(8123));
+
+    let error = check_port_free(&registry, Some(8123)).expect_err("8123 is claimed");
+
+    assert!(matches!(error, InstallError::PortTaken { .. }), "{error}");
+    // Naming the holder is the point: the user cannot resolve a collision with
+    // an app they cannot identify.
+    assert!(error.to_string().contains("first"), "{error}");
+
+    check_port_free(&registry, Some(8124)).expect("another number is free");
+}
+
+#[test]
+fn a_dynamic_port_neither_claims_nor_loses_a_number() {
+    // The default, and what makes the gate narrow: a port picked free at launch
+    // cannot collide at install with anything, in either direction.
+    check_port_free(&registry_with("first", Some(8123)), None).expect("dynamic against static");
+    check_port_free(&registry_with("first", None), Some(8123)).expect("static against dynamic");
+    check_port_free(&registry_with("first", None), None).expect("dynamic against dynamic");
+    check_port_free(&Registry::default(), Some(8123)).expect("nothing is installed");
+}
+
+#[test]
+fn a_pinned_port_nothing_can_bind_is_refused() {
+    // The one value that survives the manifest's `u16` parse and still cannot
+    // be bound: zero means "any free port" to the OS, the opposite of pinning.
+    let error = check_port_free(&Registry::default(), Some(0)).expect_err("0 is not a port");
+
+    assert!(
+        matches!(error, InstallError::UnusablePort { .. }),
         "{error}"
     );
 }
