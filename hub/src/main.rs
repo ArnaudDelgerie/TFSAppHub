@@ -9,7 +9,8 @@ mod identity;
 use identity::Identity;
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 
-const OPEN_USAGE: &str = "usage: tfsapp-hub open --identity <identifier> [--name <product name>]";
+const OPEN_USAGE: &str =
+    "usage: tfsapp-hub open --identity <identifier> [--name <product name>] [--icon <path.png>]";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -55,6 +56,7 @@ fn main() {
 fn parse_open(args: &[String]) -> Result<Identity, String> {
     let mut identifier = None;
     let mut product_name = None;
+    let mut icon_path = None;
     let mut index = 0;
 
     while index < args.len() {
@@ -62,6 +64,7 @@ fn parse_open(args: &[String]) -> Result<Identity, String> {
         let slot = match flag {
             "--identity" => &mut identifier,
             "--name" => &mut product_name,
+            "--icon" => &mut icon_path,
             other => return Err(format!("unknown argument {other}")),
         };
         *slot = Some(
@@ -80,6 +83,7 @@ fn parse_open(args: &[String]) -> Result<Identity, String> {
         // worth more here than a nice one. Plan 004 replaces it with the
         // manifest's own field.
         product_name: product_name.unwrap_or_else(|| identifier.clone()),
+        icon_path: icon_path.map(std::path::PathBuf::from),
         identifier,
     })
 }
@@ -94,13 +98,24 @@ fn open(identity: Identity, mut context: tauri::Context) {
     // what this call leaves behind.
     identity::apply(&identity, &mut context);
 
-    let title = identity.product_name.clone();
     tauri::Builder::default()
         .setup(move |app| {
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                .title(&title)
-                .inner_size(1000.0, 700.0)
-                .build()?;
+            let mut window =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title(&identity.product_name)
+                    .inner_size(1000.0, 700.0);
+
+            // Per-app, at runtime, from a path — the shape the hub needs, since
+            // there is no per-app build step to bake an icon into. A failed
+            // load is already reported by `load_icon` and leaves the window
+            // with the generic one.
+            if let Some(path) = &identity.icon_path {
+                if let Some(icon) = identity::load_icon(path) {
+                    window = window.icon(icon)?;
+                }
+            }
+
+            window.build()?;
             Ok(())
         })
         .run(context)

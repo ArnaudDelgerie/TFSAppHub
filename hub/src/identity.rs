@@ -39,6 +39,10 @@ pub struct Identity {
     /// spike watched the two diverge (switcher entry and window title
     /// disagreeing), and one manifest field feeding both is the fix.
     pub product_name: String,
+    /// PNG to use as the window icon, resolved inside the installed app's own
+    /// directory. `None` when the app declares none — see [`load_icon`] for
+    /// why that is not an error.
+    pub icon_path: Option<std::path::PathBuf>,
 }
 
 /// Apply `identity` to `context`, before `tauri::Builder::run(context)` and
@@ -80,6 +84,32 @@ fn apply_to_config(identity: &Identity, config: &mut tauri::utils::config::Confi
 /// early. `set_prgname` has no such requirement and must run before GTK init.
 fn set_prgname(identifier: &str) {
     gtk::glib::set_prgname(Some(identifier));
+}
+
+/// Decode the app's window icon, for the window builder's `.icon()`.
+///
+/// This is the one identity-derived thing that is *not* free: the station
+/// bakes `bundle.icon` at build time, and the hub has no per-app build step to
+/// bake anything in, so the PNG is read from the installed app's directory at
+/// launch. `tauri`'s `image-png` feature is what makes the decode available —
+/// the station enables no image feature at all.
+///
+/// A missing or undecodable file warns and yields `None`: an app whose author
+/// shipped a broken icon is still an app the user must be able to open, and
+/// refusing to launch over a picture would be the wrong trade. It comes out as
+/// a generic window icon, which is exactly what the user would have got had
+/// the app declared no icon at all.
+pub fn load_icon(path: &std::path::Path) -> Option<tauri::image::Image<'static>> {
+    match tauri::image::Image::from_path(path) {
+        Ok(image) => Some(image),
+        Err(error) => {
+            eprintln!(
+                "tfsapp-hub: opening without a window icon — cannot read {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
