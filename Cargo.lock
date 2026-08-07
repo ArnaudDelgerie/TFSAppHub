@@ -3725,6 +3725,15 @@ dependencies = [
 [[package]]
 name = "tfsapp-core"
 version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ureq",
+ "url",
+]
 
 [[package]]
 name = "tfsapp-hub"
@@ -3732,7 +3741,6 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "flate2",
- "getrandom 0.2.17",
  "gtk",
  "keyring",
  "rfd",

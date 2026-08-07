@@ -10,3 +10,31 @@ edition = "2021"
 # here is testable headless and reusable by a non-Tauri host, and a `tauri`
 # line added below would turn a real boundary back into a mere directory.
 [dependencies]
+# `setpgid` in the spawn-time process-group helper, `getpgid` behind the
+# group/pid signalling decision, and the non-blocking `flock` plus the
+# self-pipe (`pipe`/`read`/`write`/`signal`) the sidecar liveness lock and the
+# signal forwarding are built on — all in `process.rs`.
+libc.workspace = true
+# Parse the data dir's own `data/config.json` — `port_override` (CONTRACT.md
+# §6) is what `ports.rs` resolves a static port against.
+serde.workspace = true
+serde_json.workspace = true
+# Poll the app's `/healthz` before its window opens (CONTRACT.md §4), in
+# `health.rs`. The "json" feature is not needed down here — the GitHub release
+# API the station parses with it belongs to the update check, which stays in
+# `hub/`.
+ureq.workspace = true
+# Generate a per-installation APP_SECRET (CONTRACT.md §6), in `app_secret.rs`.
+# Not shared with `hub/`: generation lives here, and 007's keyring-backed
+# resolution calls down to `random_secret_hex` rather than rolling its own.
+getrandom = "0.2"
+# The URL type `browser.rs` opens in the system browser. The station writes
+# `tauri::Url`, which is a re-export of exactly this crate — depending on it
+# directly is what keeps the boundary above real rather than nominal. Already
+# in Cargo.lock as a transitive dependency, so this adds nothing to the tree.
+url = "2"
+
+[dev-dependencies]
+# Throwaway pid-file/lock-file/log directories for the ported unit tests, so
+# none of them writes anywhere but a temp dir it owns.
+tempfile = "3"
