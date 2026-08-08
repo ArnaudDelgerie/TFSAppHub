@@ -2,6 +2,7 @@ use std::{fs, path::Path};
 
 use super::{child_args, resolve, OpenError};
 use crate::{
+    launch::Source as LaunchSource,
     paths::Paths,
     registry::{self, now_timestamp, Platform, Registry, RegistryEntry, Source, SourceKind, State},
 };
@@ -89,7 +90,13 @@ fn an_installed_app_resolves_to_its_snapshot_identity_and_data_dir() {
 
     let resolved = resolve(&paths, "demo").expect("a resolvable app");
 
-    assert_eq!(resolved.id, "demo");
+    assert_eq!(
+        resolved.source,
+        LaunchSource::Installed {
+            id: "demo".to_string()
+        }
+    );
+    assert_eq!(resolved.label, "demo");
     assert_eq!(resolved.identity.identifier, "dev.local.demo");
     // From the manifest, not from the registry: one field feeds the window title
     // and the `.desktop` Name= alike, with no bake in between.
@@ -98,13 +105,13 @@ fn an_installed_app_resolves_to_its_snapshot_identity_and_data_dir() {
     // The app's data dir hangs off `identifier` alone — the same path a packaged
     // AppImage of this app resolves, which is what makes the two the same app.
     assert_eq!(
-        resolved.data_dir,
+        resolved.state_root,
         paths
             .app_data_dir("dev.local.demo")
             .expect("a data dir path")
     );
     // Named, never created: resolving is not opening.
-    assert!(!resolved.data_dir.exists());
+    assert!(!resolved.state_root.exists());
 }
 
 #[test]

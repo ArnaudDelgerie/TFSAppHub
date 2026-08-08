@@ -10,6 +10,7 @@ mod bridge;
 mod cli;
 mod identity;
 mod install;
+mod launch;
 mod lifecycle;
 mod list;
 mod manifest;
@@ -199,8 +200,8 @@ fn prepare(id: &str, identity: &Identity) -> Launching {
         Ok(paths) => paths,
         Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
     };
-    let resolved = match open::resolve(&paths, id) {
-        Ok(resolved) => resolved,
+    let spec = match open::resolve(&paths, id) {
+        Ok(spec) => spec,
         Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
     };
 
@@ -221,22 +222,18 @@ fn prepare(id: &str, identity: &Identity) -> Launching {
         &data_dir,
         &data_subdir,
         &identity.identifier,
-        &resolved.manifest.app_version,
-        resolved.manifest.app_port,
+        &spec.manifest.app_version,
+        spec.manifest.app_port,
     );
 
-    Launching {
-        paths,
-        resolved,
-        lock,
-    }
+    Launching { paths, spec, lock }
 }
 
 /// What the guards leave for the launch itself: where the app is, what it
 /// declares, and the liveness lock proving this process is its live instance.
 struct Launching {
     paths: paths::Paths,
-    resolved: open::Resolved,
+    spec: launch::LaunchSpec,
     lock: Option<std::fs::File>,
 }
 
@@ -261,11 +258,7 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
     // all of it has to happen in this window: they refuse through a blocking
     // native dialog, which deadlocks rather than appears once Tauri has claimed
     // GTK. See `lifecycle`'s module header.
-    let Launching {
-        paths,
-        resolved,
-        lock,
-    } = prepare(id, &identity);
+    let Launching { paths, spec, lock } = prepare(id, &identity);
 
     // The app's `actions` groups, granted at runtime, before `Builder` — the
     // only window in which they can be: `add_capability` lives on `Context` and
@@ -274,7 +267,7 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
     // group this app did not declare is refused by Tauri's own ACL before any
     // handler runs. Registering the commands is not the boundary; this is.
     for (declared, grant) in window::ACTION_IPC_GRANTS {
-        if declared(&resolved.manifest.actions) {
+        if declared(&spec.manifest.actions) {
             context
                 .runtime_authority_mut()
                 .add_capability(window::action_capability(grant))
@@ -351,8 +344,8 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
                 &identity.product_name,
                 &window::splash_style(
                     &identity.product_name,
-                    resolved.manifest.splash_bg.as_deref(),
-                    resolved.manifest.splash_text.as_deref(),
+                    spec.manifest.splash_bg.as_deref(),
+                    spec.manifest.splash_text.as_deref(),
                 ),
                 &app_origin,
             )?;
@@ -368,7 +361,7 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
                 serve(
                     handle,
                     paths,
-                    resolved,
+                    spec,
                     identity,
                     lock,
                     app_origin,
@@ -394,7 +387,7 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
 fn serve(
     app: tauri::AppHandle,
     paths: paths::Paths,
-    resolved: open::Resolved,
+    spec: launch::LaunchSpec,
     identity: Identity,
     lock: Option<std::fs::File>,
     app_origin: window::AppOriginSlot,
@@ -402,7 +395,7 @@ fn serve(
 ) {
     use tauri::Manager;
 
-    let manifest = &resolved.manifest;
+    let manifest = &spec.manifest;
     if manifest.splash_path.is_some() {
         // Said, not swallowed: an app author who declared a splash page has to
         // learn it is not the one on screen. See `window::splash_style`.
@@ -413,11 +406,11 @@ fn serve(
         );
     }
 
-    let environment =
-        match app_env::resolve(&paths, manifest, &resolved.app_dir, app_env::Mode::Launch) {
-            Ok(environment) => environment,
-            Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
-        };
+    let environment = match app_env::resolve(&paths, manifest, &spec.app_dir, app_env::Mode::Launch)
+    {
+        Ok(environment) => environment,
+        Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
+    };
     let toolchain = match php::toolchain(&paths) {
         Ok(toolchain) => toolchain,
         Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
@@ -431,7 +424,7 @@ fn serve(
 
     let (sidecar, url) = match sidecar::start(
         &toolchain,
-        &resolved.app_dir,
+        &spec.app_dir,
         &environment,
         manifest,
         lock,

@@ -34,8 +34,8 @@ use std::{fmt, io, path::PathBuf, process::Command};
 
 use crate::{
     cli::{EXIT_FAILED, EXIT_OK, OPEN_CHILD_SUBCOMMAND},
-    identity::Identity,
-    manifest::{self, Manifest, ManifestError},
+    launch::{LaunchSpec, Source},
+    manifest::{self, ManifestError},
     paths::{Paths, PathsError},
     registry::{self, RegistryError, State},
 };
@@ -69,45 +69,20 @@ pub fn run(id: &str) -> i32 {
     }
 }
 
-/// Everything the parent resolves before re-executing itself.
+/// The installed constructor of [`LaunchSpec`]: look the app up and check it
+/// can be opened at all.
 ///
 /// The manifest is loaded from the **installed snapshot**, never from the
 /// original source: what runs is what was installed, and a source tree edited
 /// since changes nothing until `update <id>`. That is the same rule the
 /// installer states, read from the other end.
 ///
-/// Three of its fields are the *child's* inputs and have no parent-side reader:
-/// the parent resolves them only to prove they can be resolved, which is what
-/// makes `open` fail at the terminal instead of inside a window. Step 3 of this
-/// plan is where they get read for real — remove the allow with it rather than
-/// letting it linger.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct Resolved {
-    /// The hub-local handle, which the child needs in order to find the same
-    /// snapshot the parent just validated.
-    pub id: String,
-    pub app_dir: PathBuf,
-    pub manifest: Manifest,
-    pub identity: Identity,
-    /// `<OS data dir>/TFSApp/<identifier>/`. Named, not created — creating it is
-    /// the child's job, once it is actually going to run the app.
-    pub data_dir: PathBuf,
-    /// What the manifest parse wanted to say. Carried out rather than printed
-    /// where it is produced, because both the parent and the child resolve the
-    /// same app and only one of them is attached to the terminal the user typed
-    /// in — printing at the source would say everything twice.
-    pub warnings: Vec<String>,
-}
-
-/// Look the app up and check it can be opened at all.
-///
 /// Every refusal below names the app and the way out, because the audience is
 /// someone at a terminal who typed one word and got nothing. The one state that
 /// is *not* a refusal is `needs-revalidation`: the app's dependencies were
 /// resolved against a PHP that has since moved, which is a reason to revalidate
 /// (plan 012) and not a reason to keep the user out of their own data.
-pub fn resolve(paths: &Paths, id: &str) -> Result<Resolved, OpenError> {
+pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
     let installed = registry::load(paths)?;
     let entry = installed
         .get(id)
@@ -153,15 +128,16 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<Resolved, OpenError> {
         });
     }
 
-    let data_dir = paths.app_data_dir(&manifest.identifier)?;
+    let state_root = paths.app_data_dir(&manifest.identifier)?;
     let identity = manifest.identity(&app_dir);
 
-    Ok(Resolved {
-        id: id.to_string(),
+    Ok(LaunchSpec {
+        source: Source::Installed { id: id.to_string() },
         app_dir,
-        manifest,
         identity,
-        data_dir,
+        manifest,
+        state_root,
+        label: id.to_string(),
         warnings: loaded.warnings,
     })
 }
@@ -174,17 +150,22 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<Resolved, OpenError> {
 /// error could want a dialog — so the value it needs must be reachable with no
 /// I/O at all. `--id` comes along so the child can resolve the rest of the app
 /// once it is safely past that point.
-pub fn child_args(resolved: &Resolved) -> Vec<String> {
+///
+/// Only ever called on a [`Source::Installed`] spec — `resolve` above is this
+/// module's only constructor, and it never builds a `Live` one.
+pub fn child_args(spec: &LaunchSpec) -> Vec<String> {
     let mut args = vec![
         OPEN_CHILD_SUBCOMMAND.to_string(),
         "--id".to_string(),
-        resolved.id.clone(),
+        spec.installed_id()
+            .expect("open's own LaunchSpec is always Source::Installed")
+            .to_string(),
         "--identity".to_string(),
-        resolved.identity.identifier.clone(),
+        spec.identity.identifier.clone(),
         "--name".to_string(),
-        resolved.identity.product_name.clone(),
+        spec.identity.product_name.clone(),
     ];
-    if let Some(icon) = &resolved.identity.icon_path {
+    if let Some(icon) = &spec.identity.icon_path {
         args.push("--icon".to_string());
         args.push(icon.display().to_string());
     }
@@ -198,10 +179,10 @@ pub fn child_args(resolved: &Resolved) -> Vec<String> {
 /// they typed it. A `.desktop` launch inherits nothing useful either way, which
 /// is why the child's fatal errors also go through a native dialog rather than
 /// through stderr alone.
-fn launch(resolved: &Resolved) -> Result<u32, OpenError> {
+fn launch(spec: &LaunchSpec) -> Result<u32, OpenError> {
     let executable = std::env::current_exe().map_err(OpenError::NoExecutable)?;
     let mut command = Command::new(&executable);
-    command.args(child_args(resolved));
+    command.args(child_args(spec));
     tfsapp_core::process::set_own_process_group(&mut command);
 
     command
