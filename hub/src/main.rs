@@ -8,6 +8,7 @@
 mod app_env;
 mod bridge;
 mod cli;
+mod desktop;
 mod dev;
 mod hub_bin;
 mod identity;
