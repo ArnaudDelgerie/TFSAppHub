@@ -192,7 +192,7 @@ fn a_missing_manifest_is_reported_as_the_contract_states_it() {
 #[test]
 fn an_app_version_nothing_can_compare_is_refused_at_install() {
     // The hub's equivalent of the station's build-time semver check
-    // (CONTRACT.md §2 / .project/contract-amendments.md #5): install is the
+    // (CONTRACT.md §2, "`app_version` is semver"): install is the
     // moment the hub can still say no, and `update` is what would otherwise
     // discover it months later.
     let root = tempfile::tempdir().expect("a temp dir");

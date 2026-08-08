@@ -25,9 +25,9 @@
 //! `update <id>` will be — plans 011 and 012 — and "a newer version exists"
 //! means nothing until something can act on it.
 //!
-//! Logged as friction #7 in `.project/contract-amendments.md`: the clause states
-//! an AppImage asset where it should guarantee the question, leaving the
-//! resolution to the host.
+//! CONTRACT.md §7 states this the way it should have been stated all along: the
+//! result says what changed and nothing about how to apply it, because how an
+//! update is applied belongs to the host.
 
 use serde::{Deserialize, Serialize};
 

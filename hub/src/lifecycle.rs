@@ -32,9 +32,9 @@
 //! opening. It is refused, naming the command that resolves it.
 //!
 //! The event *itself* is not gone, it moved: the hub's `install` is the install
-//! event (see `install.rs`, and friction #6 in
-//! `.project/contract-amendments.md`), and it is what writes the record these
-//! guards read.
+//! event (see `install.rs`, and CONTRACT.md §6, which states the lifecycle as
+//! an ordering guarantee rather than as a launch), and it is what writes the
+//! record these guards read.
 
 use std::{
     fs,

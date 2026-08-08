@@ -263,8 +263,8 @@ impl Toolchain {
     /// and the Messenger worker need them just as much: both are PHP processes
     /// that can shell out to PHP, and both would otherwise land on the host's
     /// interpreter — or, on the machine with no PHP at all that the hub exists
-    /// to serve, on nothing. See `.project/station-findings.md` #3, which
-    /// measured it.
+    /// to serve, on nothing. Measured, not assumed: see ARCHITECTURE.md's
+    /// "The `PHP_BINARY` shim".
     pub fn shim_env(&self) -> Vec<(&'static str, String)> {
         let mut variables = vec![("PHP_BINARY", path_to_string(&self.shim))];
         if let Some(directory) = self.shim.parent() {

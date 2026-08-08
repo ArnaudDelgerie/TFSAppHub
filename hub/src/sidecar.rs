@@ -149,7 +149,7 @@ pub fn start(
     // interpreter is empty — so without these two they would land on whatever
     // `php` the machine happens to have, or on none at all, which is precisely
     // the machine the hub exists to serve. Measured, not assumed: see
-    // `.project/station-findings.md` #3.
+    // ARCHITECTURE.md's "The `PHP_BINARY` shim".
     let mut envs = environment.vars.clone();
     envs.extend(toolchain.shim_env());
 
