@@ -9,6 +9,7 @@ mod app_env;
 mod bridge;
 mod cli;
 mod dev;
+mod hub_bin;
 mod identity;
 mod install;
 mod launch;
