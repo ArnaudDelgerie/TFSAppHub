@@ -6,6 +6,17 @@ use crate::{
     registry::{now_timestamp, Platform, Registry, RegistryEntry, Source, SourceKind, State},
 };
 
+/// This module's own `identifier`, and deliberately not the one every other
+/// module uses.
+///
+/// A tempdir isolates the files; nothing isolates the keyring, whose service
+/// name *is* the identifier and whose namespace belongs to the login session.
+/// These tests are the only ones in the suite that **delete** keyring accounts,
+/// so sharing an identifier with `app_env_tests` or `install_tests` meant a
+/// purge here could remove an `app-secret` another test had just written, in
+/// another thread, and make it read back a different secret.
+const IDENTIFIER: &str = "dev.local.demo-remove";
+
 fn temp_paths() -> (tempfile::TempDir, Paths) {
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
@@ -18,13 +29,15 @@ fn installed_snapshot(paths: &Paths, id: &str) {
     fs::create_dir_all(&app_dir).expect("an installed tree");
     fs::write(
         app_dir.join("tfsapp.config.json"),
-        r#"{
+        format!(
+            r#"{{
           "product_name": "Demo App",
-          "identifier": "dev.local.demo",
+          "identifier": "{IDENTIFIER}",
           "project_name": "demo",
           "app_version": "0.6.0",
-          "actions": {"secrets": {"ipc": true, "keys": ["openai", "anthropic"]}}
-        }"#,
+          "actions": {{"secrets": {{"ipc": true, "keys": ["openai", "anthropic"]}}}}
+        }}"#
+        ),
     )
     .expect("a manifest");
 }
@@ -36,18 +49,18 @@ fn a_plain_remove_keeps_the_data_and_a_purge_names_every_zone() {
     let (base, paths) = temp_paths();
     installed_snapshot(&paths, "demo");
 
-    let kept = plan(&paths, "demo", "dev.local.demo", false).expect("a plan");
+    let kept = plan(&paths, "demo", IDENTIFIER, false).expect("a plan");
     assert_eq!(kept.app_dir, paths.app_dir("demo").expect("an app dir"));
     assert!(
         kept.keyring_accounts.is_empty(),
         "a plain remove never touches the keyring"
     );
 
-    let purged = plan(&paths, "demo", "dev.local.demo", true).expect("a plan");
-    assert_eq!(purged.data_dir, base.path().join("TFSApp/dev.local.demo"));
+    let purged = plan(&paths, "demo", IDENTIFIER, true).expect("a plan");
+    assert_eq!(purged.data_dir, base.path().join("TFSApp").join(IDENTIFIER));
     // A sibling of TFSApp/, not a child — WebKit derives it from the GTK app id
     // and has never heard of this project's vendor folder.
-    assert_eq!(purged.webkit_data_dir, base.path().join("dev.local.demo"));
+    assert_eq!(purged.webkit_data_dir, base.path().join(IDENTIFIER));
     assert_eq!(
         purged.keyring_accounts,
         vec![
@@ -66,7 +79,7 @@ fn an_unreadable_manifest_costs_the_declared_keys_and_nothing_else() {
     // need no manifest to be known.
     let (_base, paths) = temp_paths();
 
-    let purged = plan(&paths, "demo", "dev.local.demo", true).expect("a plan");
+    let purged = plan(&paths, "demo", IDENTIFIER, true).expect("a plan");
 
     assert_eq!(
         purged.keyring_accounts,
@@ -88,7 +101,7 @@ fn removing_something_that_is_not_installed_says_where_to_look() {
 fn a_remove_drops_the_tree_and_the_entry_and_keeps_the_data() {
     let (base, paths) = temp_paths();
     installed_snapshot(&paths, "demo");
-    let data_dir = paths.app_data_dir("dev.local.demo").expect("a data dir");
+    let data_dir = paths.app_data_dir(IDENTIFIER).expect("a data dir");
     fs::create_dir_all(data_dir.join("data")).expect("an app data dir");
     fs::write(data_dir.join("data/app.db"), "not really a database").expect("a database");
 
@@ -110,10 +123,8 @@ fn a_remove_drops_the_tree_and_the_entry_and_keeps_the_data() {
 fn a_purge_takes_the_data_with_it() {
     let (_base, paths) = temp_paths();
     installed_snapshot(&paths, "demo");
-    let data_dir = paths.app_data_dir("dev.local.demo").expect("a data dir");
-    let webkit_dir = paths
-        .webkit_data_dir("dev.local.demo")
-        .expect("a webkit dir");
+    let data_dir = paths.app_data_dir(IDENTIFIER).expect("a data dir");
+    let webkit_dir = paths.webkit_data_dir(IDENTIFIER).expect("a webkit dir");
     fs::create_dir_all(data_dir.join("data")).expect("an app data dir");
     fs::write(data_dir.join("data/app.db"), "not really a database").expect("a database");
     fs::create_dir_all(&webkit_dir).expect("a webkit data dir");
@@ -135,7 +146,7 @@ mod registry {
         let mut registry = Registry::default();
         registry.upsert(RegistryEntry {
             id: id.to_string(),
-            identifier: "dev.local.demo".to_string(),
+            identifier: IDENTIFIER.to_string(),
             source: Source {
                 kind: SourceKind::LocalPath,
                 location: "/home/arnaud/Dev/Demo".to_string(),

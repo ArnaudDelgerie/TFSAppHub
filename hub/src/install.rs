@@ -33,6 +33,7 @@ use std::{
 use crate::{
     app_env::{self, EnvError},
     cli::{EXIT_FAILED, EXIT_OK},
+    lifecycle::{self, LifecycleError},
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
     paths::{Paths, PathsError},
     php::{self, PhpError, Toolchain},
@@ -209,7 +210,7 @@ fn prepare(
     manifest: &Manifest,
     app_dir: &Path,
 ) -> Result<(), InstallError> {
-    let environment = app_env::resolve(paths, manifest, app_dir)?;
+    let environment = app_env::resolve(paths, manifest, app_dir, app_env::Mode::Install)?;
     // Named before the first command runs, because the next thing on screen is
     // a migration writing a database into it — under `identifier`, which is
     // what makes it the same data dir a packaged install of this app uses.
@@ -225,6 +226,17 @@ fn prepare(
     {
         toolchain.console(app_dir, &environment.vars, command)?;
     }
+
+    // The install event's success point (CONTRACT.md §6): the data dir records
+    // which version of the app last wrote it, and it is written **only** once
+    // every hook above has succeeded — a failed install leaves the dir undated,
+    // so the next attempt starts the whole event over rather than believing it
+    // already ran.
+    //
+    // This is the record `open`'s version guard reads, and the same file a
+    // packaged AppImage of this app writes and reads: one data dir, one record,
+    // whichever host wrote it.
+    lifecycle::write_data_version(&environment.data_subdir, &manifest.app_version)?;
 
     Ok(())
 }
@@ -493,6 +505,10 @@ pub enum InstallError {
     Env(EnvError),
     Php(PhpError),
     Platform(PlatformError),
+    /// The install ran and the data dir's version record could not be written —
+    /// which would leave the app installed but undated, and so re-running its
+    /// whole install event on the next one.
+    Lifecycle(LifecycleError),
     /// The derived or given `id` cannot name a directory or be typed as one
     /// word.
     UnusableId {
@@ -542,6 +558,7 @@ impl fmt::Display for InstallError {
             Self::Env(error) => write!(formatter, "{error}"),
             Self::Php(error) => write!(formatter, "{error}"),
             Self::Platform(error) => write!(formatter, "{error}"),
+            Self::Lifecycle(error) => write!(formatter, "{error}"),
             Self::UnusableId { id, derived } => {
                 let source = match derived {
                     true => format!(
@@ -609,6 +626,7 @@ impl std::error::Error for InstallError {
             Self::Env(error) => Some(error),
             Self::Php(error) => Some(error),
             Self::Platform(error) => Some(error),
+            Self::Lifecycle(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -654,6 +672,12 @@ impl From<PhpError> for InstallError {
 impl From<PlatformError> for InstallError {
     fn from(error: PlatformError) -> Self {
         Self::Platform(error)
+    }
+}
+
+impl From<LifecycleError> for InstallError {
+    fn from(error: LifecycleError) -> Self {
+        Self::Lifecycle(error)
     }
 }
 

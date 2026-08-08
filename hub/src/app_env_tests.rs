@@ -1,13 +1,35 @@
 use std::{os::unix::fs::PermissionsExt, path::Path};
 
-use super::resolve;
+use super::{resolve, Mode};
 use crate::{manifest, paths::Paths};
 
-fn manifest_with(extra: &str) -> manifest::Manifest {
+/// One `identifier` per test, named after the test.
+///
+/// A tempdir isolates everything here **except** the keyring, because the
+/// identifier *is* the Secret Service name and that namespace belongs to the
+/// login session, not to the test (see `secrets.rs` on why it is a namespace and
+/// not a boundary). Two tests sharing an identifier therefore share one
+/// `app-secret` account, and `cargo test`'s threads turn that into a race:
+/// `remove_tests`' purge deletes accounts under its identifier, which used to be
+/// this one — so a resolve here could have its own entry deleted between the
+/// write and the read-back, fall through to the file, and come back with a
+/// different secret than the resolve before it.
+///
+/// Named after the test rather than made unique per *run* (a pid, a counter):
+/// both isolate, but only this one leaves a bounded set of accounts behind.
+/// `make check` stands up a throwaway Secret Service, so nothing accumulates
+/// there — a bare `cargo test` writes to the developer's real keyring, and
+/// growing it by five entries per run would be a poor trade for the same
+/// isolation.
+fn identifier_for(test: &str) -> String {
+    format!("dev.local.demo-env-{test}")
+}
+
+fn manifest_for(identifier: &str, extra: &str) -> manifest::Manifest {
     let json = format!(
         r#"{{
           "product_name": "Demo App",
-          "identifier": "dev.local.demo",
+          "identifier": "{identifier}",
           "project_name": "demo",
           "app_version": "0.6.0"
           {extra}
@@ -32,9 +54,15 @@ fn every_variable_the_contract_lists_is_injected() {
     // app runs against the wrong database and says nothing.
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("every-variable");
 
-    let environment = resolve(&paths, &manifest_with(""), Path::new("/apps/demo"))
-        .expect("the environment resolves");
+    let environment = resolve(
+        &paths,
+        &manifest_for(&identifier, ""),
+        Path::new("/apps/demo"),
+        Mode::Install,
+    )
+    .expect("the environment resolves");
 
     for key in [
         "TFS_APP_IDENTIFIER",
@@ -79,11 +107,17 @@ fn the_data_the_app_reads_hangs_off_identifier_and_nothing_else() {
     // root, not from the hub-local id.
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("data-dir");
 
-    let environment = resolve(&paths, &manifest_with(""), Path::new("/apps/whatever"))
-        .expect("the environment resolves");
+    let environment = resolve(
+        &paths,
+        &manifest_for(&identifier, ""),
+        Path::new("/apps/whatever"),
+        Mode::Install,
+    )
+    .expect("the environment resolves");
 
-    let expected = base.path().join("TFSApp").join("dev.local.demo");
+    let expected = base.path().join("TFSApp").join(&identifier);
     assert_eq!(environment.data_dir, expected);
     assert_eq!(
         value(&environment.vars, "DATABASE_URL"),
@@ -113,14 +147,23 @@ fn the_async_worker_toggle_reaches_both_the_transport_and_the_app() {
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
 
-    let off = resolve(&paths, &manifest_with(""), Path::new("/apps/demo")).expect("it resolves");
+    let identifier = identifier_for("async-worker");
+
+    let off = resolve(
+        &paths,
+        &manifest_for(&identifier, ""),
+        Path::new("/apps/demo"),
+        Mode::Install,
+    )
+    .expect("it resolves");
     assert_eq!(value(&off.vars, "MESSENGER_TRANSPORT_DSN"), "sync://");
     assert_eq!(value(&off.vars, "TFS_ASYNC_WORKER"), "0");
 
     let on = resolve(
         &paths,
-        &manifest_with(r#", "async_worker": true"#),
+        &manifest_for(&identifier, r#", "async_worker": true"#),
         Path::new("/apps/demo"),
+        Mode::Install,
     )
     .expect("it resolves");
     assert_eq!(
@@ -135,17 +178,25 @@ fn a_pinned_port_is_honoured_and_an_absent_one_is_picked() {
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
 
+    let identifier = identifier_for("ports");
+
     let pinned = resolve(
         &paths,
-        &manifest_with(r#", "app_port": 8123"#),
+        &manifest_for(&identifier, r#", "app_port": 8123"#),
         Path::new("/apps/demo"),
+        Mode::Install,
     )
     .expect("it resolves");
     assert_eq!(value(&pinned.vars, "APP_PORT"), "8123");
     assert_eq!(value(&pinned.vars, "APP_ORIGIN"), "http://127.0.0.1:8123");
 
-    let dynamic =
-        resolve(&paths, &manifest_with(""), Path::new("/apps/demo")).expect("it resolves");
+    let dynamic = resolve(
+        &paths,
+        &manifest_for(&identifier, ""),
+        Path::new("/apps/demo"),
+        Mode::Install,
+    )
+    .expect("it resolves");
     let picked: u16 = value(&dynamic.vars, "APP_PORT")
         .parse()
         .expect("a port number");
@@ -157,9 +208,24 @@ fn the_secret_is_the_same_one_the_next_command_will_read() {
     // Anything Symfony signs during an install has to keep validating after it.
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
+    // One identifier across both resolves, or this would compare two different
+    // apps' secrets and pass for the wrong reason.
+    let identifier = identifier_for("stable-secret");
 
-    let first = resolve(&paths, &manifest_with(""), Path::new("/apps/demo")).expect("it resolves");
-    let second = resolve(&paths, &manifest_with(""), Path::new("/apps/demo")).expect("it resolves");
+    let first = resolve(
+        &paths,
+        &manifest_for(&identifier, ""),
+        Path::new("/apps/demo"),
+        Mode::Install,
+    )
+    .expect("it resolves");
+    let second = resolve(
+        &paths,
+        &manifest_for(&identifier, ""),
+        Path::new("/apps/demo"),
+        Mode::Install,
+    )
+    .expect("it resolves");
 
     assert_eq!(
         value(&first.vars, "APP_SECRET"),

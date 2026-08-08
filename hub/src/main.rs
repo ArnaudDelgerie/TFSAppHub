@@ -6,22 +6,29 @@
 // `cli.rs` stay at ~215 lines across sixty plans.
 
 mod app_env;
+mod bridge;
 mod cli;
 mod identity;
 mod install;
+mod lifecycle;
 mod list;
 mod manifest;
+mod open;
 mod paths;
 mod php;
 mod platform;
 mod prompt;
 mod registry;
 mod remove;
+mod secrets;
+mod sidecar;
 mod source;
+mod update;
+mod window;
+mod worker;
 
 use cli::{Command, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE};
 use identity::Identity;
-use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -97,28 +104,30 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             &context.package_info().version.to_string(),
         ),
         Command::List => list::run(),
+        // Resolves and re-executes; the window itself belongs to the child this
+        // returns from, which is why the parent has an exit code to give at all.
+        Command::Open { id } => open::run(&id),
         Command::Remove {
             id,
             purge,
             assume_yes,
         } => remove::run(&id, purge, assume_yes),
         Command::Platform => print_platform(),
-        Command::OpenIdentity {
+        // The app's own process, re-executed by `open <id>` above. Everything it
+        // needs to become that app before GTK exists travels in argv — see
+        // `open::child_args`.
+        Command::OpenChild {
+            id,
             identifier,
             product_name,
             icon_path,
         } => {
-            open(
+            open_window(
+                &id,
                 Identity {
-                    // Defaulting to the identifier rather than to some
-                    // prettified form of it: the window title is the only place
-                    // plan 003's manual checks can read which identity a given
-                    // window carries, so a lossless default is worth more here
-                    // than a nice one. Plan 007 replaces it with the manifest's
-                    // own field.
-                    product_name: product_name.unwrap_or_else(|| identifier.clone()),
-                    icon_path: icon_path.map(std::path::PathBuf::from),
                     identifier,
+                    product_name,
+                    icon_path: icon_path.map(std::path::PathBuf::from),
                 },
                 context,
             );
@@ -174,17 +183,111 @@ fn print_platform() -> i32 {
     }
 }
 
-/// Open one window under `identity`. The window lands on the checked-in
-/// placeholder page: serving a real Symfony app behind a FrankenPHP sidecar is
-/// plan 007's job, and nothing here should pretend otherwise.
-fn open(identity: Identity, mut context: tauri::Context) {
+/// Re-resolve the app in its own process and run every launch guard against it.
+///
+/// The parent already resolved all of this before spawning us, and this is not
+/// that work repeated for its own sake: the parent proved the app *can* be
+/// opened, cheaply and at the terminal, so a mistyped id never costs a window.
+/// What happens here is the part that has to happen in the process that will
+/// actually hold the app — the liveness lock is held by *this* pid, and the port
+/// is bound to prove it is free to *this* process.
+///
+/// A failure exits through `lifecycle::fatal_startup_error`, which is the only
+/// thing that reaches a user who launched from a desktop entry.
+fn prepare(id: &str, identity: &Identity) -> Launching {
+    let paths = match paths::Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+    };
+    let resolved = match open::resolve(&paths, id) {
+        Ok(resolved) => resolved,
+        Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+    };
+
+    // `0700` on every launch, not only on creation: the directory holds the
+    // app's database and its `APP_SECRET`, so an installation created by an
+    // older host or recreated by hand gets tightened on its next use.
+    let data_dir = match paths.create_app_data_dir(&identity.identifier) {
+        Ok(data_dir) => data_dir,
+        Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+    };
+    let data_subdir = data_dir.join("data");
+    if let Err(error) = std::fs::create_dir_all(&data_subdir) {
+        lifecycle::fatal_startup_error(&format!("{}: {error}", data_subdir.display()));
+    }
+
+    let lock = lifecycle::prepare_launch(
+        id,
+        &data_dir,
+        &data_subdir,
+        &identity.identifier,
+        &resolved.manifest.app_version,
+        resolved.manifest.app_port,
+    );
+
+    Launching {
+        paths,
+        resolved,
+        lock,
+    }
+}
+
+/// What the guards leave for the launch itself: where the app is, what it
+/// declares, and the liveness lock proving this process is its live instance.
+struct Launching {
+    paths: paths::Paths,
+    resolved: open::Resolved,
+    lock: Option<std::fs::File>,
+}
+
+/// Open the app installed as `id`, under `identity`.
+///
+/// The shape is the station's, and its order is the part worth reading. The
+/// splash window is built **first**, on the main thread, before the sidecar
+/// exists — and `.setup()` returns immediately after spawning the thread that
+/// does everything else. That early return is what lets the GTK event loop
+/// advance far enough to actually paint the splash. Everything slow then happens
+/// off the main thread and ends by navigating that same window to the backend,
+/// so nothing visibly jumps and no second window appears.
+fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
     // Before the `Builder` exists, and so before anything has initialised GTK
     // — the whole point of the module. Everything identity-derived downstream
     // (app id, bus name, single-instance key, WM_CLASS, cookie store) reads
-    // what this call leaves behind.
+    // what this call leaves behind. First of all, so that even a guard's own
+    // refusal dialog below carries this app's identity rather than the hub's.
     identity::apply(&identity, &mut context);
 
-    let relaunched = identity.identifier.clone();
+    // Everything from here to `Builder` is CONTRACT.md §6's launch guards, and
+    // all of it has to happen in this window: they refuse through a blocking
+    // native dialog, which deadlocks rather than appears once Tauri has claimed
+    // GTK. See `lifecycle`'s module header.
+    let Launching {
+        paths,
+        resolved,
+        lock,
+    } = prepare(id, &identity);
+
+    // The app's `actions` groups, granted at runtime, before `Builder` — the
+    // only window in which they can be: `add_capability` lives on `Context` and
+    // has no equivalent once `Builder::run` has taken over. The static
+    // `capabilities/default.json` grants nothing at all, so an `invoke` for a
+    // group this app did not declare is refused by Tauri's own ACL before any
+    // handler runs. Registering the commands is not the boundary; this is.
+    for (declared, grant) in window::ACTION_IPC_GRANTS {
+        if declared(&resolved.manifest.actions) {
+            context
+                .runtime_authority_mut()
+                .add_capability(window::action_capability(grant))
+                .expect("a valid action capability");
+        }
+    }
+
+    // One slot per process, shared by every window this process builds: the
+    // splash's navigation policy needs to read the backend's origin, and the
+    // splash is built long before that origin exists.
+    let app_origin = window::new_app_origin_slot();
+    let relaunch_origin = app_origin.clone();
+
     tauri::Builder::default()
         // Registered before every other plugin, per the plugin's own guidance,
         // and after the identity mutation above — which is what makes its key
@@ -192,34 +295,183 @@ fn open(identity: Identity, mut context: tauri::Context) {
         // the one binary therefore never collide on it, and a second launch of
         // *this* app reaches the closure below instead of booting a second
         // process against the same data dir.
-        //
-        // Logging is all it does for now. The real behaviour — opening another
-        // window on the sidecar already running, the station's plan 007
-        // semantics — needs a sidecar, and there is none until plan 007.
         .plugin(tauri_plugin_single_instance::init(
-            move |_app, args, cwd| {
-                println!("tfsapp-hub: {relaunched}: relaunched with {args:?} from {cwd}");
+            move |app, _args, _cwd| {
+                use tauri::Manager;
+
+                // A second `open` of an app already running is not an error and
+                // not a no-op: it opens another window on the backend already
+                // up. Before the backend is resolved there is no `Launch` state
+                // yet and this deliberately does nothing — the window on its way
+                // is the one the user is waiting for.
+                let Some(launch) = app.try_state::<sidecar::Launch>() else {
+                    println!("tfsapp-hub: still starting — the window is on its way.");
+                    return;
+                };
+                if let Err(error) = window::create_app_window(
+                    app,
+                    &launch.url,
+                    &launch.product_name,
+                    &relaunch_origin,
+                ) {
+                    eprintln!("tfsapp-hub: cannot open another window: {error}");
+                }
             },
         ))
+        .plugin(tauri_plugin_dialog::init())
+        // Registered unconditionally in both cases — registration is not the
+        // boundary, the ACL grant above is. With a group's `ipc` off, nothing
+        // grants its permission and `invoke()` is refused before a handler runs.
+        .invoke_handler(tauri::generate_handler![
+            secrets::secret_has,
+            secrets::secret_get,
+            secrets::secret_set,
+            secrets::secret_delete,
+            secrets::secret_list,
+            update::update_check,
+        ])
         .setup(move |app| {
-            let mut window =
-                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                    .title(&identity.product_name)
-                    .inner_size(1000.0, 700.0);
-
-            // Per-app, at runtime, from a path — the shape the hub needs, since
-            // there is no per-app build step to bake an icon into. A failed
-            // load is already reported by `load_icon` and leaves the window
-            // with the generic one.
-            if let Some(path) = &identity.icon_path {
-                if let Some(icon) = identity::load_icon(path) {
-                    window = window.icon(icon)?;
-                }
+            // Greyscale rather than subpixel text antialiasing, for every
+            // WebView this process creates. It has to run after Tauri has
+            // initialised GTK and before any window exists, because WebKit reads
+            // its font options when its web process starts. A `None` here means
+            // GTK is not initialised, which is a situation to leave alone rather
+            // than panic on.
+            if let Some(settings) = gtk::Settings::default() {
+                use gtk::prelude::GtkSettingsExt;
+                settings.set_gtk_xft_rgba(Some("none"));
             }
 
-            window.build()?;
+            // Before either window exists, so it covers the whole life of the
+            // sidecar the thread below is about to spawn.
+            lifecycle::install_shutdown_on_signal(app.handle());
+
+            let splash = window::create_splash_window(
+                app,
+                &identity.product_name,
+                &window::splash_style(
+                    &identity.product_name,
+                    resolved.manifest.splash_bg.as_deref(),
+                    resolved.manifest.splash_text.as_deref(),
+                ),
+                &app_origin,
+            )?;
+            if let Some(path) = &identity.icon_path {
+                if let Some(icon) = identity::load_icon(path) {
+                    splash.set_icon(icon)?;
+                }
+            }
+            let splash_label = splash.label().to_string();
+
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                serve(
+                    handle,
+                    paths,
+                    resolved,
+                    identity,
+                    lock,
+                    app_origin,
+                    splash_label,
+                );
+            });
+
             Ok(())
         })
+        .on_window_event(lifecycle::on_window_event)
         .run(context)
         .expect("failed to run the app window");
+}
+
+/// Everything between the splash appearing and the app answering, off the main
+/// thread.
+///
+/// Every failure hands off to `lifecycle::fatal_post_setup_error`, which stops
+/// whatever is already running, shows a dialog over the still-visible splash and
+/// exits. Already off the main thread here by construction, which is what that
+/// function requires.
+#[allow(clippy::too_many_arguments)]
+fn serve(
+    app: tauri::AppHandle,
+    paths: paths::Paths,
+    resolved: open::Resolved,
+    identity: Identity,
+    lock: Option<std::fs::File>,
+    app_origin: window::AppOriginSlot,
+    splash_label: String,
+) {
+    use tauri::Manager;
+
+    let manifest = &resolved.manifest;
+    if manifest.splash_path.is_some() {
+        // Said, not swallowed: an app author who declared a splash page has to
+        // learn it is not the one on screen. See `window::splash_style`.
+        eprintln!(
+            "tfsapp-hub: warning: this app declares \"splash_path\", which the hub cannot \
+             serve — it has no per-app build step to bundle the page with. Showing the hub's \
+             own splash in its colours instead."
+        );
+    }
+
+    let environment =
+        match app_env::resolve(&paths, manifest, &resolved.app_dir, app_env::Mode::Launch) {
+            Ok(environment) => environment,
+            Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
+        };
+    let toolchain = match php::toolchain(&paths) {
+        Ok(toolchain) => toolchain,
+        Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
+    };
+
+    // Managed before the sidecar starts, so the IPC commands can never meet a
+    // window without a store behind it: `secrets.rs` resolves both from the
+    // calling window and has nothing else to fall back on.
+    app.manage(environment.secret_store.clone());
+    app.manage(manifest.actions.secrets.clone());
+
+    let (sidecar, url) = match sidecar::start(
+        &toolchain,
+        &resolved.app_dir,
+        &environment,
+        manifest,
+        lock,
+        &app,
+    ) {
+        Ok(started) => started,
+        Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
+    };
+    app.manage(std::sync::Mutex::new(sidecar));
+
+    let sidecar_log = environment.log_dir.join("sidecar.log");
+    let healthy = {
+        let state = app.state::<std::sync::Mutex<sidecar::Sidecar>>();
+        let mut guard = state.lock().expect("the sidecar mutex is not poisoned");
+        let server = guard
+            .server
+            .as_mut()
+            .expect("the server is always Some right after start");
+        tfsapp_core::health::wait_for_healthz(&url, server, Some(&sidecar_log))
+    };
+    if let Err(error) = healthy {
+        return lifecycle::fatal_post_setup_error(app, error.to_string());
+    }
+
+    // Hand the *same* window over to the backend rather than opening a second
+    // one. The origin is published first: this programmatic navigation goes
+    // through the very policy that would otherwise cancel it, leaving the app
+    // stuck on its splash for ever.
+    let Some(window) = app.get_webview_window(&splash_label) else {
+        // The user closed the splash before the backend was ready; the close
+        // handler has already torn the sidecar down. Nothing left to navigate.
+        return;
+    };
+    window::publish_app_origin(&app_origin, &url);
+    if let Err(error) = window.navigate(url.parse().expect("a valid local backend URL")) {
+        return lifecycle::fatal_post_setup_error(app, error.to_string());
+    }
+
+    app.manage(sidecar::Launch {
+        url,
+        product_name: identity.product_name,
+    });
 }

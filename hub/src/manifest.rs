@@ -118,10 +118,18 @@ pub struct Manifest {
     /// no per-app build step to bake an icon into.
     #[serde(default)]
     pub icon_path: Option<String>,
-    /// Project-root-relative path to the cold-start splash page. Read for the
-    /// same reason as `icon_path`: what the station bakes, the hub resolves.
+    /// Project-root-relative path to the cold-start splash page. Parsed, and —
+    /// so far — not honoured: the hub shows its own splash page and says so at
+    /// launch. See `window::splash_style` for why, and for what *is* honoured.
     #[serde(default)]
     pub splash_path: Option<String>,
+    /// The splash's background and text colours. Honoured: the hub's own splash
+    /// page reads them as CSS variables, so an app's cold start carries its own
+    /// palette even though the page itself is the hub's.
+    #[serde(default)]
+    pub splash_bg: Option<String>,
+    #[serde(default)]
+    pub splash_text: Option<String>,
     /// Launch-time lifecycle commands (CONTRACT.md §2/§6). The station's dev
     /// mode ignores this key — there is no versioned data dir to install or
     /// update — while the hub is exactly the host that has one.

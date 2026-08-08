@@ -1,0 +1,95 @@
+# The app's Caddy configuration, byte for byte the station's
+# `desktop/src-tauri/resources/Caddyfile.desktop`.
+#
+# It is copied rather than referenced because the two repos ship separately, and
+# it is copied *whole* rather than trimmed because every block below is
+# CONTRACT.md §4 — the hardening headers, the CSP, the Mercure hub's JWT gating,
+# the AssetMapper caching exception. §4 is canonical and the hub cannot deliver
+# it more weakly, so the only safe relationship between the two files is
+# equality: diff them before changing either.
+#
+# Nothing in it is per-app. Document root and port come from the environment the
+# hub injects (§3, see `app_env.rs`), which is exactly what lets one file serve
+# every installed app — the same property that let one station binary serve any
+# project in dev.
+#
+# The hub writes it into each app's own data dir at launch (see `sidecar.rs`),
+# because it has no per-app build step to place it with and Caddy needs a path.
+
+{
+    # Register the FrankenPHP app so php_server has a running PHP runtime.
+    frankenphp
+    auto_https off
+    admin off
+}
+
+# Document root and port are driven entirely by the environment the launcher
+# injects (main.rs) — never a compiled-in path. APP_PUBLIC_DIR resolves to the
+# target project's app/public, so the same station serves any project.
+http://127.0.0.1:{$APP_PORT} {
+    root * "{$APP_PUBLIC_DIR}"
+
+    header {
+        Cache-Control "no-store"
+        Pragma "no-cache"
+        Expires "0"
+    }
+
+    # Hardening defaults for the loopback origin (CONTRACT.md §4, plan 034).
+    # The `?` form only sets a field the response doesn't already carry, so a
+    # project emitting its own value wins outright. Each gets its own `header`
+    # directive rather than sharing one block: Caddy evaluates every `?`
+    # field inside the same block as a single batch, so if a project's
+    # response already carries just one of these names, the whole batch is
+    # skipped — silently dropping the others too. Verified empirically with a
+    # standalone Caddyfile before relying on this.
+    header ?X-Content-Type-Options "nosniff"
+    header ?Referrer-Policy "no-referrer"
+    header ?X-Frame-Options "DENY"
+
+    # Containment, not XSS prevention (CONTRACT.md §4, plan 034):
+    # 'unsafe-inline' stays in script-src/style-src because AssetMapper's
+    # importmap and the dev Web Profiler toolbar are inline through and
+    # through, and a project's own inline <script>/<style> blocks need it
+    # too. connect-src's ipc: and http://ipc.localhost entries are Tauri's
+    # IPC transport (scripts/core.js) — omitting them doesn't break
+    # invoke(), it silently falls back to postMessage behind a
+    # console.warn (scripts/ipc-protocol.js). data: is only for the inline
+    # SVG favicon.
+    header ?Content-Security-Policy "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+
+    # Always mounted, regardless of async_worker (CONTRACT.md §2/§6, plan
+    # 028): a Caddy directive with no extra process, effectively free at
+    # rest. Only the Messenger worker process is gated behind async_worker.
+    # Subscriptions require a valid subscriber JWT (CONTRACT.md §4, plan
+    # 033); a subscriber without one gets 401, there is no anonymous
+    # fallback, and a topic nobody is authorized for is silently never
+    # delivered. How the JWT arrives is the project's call: with only
+    # subscriber_jwt set below, this hub accepts all three of the
+    # protocol's transports (Authorization header, mercureAuthorization
+    # cookie, ?authorization= query param — probed, not assumed). §4
+    # recommends the cookie, because app and hub share an origin here and
+    # a native EventSource cannot set headers.
+    mercure {
+        publisher_jwt {$MERCURE_JWT_SECRET}
+        subscriber_jwt {$MERCURE_JWT_SECRET}
+        transport local
+        cors_origins {$APP_ORIGIN} tauri://localhost
+    }
+
+    # Symfony's AssetMapper (and Encore) serve static assets under /assets/
+    # with content-hashed filenames, so caching them is always safe — a
+    # content change is a different URL. Override the no-store default above
+    # for that path only; everything else (HTML, API responses) stays
+    # uncached.
+    @assets path /assets/*
+    header @assets {
+        Cache-Control "public, max-age=31536000, immutable"
+        -Pragma
+        -Expires
+    }
+
+    # Classic mode: one Symfony boot per request. Symfony worker mode is a
+    # separate, later concern from the Messenger async worker above.
+    php_server
+}

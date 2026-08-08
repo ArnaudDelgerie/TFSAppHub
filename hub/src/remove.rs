@@ -52,16 +52,15 @@ use crate::{
     registry::{self, RegistryError},
 };
 
-/// The keyring account holding `APP_SECRET` (CONTRACT.md §6). Spelled out here
-/// rather than imported because the hub has no `secrets.rs` yet — plan 007
-/// brings the station's over, and this constant should move into it then rather
-/// than stay duplicated.
-const APP_SECRET_ACCOUNT: &str = "app-secret";
-
-/// The account the station's store writes and reads to find out whether a
-/// keyring answers at all. Removed with the rest: leaving it behind would have
-/// a purged app still own an entry.
-const PROBE_ACCOUNT: &str = "__tfsapp_availability_probe__";
+/// The two accounts a purge owns whatever the manifest says: the one holding
+/// `APP_SECRET` (CONTRACT.md §6), and the one the store writes and reads to find
+/// out whether a keyring answers at all. Leaving either behind would have a
+/// purged app still own an entry.
+///
+/// Imported from the module that writes them, now that plan 007 has brought it
+/// over — 006 spelled them out here because there was nothing yet to import
+/// from, and a duplicated account name is a purge that silently misses.
+use crate::secrets::{APP_SECRET_ACCOUNT, PROBE_ACCOUNT};
 
 /// The whole command. Returns the process's exit code.
 pub fn run(id: &str, purge: bool, assume_yes: bool) -> i32 {

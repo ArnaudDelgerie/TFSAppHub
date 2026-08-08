@@ -33,33 +33,75 @@ use crate::{
     paths::{Paths, PathsError},
 };
 
-/// The §3 variables, plus the one path a caller needs in its own right.
+/// Which moment is assembling this environment.
 ///
-/// The resolved port is deliberately *not* a field: nothing in an install binds
-/// it, and `APP_PORT` already carries it. Plan 007, which does bind it, is the
-/// one that should decide how it wants to hold the value.
+/// The variables are identical either way — that is the point of §3, and an app
+/// must not be able to tell an install's `bin/console` from a launch's. What
+/// differs is what the assembly *does to the data dir* on its way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// An `install` or `update`: warm what the app's own commands are about to
+    /// build, and throw nothing away.
+    Install,
+    /// A launch: wipe `cache/` and `build/`, and rotate the logs before anything
+    /// opens them.
+    Launch,
+}
+
+/// The §3 variables, plus the paths a caller needs in their own right.
 pub struct AppEnvironment {
     /// Ready for `core`'s `command_with_env`.
     pub vars: Vec<(&'static str, String)>,
     /// `<OS data dir>/TFSApp/<identifier>/` — where the app's own data lands,
     /// which is what an install has to be able to name to the user.
     pub data_dir: PathBuf,
+    /// `<data_dir>/data/` — the app's own writable subdirectory: its SQLite
+    /// database, its `APP_SECRET`, and `config.json`, the record of which
+    /// version last wrote all of it (CONTRACT.md §6). Carried out because the
+    /// caller that finishes an install event has to stamp that record, and
+    /// rebuilding the path at each call site is how two of them end up
+    /// disagreeing.
+    pub data_subdir: PathBuf,
+    /// `<data_dir>/log/` — where `commands.log` and `sidecar.log` land. The one
+    /// place a launch failure can be read from afterwards, which is why every
+    /// message that mentions a failure names a file in here.
+    pub log_dir: PathBuf,
+    /// The port `APP_PORT`/`APP_ORIGIN` were built from, for the caller that has
+    /// to poll `/healthz` on it and point a window at it. Reading it back out of
+    /// `vars` would work and would be one string parse away from a launch that
+    /// silently polls the wrong port.
+    pub port: u16,
+    /// The store `APP_SECRET` was resolved against, carried out so the launch
+    /// can hand the very same instance to the IPC commands and the bridge — one
+    /// keyring probe per launch, and no way for two of them to disagree about
+    /// which backend is in use.
+    pub secret_store: crate::secrets::SecretStore,
 }
 
 /// Assemble CONTRACT.md §3 for `manifest`'s app, installed at `app_dir`.
 ///
-/// Creates the data dir and its four subdirectories, and nothing else. In
-/// particular it does **not** wipe `cache/` and `build/` the way the station
-/// does on every launch: over there the wipe is a remedy for a random
-/// `/tmp/.mount_*` path baking itself into the compiled container, a cause the
-/// hub does not have (it runs apps from a stable real path). Whether to wipe at
-/// *launch* is plan 007's decision to make and measure; an install is not a
-/// launch, and wiping here would only throw away the cache the install just
-/// warmed.
+/// Creates the data dir and its four subdirectories. What else it does depends
+/// on [`Mode`], and only one of the two differences is interesting.
+///
+/// **The launch-time cache wipe is the station's workaround, kept deliberately.**
+/// Over there `cache/` and `build/` are emptied on every launch because a random
+/// `/tmp/.mount_*` AppImage path bakes itself into the compiled Symfony
+/// container, and reusing it across an upgrade is how a stale container survives.
+/// The hub does not have that cause: it runs apps from a stable real path (see
+/// `paths.rs`). So a persistent warm cache is *possible* here — which is not the
+/// same as proven, and claiming it needs its own measurement. Until then the hub
+/// pays the same cost the station pays, because the failure mode of getting this
+/// wrong is a user running last version's compiled container against this
+/// version's code. Plan 007 keeps the wipe on purpose and says so; dropping it is
+/// its own plan.
+///
+/// An install is not a launch: wiping there would throw away the very cache the
+/// install's own `cache:warmup` just built.
 pub fn resolve(
     paths: &Paths,
     manifest: &Manifest,
     app_dir: &Path,
+    mode: Mode,
 ) -> Result<AppEnvironment, EnvError> {
     let data_dir = paths.create_app_data_dir(&manifest.identifier)?;
     let data_subdir = data_dir.join("data");
@@ -67,6 +109,13 @@ pub fn resolve(
     let build_dir = data_dir.join("build");
     let log_dir = data_dir.join("log");
     let sessions_dir = data_dir.join("sessions");
+    if mode == Mode::Launch {
+        // Best-effort: a directory that cannot be removed is recreated below and
+        // the launch carries on, rather than refusing to open the app over a
+        // cache it could not clear.
+        let _ = fs::remove_dir_all(&cache_dir);
+        let _ = fs::remove_dir_all(&build_dir);
+    }
     for directory in [
         &data_subdir,
         &cache_dir,
@@ -78,6 +127,13 @@ pub fn resolve(
             path: directory.clone(),
             source,
         })?;
+    }
+    if mode == Mode::Launch {
+        // Once per launch, and here rather than anywhere later: this is the one
+        // point both `commands.log`'s first write and `sidecar.log`'s fd open
+        // are still ahead of, which is what a size-based rotation needs to be
+        // true to rotate the file rather than the file's replacement.
+        tfsapp_core::log::rotate_logs(&log_dir);
     }
 
     // The same resolution packaged mode makes, `data/config.json`'s
@@ -98,14 +154,14 @@ pub fn resolve(
     let origin = format!("http://127.0.0.1:{port}");
     let mercure_url = format!("{origin}/.well-known/mercure");
 
-    // The file-backed half of CONTRACT.md §6's `APP_SECRET`, deliberately: the
-    // keyring-backed store lands in plan 007 with the rest of `secrets`, and
-    // the contract's own resolution order makes this forward-compatible — an
-    // existing keyring entry always wins, and a file left here is *migrated*
-    // into the keyring rather than competing with it. Stable across the
-    // install's commands and whatever runs later, which is what anything
-    // Symfony signs needs.
-    let app_secret = tfsapp_core::app_secret::load_or_create_app_secret(&data_subdir)
+    // The real store, probed once here — for an install exactly as for a
+    // launch. Both write `APP_SECRET`, and having one of them write a plaintext
+    // file while the other used the keyring would leave a secret on disk that
+    // nothing needed. CONTRACT.md §6's resolution order does the rest: an
+    // existing keyring entry always wins, and a file from an older installation
+    // is migrated into the keyring rather than competing with it.
+    let secret_store = crate::secrets::new_store(&manifest.identifier, &data_subdir);
+    let app_secret = crate::secrets::resolve_app_secret(&secret_store, &data_subdir)
         .map_err(|error| EnvError::Secret(error.to_string()))?;
     // Purely internal, never persisted: the same loopback process signs and
     // validates these, so a fresh one per invocation is strictly better than a
@@ -147,11 +203,13 @@ pub fn resolve(
             }
             .to_string(),
         ),
-        // Zero, and true while it is written: no secret store is opened during
-        // an install, so the store backing `APP_SECRET` here is the file
-        // fallback and an app is right to warn its user about degraded secret
-        // storage. Plan 007 opens the real store and this value follows it.
-        ("TFS_KEYRING_AVAILABLE", "0".to_string()),
+        // What the probe above actually picked, not whether a keyring is
+        // installed: a present-but-locked one has already fallen back to the
+        // file, and an app is entitled to warn its user on that basis.
+        (
+            "TFS_KEYRING_AVAILABLE",
+            crate::secrets::keyring_env_value(&secret_store).to_string(),
+        ),
         ("TFS_APP_IDENTIFIER", manifest.identifier.clone()),
         ("TFS_APP_VERSION", manifest.app_version.clone()),
     ];
@@ -161,7 +219,14 @@ pub fn resolve(
     // *running*, and an install starts none. Present-but-dead would be worse
     // than absent — an app would open a connection to nothing.
 
-    Ok(AppEnvironment { vars, data_dir })
+    Ok(AppEnvironment {
+        vars,
+        data_dir,
+        data_subdir,
+        log_dir,
+        port,
+        secret_store,
+    })
 }
 
 #[derive(Debug)]

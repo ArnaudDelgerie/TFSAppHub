@@ -68,6 +68,11 @@ semver.workspace = true
 # them resolves its paths against a temp dir it owns, so the suite never reads
 # or writes the developer's real `~/.local/share/TFSApp/`.
 tempfile.workspace = true
+# tauri's MockRuntime (test-only feature), so `secrets_tests.rs` can stand up two
+# real apps with two real windows and prove that resolving a secret store from
+# the calling window reaches that app's store and no other — the one regression
+# plan 007 must not ship.
+tauri = { version = "2", features = ["test"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
