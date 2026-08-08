@@ -152,7 +152,7 @@ pub const SURFACE: &[Spec] = &[
         form: "dev <local-path>",
         summary: "Run a live project in its own window, served in place.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "update",
