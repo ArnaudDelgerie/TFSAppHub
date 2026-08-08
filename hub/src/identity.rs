@@ -29,6 +29,7 @@
 /// `tfsapp.config.json` (plan 004) — the one place it will come from once
 /// `open <id>` resolves an installed app (plan 007). Until then the temporary
 /// `open --identity <id>` form in `main.rs` still builds it from argv.
+#[derive(Debug)]
 pub struct Identity {
     /// Reverse-DNS application identifier, e.g. `dev.tfsapp.test`. It is at
     /// once the GTK app id, the D-Bus name, the single-instance key, the

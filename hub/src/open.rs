@@ -1,0 +1,308 @@
+//! `tfsapp-hub open <id>` — give an installed app its own window.
+//!
+//! **One OS process per open app.** `open <id>` resolves the app, then
+//! re-executes the hub binary as a child carrying that app's identity; the child
+//! is the one that mutates its runtime identity (see `identity.rs`), boots the
+//! app's sidecar and opens the window. The parent's only job is to resolve, to
+//! fail fast with a message a terminal user can act on, and to get out of the
+//! way.
+//!
+//! It is not one process serving N apps, and that was decided rather than
+//! defaulted (see `.project/plan/007-open-an-installed-app.md`'s Overview, which
+//! also records why a single shared FrankenPHP was rejected). Three reasons, in
+//! the order they bite:
+//!
+//! - every isolation guarantee of CONTRACT.md §5 holds verbatim, because it is
+//!   the same shape the station already has: one process, one identifier, one
+//!   data dir, one cookie store;
+//! - a segfault in one app cannot take the whole suite down with it;
+//! - the station's lifecycle, sidecar, worker and window code keeps working per
+//!   process essentially unmodified.
+//!
+//! The cost — each app pays its own FrankenPHP startup — is the cost today. The
+//! size win comes from sharing the binary on disk, never from sharing the
+//! process.
+//!
+//! **The parent does not hold the shell.** It spawns and returns, so `open` from
+//! a terminal gives the prompt straight back and a `.desktop` entry (plan 009)
+//! does not leave a launcher process hanging around the window's lifetime. The
+//! child gets its own process group, which is what lets its whole descendant
+//! tree — FrankenPHP, its PHP workers, a Messenger worker — be signalled as one
+//! (see `core`'s `set_own_process_group`).
+
+use std::{fmt, io, path::PathBuf, process::Command};
+
+use crate::{
+    cli::{EXIT_FAILED, EXIT_OK, OPEN_CHILD_SUBCOMMAND},
+    identity::Identity,
+    manifest::{self, Manifest, ManifestError},
+    paths::{Paths, PathsError},
+    registry::{self, RegistryError, State},
+};
+
+/// The whole command, parent side. Returns the process's exit code.
+pub fn run(id: &str) -> i32 {
+    let paths = match Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+
+    match resolve(&paths, id).and_then(|resolved| launch(&resolved)) {
+        Ok(pid) => {
+            println!("Opening {id} (pid {pid}).");
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            EXIT_FAILED
+        }
+    }
+}
+
+/// Everything the parent resolves before re-executing itself.
+///
+/// The manifest is loaded from the **installed snapshot**, never from the
+/// original source: what runs is what was installed, and a source tree edited
+/// since changes nothing until `update <id>`. That is the same rule the
+/// installer states, read from the other end.
+///
+/// Three of its fields are the *child's* inputs and have no parent-side reader:
+/// the parent resolves them only to prove they can be resolved, which is what
+/// makes `open` fail at the terminal instead of inside a window. Step 3 of this
+/// plan is where they get read for real — remove the allow with it rather than
+/// letting it linger.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct Resolved {
+    /// The hub-local handle, which the child needs in order to find the same
+    /// snapshot the parent just validated.
+    pub id: String,
+    pub app_dir: PathBuf,
+    pub manifest: Manifest,
+    pub identity: Identity,
+    /// `<OS data dir>/TFSApp/<identifier>/`. Named, not created — creating it is
+    /// the child's job, once it is actually going to run the app.
+    pub data_dir: PathBuf,
+}
+
+/// Look the app up and check it can be opened at all.
+///
+/// Every refusal below names the app and the way out, because the audience is
+/// someone at a terminal who typed one word and got nothing. The one state that
+/// is *not* a refusal is `needs-revalidation`: the app's dependencies were
+/// resolved against a PHP that has since moved, which is a reason to revalidate
+/// (plan 012) and not a reason to keep the user out of their own data.
+pub fn resolve(paths: &Paths, id: &str) -> Result<Resolved, OpenError> {
+    let installed = registry::load(paths)?;
+    let entry = installed
+        .get(id)
+        .ok_or_else(|| OpenError::NotInstalled { id: id.to_string() })?;
+
+    match entry.state {
+        State::Broken => {
+            return Err(OpenError::Broken {
+                id: id.to_string(),
+                platform: entry.platform.to_string(),
+            })
+        }
+        State::NeedsRevalidation => eprintln!(
+            "tfsapp-hub: warning: {id} was installed against PHP {} and the hub now runs \
+             something else. Opening it anyway; its dependencies have not been re-resolved.",
+            entry.platform
+        ),
+        State::Ready => {}
+    }
+
+    let app_dir = paths.app_dir(id)?;
+    if !app_dir.is_dir() {
+        return Err(OpenError::NoSnapshot {
+            id: id.to_string(),
+            path: app_dir,
+        });
+    }
+
+    let loaded = manifest::load(&app_dir)?;
+    loaded.report_warnings();
+    let manifest = loaded.manifest;
+
+    // The registry's `identifier` and the snapshot's must agree, because they
+    // name the same thing from two sides and everything downstream hangs off it:
+    // the data dir, the keyring namespace, the window identity, the
+    // single-instance key. A disagreement can only come from a tree edited under
+    // the hub, and opening on the manifest's value would quietly point the app
+    // at a different data dir than the one `list` and `remove` name.
+    if entry.identifier != manifest.identifier {
+        return Err(OpenError::IdentityChanged {
+            id: id.to_string(),
+            registered: entry.identifier.clone(),
+            declared: manifest.identifier.clone(),
+        });
+    }
+
+    let data_dir = paths.app_data_dir(&manifest.identifier)?;
+    let identity = manifest.identity(&app_dir);
+
+    Ok(Resolved {
+        id: id.to_string(),
+        app_dir,
+        manifest,
+        identity,
+        data_dir,
+    })
+}
+
+/// The child's argv, after the binary's own name.
+///
+/// The identity travels as arguments rather than being re-derived by the child,
+/// and that is worth a line. Applying it has to happen before anything touches
+/// GTK — before the registry is read, before a manifest is parsed, before any
+/// error could want a dialog — so the value it needs must be reachable with no
+/// I/O at all. `--id` comes along so the child can resolve the rest of the app
+/// once it is safely past that point.
+pub fn child_args(resolved: &Resolved) -> Vec<String> {
+    let mut args = vec![
+        OPEN_CHILD_SUBCOMMAND.to_string(),
+        "--id".to_string(),
+        resolved.id.clone(),
+        "--identity".to_string(),
+        resolved.identity.identifier.clone(),
+        "--name".to_string(),
+        resolved.identity.product_name.clone(),
+    ];
+    if let Some(icon) = &resolved.identity.icon_path {
+        args.push("--icon".to_string());
+        args.push(icon.display().to_string());
+    }
+    args
+}
+
+/// Re-execute this binary as the app's own process, and answer with its pid.
+///
+/// stdio is inherited on purpose: the child's own startup messages are the ones
+/// worth reading, and a terminal user who typed `open` should see them where
+/// they typed it. A `.desktop` launch inherits nothing useful either way, which
+/// is why the child's fatal errors also go through a native dialog rather than
+/// through stderr alone.
+fn launch(resolved: &Resolved) -> Result<u32, OpenError> {
+    let executable = std::env::current_exe().map_err(OpenError::NoExecutable)?;
+    let mut command = Command::new(&executable);
+    command.args(child_args(resolved));
+    tfsapp_core::process::set_own_process_group(&mut command);
+
+    command
+        .spawn()
+        .map(|child| child.id())
+        .map_err(|source| OpenError::Unstartable { executable, source })
+}
+
+/// Everything that can stop an `open` before the app's own process exists.
+#[derive(Debug)]
+pub enum OpenError {
+    Registry(RegistryError),
+    Manifest(ManifestError),
+    Paths(PathsError),
+    NotInstalled {
+        id: String,
+    },
+    Broken {
+        id: String,
+        platform: String,
+    },
+    NoSnapshot {
+        id: String,
+        path: PathBuf,
+    },
+    IdentityChanged {
+        id: String,
+        registered: String,
+        declared: String,
+    },
+    NoExecutable(io::Error),
+    Unstartable {
+        executable: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for OpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(error) => write!(formatter, "{error}"),
+            Self::Manifest(error) => write!(formatter, "{error}"),
+            Self::Paths(error) => write!(formatter, "{error}"),
+            Self::NotInstalled { id } => write!(
+                formatter,
+                "no app is installed under {id}. `tfsapp-hub list` shows what is, \
+                 and `tfsapp-hub install <source>` adds one."
+            ),
+            Self::Broken { id, platform } => write!(
+                formatter,
+                "{id} is marked broken: its dependencies were resolved against PHP \
+                 {platform} and could not be re-resolved against the PHP this hub runs. \
+                 Update the app (`tfsapp-hub update {id}`), or roll the hub back \
+                 (`tfsapp-hub --rollback`). Opening it would only fail later, deeper."
+            ),
+            Self::NoSnapshot { id, path } => write!(
+                formatter,
+                "{id} is registered but {} does not exist. Reinstall it, or drop the \
+                 entry with `tfsapp-hub remove {id}`.",
+                path.display()
+            ),
+            Self::IdentityChanged {
+                id,
+                registered,
+                declared,
+            } => write!(
+                formatter,
+                "{id} was installed as {registered} and its installed source now declares \
+                 {declared}. The identifier names the app's data dir, so the hub will not \
+                 guess which one you meant: reinstall the app under the identifier you want."
+            ),
+            Self::NoExecutable(source) => write!(
+                formatter,
+                "cannot find the hub's own binary to open the app with: {source}"
+            ),
+            Self::Unstartable { executable, source } => {
+                write!(formatter, "cannot start {}: {source}", executable.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for OpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Registry(error) => Some(error),
+            Self::Manifest(error) => Some(error),
+            Self::Paths(error) => Some(error),
+            Self::NoExecutable(source) => Some(source),
+            Self::Unstartable { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<RegistryError> for OpenError {
+    fn from(error: RegistryError) -> Self {
+        Self::Registry(error)
+    }
+}
+
+impl From<ManifestError> for OpenError {
+    fn from(error: ManifestError) -> Self {
+        Self::Manifest(error)
+    }
+}
+
+impl From<PathsError> for OpenError {
+    fn from(error: PathsError) -> Self {
+        Self::Paths(error)
+    }
+}
+
+#[cfg(test)]
+#[path = "open_tests.rs"]
+mod tests;

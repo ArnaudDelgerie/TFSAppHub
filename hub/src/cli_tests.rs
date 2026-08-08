@@ -239,7 +239,6 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
     for line in [
         "--update",
         "--rollback",
-        "open demo",
         "update demo",
         "export demo /tmp/demo",
         "import demo /tmp/demo.tar.gz",
@@ -256,6 +255,7 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         "--help",
         "list",
         "install ../TFSAppTest",
+        "open demo",
         "remove demo",
     ] {
         assert!(command(line).is_implemented(), "{line:?} works today");
@@ -309,17 +309,30 @@ fn every_form_in_the_surface_parses_back_to_its_own_command() {
 fn the_hidden_subcommands_stay_reachable_and_unlisted() {
     assert_eq!(command("__platform"), Command::Platform);
     assert_eq!(
-        command("__open --identity dev.local.demo --name Demo --icon /tmp/demo.png"),
-        Command::OpenIdentity {
+        command("__open --id demo --identity dev.local.demo --name Demo --icon /tmp/demo.png"),
+        Command::OpenChild {
+            id: "demo".to_string(),
             identifier: "dev.local.demo".to_string(),
-            product_name: Some("Demo".to_string()),
+            product_name: "Demo".to_string(),
             icon_path: Some("/tmp/demo.png".to_string()),
         }
     );
-    assert!(refusal("__open --name Demo").message.contains("--identity"));
+    // The three identity flags are required and never defaulted: this form is
+    // written by `open <id>` alone, so a missing one is a bug in the parent and
+    // filling it in would hide exactly that.
+    for (missing, invocation) in [
+        ("--id", "__open --identity dev.local.demo --name Demo"),
+        ("--identity", "__open --id demo --name Demo"),
+        ("--name", "__open --id demo --identity dev.local.demo"),
+    ] {
+        assert!(
+            refusal(invocation).message.contains(missing),
+            "{invocation:?} should name the missing {missing}"
+        );
+    }
 
-    // Hidden means hidden: they are temporary, and a user who reads about one
-    // in `--help` will reasonably expect it to keep working.
+    // Hidden means hidden: a user who reads about one in `--help` will
+    // reasonably expect it to be theirs to type, and neither of these is.
     for spec in SURFACE {
         assert!(
             !spec.name.starts_with("__"),

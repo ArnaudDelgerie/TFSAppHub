@@ -11,6 +11,7 @@ mod identity;
 mod install;
 mod list;
 mod manifest;
+mod open;
 mod paths;
 mod php;
 mod platform;
@@ -97,28 +98,30 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             &context.package_info().version.to_string(),
         ),
         Command::List => list::run(),
+        // Resolves and re-executes; the window itself belongs to the child this
+        // returns from, which is why the parent has an exit code to give at all.
+        Command::Open { id } => open::run(&id),
         Command::Remove {
             id,
             purge,
             assume_yes,
         } => remove::run(&id, purge, assume_yes),
         Command::Platform => print_platform(),
-        Command::OpenIdentity {
+        // The app's own process, re-executed by `open <id>` above. Everything it
+        // needs to become that app before GTK exists travels in argv — see
+        // `open::child_args`.
+        Command::OpenChild {
+            id,
             identifier,
             product_name,
             icon_path,
         } => {
-            open(
+            open_window(
+                &id,
                 Identity {
-                    // Defaulting to the identifier rather than to some
-                    // prettified form of it: the window title is the only place
-                    // plan 003's manual checks can read which identity a given
-                    // window carries, so a lossless default is worth more here
-                    // than a nice one. Plan 007 replaces it with the manifest's
-                    // own field.
-                    product_name: product_name.unwrap_or_else(|| identifier.clone()),
-                    icon_path: icon_path.map(std::path::PathBuf::from),
                     identifier,
+                    product_name,
+                    icon_path: icon_path.map(std::path::PathBuf::from),
                 },
                 context,
             );
@@ -174,17 +177,19 @@ fn print_platform() -> i32 {
     }
 }
 
-/// Open one window under `identity`. The window lands on the checked-in
-/// placeholder page: serving a real Symfony app behind a FrankenPHP sidecar is
-/// plan 007's job, and nothing here should pretend otherwise.
-fn open(identity: Identity, mut context: tauri::Context) {
+/// Open one window under `identity`, for the app installed as `id`.
+///
+/// The window still lands on the checked-in placeholder page: the lifecycle
+/// guards, the sidecar and the real backend arrive in this plan's later steps,
+/// and nothing here should pretend otherwise in the meantime.
+fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
     // Before the `Builder` exists, and so before anything has initialised GTK
     // — the whole point of the module. Everything identity-derived downstream
     // (app id, bus name, single-instance key, WM_CLASS, cookie store) reads
     // what this call leaves behind.
     identity::apply(&identity, &mut context);
 
-    let relaunched = identity.identifier.clone();
+    let relaunched = id.to_string();
     tauri::Builder::default()
         // Registered before every other plugin, per the plugin's own guidance,
         // and after the identity mutation above — which is what makes its key

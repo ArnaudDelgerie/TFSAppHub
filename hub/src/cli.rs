@@ -47,13 +47,16 @@ pub const EXIT_UNIMPLEMENTED: i32 = 3;
 /// can show it.
 pub const PLATFORM_SUBCOMMAND: &str = "__platform";
 
-/// Temporary and hidden, same convention. Plan 003's manual identity checks
-/// open a window from argv alone, because until an app is installed there is no
-/// manifest and no registry entry to resolve an identity from. Plan 007 gives
-/// `open <id>` the real thing and this form goes away with it — it is kept
-/// until then so the identity code that the spike validated stays exercisable
-/// by hand rather than only by its unit tests.
-pub const OPEN_IDENTITY_SUBCOMMAND: &str = "__open";
+/// Hidden, same convention, and not temporary: this is the form `open <id>`
+/// re-executes the hub binary with (plan 007, see `open.rs`). It is one half of
+/// one command rather than a command of its own — a user has no reason to type
+/// it and no way to get it right, since the identity it carries is exactly what
+/// the parent just resolved for them.
+///
+/// It grew out of plan 003's `__open --identity <id>`, which opened a window
+/// from argv alone because nothing was installed yet to resolve an identity
+/// from. Same hidden word, now with a real caller.
+pub const OPEN_CHILD_SUBCOMMAND: &str = "__open";
 
 /// Which level of subject a form acts on — the grammar's whole content, and
 /// the two groups `--help` prints under.
@@ -138,7 +141,7 @@ pub const SURFACE: &[Spec] = &[
         form: "open <id>",
         summary: "Open an installed app's window.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "update",
@@ -293,12 +296,15 @@ pub enum Command {
     Run(RunInvocation),
     /// Hidden, temporary — see [`PLATFORM_SUBCOMMAND`].
     Platform,
-    /// Hidden, temporary — see [`OPEN_IDENTITY_SUBCOMMAND`]. Carries the raw
-    /// strings rather than an `Identity` so this module stays free of the
-    /// identity types it would otherwise have to know about.
-    OpenIdentity {
+    /// Hidden — see [`OPEN_CHILD_SUBCOMMAND`]. Carries the raw strings rather
+    /// than an `Identity` so this module stays free of the identity types it
+    /// would otherwise have to know about.
+    OpenChild {
+        /// The hub-local handle, which is how the child finds the same
+        /// installed snapshot its parent validated.
+        id: String,
         identifier: String,
-        product_name: Option<String>,
+        product_name: String,
         icon_path: Option<String>,
     },
 }
@@ -342,7 +348,7 @@ impl Command {
             Self::Import { .. } => "import",
             Self::Run(_) => "run",
             Self::Platform => PLATFORM_SUBCOMMAND,
-            Self::OpenIdentity { .. } => OPEN_IDENTITY_SUBCOMMAND,
+            Self::OpenChild { .. } => OPEN_CHILD_SUBCOMMAND,
         }
     }
 
@@ -466,7 +472,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         }
         "run" => parse_run(rest),
         PLATFORM_SUBCOMMAND => Ok(Command::Platform),
-        OPEN_IDENTITY_SUBCOMMAND => parse_open_identity(rest),
+        OPEN_CHILD_SUBCOMMAND => parse_open_child(rest),
         unknown => Err(UsageError {
             message: match unknown.starts_with('-') {
                 // Saying which level was meant is the whole grammar in one
@@ -559,26 +565,35 @@ fn parse_run(args: &[String]) -> Result<Command, UsageError> {
     }))
 }
 
-/// The hidden `__open --identity <id> [--name <n>] [--icon <p>]`.
-fn parse_open_identity(args: &[String]) -> Result<Command, UsageError> {
+/// The hidden `__open --id <id> --identity <identifier> --name <n> [--icon <p>]`.
+///
+/// All three of the first are required, and none is defaulted: this form is
+/// written by `open <id>` and by nothing else, so a missing one is a bug in the
+/// parent rather than a user's typo, and quietly filling it in would hide
+/// exactly that. `--icon` stays optional because an app declaring no icon is
+/// ordinary.
+fn parse_open_child(args: &[String]) -> Result<Command, UsageError> {
     let options = options(
-        OPEN_IDENTITY_SUBCOMMAND,
+        OPEN_CHILD_SUBCOMMAND,
         args,
-        &["--identity", "--name", "--icon"],
+        &["--id", "--identity", "--name", "--icon"],
         &[],
     )?;
-    options.no_positionals(OPEN_IDENTITY_SUBCOMMAND)?;
+    options.no_positionals(OPEN_CHILD_SUBCOMMAND)?;
 
-    let identifier = options.value("--identity").ok_or_else(|| {
-        usage_error(
-            OPEN_IDENTITY_SUBCOMMAND,
-            format!("{OPEN_IDENTITY_SUBCOMMAND} needs --identity"),
-        )
-    })?;
+    let required = |flag: &str| {
+        options.value(flag).ok_or_else(|| {
+            usage_error(
+                OPEN_CHILD_SUBCOMMAND,
+                format!("{OPEN_CHILD_SUBCOMMAND} needs {flag}"),
+            )
+        })
+    };
 
-    Ok(Command::OpenIdentity {
-        identifier,
-        product_name: options.value("--name"),
+    Ok(Command::OpenChild {
+        id: required("--id")?,
+        identifier: required("--identity")?,
+        product_name: required("--name")?,
         icon_path: options.value("--icon"),
     })
 }
