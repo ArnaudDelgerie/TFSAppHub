@@ -89,6 +89,18 @@ identity from the environment (§3), not by parsing its own
 that sets those variables. An app that reads the manifest at runtime has coupled
 itself to being installed, which is exactly what §3 exists to avoid.
 
+**Frontend assets ship built.** The host resolves PHP dependencies with its own
+interpreter at install time; it does not run Node, and it never builds assets.
+An app with a frontend build step commits its output, or its pages arrive
+without it. This is the same boundary the lifecycle draws in §6 — the developer
+builds on their machine, the host installs and serves — and it is what keeps an
+app's prerequisites down to "a Symfony project".
+
+**What is in the directory is what gets installed.** Installing from a local
+path snapshots the tree as it stands, so a `.env.local` full of development
+overrides is snapshotted with it. Keep the source you install from clean of
+anything you would not commit.
+
 **The app's own source is never where its data lives.** The project directory is
 read-only from the app's point of view: the database, cache, sessions, logs and
 secrets all go to a per-app data directory the hub provides and names in the
@@ -836,3 +848,89 @@ or not in `keys` — before the store is touched) → `413 value_too_large` on
 
 The bridge never logs the token, a secret value, or the update check's body, on
 success or on failure.
+
+---
+
+## 8. What a host cannot honour, and how you find out
+
+The second standing rule in practice. Everything below is a case where an app
+declares something the machine — or this host, today — cannot deliver exactly.
+None of them fails the app; all of them are visible.
+
+### The renderer belongs to the host
+
+An app's frontend runs against the WebKitGTK the host ships, not one frozen per
+app at build time. Two consequences worth designing around: every installed app
+on a machine gets the *same* renderer, so a feature that works in one works in
+all; and that renderer moves when the host is updated, not when the app is.
+Target the host's, not the browser you develop against.
+
+### An icon larger than a window property can carry
+
+`icon_path` should be a large square PNG. Some surfaces cannot take it at full
+size — a window icon property has a hard ceiling, and a source above it is
+silently dropped by the toolkit, leaving a generic icon and no error. The host
+downscales for that surface, and says which size it used. The full-size file
+stays the one used everywhere that can take it.
+
+Do not pre-shrink the source to dodge this. It costs quality on every other
+surface to fix one.
+
+### A pinned port that is already taken
+
+`app_port` pins a port for a reason, so a host that quietly took a different one
+would break whatever the pin was for. Startup stops instead, and names the
+conflict.
+
+The resolution is per-installation rather than per-app, because the manifest is
+the same on every machine and the conflict is not: it is `port_override` in the
+app's own `data/config.json`, which survives updates. An app that does not
+actually need a fixed port should leave `app_port` out and take a dynamic one.
+
+### The cold-start page
+
+`splash_path` is **not honoured today.** The file sits inside the installed
+snapshot, outside `public/`, and it is wanted *before* the app's own server
+exists — so it is reachable neither over HTTP nor from the window's own origin.
+Rather than fail, the host shows its own cold-start page in the app's declared
+`splash_bg` / `splash_text` colours, with its `product_name`, and warns at
+launch that it did so.
+
+So `splash_bg` and `splash_text` work; `splash_path` is parsed, reported and
+ignored. Closing that gap is a queued plan, not a change of contract.
+
+### Off-window work, and secret storage
+
+Both are covered where they belong — §3's `TFS_ASYNC_WORKER` and
+`TFS_KEYRING_AVAILABLE` — and both are listed here because they are the same
+rule: the app declares the maximum, the machine delivers what it can, and the
+environment says which.
+
+### Declared but not yet runnable
+
+`run` aliases are parsed and validated, and the command that runs one is a
+queued plan. An app may declare them; nothing runs them yet. This is stated
+rather than left silent so that an alias which appears to do nothing is
+recognisable as an unbuilt feature and not as a broken declaration.
+
+---
+
+## Things this document deliberately does not cover
+
+**A navigation off the app's origin leaves the app.** A link to another site
+opens in the user's own browser instead of replacing the application inside its
+own frame; `javascript:` URLs are refused outright. This is worth knowing when
+writing links, but it is the host's navigation policy rather than a promise to
+the app — [`ARCHITECTURE.md`](ARCHITECTURE.md) has the rules.
+
+**A launch that fails always says so.** No silent exit, no window that never
+appears. What the message says and where it appears is the host's.
+
+**How any of this is implemented** — the installer, the snapshot, the registry,
+the process supervision and teardown, the bundled interpreter, the packaging —
+is in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+**What a user types** — installing, opening, listing, removing — is in
+[`README.md`](README.md). The commands a person runs are not configured by the
+manifest and are not part of this contract, with one exception: the `run`
+aliases above, because the commands they run are the app's own.
