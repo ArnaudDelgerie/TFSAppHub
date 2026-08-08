@@ -79,9 +79,26 @@ path/to/project/
 
 Plus one HTTP route, `GET /healthz` → `200`, covered in §4.
 
-That is the whole requirement. There is no TFSApp base class to extend, no
-directory to create, no file the hub writes into the project. Installing does
-not modify the source it was pointed at.
+There is no directory to create and no file the hub writes into the project;
+installing does not modify the source it was pointed at.
+
+**Plus one obligation in the app's kernel.** Symfony decides where its cache,
+its build artefacts and its logs go, and it decides it *inside the project* by
+default — which is the installed snapshot, replaced on the next update. So the
+app must honour three of §3's variables in its kernel:
+
+```php
+public function getCacheDir(): string { return $_SERVER['APP_CACHE_DIR'] ?? parent::getCacheDir(); }
+public function getBuildDir(): string { return $_SERVER['APP_BUILD_DIR'] ?? parent::getBuildDir(); }
+public function getLogDir(): string   { return $_SERVER['APP_LOG_DIR']   ?? parent::getLogDir(); }
+```
+
+Extending `ArnaudDelgerie\TFSAppBundle\Kernel\TFSAppKernel` is the supported way
+to get exactly that, and what the reference app does. Writing the three overrides
+by hand satisfies the requirement just as well — the contract binds the
+behaviour, not the class. What it does not tolerate is neither: the host would
+inject the three variables and the app would silently ignore them, writing into
+a directory an update replaces.
 
 **The manifest is read by the hub, never by PHP.** The app learns its own
 identity from the environment (§3), not by parsing its own
@@ -308,6 +325,25 @@ database, or to the app's data directory (§5).
 
 *(The hub empties them on every launch today. That is a choice about safety, not
 a property of this clause, and it is `ARCHITECTURE.md`'s to explain.)*
+
+### The database is SQLite, and that is a constraint on the app
+
+`DATABASE_URL` is the host's to set, in every mode, and it always names a SQLite
+file. An app that declares its own in `.env` is not overridden so much as unheard:
+a process environment variable wins over Symfony's dotenv files, by design and in
+both directions of the argument.
+
+So the app's schema, its queries and — above all — its **migrations must run on
+SQLite**. That last one is the reason this is stated as a requirement rather than
+left to be inferred from the DSN, because its failure mode is the worst shape a
+failure can take: `doctrine:migrations:diff` emits DDL for the platform it was
+generated against, so a migration produced on MySQL or Postgres is syntactically
+fine, passes review, passes the author's own test suite, and then fails **at
+install time on the end user's machine** — inside a `pre-install` hook, on a
+terminal that user did not ask for.
+
+Develop against SQLite and the whole class of problem is gone by construction,
+which is why the host declines to offer anything else.
 
 ### The database is real, and it is migrated before the app opens
 
