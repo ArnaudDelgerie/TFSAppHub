@@ -70,6 +70,15 @@ pub fn setup_transports(
 /// invisible. No `-vvv`: the app's real logs go through Symfony's own logger
 /// under `APP_LOG_DIR`, and duplicating them into `sidecar.log` would only make
 /// the file useless for what it is actually for.
+///
+/// No `--env`/`--no-debug`: `bin/console` reads `APP_ENV`/`APP_DEBUG` straight
+/// from `envs` when neither flag is given, exactly as the FrankenPHP server
+/// started alongside it does — the same values, the same way, in every process.
+/// Hardcoding `--env=prod` here (as the station's single-mode `worker.rs` did)
+/// would override the injected value and win over it, so a dev session's
+/// worker would run its prod kernel while its web server ran dev — silently
+/// breaking CONTRACT.md §3's "every process the hub starts on the app's behalf
+/// gets the same list" the moment `dev` gave `APP_ENV` a second value to carry.
 pub fn spawn_worker(
     frankenphp: &Path,
     app_dir: &Path,
@@ -84,8 +93,6 @@ pub fn spawn_worker(
         "async",
         "--time-limit=3600",
         "--memory-limit=256M",
-        "--env=prod",
-        "--no-debug",
     ]);
     command.current_dir(app_dir);
     let (stdout, stderr) = log::sidecar_log_stdio(log_dir)?;

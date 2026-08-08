@@ -192,6 +192,9 @@ thing and the dock says another".
 | Data directory, keyring namespace, cookie store | `identifier` |
 | The handle you type on the command line | assigned at install, recorded in the hub's registry |
 
+Every surface fed by `identifier` reads `dev.<identifier>` instead, for a dev
+session — see §9.
+
 One consequence surprises people the first time and is not a defect. Until an
 app has a desktop entry, a desktop environment has no `Name=` to read and falls
 back to a label derived from the window class — which is the identifier. So an
@@ -213,7 +216,8 @@ The hub **refuses at the transitions**: installing or updating an app whose
 what the value is for. It does **not** re-check when opening an app that is
 already installed — an app that passed the gate on its way in should not become
 unopenable later, and re-refusing it would make the hub reject something it
-itself accepted.
+itself accepted. A dev session never installs, so neither check ever runs
+against one — see §9.
 
 Bump it when the app changes in a way that its data has to follow. The hub runs
 the update lifecycle (§6) on the strength of this field alone; a source whose
@@ -274,14 +278,14 @@ console command. An app cannot tell them apart, and that is deliberate.
 
 | Variable | Value | For |
 | --- | --- | --- |
-| `TFS_APP_IDENTIFIER` | `identifier` from the manifest | the app's own identity |
+| `TFS_APP_IDENTIFIER` | `identifier` from the manifest, prefixed `dev.` in dev (§9) | the app's own identity |
 | `TFS_APP_VERSION` | `app_version` from the manifest | the app's own version |
 | `APP_ENV` | `prod` | Symfony |
 | `APP_DEBUG` | `0` | Symfony |
 | `APP_SECRET` | a per-app secret, generated once and kept — §5 | Symfony |
 | `APP_PORT` | `app_port` if pinned, else a free loopback port for this launch | the web server |
 | `APP_ORIGIN` | `http://127.0.0.1:<APP_PORT>` | Symfony, the web server |
-| `APP_PUBLIC_DIR` | the app's `public/` inside the installed snapshot | the web server's document root |
+| `APP_PUBLIC_DIR` | the app's `public/` — inside the installed snapshot, or inside the live project in dev (§9) | the web server's document root |
 | `APP_CACHE_DIR` | a writable cache directory — see the lifetime note below | Symfony |
 | `APP_BUILD_DIR` | a writable build directory — same lifetime note | Symfony |
 | `APP_LOG_DIR` | a writable log directory | Symfony |
@@ -323,8 +327,11 @@ both exist before any of the app's own code runs, and warming them is what the
 install lifecycle is for (§6). Anything that must survive a launch goes to the
 database, or to the app's data directory (§5).
 
-*(The hub empties them on every launch today. That is a choice about safety, not
-a property of this clause, and it is `ARCHITECTURE.md`'s to explain.)*
+*(The hub empties them on every launch of an installed app today; a dev session
+does not, so its container survives a relaunch instead of paying for a full
+rebuild on every reload (§9). That difference is a choice about safety and
+cost, not a property of this clause, and it is `ARCHITECTURE.md`'s to
+explain.)*
 
 ### The database is SQLite, and that is a constraint on the app
 
@@ -352,6 +359,10 @@ survives updates and is what the rollback anchor is taken from. It is empty on a
 fresh install: creating the schema is the app's own job, declared as a
 `pre-install` lifecycle command (§6), and the hub runs it at install time —
 before any window exists, on a terminal where a failure is legible.
+
+A dev session never installs, so nothing runs `pre-install` for it and nothing
+creates its schema automatically — the developer's own console does, against
+the injected `DATABASE_URL`, exactly as below (§9).
 
 An app author running the same project outside the hub gets whatever their own
 `.env` names, which is a different file and correctly so. Point the console at
@@ -525,6 +536,11 @@ whether a host is present.
   sessions/         APP_SESSION_DIR — persists
 ```
 
+This is the installed layout. A dev session's equivalent lives under the
+project's own `var/` instead of an OS data directory, keyed by `dev.<identifier>`
+rather than `identifier` — see §9, which is also where the isolation guarantees
+below are shown to hold for it exactly as they do here.
+
 The path derives from `identifier` **alone**. Not from where the host binary
 lives, not from the handle you type, not from the source the app was installed
 from. That is a guarantee and not an implementation accident: it means the app's
@@ -544,7 +560,8 @@ values — CSRF tokens, remember-me cookies, signed URIs — keep validating acr
 restarts. It lives in the OS keyring when one is reachable, probed with a
 throwaway round-trip before any real secret is touched, and falls back to a
 plaintext `0600` file when the probe fails. `TFS_KEYRING_AVAILABLE` (§3) reports
-which happened, for this launch.
+which happened, for this launch. None of this runs for a dev session, whose
+`APP_SECRET` is a fixed constant instead — see §9.
 
 Two consequences an app author should know rather than discover:
 
@@ -634,7 +651,9 @@ application on the same machine would be a breach.
 ## 6. Lifecycle
 
 An app declares, under `commands`, what has to run when it arrives on a machine
-and when a newer version of it does:
+and when a newer version of it does. Both events belong to `install` and
+`update`; a dev session goes through neither, and none of this section runs for
+one — see §9.
 
 ```json
 {
@@ -920,8 +939,11 @@ conflict.
 
 The resolution is per-installation rather than per-app, because the manifest is
 the same on every machine and the conflict is not: it is `port_override` in the
-app's own `data/config.json`, which survives updates. An app that does not
-actually need a fixed port should leave `app_port` out and take a dynamic one.
+app's own `data/config.json`, which survives updates. A dev session has no
+`data/config.json` to hold one (§9): the guard still runs and still stops on a
+real conflict, but the only fix there is to free the port or drop `app_port`
+from the manifest. An app that does not actually need a fixed port should
+leave `app_port` out and take a dynamic one.
 
 ### The cold-start page
 
@@ -948,6 +970,78 @@ environment says which.
 queued plan. An app may declare them; nothing runs them yet. This is stated
 rather than left silent so that an alias which appears to do nothing is
 recognisable as an unbuilt feature and not as a broken declaration.
+
+---
+
+## 9. Running a project in dev
+
+`tfsapp-hub dev path/to/project` runs the same app against its **live source**
+— served in place, never snapshotted — for a developer who has not installed
+it. This section says what an app author can rely on there, in the same terms
+as the rest of this document: what the app sees, never how the hub does it.
+
+### What differs, and it is a closed list
+
+- `APP_ENV=dev` and `APP_DEBUG=1`, not `prod` and `0`.
+- Every §3 path — `APP_CACHE_DIR`, `APP_BUILD_DIR`, `APP_LOG_DIR`,
+  `APP_SESSION_DIR` — is rooted at the project's own `var/` instead of an OS
+  data directory.
+- `DATABASE_URL` points at `var/data/app.db` inside the project — **still
+  SQLite, still the host's to set**, so §3's requirement that migrations run
+  on SQLite binds in dev exactly as it does once installed.
+- `APP_SECRET` is a fixed, throwaway constant, never the installation's
+  generated-and-kept value (§5). It buys the dev loop — a fresh random secret
+  on every relaunch would log the developer out each time — and nothing signed
+  with it is meant to outlive the session.
+- The keyring service is a namespace of its own, so a secret set from a dev
+  session and one set from the installed app (§5, §7) never collide and never
+  meet.
+- The runtime identity is its own, `dev.<identifier>` — the window class, the
+  GTK application id, the single-instance key, the cookie store, the data
+  directory, the keyring namespace, all of it (§2). This is what lets the same
+  project be open in dev and installed at once, in two windows, on two
+  databases, neither able to see the other's.
+
+### What does not differ
+
+§3's variable list is the same list, in the same names and the same order.
+§4's HTTP contract holds exactly. §5's isolation holds — a dev session gets
+its own data directory, its own cookie store, its own liveness lock, by the
+same identifier-keyed rules an installed app gets; it is simply a different
+identifier. §7's `actions` behave identically over both transports, and
+`actions.update` already answers the same way in both: `unavailable`, since
+the host resolves updates itself regardless of which mode is asking.
+
+### No install, so no install lifecycle
+
+§6's `pre-install`, `post-install`, `pre-update` and `post-update` never run
+for a dev session. They are events an app passes through once, on arrival or
+on update, and a dev session is neither: the project was never installed, and
+nothing will ever "update" it out from under a developer editing it live.
+Whatever `pre-install` would have set up — typically
+`doctrine:migrations:migrate` — is the developer's own to run, against the
+injected `DATABASE_URL`, the same way any Symfony project's migrations run
+outside the hub. `app_version`'s install/update bookkeeping (§2) plays no part
+either: nothing compares it, nothing is refused for a downgrade, nothing is
+recorded — an author is free to edit it while iterating.
+
+### The footprint: `var/`, and nothing else
+
+The hub serves the project's source **in place** and never modifies it — the
+same guarantee §1 states for what installing does to a source tree, read from
+the running-from-source side instead. The one directory the hub writes into is
+`var/`, which the app's own `TFSAppKernel` already points its cache, build,
+log and session directories at (§1); nothing outside it is ever touched.
+
+### The guardrail
+
+The hub does not watch the project, does not compile anything, and does not
+build any asset. It serves the source as it finds it on each request and
+relaunches it on demand — nothing more. An app whose frontend needs a build
+step builds it with its own tooling, exactly as §1 already requires of an
+installed app: dev changes where the source lives, never who is responsible
+for building it. When the answer to "can the hub watch and rebuild for me?"
+comes up, it is no — the developer's own build tool already has a `--watch`.
 
 ---
 

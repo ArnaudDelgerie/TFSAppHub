@@ -210,7 +210,17 @@ fn prepare(
     manifest: &Manifest,
     app_dir: &Path,
 ) -> Result<(), InstallError> {
-    let environment = app_env::resolve(paths, manifest, app_dir, app_env::Mode::Install)?;
+    // `0700` on every install, not only on the first: an app reinstalled after
+    // an older host created it laxly gets tightened here rather than staying
+    // that way forever (`paths::create_app_data_dir`'s own doc).
+    let state_root = paths.create_app_data_dir(&manifest.identifier)?;
+    let environment = app_env::resolve(
+        manifest,
+        app_dir,
+        &manifest.identifier,
+        &state_root,
+        app_env::Mode::Install,
+    )?;
     // Named before the first command runs, because the next thing on screen is
     // a migration writing a database into it — under `identifier`, which is
     // what makes it the same data dir a packaged install of this app uses.

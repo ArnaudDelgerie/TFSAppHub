@@ -8,8 +8,10 @@
 mod app_env;
 mod bridge;
 mod cli;
+mod dev;
 mod identity;
 mod install;
+mod launch;
 mod lifecycle;
 mod list;
 mod manifest;
@@ -27,7 +29,7 @@ mod update;
 mod window;
 mod worker;
 
-use cli::{Command, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE};
+use cli::{Command, OpenChildSource, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE};
 use identity::Identity;
 
 fn main() {
@@ -107,23 +109,26 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         // Resolves and re-executes; the window itself belongs to the child this
         // returns from, which is why the parent has an exit code to give at all.
         Command::Open { id } => open::run(&id),
+        // Foreground, unlike `open` — see `dev::run`.
+        Command::Dev { path } => dev::run(&path),
         Command::Remove {
             id,
             purge,
             assume_yes,
         } => remove::run(&id, purge, assume_yes),
         Command::Platform => print_platform(),
-        // The app's own process, re-executed by `open <id>` above. Everything it
-        // needs to become that app before GTK exists travels in argv — see
-        // `open::child_args`.
+        // The app's own process, re-executed by `open <id>` (and, once plan 009
+        // lands `dev`'s own foreground parent, by `dev <path>`) above.
+        // Everything it needs to become that app before GTK exists travels in
+        // argv — see `open::child_args`.
         Command::OpenChild {
-            id,
+            source,
             identifier,
             product_name,
             icon_path,
         } => {
             open_window(
-                &id,
+                source,
                 Identity {
                     identifier,
                     product_name,
@@ -187,56 +192,85 @@ fn print_platform() -> i32 {
 ///
 /// The parent already resolved all of this before spawning us, and this is not
 /// that work repeated for its own sake: the parent proved the app *can* be
-/// opened, cheaply and at the terminal, so a mistyped id never costs a window.
-/// What happens here is the part that has to happen in the process that will
-/// actually hold the app — the liveness lock is held by *this* pid, and the port
-/// is bound to prove it is free to *this* process.
+/// opened, cheaply and at the terminal, so a mistyped id or path never costs a
+/// window. What happens here is the part that has to happen in the process
+/// that will actually hold the app — the liveness lock is held by *this* pid,
+/// and the port is bound to prove it is free to *this* process.
 ///
 /// A failure exits through `lifecycle::fatal_startup_error`, which is the only
 /// thing that reaches a user who launched from a desktop entry.
-fn prepare(id: &str, identity: &Identity) -> Launching {
+///
+/// Rebuilds the matching `LaunchSpec` from `source` — `open::resolve` for
+/// `--id`, `dev::resolve` for `--project` — which is `OpenChildSource`'s whole
+/// reason to exist: one child, two constructors, resolved here rather than at
+/// the parent so a mistyped id and a mistyped path fail the same way.
+fn prepare(source: &OpenChildSource, identity: &Identity) -> Launching {
     let paths = match paths::Paths::resolve() {
         Ok(paths) => paths,
         Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
     };
-    let resolved = match open::resolve(&paths, id) {
-        Ok(resolved) => resolved,
-        Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+    let resolved = match source {
+        OpenChildSource::Id(id) => open::resolve(&paths, id).map_err(|error| error.to_string()),
+        OpenChildSource::Project(path) => dev::resolve(path).map_err(|error| error.to_string()),
+    };
+    let spec = match resolved {
+        Ok(spec) => spec,
+        Err(message) => lifecycle::fatal_startup_error(&message),
     };
 
-    // `0700` on every launch, not only on creation: the directory holds the
-    // app's database and its `APP_SECRET`, so an installation created by an
-    // older host or recreated by hand gets tightened on its next use.
-    let data_dir = match paths.create_app_data_dir(&identity.identifier) {
-        Ok(data_dir) => data_dir,
-        Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+    // `spec.state_root`, created the way its own source needs: `0700` on every
+    // launch for an installed app, because the directory holds the app's
+    // database and its `APP_SECRET` and an installation created by an older
+    // host or recreated by hand gets tightened on its next use; a plain
+    // `var/` for a dev session, which needs no such tightening — it is the
+    // developer's own project directory (CONTRACT.md's dev section).
+    let data_dir = match &spec.source {
+        launch::Source::Installed { .. } => match paths.create_app_data_dir(&identity.identifier) {
+            Ok(data_dir) => data_dir,
+            Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+        },
+        launch::Source::Live => match std::fs::create_dir_all(&spec.state_root) {
+            Ok(()) => spec.state_root.clone(),
+            Err(error) => {
+                lifecycle::fatal_startup_error(&format!("{}: {error}", spec.state_root.display()))
+            }
+        },
     };
     let data_subdir = data_dir.join("data");
     if let Err(error) = std::fs::create_dir_all(&data_subdir) {
         lifecycle::fatal_startup_error(&format!("{}: {error}", data_subdir.display()));
     }
 
-    let lock = lifecycle::prepare_launch(
-        id,
-        &data_dir,
-        &data_subdir,
-        &identity.identifier,
-        &resolved.manifest.app_version,
-        resolved.manifest.app_port,
-    );
+    // `spec.label` rather than a hub-local id: a dev session has none to give,
+    // and the label is the same thing a message about this launch would call
+    // it either way (plan 009 step 1). The two sources part ways here too: an
+    // installed launch runs every guard, a dev one skips the version guard and
+    // writes no `data/config.json` — see `lifecycle::prepare_dev_launch`.
+    let lock = match &spec.source {
+        launch::Source::Installed { .. } => lifecycle::prepare_launch(
+            &spec.label,
+            &data_dir,
+            &data_subdir,
+            &identity.identifier,
+            &spec.manifest.app_version,
+            spec.manifest.app_port,
+        ),
+        launch::Source::Live => lifecycle::prepare_dev_launch(
+            &data_dir,
+            &data_subdir,
+            &identity.identifier,
+            spec.manifest.app_port,
+        ),
+    };
 
-    Launching {
-        paths,
-        resolved,
-        lock,
-    }
+    Launching { paths, spec, lock }
 }
 
 /// What the guards leave for the launch itself: where the app is, what it
 /// declares, and the liveness lock proving this process is its live instance.
 struct Launching {
     paths: paths::Paths,
-    resolved: open::Resolved,
+    spec: launch::LaunchSpec,
     lock: Option<std::fs::File>,
 }
 
@@ -249,7 +283,7 @@ struct Launching {
 /// advance far enough to actually paint the splash. Everything slow then happens
 /// off the main thread and ends by navigating that same window to the backend,
 /// so nothing visibly jumps and no second window appears.
-fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
+fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::Context) {
     // Before the `Builder` exists, and so before anything has initialised GTK
     // — the whole point of the module. Everything identity-derived downstream
     // (app id, bus name, single-instance key, WM_CLASS, cookie store) reads
@@ -261,11 +295,7 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
     // all of it has to happen in this window: they refuse through a blocking
     // native dialog, which deadlocks rather than appears once Tauri has claimed
     // GTK. See `lifecycle`'s module header.
-    let Launching {
-        paths,
-        resolved,
-        lock,
-    } = prepare(id, &identity);
+    let Launching { paths, spec, lock } = prepare(&source, &identity);
 
     // The app's `actions` groups, granted at runtime, before `Builder` — the
     // only window in which they can be: `add_capability` lives on `Context` and
@@ -274,7 +304,7 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
     // group this app did not declare is refused by Tauri's own ACL before any
     // handler runs. Registering the commands is not the boundary; this is.
     for (declared, grant) in window::ACTION_IPC_GRANTS {
-        if declared(&resolved.manifest.actions) {
+        if declared(&spec.manifest.actions) {
             context
                 .runtime_authority_mut()
                 .add_capability(window::action_capability(grant))
@@ -351,8 +381,8 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
                 &identity.product_name,
                 &window::splash_style(
                     &identity.product_name,
-                    resolved.manifest.splash_bg.as_deref(),
-                    resolved.manifest.splash_text.as_deref(),
+                    spec.manifest.splash_bg.as_deref(),
+                    spec.manifest.splash_text.as_deref(),
                 ),
                 &app_origin,
             )?;
@@ -368,7 +398,7 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
                 serve(
                     handle,
                     paths,
-                    resolved,
+                    spec,
                     identity,
                     lock,
                     app_origin,
@@ -394,7 +424,7 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
 fn serve(
     app: tauri::AppHandle,
     paths: paths::Paths,
-    resolved: open::Resolved,
+    spec: launch::LaunchSpec,
     identity: Identity,
     lock: Option<std::fs::File>,
     app_origin: window::AppOriginSlot,
@@ -402,7 +432,7 @@ fn serve(
 ) {
     use tauri::Manager;
 
-    let manifest = &resolved.manifest;
+    let manifest = &spec.manifest;
     if manifest.splash_path.is_some() {
         // Said, not swallowed: an app author who declared a splash page has to
         // learn it is not the one on screen. See `window::splash_style`.
@@ -413,11 +443,20 @@ fn serve(
         );
     }
 
-    let environment =
-        match app_env::resolve(&paths, manifest, &resolved.app_dir, app_env::Mode::Launch) {
-            Ok(environment) => environment,
-            Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
-        };
+    let env_mode = match spec.source {
+        launch::Source::Installed { .. } => app_env::Mode::Launch,
+        launch::Source::Live => app_env::Mode::Dev,
+    };
+    let environment = match app_env::resolve(
+        manifest,
+        &spec.app_dir,
+        &identity.identifier,
+        &spec.state_root,
+        env_mode,
+    ) {
+        Ok(environment) => environment,
+        Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
+    };
     let toolchain = match php::toolchain(&paths) {
         Ok(toolchain) => toolchain,
         Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
@@ -431,7 +470,7 @@ fn serve(
 
     let (sidecar, url) = match sidecar::start(
         &toolchain,
-        &resolved.app_dir,
+        &spec.app_dir,
         &environment,
         manifest,
         lock,

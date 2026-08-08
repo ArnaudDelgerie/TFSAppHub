@@ -1,4 +1,8 @@
-use std::{os::unix::fs::PermissionsExt, path::Path};
+use std::{
+    collections::BTreeSet,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
 use super::{resolve, Mode};
 use crate::{manifest, paths::Paths};
@@ -40,11 +44,25 @@ fn manifest_for(identifier: &str, extra: &str) -> manifest::Manifest {
         .manifest
 }
 
+/// An installed app's `state_root`, created the way `install::prepare` and
+/// `main::prepare` create it — `resolve` itself no longer does, since a dev
+/// session's `var/` must not get the same `0700` tightening (see the module
+/// header).
+fn state_root(paths: &Paths, identifier: &str) -> PathBuf {
+    paths
+        .create_app_data_dir(identifier)
+        .expect("a created data dir")
+}
+
 fn value<'a>(vars: &'a [(&'static str, String)], key: &str) -> &'a str {
     vars.iter()
         .find(|(name, _)| *name == key)
         .map(|(_, value)| value.as_str())
         .unwrap_or_else(|| panic!("{key} should be injected — CONTRACT.md §3 lists it"))
+}
+
+fn var_names(vars: &[(&'static str, String)]) -> BTreeSet<&'static str> {
+    vars.iter().map(|(name, _)| *name).collect()
 }
 
 #[test]
@@ -55,11 +73,13 @@ fn every_variable_the_contract_lists_is_injected() {
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     let identifier = identifier_for("every-variable");
+    let state_root = state_root(&paths, &identifier);
 
     let environment = resolve(
-        &paths,
         &manifest_for(&identifier, ""),
         Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
         Mode::Install,
     )
     .expect("the environment resolves");
@@ -108,16 +128,17 @@ fn the_data_the_app_reads_hangs_off_identifier_and_nothing_else() {
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     let identifier = identifier_for("data-dir");
+    let expected = state_root(&paths, &identifier);
 
     let environment = resolve(
-        &paths,
         &manifest_for(&identifier, ""),
         Path::new("/apps/whatever"),
+        &identifier,
+        &expected,
         Mode::Install,
     )
     .expect("the environment resolves");
 
-    let expected = base.path().join("TFSApp").join(&identifier);
     assert_eq!(environment.data_dir, expected);
     assert_eq!(
         value(&environment.vars, "DATABASE_URL"),
@@ -130,7 +151,9 @@ fn the_data_the_app_reads_hangs_off_identifier_and_nothing_else() {
     );
 
     // It holds the app's database and its generated APP_SECRET (CONTRACT.md
-    // §6), so the mode is re-applied on every use, not only at creation.
+    // §6), so the mode is the caller's to have applied before `resolve` ever
+    // touches the directory — `state_root` above is `create_app_data_dir`,
+    // exactly as `install::prepare` and `main::prepare` call it.
     let mode = std::fs::metadata(&expected)
         .expect("a created data dir")
         .permissions()
@@ -148,11 +171,13 @@ fn the_async_worker_toggle_reaches_both_the_transport_and_the_app() {
     let paths = Paths::rooted_at(base.path());
 
     let identifier = identifier_for("async-worker");
+    let state_root = state_root(&paths, &identifier);
 
     let off = resolve(
-        &paths,
         &manifest_for(&identifier, ""),
         Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
         Mode::Install,
     )
     .expect("it resolves");
@@ -160,9 +185,10 @@ fn the_async_worker_toggle_reaches_both_the_transport_and_the_app() {
     assert_eq!(value(&off.vars, "TFS_ASYNC_WORKER"), "0");
 
     let on = resolve(
-        &paths,
         &manifest_for(&identifier, r#", "async_worker": true"#),
         Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
         Mode::Install,
     )
     .expect("it resolves");
@@ -179,11 +205,13 @@ fn a_pinned_port_is_honoured_and_an_absent_one_is_picked() {
     let paths = Paths::rooted_at(base.path());
 
     let identifier = identifier_for("ports");
+    let state_root = state_root(&paths, &identifier);
 
     let pinned = resolve(
-        &paths,
         &manifest_for(&identifier, r#", "app_port": 8123"#),
         Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
         Mode::Install,
     )
     .expect("it resolves");
@@ -191,9 +219,10 @@ fn a_pinned_port_is_honoured_and_an_absent_one_is_picked() {
     assert_eq!(value(&pinned.vars, "APP_ORIGIN"), "http://127.0.0.1:8123");
 
     let dynamic = resolve(
-        &paths,
         &manifest_for(&identifier, ""),
         Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
         Mode::Install,
     )
     .expect("it resolves");
@@ -211,18 +240,21 @@ fn the_secret_is_the_same_one_the_next_command_will_read() {
     // One identifier across both resolves, or this would compare two different
     // apps' secrets and pass for the wrong reason.
     let identifier = identifier_for("stable-secret");
+    let state_root = state_root(&paths, &identifier);
 
     let first = resolve(
-        &paths,
         &manifest_for(&identifier, ""),
         Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
         Mode::Install,
     )
     .expect("it resolves");
     let second = resolve(
-        &paths,
         &manifest_for(&identifier, ""),
         Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
         Mode::Install,
     )
     .expect("it resolves");
@@ -236,5 +268,149 @@ fn the_secret_is_the_same_one_the_next_command_will_read() {
     assert_ne!(
         value(&first.vars, "MERCURE_JWT_SECRET"),
         value(&second.vars, "MERCURE_JWT_SECRET")
+    );
+}
+
+#[test]
+fn a_dev_launch_roots_every_app_path_under_var() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let identifier = format!("dev.{}", identifier_for("dev-var-root"));
+    let state_root = project.path().join("var");
+
+    let environment = resolve(
+        &manifest_for(&identifier_for("dev-var-root"), ""),
+        project.path(),
+        &identifier,
+        &state_root,
+        Mode::Dev,
+    )
+    .expect("the dev environment resolves");
+
+    assert_eq!(environment.data_dir, state_root);
+    for key in [
+        "APP_CACHE_DIR",
+        "APP_BUILD_DIR",
+        "APP_LOG_DIR",
+        "APP_SESSION_DIR",
+    ] {
+        let path = value(&environment.vars, key);
+        assert!(
+            Path::new(path).starts_with(&state_root),
+            "{key} ({path}) should be under {}",
+            state_root.display()
+        );
+    }
+    assert_eq!(
+        value(&environment.vars, "DATABASE_URL"),
+        format!("sqlite:///{}", state_root.join("data/app.db").display())
+    );
+    assert_eq!(value(&environment.vars, "APP_ENV"), "dev");
+    assert_eq!(value(&environment.vars, "APP_DEBUG"), "1");
+    // The prefix travels as the runtime identifier, not just the identity's:
+    // `TFS_APP_IDENTIFIER` is what the app itself reads.
+    assert_eq!(value(&environment.vars, "TFS_APP_IDENTIFIER"), identifier);
+
+    // Fixed and throwaway, never the keyring-backed value an installed launch
+    // resolves — see `DEV_APP_SECRET`'s own doc.
+    assert_eq!(
+        value(&environment.vars, "APP_SECRET"),
+        super::DEV_APP_SECRET
+    );
+
+    // Named, never created by this call alone up front — but by the time
+    // `resolve` returns, its five subdirectories exist under `var/` and
+    // nowhere else in the project.
+    assert!(state_root.join("data").is_dir());
+    assert!(state_root.join("cache").is_dir());
+    assert!(!project.path().join("cache").exists());
+}
+
+#[test]
+fn a_dev_launch_never_wipes_cache_or_build() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let identifier = format!("dev.{}", identifier_for("dev-no-wipe"));
+    let state_root = project.path().join("var");
+    std::fs::create_dir_all(state_root.join("cache")).expect("a pre-existing cache dir");
+    std::fs::write(state_root.join("cache/marker"), "warm").expect("a marker file");
+
+    resolve(
+        &manifest_for(&identifier_for("dev-no-wipe"), ""),
+        project.path(),
+        &identifier,
+        &state_root,
+        Mode::Dev,
+    )
+    .expect("the dev environment resolves");
+
+    assert!(
+        state_root.join("cache/marker").is_file(),
+        "dev must never wipe a warm cache — Symfony's own container invalidation is the \
+         mechanism, not a wipe on every relaunch"
+    );
+}
+
+#[test]
+fn the_dev_secrets_store_service_carries_the_prefix() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let bare_identifier = identifier_for("dev-secrets-service");
+    let prefixed = format!("dev.{bare_identifier}");
+    let state_root = project.path().join("var");
+
+    let environment = resolve(
+        &manifest_for(&bare_identifier, ""),
+        project.path(),
+        &prefixed,
+        &state_root,
+        Mode::Dev,
+    )
+    .expect("the dev environment resolves");
+
+    // A dev session's declared secrets and the same project's installed
+    // secrets must never resolve to the same keyring entry — the trap the
+    // station's own `dev_secrets_service` already solved, carried over here as
+    // the whole runtime identity rather than a service string built ad hoc.
+    crate::secrets::secrets_set(&environment.secret_store, "probe", "dev-value".to_string());
+    let installed_store = crate::secrets::new_store(&bare_identifier, &state_root.join("data"));
+    assert_ne!(
+        crate::secrets::secrets_get(&installed_store, "probe").as_deref(),
+        Some("dev-value"),
+        "a dev session's secret must not be visible under the installed app's own service"
+    );
+}
+
+#[test]
+fn dev_and_installed_inject_the_same_set_of_variable_names() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("same-variable-names");
+    let installed_state_root = state_root(&paths, &identifier);
+
+    let installed = resolve(
+        &manifest_for(&identifier, ""),
+        Path::new("/apps/demo"),
+        &identifier,
+        &installed_state_root,
+        Mode::Launch,
+    )
+    .expect("the installed environment resolves");
+
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let dev_identifier = format!("dev.{identifier}");
+    let dev_state_root = project.path().join("var");
+
+    let dev = resolve(
+        &manifest_for(&identifier, ""),
+        project.path(),
+        &dev_identifier,
+        &dev_state_root,
+        Mode::Dev,
+    )
+    .expect("the dev environment resolves");
+
+    assert_eq!(
+        var_names(&installed.vars),
+        var_names(&dev.vars),
+        "§3 is one list — dev and installed must inject the same variable names, \
+         never a different set"
     );
 }

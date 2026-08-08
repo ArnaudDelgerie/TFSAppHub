@@ -143,6 +143,17 @@ pub const SURFACE: &[Spec] = &[
         level: Level::App,
         availability: Availability::Implemented,
     },
+    // The second bare word whose argument is a path rather than an app id —
+    // `install`'s own exemption, taken again for the same reason: `dev`'s
+    // subject is a source, not yet an installed app (plan 005's 2026-08-08
+    // amendment). The grammar rule stays unbent.
+    Spec {
+        name: "dev",
+        form: "dev <local-path>",
+        summary: "Run a live project in its own window, served in place.",
+        level: Level::App,
+        availability: Availability::Implemented,
+    },
     Spec {
         name: "update",
         form: "update <id> [--ref <tag|branch|sha>] [--force]",
@@ -274,6 +285,9 @@ pub enum Command {
     Open {
         id: String,
     },
+    Dev {
+        path: String,
+    },
     Update {
         id: String,
         reference: Option<String>,
@@ -300,13 +314,26 @@ pub enum Command {
     /// than an `Identity` so this module stays free of the identity types it
     /// would otherwise have to know about.
     OpenChild {
-        /// The hub-local handle, which is how the child finds the same
-        /// installed snapshot its parent validated.
-        id: String,
+        /// Which of `open`'s or `dev`'s constructors the child rebuilds its
+        /// `LaunchSpec` with.
+        source: OpenChildSource,
         identifier: String,
         product_name: String,
         icon_path: Option<String>,
     },
+}
+
+/// `__open`'s `--id <id>` or `--project <path>` — exactly one, never both.
+///
+/// One hidden subcommand serving two callers rather than a second hidden
+/// subcommand: `open <id>` re-execs with `--id`, `dev <path>` (plan 009) with
+/// `--project`, and the child rebuilds the matching `LaunchSpec` from
+/// whichever it was given. A second hidden subcommand would fork the child
+/// path, which is precisely what the `LaunchSpec` refactor exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenChildSource {
+    Id(String),
+    Project(String),
 }
 
 /// `run`'s three forms. Kept apart from [`Command`]'s other variants because
@@ -342,6 +369,7 @@ impl Command {
             Self::Install { .. } => "install",
             Self::List => "list",
             Self::Open { .. } => "open",
+            Self::Dev { .. } => "dev",
             Self::Update { .. } => "update",
             Self::Remove { .. } => "remove",
             Self::Export { .. } => "export",
@@ -438,6 +466,12 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             let mut options = options("open", rest, &[], &[])?;
             Ok(Command::Open {
                 id: options.exactly_one("open", "an app id")?,
+            })
+        }
+        "dev" => {
+            let mut options = options("dev", rest, &[], &[])?;
+            Ok(Command::Dev {
+                path: options.exactly_one("dev", "a project path")?,
             })
         }
         "update" => {
@@ -565,21 +599,40 @@ fn parse_run(args: &[String]) -> Result<Command, UsageError> {
     }))
 }
 
-/// The hidden `__open --id <id> --identity <identifier> --name <n> [--icon <p>]`.
+/// The hidden `__open (--id <id> | --project <path>) --identity <identifier>
+/// --name <n> [--icon <p>]`.
 ///
-/// All three of the first are required, and none is defaulted: this form is
-/// written by `open <id>` and by nothing else, so a missing one is a bug in the
-/// parent rather than a user's typo, and quietly filling it in would hide
-/// exactly that. `--icon` stays optional because an app declaring no icon is
-/// ordinary.
+/// `--identity`/`--name` are required, and neither is defaulted: this form is
+/// written by `open <id>` or `dev <path>` and by nothing else, so a missing one
+/// is a bug in the parent rather than a user's typo, and quietly filling it in
+/// would hide exactly that. `--icon` stays optional because an app declaring no
+/// icon is ordinary. `--id`/`--project` are exactly-one — see
+/// [`OpenChildSource`].
 fn parse_open_child(args: &[String]) -> Result<Command, UsageError> {
     let options = options(
         OPEN_CHILD_SUBCOMMAND,
         args,
-        &["--id", "--identity", "--name", "--icon"],
+        &["--id", "--project", "--identity", "--name", "--icon"],
         &[],
     )?;
     options.no_positionals(OPEN_CHILD_SUBCOMMAND)?;
+
+    let source = match (options.value("--id"), options.value("--project")) {
+        (Some(id), None) => OpenChildSource::Id(id),
+        (None, Some(path)) => OpenChildSource::Project(path),
+        (None, None) => {
+            return Err(usage_error(
+                OPEN_CHILD_SUBCOMMAND,
+                format!("{OPEN_CHILD_SUBCOMMAND} needs --id or --project"),
+            ))
+        }
+        (Some(_), Some(_)) => {
+            return Err(usage_error(
+                OPEN_CHILD_SUBCOMMAND,
+                format!("{OPEN_CHILD_SUBCOMMAND} takes --id or --project, not both"),
+            ))
+        }
+    };
 
     let required = |flag: &str| {
         options.value(flag).ok_or_else(|| {
@@ -591,7 +644,7 @@ fn parse_open_child(args: &[String]) -> Result<Command, UsageError> {
     };
 
     Ok(Command::OpenChild {
-        id: required("--id")?,
+        source,
         identifier: required("--identity")?,
         product_name: required("--name")?,
         icon_path: options.value("--icon"),

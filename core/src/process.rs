@@ -183,6 +183,24 @@ pub fn terminate(pid: u32) {
     }
 }
 
+/// Send one SIGTERM to `pid`'s process group and return immediately — no
+/// wait, no SIGKILL escalation. The counterpart to [`terminate`] for a caller
+/// whose *target* already owns a bounded, escalating teardown of its own
+/// (plan 009's `dev`: the child's `lifecycle::install_shutdown_on_signal`
+/// stops the worker, then the server, each with `terminate`'s own up-to-3s
+/// SIGTERM-then-SIGKILL budget — up to ~6s together). Relaying with
+/// `terminate` itself would impose a second, shorter 3s budget from outside,
+/// racing the inner one: the outer caller would SIGKILL the target mid-way
+/// through its own orderly shutdown, orphaning whatever it had not gotten to
+/// yet — measured live during plan 009 step 6, where it left a dev session's
+/// FrankenPHP server running after `Ctrl-C`. Firing one signal and leaving
+/// the wait to the caller's own `Child::wait()` means only one budget is ever
+/// in play: the target's.
+pub fn signal_terminate_once(pid: u32) {
+    let operand = signal_target(pid, process_group_id(pid)).operand();
+    let _ = Command::new("kill").arg("--").arg(&operand).status();
+}
+
 pub fn process_exists(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }

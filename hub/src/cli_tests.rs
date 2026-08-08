@@ -1,5 +1,6 @@
 use super::{
-    help_text, parse, Availability, Command, RunInvocation, UsageError, NOT_YET_MARKER, SURFACE,
+    help_text, parse, Availability, Command, OpenChildSource, RunInvocation, UsageError,
+    NOT_YET_MARKER, SURFACE,
 };
 
 /// Every test spells its invocation the way a user types it. Splitting on
@@ -71,6 +72,12 @@ fn bare_words_route_to_an_app() {
         command("open demo"),
         Command::Open {
             id: "demo".to_string()
+        }
+    );
+    assert_eq!(
+        command("dev ../TFSAppTest"),
+        Command::Dev {
+            path: "../TFSAppTest".to_string()
         }
     );
     assert_eq!(
@@ -194,6 +201,8 @@ fn a_malformed_invocation_names_the_right_form() {
     let cases = [
         ("open", "open <id>"),
         ("open one two", "open <id>"),
+        ("dev", "dev <local-path>"),
+        ("dev one two", "dev <local-path>"),
         ("install", "install <source>"),
         ("install ../app --as", "install <source>"),
         ("list --all", "list"),
@@ -311,17 +320,27 @@ fn the_hidden_subcommands_stay_reachable_and_unlisted() {
     assert_eq!(
         command("__open --id demo --identity dev.local.demo --name Demo --icon /tmp/demo.png"),
         Command::OpenChild {
-            id: "demo".to_string(),
+            source: OpenChildSource::Id("demo".to_string()),
             identifier: "dev.local.demo".to_string(),
             product_name: "Demo".to_string(),
             icon_path: Some("/tmp/demo.png".to_string()),
         }
     );
-    // The three identity flags are required and never defaulted: this form is
-    // written by `open <id>` alone, so a missing one is a bug in the parent and
-    // filling it in would hide exactly that.
+    // `dev`'s own source, the same form otherwise — one hidden subcommand
+    // serving both callers rather than a twin (see `OpenChildSource`).
+    assert_eq!(
+        command("__open --project /tmp/demo --identity dev.local.demo --name Demo"),
+        Command::OpenChild {
+            source: OpenChildSource::Project("/tmp/demo".to_string()),
+            identifier: "dev.local.demo".to_string(),
+            product_name: "Demo".to_string(),
+            icon_path: None,
+        }
+    );
+    // `--identity`/`--name` are required and never defaulted: this form is
+    // written by `open <id>` or `dev <path>` alone, so a missing one is a bug
+    // in the parent and filling it in would hide exactly that.
     for (missing, invocation) in [
-        ("--id", "__open --identity dev.local.demo --name Demo"),
         ("--identity", "__open --id demo --name Demo"),
         ("--name", "__open --id demo --identity dev.local.demo"),
     ] {
@@ -330,6 +349,15 @@ fn the_hidden_subcommands_stay_reachable_and_unlisted() {
             "{invocation:?} should name the missing {missing}"
         );
     }
+    // Neither source, or both: refused rather than guessed at.
+    assert!(refusal("__open --identity dev.local.demo --name Demo")
+        .message
+        .contains("--id or --project"));
+    assert!(
+        refusal("__open --id demo --project /tmp/demo --identity dev.local.demo --name Demo")
+            .message
+            .contains("not both")
+    );
 
     // Hidden means hidden: a user who reads about one in `--help` will
     // reasonably expect it to be theirs to type, and neither of these is.
