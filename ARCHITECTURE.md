@@ -72,10 +72,13 @@ second consumer exists to justify it. Not for tidiness.
 ## Where things live
 
 ```
-<OS data dir>/TFSApp/hub/apps/<id>/     the installed snapshot — what actually runs
-<OS data dir>/TFSApp/hub/registry.json  what is installed, from where, at what version
-<OS data dir>/TFSApp/hub/bin/php        the interpreter shim (see below)
-<OS data dir>/TFSApp/<identifier>/      the app's own data — CONTRACT.md §5
+<OS data dir>/TFSApp/hub/apps/<id>/          the installed snapshot — what actually runs
+<OS data dir>/TFSApp/hub/registry.json       what is installed, from where, at what version
+<OS data dir>/TFSApp/hub/bin/php             the interpreter shim (see below)
+<OS data dir>/TFSApp/hub/bin/tfsapp-hub      the stable hub copy .desktop entries point at
+<OS data dir>/TFSApp/<identifier>/           the app's own data — CONTRACT.md §5
+<OS data dir>/applications/<identifier>.desktop  the generated entry — XDG's own directory,
+                                                  a sibling of TFSApp/, not a child of it
 ```
 
 The last line is load-bearing and the reason the first three are siblings of it
@@ -135,6 +138,8 @@ open. In order:
    installed it.
 8. Write the version record into the data directory — **only** once every step
    above has succeeded.
+9. Refresh the stable copy of the hub itself, and write the app's `.desktop`
+   entry — best-effort, and skipped together by `--no-desktop-entry`.
 
 Step 8 is the one worth defending. The record is what decides whether a later
 moment is an install, an update, or a downgrade to refuse, and writing it
@@ -142,10 +147,43 @@ speculatively would make a failed install look like a completed one. A failure
 leaves the directory undated, so the next attempt replays the whole event rather
 than resuming into the middle of it.
 
+Step 9 runs **last**, after the app is registered and ready, for the same
+reason registration itself runs last: an entry advertising an app whose
+`composer install` failed would sit in the user's application grid pointing at
+nothing. The app is usable from the CLI before it is advertised anywhere else.
+A failure here — the copy or the entry — is a warning naming the path and the
+cause, never a reason to undo an install that has already succeeded.
+
 **No sidecar runs during an install.** Lifecycle commands get the full
 environment and a real database, on a terminal where a failure is legible — but
 they cannot reach their own app over HTTP, which is exactly what `CONTRACT.md`
 §6 tells app authors not to attempt.
+
+### The stable path a `.desktop` entry points at
+
+`Exec=` in a generated entry never names the AppImage the user downloaded —
+`~/Downloads/tfsapp-hub-0.3.0.AppImage` is a path a launcher cannot depend on,
+since tidying that folder would silently break every app's launcher at once.
+Every entry instead points at `<OS data dir>/TFSApp/hub/bin/tfsapp-hub`, a copy
+of the hub kept current beside the `php` shim, in the `bin/` directory the
+"Where things live" table above already gives the hub's own executables.
+
+The image copied is `$APPIMAGE` when the process is running as one, and
+`current_exe()` otherwise. That split exists because `current_exe()` resolves
+to a FUSE mount (`/tmp/.mount_XXXX/usr/bin/tfsapp-hub`) inside an AppImage — a
+path that disappears the moment the process exits, so a launcher built from it
+would point at nothing the next time it was clicked. `$APPIMAGE` is what the
+AppImage runtime exports for exactly this case.
+
+The replacement is a **rename**, not an in-place write: a temp file written
+beside the target, then renamed over it. Two apps sharing this one file is the
+ordinary case, not an edge case — one may be open from it while a second
+install refreshes it for a newer hub — and a rename swaps the whole inode
+atomically, so a process already running the old copy keeps running the
+generation it started with instead of meeting a half-written 170 MB binary or
+an `ETXTBSY`. It is also what hub self-update (queued, not yet built) will
+replace this same file with, which is the other reason it lives under the
+hub's own root rather than beside a per-app path.
 
 ## Opening an app
 

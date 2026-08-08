@@ -195,13 +195,22 @@ thing and the dock says another".
 Every surface fed by `identifier` reads `dev.<identifier>` instead, for a dev
 session — see §9.
 
-One consequence surprises people the first time and is not a defect. Until an
-app has a desktop entry, a desktop environment has no `Name=` to read and falls
-back to a label derived from the window class — which is the identifier. So an
-app with no entry installed can appear in the window switcher as
-`dev.local.labelboard` rather than as *LabelBoard*. The fix is the desktop
-entry, never the window class: the class has to be the identifier or nothing can
-match a window to its own app.
+**An installed app has a desktop entry, and this is the normal case.**
+Installing writes `Name=` from `product_name` and `Icon=` from `icon_path` at
+full size — the same fields and the same one-field-per-surface rule as the
+table above — to a per-user location with no root required. The user may
+decline it at install (`--no-desktop-entry`), and `remove` reverses it. An app
+must not ship a `.desktop` file of its own: the hub writes and owns the one
+that names it.
+
+One consequence surprises people the first time and is not a defect, and it is
+now the *exception's* behaviour rather than the rule's: without a desktop
+entry — a dev session (§9), or an install that declined one — a desktop
+environment has no `Name=` to read and falls back to a label derived from the
+window class, which is the identifier. So a window with no entry behind it can
+appear in the switcher as `dev.local.labelboard` rather than as *LabelBoard*.
+The fix is the desktop entry, never the window class: the class has to be the
+identifier or nothing can match a window to its own app.
 
 ### `app_version` is semver, and it is load-bearing
 
@@ -1001,6 +1010,10 @@ as the rest of this document: what the app sees, never how the hub does it.
   directory, the keyring namespace, all of it (§2). This is what lets the same
   project be open in dev and installed at once, in two windows, on two
   databases, neither able to see the other's.
+- A dev session installs nothing, so it has no desktop entry. Its window falls
+  back to the class-derived label §2 describes — `dev.<identifier>` rather
+  than `product_name` — which is a cost paid by the one person who can be told
+  why: the developer running it.
 
 ### What does not differ
 

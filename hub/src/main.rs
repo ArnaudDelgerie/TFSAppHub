@@ -8,7 +8,9 @@
 mod app_env;
 mod bridge;
 mod cli;
+mod desktop;
 mod dev;
+mod hub_bin;
 mod identity;
 mod install;
 mod launch;
@@ -94,11 +96,13 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             id,
             reference,
             assume_yes,
+            no_desktop_entry,
         } => install::run(
             &source,
             id.as_deref(),
             reference.as_deref(),
             assume_yes,
+            no_desktop_entry,
             // The same package info `--version` prints, threaded in rather than
             // read from `CARGO_PKG_VERSION` here: the registry records which
             // hub wrote it, and two ways of asking that question are one too

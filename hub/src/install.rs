@@ -33,6 +33,7 @@ use std::{
 use crate::{
     app_env::{self, EnvError},
     cli::{EXIT_FAILED, EXIT_OK},
+    desktop, hub_bin,
     lifecycle::{self, LifecycleError},
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
     paths::{Paths, PathsError},
@@ -45,11 +46,13 @@ use crate::{
 
 /// The whole command: install `source`, or say why not. Returns the process's
 /// exit code.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     source: &str,
     id: Option<&str>,
     reference: Option<&str>,
     assume_yes: bool,
+    no_desktop_entry: bool,
     hub_version: &str,
 ) -> i32 {
     let paths = match Paths::resolve() {
@@ -60,7 +63,15 @@ pub fn run(
         }
     };
 
-    match install(&paths, source, id, reference, assume_yes, hub_version) {
+    match install(
+        &paths,
+        source,
+        id,
+        reference,
+        assume_yes,
+        no_desktop_entry,
+        hub_version,
+    ) {
         Ok(Some(id)) => {
             println!("Installed {id}. `tfsapp-hub list` shows it.");
             EXIT_OK
@@ -80,12 +91,14 @@ pub fn run(
 /// Takes its `Paths` rather than resolving them, which is what lets the whole
 /// pipeline — copy, Composer, hooks, cleanup — run against a throwaway root in
 /// a test instead of the developer's real `~/.local/share/TFSApp/`.
+#[allow(clippy::too_many_arguments)]
 fn install(
     paths: &Paths,
     source: &str,
     id: Option<&str>,
     reference: Option<&str>,
     assume_yes: bool,
+    no_desktop_entry: bool,
     hub_version: &str,
 ) -> Result<Option<String>, InstallError> {
     let resolved = source::resolve(&source::classify(source), reference)?;
@@ -112,7 +125,7 @@ fn install(
     let platform = platform::probe(&toolchain.frankenphp)?.fingerprint();
 
     let app_dir = paths.app_dir(&id)?;
-    announce(&id, manifest, &resolved, &app_dir, paths)?;
+    announce(&id, manifest, &resolved, &app_dir, paths, no_desktop_entry)?;
     if !prompt::confirmed(assume_yes) {
         println!("Aborted — nothing was installed.");
         return Ok(None);
@@ -149,7 +162,33 @@ fn install(
         registry.upsert(entry);
     })?;
 
+    // Last of all, and best-effort: an app whose entry could not be written
+    // is still installed and still usable from the CLI, the entry is only a
+    // convenience, and a failure here must not undo the install above it.
+    if !no_desktop_entry {
+        write_desktop_entry(paths, &id, manifest, &app_dir);
+    }
+
     Ok(Some(id))
+}
+
+/// Refresh the stable hub copy and (re)write this app's desktop entry.
+///
+/// Both steps are best-effort: a failure is a warning naming the path and the
+/// cause, never a reason to fail an install that has already succeeded.
+fn write_desktop_entry(paths: &Paths, id: &str, manifest: &Manifest, app_dir: &Path) {
+    if let Err(error) = hub_bin::ensure_current(paths) {
+        eprintln!(
+            "tfsapp-hub: warning: could not refresh the stable hub copy at {}: {error}",
+            paths.hub_executable_path().display()
+        );
+    }
+
+    let identity = manifest.identity(app_dir);
+    match desktop::write(id, &identity, &paths.hub_executable_path(), paths) {
+        Ok(path) => println!("Desktop entry: {}", path.display()),
+        Err(error) => eprintln!("tfsapp-hub: warning: could not write the desktop entry: {error}"),
+    }
 }
 
 /// Say what is about to happen, in the terms the user will have to reason about
@@ -168,6 +207,7 @@ fn announce(
     resolved: &source::Resolved,
     app_dir: &Path,
     paths: &Paths,
+    no_desktop_entry: bool,
 ) -> Result<(), InstallError> {
     println!(
         "Install {} {} as \"{id}\":",
@@ -179,6 +219,13 @@ fn announce(
         "  data dir  {}",
         paths.app_data_dir(&manifest.identifier)?.display()
     );
+    if !no_desktop_entry {
+        println!(
+            "  entry     {}",
+            paths.desktop_entry_path(&manifest.identifier)?.display()
+        );
+        println!("  hub path  {}", paths.hub_executable_path().display());
+    }
     println!();
     println!(
         "This runs the app's own PHP on your machine: Composer's dependency\n\

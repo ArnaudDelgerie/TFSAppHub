@@ -124,7 +124,8 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "install",
-        form: "install <source> [--as <id>] [--ref <tag|branch|sha>] [--yes]",
+        form: "install <source> [--as <id>] [--ref <tag|branch|sha>] [--yes] \
+               [--no-desktop-entry]",
         summary: "Install an app from a local directory or a git URL.",
         level: Level::App,
         availability: Availability::Implemented,
@@ -280,6 +281,11 @@ pub enum Command {
         /// machine irreversibly ask first, and both take the same escape for a
         /// script — the spelling the station's own lifecycle flags established.
         assume_yes: bool,
+        /// `--no-desktop-entry`: skip both the generated `.desktop` entry and
+        /// the stable self-copy that only exists to be pointed at — a flag
+        /// that says "do not touch my desktop" should not leave a silent
+        /// 170 MB copy behind either.
+        no_desktop_entry: bool,
     },
     List,
     Open {
@@ -449,13 +455,19 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             assume_yes: assume_yes("--rollback", rest)?,
         }),
         "install" => {
-            let mut options = options("install", rest, &["--as", "--ref"], &["--yes", "-y"])?;
+            let mut options = options(
+                "install",
+                rest,
+                &["--as", "--ref"],
+                &["--yes", "-y", "--no-desktop-entry"],
+            )?;
             let source = options.exactly_one("install", "a source")?;
             Ok(Command::Install {
                 source,
                 id: options.value("--as"),
                 reference: options.value("--ref"),
                 assume_yes: options.assume_yes(),
+                no_desktop_entry: options.flag("--no-desktop-entry"),
             })
         }
         "list" => {
