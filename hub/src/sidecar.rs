@@ -125,10 +125,12 @@ pub fn start(
     toolchain: &Toolchain,
     app_dir: &Path,
     environment: &AppEnvironment,
-    async_worker: bool,
+    manifest: &crate::manifest::Manifest,
     lock: Option<fs::File>,
     app: &tauri::AppHandle,
 ) -> Result<(Sidecar, String), Box<dyn std::error::Error>> {
+    let async_worker = manifest.async_worker;
+    let actions = &manifest.actions;
     let url = format!("http://127.0.0.1:{}", environment.port);
     let pid_file = environment.data_dir.join("sidecar.pid");
 
@@ -150,6 +152,28 @@ pub fn start(
     // `.project/station-findings.md` #3.
     let mut envs = environment.vars.clone();
     envs.extend(toolchain.shim_env());
+
+    // Only when some group actually declares `bridge: true`: no thread, no port
+    // bound, and no `TFS_BRIDGE_*` in the app's environment otherwise. §3 makes
+    // those two variables conditional on a bridge *running*, and
+    // present-but-dead would be worse than absent — an app would open a
+    // connection to nothing.
+    if actions.secrets.bridge || actions.update.bridge {
+        let bridge = crate::bridge::start(
+            environment.secret_store.clone(),
+            actions.secrets.keys.clone(),
+            crate::bridge::BridgeGroups {
+                secrets: actions.secrets.bridge,
+                update: actions.update.bridge,
+            },
+        )
+        .map_err(|error| format!("Cannot start the actions bridge: {error}"))?;
+        envs.push((
+            "TFS_BRIDGE_URL",
+            format!("http://127.0.0.1:{}", bridge.port),
+        ));
+        envs.push(("TFS_BRIDGE_TOKEN", bridge.token));
+    }
 
     // The app's own stdout and stderr have nowhere to go when it was launched
     // from a desktop entry, so they are redirected rather than inherited. The

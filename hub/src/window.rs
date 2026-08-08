@@ -145,6 +145,48 @@ fn with_window_policy<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
         })
 }
 
+/// One `actions` group's runtime IPC identity: the capability name Tauri's ACL
+/// uses internally, and the permission (declared in `permissions/<group>.toml`)
+/// it grants when the app's manifest turns that group's `ipc` on.
+pub struct ActionIpcGrant {
+    capability_identifier: &'static str,
+    permission: &'static str,
+}
+
+pub const SECRETS_IPC_GRANT: ActionIpcGrant = ActionIpcGrant {
+    capability_identifier: "actions-secrets",
+    permission: "allow-secrets",
+};
+pub const UPDATE_IPC_GRANT: ActionIpcGrant = ActionIpcGrant {
+    capability_identifier: "actions-update",
+    permission: "allow-update",
+};
+
+/// The table the launch walks, pairing each group's `ipc` flag with the grant it
+/// activates. A third group is one entry here, not another `if` at the call
+/// site — and the pairing is what keeps the groups independent, so one group's
+/// grant can never imply another's.
+pub type ActionIpcGrantEntry = (fn(&crate::manifest::ActionsConfig) -> bool, ActionIpcGrant);
+
+pub const ACTION_IPC_GRANTS: &[ActionIpcGrantEntry] = &[
+    (|actions| actions.secrets.ipc, SECRETS_IPC_GRANT),
+    (|actions| actions.update.ipc, UPDATE_IPC_GRANT),
+];
+
+/// Build one group's runtime capability grant.
+///
+/// `main*` rather than a literal `main`, because a relaunch adds `main-2`,
+/// `main-3`, … and a capability scoped to the first window alone would refuse
+/// every window after it. `remote` covers the backend's own origin, which is
+/// where the app's pages are actually served from — the port is not known when
+/// this is built, hence the wildcard.
+pub fn action_capability(grant: &ActionIpcGrant) -> tauri::ipc::CapabilityBuilder {
+    tauri::ipc::CapabilityBuilder::new(grant.capability_identifier)
+        .window("main*")
+        .remote("http://127.0.0.1:*".to_string())
+        .permission(grant.permission)
+}
+
 /// The script that dresses the hub's splash page in the app's own colours.
 ///
 /// **What the hub honours, and what it does not.** `splash_bg` and `splash_text`

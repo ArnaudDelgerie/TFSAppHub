@@ -71,6 +71,11 @@ pub struct AppEnvironment {
     /// `vars` would work and would be one string parse away from a launch that
     /// silently polls the wrong port.
     pub port: u16,
+    /// The store `APP_SECRET` was resolved against, carried out so the launch
+    /// can hand the very same instance to the IPC commands and the bridge — one
+    /// keyring probe per launch, and no way for two of them to disagree about
+    /// which backend is in use.
+    pub secret_store: crate::secrets::SecretStore,
 }
 
 /// Assemble CONTRACT.md §3 for `manifest`'s app, installed at `app_dir`.
@@ -149,14 +154,14 @@ pub fn resolve(
     let origin = format!("http://127.0.0.1:{port}");
     let mercure_url = format!("{origin}/.well-known/mercure");
 
-    // The file-backed half of CONTRACT.md §6's `APP_SECRET`, deliberately: the
-    // keyring-backed store lands in plan 007 with the rest of `secrets`, and
-    // the contract's own resolution order makes this forward-compatible — an
-    // existing keyring entry always wins, and a file left here is *migrated*
-    // into the keyring rather than competing with it. Stable across the
-    // install's commands and whatever runs later, which is what anything
-    // Symfony signs needs.
-    let app_secret = tfsapp_core::app_secret::load_or_create_app_secret(&data_subdir)
+    // The real store, probed once here — for an install exactly as for a
+    // launch. Both write `APP_SECRET`, and having one of them write a plaintext
+    // file while the other used the keyring would leave a secret on disk that
+    // nothing needed. CONTRACT.md §6's resolution order does the rest: an
+    // existing keyring entry always wins, and a file from an older installation
+    // is migrated into the keyring rather than competing with it.
+    let secret_store = crate::secrets::new_store(&manifest.identifier, &data_subdir);
+    let app_secret = crate::secrets::resolve_app_secret(&secret_store, &data_subdir)
         .map_err(|error| EnvError::Secret(error.to_string()))?;
     // Purely internal, never persisted: the same loopback process signs and
     // validates these, so a fresh one per invocation is strictly better than a
@@ -198,11 +203,13 @@ pub fn resolve(
             }
             .to_string(),
         ),
-        // Zero, and true while it is written: no secret store is opened during
-        // an install, so the store backing `APP_SECRET` here is the file
-        // fallback and an app is right to warn its user about degraded secret
-        // storage. Plan 007 opens the real store and this value follows it.
-        ("TFS_KEYRING_AVAILABLE", "0".to_string()),
+        // What the probe above actually picked, not whether a keyring is
+        // installed: a present-but-locked one has already fallen back to the
+        // file, and an app is entitled to warn its user on that basis.
+        (
+            "TFS_KEYRING_AVAILABLE",
+            crate::secrets::keyring_env_value(&secret_store).to_string(),
+        ),
         ("TFS_APP_IDENTIFIER", manifest.identifier.clone()),
         ("TFS_APP_VERSION", manifest.app_version.clone()),
     ];
@@ -218,6 +225,7 @@ pub fn resolve(
         data_subdir,
         log_dir,
         port,
+        secret_store,
     })
 }
 

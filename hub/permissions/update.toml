@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-update"
+description = "Allows an app's frontend to reach actions.update over Tauri's own IPC (update_check) — the same check its Symfony side can reach over the HTTP bridge when it declares bridge: true. One permission for the group's one command, matching the all-or-nothing actions.update.ipc granularity (see CONTRACT.md §2). The hub answers this check `unavailable`: it updates an app from the source the registry records, not from a release feed (see update.rs)."
+commands.allow = ["update_check"]

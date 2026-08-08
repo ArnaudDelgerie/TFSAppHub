@@ -94,3 +94,26 @@ friction and co-residency, not the kind of risk.
 No sandbox is claimed. Sources default to a pinned tag or commit, never a branch.
 For a developer audience this is exactly `composer require`, and pretending
 otherwise would be worse than saying it.
+
+### Stored secrets are namespaced, not isolated
+
+Each app's secrets — its `APP_SECRET`, and anything it declares under
+`actions.secrets.keys` — go into the OS keyring under that app's `identifier` as
+the service name. That keeps two apps from **colliding**. It does not keep them
+from **reading each other**.
+
+The Secret Service authorises per login session, so any process running as this
+user can list and read any service's entries. This is not something the hub
+introduces: the same read succeeds today between two installed standalone
+AppImages, and it would succeed against any other application on the desktop that
+uses the same keyring. Key prefixing would not help — a reader lists entries, it
+does not guess their names.
+
+Where the hub *is* strict is in what it hands to an app's own code: a webview
+reaches its secret store through the window it belongs to, never by naming one,
+so an app cannot ask the hub for another app's secrets. What it cannot prevent is
+that app asking the keyring directly, exactly as any program on the machine can.
+
+The only real fix is sandboxing the processes, which is a change of distribution
+format and is not on the roadmap. Read per-`identifier` storage as tidiness, not
+as secrecy.

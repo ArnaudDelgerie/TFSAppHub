@@ -6,6 +6,7 @@
 // `cli.rs` stay at ~215 lines across sixty plans.
 
 mod app_env;
+mod bridge;
 mod cli;
 mod identity;
 mod install;
@@ -19,8 +20,10 @@ mod platform;
 mod prompt;
 mod registry;
 mod remove;
+mod secrets;
 mod sidecar;
 mod source;
+mod update;
 mod window;
 mod worker;
 
@@ -264,6 +267,21 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
         lock,
     } = prepare(id, &identity);
 
+    // The app's `actions` groups, granted at runtime, before `Builder` — the
+    // only window in which they can be: `add_capability` lives on `Context` and
+    // has no equivalent once `Builder::run` has taken over. The static
+    // `capabilities/default.json` grants nothing at all, so an `invoke` for a
+    // group this app did not declare is refused by Tauri's own ACL before any
+    // handler runs. Registering the commands is not the boundary; this is.
+    for (declared, grant) in window::ACTION_IPC_GRANTS {
+        if declared(&resolved.manifest.actions) {
+            context
+                .runtime_authority_mut()
+                .add_capability(window::action_capability(grant))
+                .expect("a valid action capability");
+        }
+    }
+
     // One slot per process, shared by every window this process builds: the
     // splash's navigation policy needs to read the backend's origin, and the
     // splash is built long before that origin exists.
@@ -301,6 +319,17 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
             },
         ))
         .plugin(tauri_plugin_dialog::init())
+        // Registered unconditionally in both cases — registration is not the
+        // boundary, the ACL grant above is. With a group's `ipc` off, nothing
+        // grants its permission and `invoke()` is refused before a handler runs.
+        .invoke_handler(tauri::generate_handler![
+            secrets::secret_has,
+            secrets::secret_get,
+            secrets::secret_set,
+            secrets::secret_delete,
+            secrets::secret_list,
+            update::update_check,
+        ])
         .setup(move |app| {
             // Greyscale rather than subpixel text antialiasing, for every
             // WebView this process creates. It has to run after Tauri has
@@ -394,11 +423,17 @@ fn serve(
         Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
     };
 
+    // Managed before the sidecar starts, so the IPC commands can never meet a
+    // window without a store behind it: `secrets.rs` resolves both from the
+    // calling window and has nothing else to fall back on.
+    app.manage(environment.secret_store.clone());
+    app.manage(manifest.actions.secrets.clone());
+
     let (sidecar, url) = match sidecar::start(
         &toolchain,
         &resolved.app_dir,
         &environment,
-        manifest.async_worker,
+        manifest,
         lock,
         &app,
     ) {
