@@ -1,6 +1,6 @@
 use std::fs;
 
-use super::{resolve, DevError};
+use super::{child_args, resolve, DevError};
 use crate::launch::Source;
 
 /// A minimal but complete project: a manifest, `bin/console`,
@@ -58,6 +58,33 @@ fn an_icon_resolves_inside_the_project_unprefixed() {
     assert_eq!(
         spec.identity.icon_path.as_deref(),
         Some(dir.path().join("assets/icon.png").as_path())
+    );
+}
+
+#[test]
+fn the_child_argv_carries_the_project_path_not_an_id() {
+    let dir = tempfile::tempdir().expect("a temp project dir");
+    project(dir.path(), "dev.local.demo", Some("assets/icon.png"));
+
+    let spec = resolve(dir.path().to_str().expect("a utf8 path")).expect("a resolvable project");
+    let args = child_args(&spec);
+
+    // `--project`, never `--id`: this is the dev counterpart of
+    // `open::child_args`, and the source it carries is a path, not a
+    // registered handle.
+    assert_eq!(
+        args,
+        vec![
+            "__open".to_string(),
+            "--project".to_string(),
+            dir.path().display().to_string(),
+            "--identity".to_string(),
+            "dev.dev.local.demo".to_string(),
+            "--name".to_string(),
+            "Demo App".to_string(),
+            "--icon".to_string(),
+            dir.path().join("assets/icon.png").display().to_string(),
+        ]
     );
 }
 

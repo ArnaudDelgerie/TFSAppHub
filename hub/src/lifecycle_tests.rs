@@ -1,8 +1,8 @@
 use std::fs;
 
 use super::{
-    lifecycle_decision, read_data_version, write_data_version, LifecycleDecisionError,
-    LifecycleError, LifecycleEvent,
+    lifecycle_decision, prepare_dev_launch, read_data_version, write_data_version,
+    LifecycleDecisionError, LifecycleError, LifecycleEvent,
 };
 
 fn version(text: &str) -> semver::Version {
@@ -117,6 +117,24 @@ fn writing_a_version_leaves_no_temp_file_behind() {
     // The write is temp-file-plus-rename so a crash can never leave a truncated
     // record; the rename is also what must leave nothing beside it.
     assert!(!data_subdir.path().join("config.json.tmp").exists());
+}
+
+// --- prepare_dev_launch ----------------------------------------------------
+
+#[test]
+fn a_dev_launch_takes_the_lock_and_writes_no_version_record() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let data_subdir = data_dir.path().join("data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+
+    let lock = prepare_dev_launch(data_dir.path(), &data_subdir, "dev.local.demo", None);
+
+    assert!(lock.is_some(), "a fresh dev session takes the lock");
+    // The load-bearing difference from `prepare_launch`: no version guard
+    // runs, so nothing is ever stamped here — an author editing
+    // `app_version` in their own tree must never be refused a launch or
+    // have a stray record written under it.
+    assert!(!data_subdir.join("config.json").exists());
 }
 
 #[test]

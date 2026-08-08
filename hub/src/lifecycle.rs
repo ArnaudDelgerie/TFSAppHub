@@ -218,6 +218,32 @@ pub fn prepare_launch(
     lock
 }
 
+/// The dev variant of [`prepare_launch`]: the same reap and liveness lock, the
+/// same port guard, but never the version guard — a dev session was never
+/// installed, so there is no `data/config.json` to compare `app_version`
+/// against, and none is written (plan 009 step 4). Lifecycle hooks stay out of
+/// both: `pre-install`/`post-install`/`pre-update`/`post-update` belong to
+/// `install`/`update`, and a dev launch is neither.
+///
+/// `id` and `data_subdir` from [`prepare_launch`] have no dev counterpart to
+/// pass, since there is no version guard here to name an app to or a
+/// `config.json` to write.
+pub fn prepare_dev_launch(
+    data_dir: &Path,
+    data_subdir: &Path,
+    identifier: &str,
+    app_port: Option<u16>,
+) -> Option<fs::File> {
+    let lock =
+        tfsapp_core::process::cleanup_previous_sidecar(&data_dir.join("sidecar.pid"), identifier);
+
+    lock.as_ref()?;
+
+    check_port(app_port, data_subdir);
+
+    lock
+}
+
 /// The version guard: decide the event, and refuse the three outcomes an app
 /// cannot be opened under.
 fn check_version(id: &str, data_subdir: &Path, app_version: &str) -> LifecycleEvent {

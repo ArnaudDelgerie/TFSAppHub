@@ -15,9 +15,10 @@
 //! project's own, unprefixed, because a user should never read "dev." in a
 //! window title.
 
-use std::{fmt, path::PathBuf};
+use std::{fmt, path::PathBuf, process::Command};
 
 use crate::{
+    cli::{EXIT_FAILED, OPEN_CHILD_SUBCOMMAND},
     identity::Identity,
     launch::{LaunchSpec, Source},
     manifest::{self, ManifestError},
@@ -26,6 +27,80 @@ use crate::{
 /// The runtime-identity namespace a dev session's identifier is prefixed
 /// with — see the module header.
 pub const DEV_IDENTIFIER_PREFIX: &str = "dev.";
+
+/// The whole command, parent side. Returns the process's exit code.
+///
+/// **Foreground, unlike `open::run`.** `open` is a launcher: it resolves,
+/// spawns, and hands the prompt back. `dev` is a loop the developer is
+/// watching, and `Ctrl-C` has to stop it — so this parent stays up, forwards
+/// `SIGINT`/`SIGTERM` to the child, waits on it, and exits with its status
+/// (`.project/plan/009-dev-local-source.md` step 4).
+///
+/// The child cannot use `spawn_signal_forwarder` as it stands: that helper
+/// gates on `TFS_APP_IDENTIFIER` in the target's `/proc/<pid>/environ`, which
+/// only the *sidecar* carries by default — the hub's own re-executed child
+/// does not. Rather than teach the forwarder a second rule, this sets the
+/// same marker on the child directly, so the one rule
+/// `core::process::terminate_if_identifier_matches` already checks
+/// everywhere else holds here too.
+pub fn run(path: &str) -> i32 {
+    let spec = match resolve(path) {
+        Ok(spec) => spec,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    for warning in &spec.warnings {
+        eprintln!("tfsapp-hub: warning: {warning}");
+    }
+
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            eprintln!(
+                "tfsapp-hub: cannot find the hub's own binary to run the project with: {error}"
+            );
+            return EXIT_FAILED;
+        }
+    };
+
+    let mut command = Command::new(&executable);
+    command.args(child_args(&spec));
+    command.env("TFS_APP_IDENTIFIER", &spec.identity.identifier);
+    tfsapp_core::process::set_own_process_group(&mut command);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("tfsapp-hub: cannot start {}: {error}", executable.display());
+            return EXIT_FAILED;
+        }
+    };
+
+    match tfsapp_core::process::install_signal_forwarding() {
+        Ok(read_fd) => tfsapp_core::process::spawn_signal_forwarder(
+            read_fd,
+            child.id(),
+            spec.identity.identifier.clone(),
+        ),
+        Err(error) => {
+            // Not fatal, and degrades the same way
+            // `lifecycle::install_shutdown_on_signal` does: the session runs
+            // exactly as it would have, just without Ctrl-C forwarding an
+            // orderly shutdown to the child.
+            eprintln!("tfsapp-hub: cannot install signal handling: {error}");
+        }
+    }
+
+    match child.wait() {
+        Ok(status) => status.code().unwrap_or(EXIT_FAILED),
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            EXIT_FAILED
+        }
+    }
+}
 
 /// The live constructor of [`LaunchSpec`]: check the project looks like a
 /// TFSApp, load its manifest, and build the spec dev's own launch pipeline
@@ -77,6 +152,30 @@ pub fn resolve(project_path: &str) -> Result<LaunchSpec, DevError> {
         label,
         warnings: loaded.warnings,
     })
+}
+
+/// The child's argv, after the binary's own name — the dev counterpart of
+/// `open::child_args`, `--project <path>` in place of `--id <id>`. See that
+/// function for why the identity travels as arguments rather than being
+/// re-derived by the child.
+///
+/// Only ever called on a [`Source::Live`] spec — `resolve` above is this
+/// module's only constructor, and it never builds an `Installed` one.
+pub fn child_args(spec: &LaunchSpec) -> Vec<String> {
+    let mut args = vec![
+        OPEN_CHILD_SUBCOMMAND.to_string(),
+        "--project".to_string(),
+        spec.app_dir.display().to_string(),
+        "--identity".to_string(),
+        spec.identity.identifier.clone(),
+        "--name".to_string(),
+        spec.identity.product_name.clone(),
+    ];
+    if let Some(icon) = &spec.identity.icon_path {
+        args.push("--icon".to_string());
+        args.push(icon.display().to_string());
+    }
+    args
 }
 
 /// Every way `dev <path>` can be refused before anything is spawned.

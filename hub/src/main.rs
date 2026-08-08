@@ -109,6 +109,8 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         // Resolves and re-executes; the window itself belongs to the child this
         // returns from, which is why the parent has an exit code to give at all.
         Command::Open { id } => open::run(&id),
+        // Foreground, unlike `open` — see `dev::run`.
+        Command::Dev { path } => dev::run(&path),
         Command::Remove {
             id,
             purge,
@@ -241,15 +243,25 @@ fn prepare(source: &OpenChildSource, identity: &Identity) -> Launching {
 
     // `spec.label` rather than a hub-local id: a dev session has none to give,
     // and the label is the same thing a message about this launch would call
-    // it either way (plan 009 step 1).
-    let lock = lifecycle::prepare_launch(
-        &spec.label,
-        &data_dir,
-        &data_subdir,
-        &identity.identifier,
-        &spec.manifest.app_version,
-        spec.manifest.app_port,
-    );
+    // it either way (plan 009 step 1). The two sources part ways here too: an
+    // installed launch runs every guard, a dev one skips the version guard and
+    // writes no `data/config.json` — see `lifecycle::prepare_dev_launch`.
+    let lock = match &spec.source {
+        launch::Source::Installed { .. } => lifecycle::prepare_launch(
+            &spec.label,
+            &data_dir,
+            &data_subdir,
+            &identity.identifier,
+            &spec.manifest.app_version,
+            spec.manifest.app_port,
+        ),
+        launch::Source::Live => lifecycle::prepare_dev_launch(
+            &data_dir,
+            &data_subdir,
+            &identity.identifier,
+            spec.manifest.app_port,
+        ),
+    };
 
     Launching { paths, spec, lock }
 }
