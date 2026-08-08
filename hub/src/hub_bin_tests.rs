@@ -28,7 +28,10 @@ fn the_copy_is_executable() {
 
     ensure_current_at(&source, &target).expect("the copy is written");
 
-    let mode = fs::metadata(&target).expect("it exists").permissions().mode();
+    let mode = fs::metadata(&target)
+        .expect("it exists")
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o777, 0o755);
 }
 
@@ -60,8 +63,15 @@ fn a_current_copy_is_left_untouched() {
     let outcome = ensure_current_at(&source, &target).expect("the second call");
 
     assert_eq!(outcome, Outcome::Current);
-    let mode = fs::metadata(&target).expect("it exists").permissions().mode();
-    assert_eq!(mode & 0o777, 0o700, "a no-op must not have rewritten the file");
+    let mode = fs::metadata(&target)
+        .expect("it exists")
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o777,
+        0o700,
+        "a no-op must not have rewritten the file"
+    );
 }
 
 #[test]
@@ -90,8 +100,8 @@ fn the_appimage_path_is_preferred_over_current_exe() {
 fn current_exe_is_the_fallback_with_no_appimage() {
     let fallback = PathBuf::from("/usr/local/bin/tfsapp-hub");
 
-    let resolved = resolve_running_image(None, || Ok(fallback.clone()))
-        .expect("the fallback resolves");
+    let resolved =
+        resolve_running_image(None, || Ok(fallback.clone())).expect("the fallback resolves");
 
     assert_eq!(resolved, fallback);
 }

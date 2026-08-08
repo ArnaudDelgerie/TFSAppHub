@@ -97,7 +97,8 @@ fn the_desktop_entry_path_is_named_after_the_identifier() {
         paths
             .desktop_entry_path("dev.local.tfsapp-test")
             .expect("a safe identifier"),
-        base.path().join("applications/dev.local.tfsapp-test.desktop")
+        base.path()
+            .join("applications/dev.local.tfsapp-test.desktop")
     );
 }
 

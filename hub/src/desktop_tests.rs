@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::{carries_marker, render, remove, write, RemovalOutcome};
+use super::{carries_marker, remove, render, write, RemovalOutcome};
 use crate::{identity::Identity, paths::Paths};
 
 fn temp_paths() -> (tempfile::TempDir, Paths) {
@@ -77,11 +77,7 @@ fn no_icon_declared_means_no_icon_line() {
 
 #[test]
 fn a_product_name_with_a_quote_and_a_newline_is_escaped_but_not_quoted() {
-    let entity = identity(
-        "dev.local.tfsapp-test",
-        "The \"Best\" App\nEver",
-        None,
-    );
+    let entity = identity("dev.local.tfsapp-test", "The \"Best\" App\nEver", None);
 
     let rendered = render("tfsapp-test", &entity, Path::new("/hub/tfsapp-hub"));
 
@@ -102,8 +98,7 @@ fn a_hub_path_with_a_space_and_a_percent_is_quoted_and_doubled() {
         Path::new("/home/a b/tfsapp hub/tfsapp-hub%"),
     );
 
-    assert!(rendered
-        .contains("Exec=\"/home/a b/tfsapp hub/tfsapp-hub%%\" open tfsapp-test\n"));
+    assert!(rendered.contains("Exec=\"/home/a b/tfsapp hub/tfsapp-hub%%\" open tfsapp-test\n"));
 }
 
 #[test]
@@ -151,8 +146,11 @@ fn a_foreign_file_with_no_marker_is_left_alone() {
         .desktop_entry_path(identifier)
         .expect("a safe identifier");
     std::fs::create_dir_all(paths.applications_dir()).expect("the applications dir");
-    std::fs::write(&path, "[Desktop Entry]\nType=Application\nName=Hand Written\n")
-        .expect("a hand-written entry");
+    std::fs::write(
+        &path,
+        "[Desktop Entry]\nType=Application\nName=Hand Written\n",
+    )
+    .expect("a hand-written entry");
 
     let outcome = remove("tfsapp-test", identifier, &paths).expect("removal does not error");
 

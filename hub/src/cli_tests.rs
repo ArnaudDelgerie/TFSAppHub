@@ -56,6 +56,7 @@ fn bare_words_route_to_an_app() {
             id: None,
             reference: None,
             assume_yes: false,
+            no_desktop_entry: false,
         }
     );
     assert_eq!(
@@ -65,6 +66,17 @@ fn bare_words_route_to_an_app() {
             id: Some("demo".to_string()),
             reference: Some("v1.4.0".to_string()),
             assume_yes: true,
+            no_desktop_entry: false,
+        }
+    );
+    assert_eq!(
+        command("install ../TFSAppTest --no-desktop-entry"),
+        Command::Install {
+            source: "../TFSAppTest".to_string(),
+            id: None,
+            reference: None,
+            assume_yes: false,
+            no_desktop_entry: true,
         }
     );
     assert_eq!(command("list"), Command::List);

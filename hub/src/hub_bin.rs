@@ -24,11 +24,6 @@
 //! a concurrent execution keeps running the generation it started with and
 //! never meets `ETXTBSY` or a half-written 170 MB launcher.
 
-// `install` (step 4 of this plan) is the first real caller of
-// `ensure_current`; until then this module's own tests are its only caller.
-// Remove the allow with that first real consumer rather than letting it linger.
-#![allow(dead_code)]
-
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
@@ -173,7 +168,10 @@ fn write_copy(source: &Path, source_meta: &fs::Metadata, target: &Path) -> Resul
 pub enum HubBinError {
     /// Neither `$APPIMAGE` nor `current_exe()` named a running image.
     NoRunningImage(io::Error),
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for HubBinError {

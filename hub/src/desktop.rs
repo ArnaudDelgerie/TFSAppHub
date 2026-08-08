@@ -21,8 +21,6 @@
 //! it wrote, for the app being removed; a hand-written or foreign file at the
 //! same path is left alone and said so.
 
-#![allow(dead_code)]
-
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
@@ -41,10 +39,7 @@ pub fn render(id: &str, identity: &Identity, hub_executable: &Path) -> String {
     entry.push_str("[Desktop Entry]\n");
     entry.push_str("Type=Application\n");
     entry.push_str("Version=1.0\n");
-    entry.push_str(&format!(
-        "Name={}\n",
-        escape_value(&identity.product_name)
-    ));
+    entry.push_str(&format!("Name={}\n", escape_value(&identity.product_name)));
     entry.push_str(&format!(
         "Exec={} open {}\n",
         exec_argument(hub_executable),
@@ -177,9 +172,7 @@ pub fn remove(id: &str, identifier: &str, paths: &Paths) -> Result<RemovalOutcom
 
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(RemovalOutcome::Absent)
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(RemovalOutcome::Absent),
         Err(source) => return Err(DesktopError::Io { path, source }),
     };
 

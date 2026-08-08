@@ -452,6 +452,9 @@ fn an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order() {
         None,
         None,
         true,
+        // Unrelated to this test's own concern, and a real copy of the test
+        // binary is not worth paying for here.
+        true,
         "0.1.0",
     )
     .expect("it installs");
@@ -488,6 +491,7 @@ fn a_failing_hook_leaves_no_directory_and_nothing_registered() {
         None,
         None,
         true,
+        true,
         "0.1.0",
     )
     .expect_err("the hook fails, so the install must");
@@ -506,5 +510,71 @@ fn a_failing_hook_leaves_no_directory_and_nothing_registered() {
             .apps
             .is_empty(),
         "nothing may be registered before the hooks succeed"
+    );
+}
+
+#[test]
+fn an_install_writes_the_desktop_entry_and_the_stable_hub_copy() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    runnable_app_tree(source.path(), "{}");
+
+    super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        false,
+        "0.1.0",
+    )
+    .expect("it installs");
+
+    let entry = paths
+        .desktop_entry_path("dev.local.demo")
+        .expect("a safe identifier");
+    assert!(
+        entry.is_file(),
+        "the desktop entry must exist at {}",
+        entry.display()
+    );
+    assert!(
+        paths.hub_executable_path().is_file(),
+        "the stable hub copy must exist"
+    );
+}
+
+#[test]
+fn no_desktop_entry_writes_neither_the_entry_nor_the_copy() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    runnable_app_tree(source.path(), "{}");
+
+    super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("it installs");
+
+    let entry = paths
+        .desktop_entry_path("dev.local.demo")
+        .expect("a safe identifier");
+    assert!(!entry.exists(), "--no-desktop-entry must write no entry");
+    assert!(
+        !paths.hub_executable_path().exists(),
+        "--no-desktop-entry must not leave a self-copy behind either"
     );
 }

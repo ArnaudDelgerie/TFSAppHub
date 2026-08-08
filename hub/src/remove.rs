@@ -46,6 +46,7 @@ use std::{
 
 use crate::{
     cli::{EXIT_FAILED, EXIT_OK},
+    desktop::{self, RemovalOutcome},
     manifest,
     paths::{Paths, PathsError},
     prompt,
@@ -121,6 +122,15 @@ fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool
     println!("  registry entry: removed");
 
     report("installed app", remove_directory(&plan.app_dir));
+    // Code-side, not data — the entry points at a snapshot that is being
+    // deleted — so plain `remove` takes it exactly as it takes `apps/<id>/`;
+    // `--purge` adds nothing here. The stable hub copy the entry's `Exec=`
+    // points at is left alone: it is the hub's own file, and another
+    // installed app's launcher points at it.
+    report(
+        "desktop entry",
+        desktop::remove(&plan.id, &plan.identifier, paths).map(desktop_removal_status),
+    );
     if purge {
         report("data dir", remove_directory(&plan.data_dir));
         report("WebKit data dir", remove_directory(&plan.webkit_data_dir));
@@ -145,6 +155,12 @@ struct RemovalPlan {
     id: String,
     identifier: String,
     app_dir: PathBuf,
+    /// The `.desktop` entry `install` may have written — code-side, taken by
+    /// plain `remove` exactly as `app_dir` is, whether or not this app
+    /// actually has one or the hub wrote it. [`desktop::remove`] is what
+    /// decides that at execution time; announcing the path ahead of it is not
+    /// a promise, only where the hub will look.
+    desktop_entry: PathBuf,
     data_dir: PathBuf,
     /// `<OS data dir>/<identifier>/` — WebKitGTK's own per-identifier website
     /// data (CONTRACT.md §5/§6), a *sibling* of `TFSApp/` and not nested under
@@ -178,6 +194,7 @@ fn plan(
     Ok(RemovalPlan {
         id: id.to_string(),
         app_dir,
+        desktop_entry: paths.desktop_entry_path(identifier)?,
         data_dir: paths.app_data_dir(identifier)?,
         webkit_data_dir: paths.webkit_data_dir(identifier)?,
         identifier: identifier.to_string(),
@@ -190,6 +207,7 @@ fn announce(plan: &RemovalPlan, purge: bool) {
     println!("Remove {} ({}):", plan.id, plan.identifier);
     println!("  - {}", plan.app_dir.display());
     println!("  - its registry entry");
+    println!("  - {} (if the hub wrote it)", plan.desktop_entry.display());
 
     match purge {
         true => {
@@ -222,17 +240,33 @@ fn announce(plan: &RemovalPlan, purge: bool) {
 /// An already-absent directory is a success, not an error: `remove` has to be
 /// re-runnable after a partial failure without the second run reporting
 /// problems the first one fixed.
-fn remove_directory(path: &Path) -> Result<bool, std::io::Error> {
+fn remove_directory(path: &Path) -> Result<&'static str, std::io::Error> {
     if !path.exists() {
-        return Ok(false);
+        return Ok("already clean");
     }
-    fs::remove_dir_all(path).map(|()| true)
+    fs::remove_dir_all(path)?;
+    Ok("removed")
 }
 
-fn report(label: &str, outcome: Result<bool, std::io::Error>) {
+/// [`desktop::RemovalOutcome`] in the same one-word-or-so vocabulary
+/// [`remove_directory`]'s outcomes are reported in, plus the third state a
+/// plain directory removal has no equivalent for: a file at the path that
+/// this hub did not write.
+fn desktop_removal_status(outcome: RemovalOutcome) -> &'static str {
     match outcome {
-        Ok(true) => println!("  {label}: removed"),
-        Ok(false) => println!("  {label}: already clean"),
+        RemovalOutcome::Removed => "removed",
+        RemovalOutcome::Absent => "already clean",
+        RemovalOutcome::LeftAlone => "left alone (not written by tfsapp-hub)",
+    }
+}
+
+/// Shared by every zone a removal touches, `desktop::remove`'s `DesktopError`
+/// included — generic over the error type rather than tied to `io::Error`, so
+/// the desktop entry's own error type reports through the same line as
+/// everything else.
+fn report<E: fmt::Display>(label: &str, outcome: Result<&'static str, E>) {
+    match outcome {
+        Ok(status) => println!("  {label}: {status}"),
         Err(error) => println!("  {label}: FAILED ({error})"),
     }
 }

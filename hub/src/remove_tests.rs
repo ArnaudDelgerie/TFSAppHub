@@ -2,6 +2,7 @@ use std::fs;
 
 use super::{plan, remove, RemoveError, APP_SECRET_ACCOUNT, PROBE_ACCOUNT};
 use crate::{
+    identity::Identity,
     paths::Paths,
     registry::{now_timestamp, Platform, Registry, RegistryEntry, Source, SourceKind, State},
 };
@@ -135,6 +136,60 @@ fn a_purge_takes_the_data_with_it() {
 
     assert!(!data_dir.exists(), "the data dir goes with --purge");
     assert!(!webkit_dir.exists(), "so does WebKit's own");
+}
+
+#[test]
+fn a_remove_takes_the_entry_it_wrote_and_leaves_the_stable_copy_alone() {
+    let (_base, paths) = temp_paths();
+    installed_snapshot(&paths, "demo");
+    registry::save_entry(&paths, "demo");
+
+    let identity = Identity {
+        identifier: IDENTIFIER.to_string(),
+        product_name: "Demo App".to_string(),
+        icon_path: None,
+    };
+    let hub_executable = paths.hub_executable_path();
+    fs::create_dir_all(hub_executable.parent().expect("a bin dir")).expect("the hub's own bin dir");
+    fs::write(&hub_executable, "not really a binary").expect("the stable hub copy");
+    crate::desktop::write("demo", &identity, &hub_executable, &paths)
+        .expect("the entry is written");
+    let entry = paths
+        .desktop_entry_path(IDENTIFIER)
+        .expect("a safe identifier");
+    assert!(entry.is_file(), "the entry must exist before removal");
+
+    assert!(remove(&paths, "demo", false, true).expect("it removes"));
+
+    assert!(!entry.exists(), "the entry this hub wrote must be gone");
+    assert!(
+        hub_executable.is_file(),
+        "the stable copy is the hub's own file, shared by every app's entry"
+    );
+}
+
+#[test]
+fn a_remove_leaves_an_unmarked_entry_untouched() {
+    let (_base, paths) = temp_paths();
+    installed_snapshot(&paths, "demo");
+    registry::save_entry(&paths, "demo");
+
+    let entry = paths
+        .desktop_entry_path(IDENTIFIER)
+        .expect("a safe identifier");
+    fs::create_dir_all(paths.applications_dir()).expect("the applications dir");
+    fs::write(
+        &entry,
+        "[Desktop Entry]\nType=Application\nName=Hand Written\n",
+    )
+    .expect("a hand-written entry with no marker");
+
+    assert!(remove(&paths, "demo", false, true).expect("it removes"));
+
+    assert!(
+        entry.is_file(),
+        "an entry this hub did not write must survive removal"
+    );
 }
 
 /// Registry fixtures, kept out of the tests above so they read as what they are
