@@ -202,8 +202,8 @@ fn announce(
 /// by then. Here there is not: install is its own moment, with no window and no
 /// server. For the ordinary contents of that hook — a cache warm, an `about` —
 /// it makes no difference; for one that expects to reach its own app over HTTP
-/// it does. Logged as friction #6 in `.project/contract-amendments.md` rather
-/// than papered over.
+/// it does. CONTRACT.md §6 says so plainly rather than leaving it to be
+/// discovered: a `post-` command may not assume its own app is reachable.
 fn prepare(
     paths: &Paths,
     toolchain: &Toolchain,
@@ -387,9 +387,8 @@ pub fn check_port_free(registry: &Registry, app_port: Option<u16>) -> Result<(),
 /// Read `root`'s manifest and check the tree is an app the hub can install.
 ///
 /// The `app_version` semver check is the hub's half of the station's
-/// build-time validation (CONTRACT.md §2 states the rule through
-/// `build-app.sh`, which does not exist here — see
-/// `.project/contract-amendments.md` #5). Install is the hub's equivalent
+/// build-time validation (CONTRACT.md §2 now states the rule on its own,
+/// naming no enforcer). Install is the hub's equivalent
 /// moment: the value is what `update` will later compare against to choose
 /// install / update / downgrade, and a value nothing can compare is a broken
 /// app whose first symptom would appear months later, at the update that needed

@@ -300,8 +300,9 @@ answers the same question without inviting a migration framework.
 ### The platform fingerprint
 
 A hub self-update replaces PHP *underneath apps that are already installed*,
-whose `composer.lock` was resolved against the old one. The station never had
-this problem: one binary, one PHP, one app, updated together or not at all.
+whose `composer.lock` was resolved against the old one. The one-app-per-binary
+route never had this problem: one binary, one PHP, one app, updated together or
+not at all.
 
 So each app records the fingerprint it was installed against — PHP's
 `major.minor`, because that is the granularity a lock's platform requirements are

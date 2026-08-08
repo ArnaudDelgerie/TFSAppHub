@@ -3,6 +3,12 @@
 One AppImage that installs, updates and runs **several** Symfony desktop apps
 from their source, using its own bundled FrankenPHP as the PHP interpreter.
 
+Since **2026-08-08 it is the only host**. `TFSAppWorkstation`, which used to build
+one standalone AppImage per app and to host the dev loop, is archived; the dev loop
+moves here (`tfsapp-hub dev <path>`, not built yet). The point of that move: writing
+a TFSApp will need no Rust toolchain, no Tauri CLI and no GTK dev libraries — just
+the hub and a Symfony project.
+
 A dev or a small IT team installs one binary. From it they add the Symfony apps
 they care about, by path or by git repository:
 
@@ -53,36 +59,42 @@ half each, if you want them separately.)
   never touches your real login keyring. Neither is the GNOME desktop, and
   neither is a runtime dependency of the packaged hub.
 
-## Relationship to TFSAppWorkstation
+## Writing an app for it
 
-[TFSAppWorkstation](https://github.com/ArnaudDelgerie/TFSAppWorkstation) (the
-*station*) is not replaced by this repo. Three roles, none of which replaces
-another:
+An app is a Symfony project with three files and one route: `bin/console`,
+`public/index.php`, a `tfsapp.config.json` manifest, and `GET /healthz` → `200`.
+No Rust, no Tauri CLI, no GTK development libraries, no base class to extend.
 
-| | |
-|---|---|
-| station, `make tauri-dev` | the development loop, against a live source tree |
-| station, `make build` | one self-contained AppImage, for someone who has nothing |
-| **hub** | run that same app from installed source, alongside others |
+[**`CONTRACT.md`**](CONTRACT.md) is what the hub and an app promise each other,
+and it is canonical — there is no second host to keep it in step with. Apps use
+the [TFSAppBundle](https://github.com/ArnaudDelgerie/TFSAppBundle) Symfony bundle
+for the PHP side of it.
 
-The station owns live source, the hub owns installed source. Install here is a
-**snapshot**: editing the original source has no effect until an explicit
-`update`, which is what makes `composer install`, migrations and a warm
-persistent cache meaningful — and exactly what makes it useless as a dev loop.
-Any pressure to add a "linked" or "watch" mode belongs to `make tauri-dev`.
+[**`ARCHITECTURE.md`**](ARCHITECTURE.md) is how the hub itself works: the crate
+boundary, runtime identity, the install pipeline, the launch sequence, the
+bundled interpreter.
 
-Both hosts share one app contract (the station's `CONTRACT.md` §1–§5) and the
-same Symfony bundle,
-[TFSAppBundle](https://github.com/ArnaudDelgerie/TFSAppBundle), unchanged. An app
-cannot tell which host it is running under. Because `identifier` comes from the
-app's own `tfsapp.config.json` in both routes, a hub-installed app and a
-station-built AppImage of the same project resolve to the **same data
-directory** — data follows between routes, with no import step.
+Install here is a **snapshot**: editing the original source has no effect until
+an explicit `update`, which is what makes `composer install`, migrations and a
+warm persistent cache meaningful — and exactly what makes it useless as a dev
+loop. The dev loop is its own mode (`dev <path>`, not built yet), and it serves
+live source **in place**: it watches nothing, compiles nothing and builds no
+assets. Your build tool already has a `--watch`.
 
-This is a fresh start, not a fork of the station: the reusable Rust modules get
-copied over and adapted (see `.project/plan/`). The modules that diverge —
-identity resolution above all — could not serve both identity models (baked at
-build vs resolved at runtime) in one tree.
+### Where the station went
+
+[TFSAppWorkstation](https://github.com/ArnaudDelgerie/TFSAppWorkstation) built
+one standalone AppImage per app and hosted the dev loop. It was archived on
+2026-08-08 and this repo took both jobs. The reasoning is written once, in
+`.project/decisions/001-single-host.md`; the short version is that a second host
+cost a permanent parity tax and its own compatibility problem per app, while the
+thing it was protecting — a single double-clickable file — is recoverable as a
+*packaging mode* of the hub rather than as a second program.
+
+This repo is a fresh start, not a fork: the reusable Rust modules were copied
+over and adapted. The modules that diverge — identity resolution above all —
+could not serve both identity models (baked at build vs resolved at runtime) in
+one tree.
 
 ## Trust posture
 
@@ -98,23 +110,15 @@ otherwise would be worse than saying it.
 
 ### Stored secrets are namespaced, not isolated
 
-Each app's secrets — its `APP_SECRET`, and anything it declares under
-`actions.secrets.keys` — go into the OS keyring under that app's `identifier` as
-the service name. That keeps two apps from **colliding**. It does not keep them
-from **reading each other**.
+Each app's secrets go into the OS keyring under that app's `identifier` as the
+service name. That keeps two apps from **colliding**. It does not keep them from
+**reading each other**: the Secret Service authorises per login session, so any
+process running as this user can list and read any service's entries. Nothing
+the hub does introduces this and nothing it could do would remove it — the only
+real fix is sandboxing the processes, which is a change of distribution format
+and is not on the roadmap.
 
-The Secret Service authorises per login session, so any process running as this
-user can list and read any service's entries. This is not something the hub
-introduces: the same read succeeds today between two installed standalone
-AppImages, and it would succeed against any other application on the desktop that
-uses the same keyring. Key prefixing would not help — a reader lists entries, it
-does not guess their names.
-
-Where the hub *is* strict is in what it hands to an app's own code: a webview
-reaches its secret store through the window it belongs to, never by naming one,
-so an app cannot ask the hub for another app's secrets. What it cannot prevent is
-that app asking the keyring directly, exactly as any program on the machine can.
-
-The only real fix is sandboxing the processes, which is a change of distribution
-format and is not on the roadmap. Read per-`identifier` storage as tidiness, not
-as secrecy.
+Read per-`identifier` storage as tidiness, not as secrecy.
+[`CONTRACT.md` §5](CONTRACT.md) states the full guarantee, including the one
+thing the hub *is* strict about: a webview reaches its secret store through the
+window it belongs to and can never name another app's.
