@@ -163,13 +163,163 @@ pub fn write_data_version(data_subdir: &Path, version: &str) -> Result<(), Lifec
     fs::rename(&temporary, &path).map_err(io_error(&path))
 }
 
-/// Run every guard, and answer with the sidecar liveness lock (CONTRACT.md §6)
-/// this launch is to hold for its whole lifetime.
+/// How long an arriving launch waits for a dying sibling's liveness lock to
+/// free up (`LaunchDecision::Wait`) before refusing. Named next to what it
+/// tracks: plan 011 step 1 measured the two-stage SIGTERM-then-SIGKILL
+/// teardown at 3.15s with no `async_worker` and 6.28–6.40s with one — two
+/// sequential `terminate()` calls, each escalating past its own 3s budget on
+/// the machine it was measured on — so this is that worst case plus margin
+/// for scheduling jitter, not a number picked by feel.
+const SERVING_WAIT_BUDGET: Duration = Duration::from_secs(10);
+
+/// `<data_dir>/serving.lock` (CONTRACT.md §6) — beside `sidecar.pid` and
+/// `sidecar.pid.lock`, so an installed launch and a dev session get theirs by
+/// the same identifier-keyed rule that gives them everything else.
 ///
-/// `None` means a live sibling already holds it: this launch is the second one
-/// of the same app, it ran no guard, touched nothing, and has one job left —
-/// hand its argv to the running instance and go away, which is
-/// `tauri-plugin-single-instance`'s from here.
+/// Answers a different question than the liveness lock: "is there an
+/// instance willing to be handed a window right now", not "does this process
+/// still own this data dir". Held means exactly that — hand this launch's
+/// argv to whoever holds it and it will answer with a window. See the plan's
+/// Overview for why the two used to be one signal and had to become two.
+pub fn serving_lock_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("serving.lock")
+}
+
+/// What an arriving launch is told, from probing the serving lock and the
+/// liveness lock, in that order (see the plan's Overview). Pure and total
+/// over its two inputs, so every case is a unit test with no process,
+/// display or session bus involved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchDecision {
+    /// A live sibling holds the serving lock: run no guard, touch nothing,
+    /// and let `tauri-plugin-single-instance` hand this launch's argv to it —
+    /// the ordinary second-`open`-of-a-running-app case, and it pays nothing.
+    HandOff,
+    /// The serving lock is free but the liveness lock is held: a sibling has
+    /// begun shutting down. Wait, bounded, for it to finish, then launch as
+    /// though nothing had been there.
+    Wait,
+    /// Both locks are free: launch immediately.
+    Launch,
+}
+
+/// Decide [`LaunchDecision`] from the two probes. `serving_held` alone
+/// decides `HandOff` — a live sibling holding the serving lock can hand a
+/// window over immediately whether or not it is also mid liveness-lock
+/// housekeeping — so `liveness_held` is only consulted once `serving_held` is
+/// false.
+pub fn decide_launch(serving_held: bool, liveness_held: bool) -> LaunchDecision {
+    if serving_held {
+        LaunchDecision::HandOff
+    } else if liveness_held {
+        LaunchDecision::Wait
+    } else {
+        LaunchDecision::Launch
+    }
+}
+
+/// Everything a launch that got past [`acquire_launch_locks`] holds for its
+/// whole lifetime: the sidecar liveness lock (CONTRACT.md §6) and the serving
+/// lock ([`serving_lock_path`]).
+#[derive(Debug)]
+pub struct LaunchLocks {
+    pub liveness: fs::File,
+    pub serving: fs::File,
+}
+
+/// Why [`acquire_launch_locks`] could not hand back a decision to launch.
+#[derive(Debug)]
+pub enum LaunchLockError {
+    /// The wait for a dying sibling's liveness lock outlived the budget it
+    /// was given.
+    Timeout(Duration),
+    /// A probe itself failed — kept distinct from `Timeout` so a caller names
+    /// what actually went wrong rather than blaming a stuck sibling for it.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for LaunchLockError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout(budget) => write!(
+                formatter,
+                "a previous instance of this app did not finish shutting down within {}s. It \
+                 may be stuck; try again in a moment.",
+                budget.as_secs()
+            ),
+            Self::Io(error) => {
+                write!(
+                    formatter,
+                    "cannot tell whether this app is already running: {error}"
+                )
+            }
+        }
+    }
+}
+
+/// The guard pair [`prepare_launch`] and [`prepare_dev_launch`] share: probe
+/// the serving lock, hand off at once if a live sibling holds it (`Ok(None)`,
+/// exactly what `cleanup_previous_sidecar` alone answered before this plan);
+/// otherwise reap and take the liveness lock — waiting up to `wait_budget` if
+/// a sibling was mid-teardown — then take the serving lock for this launch's
+/// own lifetime and answer `Ok(Some(..))`.
+///
+/// `wait_budget` is a parameter rather than reading [`SERVING_WAIT_BUDGET`]
+/// directly so a test can shrink it and prove `Timeout` without spending the
+/// real budget; both callers below pass the real constant.
+///
+/// Kept free of [`fatal_startup_error`] on purpose, unlike its two callers:
+/// this is the part worth testing without a process willing to exit under it,
+/// so a timeout comes back as [`LaunchLockError::Timeout`] for the caller to
+/// turn into a dialog.
+fn acquire_launch_locks(
+    pid_file: &Path,
+    data_dir: &Path,
+    identifier: &str,
+    wait_budget: Duration,
+) -> Result<Option<LaunchLocks>, LaunchLockError> {
+    let serving_path = serving_lock_path(data_dir);
+    let serving_held = tfsapp_core::process::try_lock_file(&serving_path)
+        .map_err(LaunchLockError::Io)?
+        .is_none();
+    let liveness_held =
+        tfsapp_core::process::is_owner_live(pid_file).map_err(LaunchLockError::Io)?;
+
+    let wait = match decide_launch(serving_held, liveness_held) {
+        LaunchDecision::HandOff => return Ok(None),
+        LaunchDecision::Wait => {
+            println!(
+                "tfsapp-hub: a previous instance of this app is still shutting down, waiting up \
+                 to {}s for it to finish...",
+                wait_budget.as_secs()
+            );
+            wait_budget
+        }
+        LaunchDecision::Launch => Duration::ZERO,
+    };
+
+    let Some(liveness) = tfsapp_core::process::cleanup_previous_sidecar(pid_file, identifier, wait)
+    else {
+        return Err(LaunchLockError::Timeout(wait_budget));
+    };
+    let serving = tfsapp_core::process::try_lock_file(&serving_path)
+        .map_err(LaunchLockError::Io)?
+        .expect(
+            "the serving lock was just observed free and nothing else in this launch's own \
+             process claims it — a lock taken out from under it here would be a different bug",
+        );
+
+    Ok(Some(LaunchLocks { liveness, serving }))
+}
+
+/// Run every guard, and answer with the locks (CONTRACT.md §6) this launch is
+/// to hold for its whole lifetime.
+///
+/// `None` means a live sibling already holds the serving lock: this launch is
+/// the second one of the same app, it ran no guard, touched nothing, and has
+/// one job left — hand its argv to the running instance and go away, which is
+/// `tauri-plugin-single-instance`'s from here. A sibling caught mid-teardown
+/// is not this case — see [`acquire_launch_locks`] and the plan's Overview.
 ///
 /// The lifecycle *event* is deliberately not returned. On the station it is,
 /// because `setup` runs the event's hooks off it; here the hooks belong to the
@@ -195,16 +345,17 @@ pub fn prepare_launch(
     identifier: &str,
     app_version: &str,
     app_port: Option<u16>,
-) -> Option<fs::File> {
-    let lock = tfsapp_core::process::cleanup_previous_sidecar(
+) -> Option<LaunchLocks> {
+    let locks = match acquire_launch_locks(
         &data_dir.join("sidecar.pid"),
+        data_dir,
         identifier,
-        Duration::ZERO,
-    );
-
-    // A live sibling holds the lock: this process must not run the guards, must
-    // not touch the data dir, and must not bind anything.
-    lock.as_ref()?;
+        SERVING_WAIT_BUDGET,
+    ) {
+        Ok(locks) => locks,
+        Err(error) => fatal_startup_error(&error.to_string()),
+    };
+    locks.as_ref()?;
 
     let event = check_version(id, data_subdir, app_version);
     // A data dir with no record at all, under an app the hub installed: the
@@ -219,14 +370,14 @@ pub fn prepare_launch(
     }
     check_port(app_port, data_subdir);
 
-    lock
+    locks
 }
 
-/// The dev variant of [`prepare_launch`]: the same reap and liveness lock, the
-/// same port guard, but never the version guard — a dev session was never
-/// installed, so there is no `data/config.json` to compare `app_version`
-/// against, and none is written (plan 009 step 4). Lifecycle hooks stay out of
-/// both: `pre-install`/`post-install`/`pre-update`/`post-update` belong to
+/// The dev variant of [`prepare_launch`]: the same guard pair, the same port
+/// guard, but never the version guard — a dev session was never installed, so
+/// there is no `data/config.json` to compare `app_version` against, and none
+/// is written (plan 009 step 4). Lifecycle hooks stay out of both:
+/// `pre-install`/`post-install`/`pre-update`/`post-update` belong to
 /// `install`/`update`, and a dev launch is neither.
 ///
 /// `id` and `data_subdir` from [`prepare_launch`] have no dev counterpart to
@@ -237,18 +388,21 @@ pub fn prepare_dev_launch(
     data_subdir: &Path,
     identifier: &str,
     app_port: Option<u16>,
-) -> Option<fs::File> {
-    let lock = tfsapp_core::process::cleanup_previous_sidecar(
+) -> Option<LaunchLocks> {
+    let locks = match acquire_launch_locks(
         &data_dir.join("sidecar.pid"),
+        data_dir,
         identifier,
-        Duration::ZERO,
-    );
-
-    lock.as_ref()?;
+        SERVING_WAIT_BUDGET,
+    ) {
+        Ok(locks) => locks,
+        Err(error) => fatal_startup_error(&error.to_string()),
+    };
+    locks.as_ref()?;
 
     check_port(app_port, data_subdir);
 
-    lock
+    locks
 }
 
 /// The version guard: decide the event, and refuse the three outcomes an app
