@@ -8,6 +8,7 @@
 mod app_env;
 mod bridge;
 mod cli;
+mod dev;
 mod identity;
 mod install;
 mod launch;
@@ -28,7 +29,7 @@ mod update;
 mod window;
 mod worker;
 
-use cli::{Command, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE};
+use cli::{Command, OpenChildSource, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE};
 use identity::Identity;
 
 fn main() {
@@ -114,17 +115,18 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             assume_yes,
         } => remove::run(&id, purge, assume_yes),
         Command::Platform => print_platform(),
-        // The app's own process, re-executed by `open <id>` above. Everything it
-        // needs to become that app before GTK exists travels in argv — see
-        // `open::child_args`.
+        // The app's own process, re-executed by `open <id>` (and, once plan 009
+        // lands `dev`'s own foreground parent, by `dev <path>`) above.
+        // Everything it needs to become that app before GTK exists travels in
+        // argv — see `open::child_args`.
         Command::OpenChild {
-            id,
+            source,
             identifier,
             product_name,
             icon_path,
         } => {
             open_window(
-                &id,
+                source,
                 Identity {
                     identifier,
                     product_name,
@@ -188,21 +190,30 @@ fn print_platform() -> i32 {
 ///
 /// The parent already resolved all of this before spawning us, and this is not
 /// that work repeated for its own sake: the parent proved the app *can* be
-/// opened, cheaply and at the terminal, so a mistyped id never costs a window.
-/// What happens here is the part that has to happen in the process that will
-/// actually hold the app — the liveness lock is held by *this* pid, and the port
-/// is bound to prove it is free to *this* process.
+/// opened, cheaply and at the terminal, so a mistyped id or path never costs a
+/// window. What happens here is the part that has to happen in the process
+/// that will actually hold the app — the liveness lock is held by *this* pid,
+/// and the port is bound to prove it is free to *this* process.
 ///
 /// A failure exits through `lifecycle::fatal_startup_error`, which is the only
 /// thing that reaches a user who launched from a desktop entry.
-fn prepare(id: &str, identity: &Identity) -> Launching {
+///
+/// Rebuilds the matching `LaunchSpec` from `source` — `open::resolve` for
+/// `--id`, `dev::resolve` for `--project` — which is `OpenChildSource`'s whole
+/// reason to exist: one child, two constructors, resolved here rather than at
+/// the parent so a mistyped id and a mistyped path fail the same way.
+fn prepare(source: &OpenChildSource, identity: &Identity) -> Launching {
     let paths = match paths::Paths::resolve() {
         Ok(paths) => paths,
         Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
     };
-    let spec = match open::resolve(&paths, id) {
+    let resolved = match source {
+        OpenChildSource::Id(id) => open::resolve(&paths, id).map_err(|error| error.to_string()),
+        OpenChildSource::Project(path) => dev::resolve(path).map_err(|error| error.to_string()),
+    };
+    let spec = match resolved {
         Ok(spec) => spec,
-        Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+        Err(message) => lifecycle::fatal_startup_error(&message),
     };
 
     // `0700` on every launch, not only on creation: the directory holds the
@@ -217,8 +228,11 @@ fn prepare(id: &str, identity: &Identity) -> Launching {
         lifecycle::fatal_startup_error(&format!("{}: {error}", data_subdir.display()));
     }
 
+    // `spec.label` rather than a hub-local id: a dev session has none to give,
+    // and the label is the same thing a message about this launch would call
+    // it either way (plan 009 step 1).
     let lock = lifecycle::prepare_launch(
-        id,
+        &spec.label,
         &data_dir,
         &data_subdir,
         &identity.identifier,
@@ -246,7 +260,7 @@ struct Launching {
 /// advance far enough to actually paint the splash. Everything slow then happens
 /// off the main thread and ends by navigating that same window to the backend,
 /// so nothing visibly jumps and no second window appears.
-fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
+fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::Context) {
     // Before the `Builder` exists, and so before anything has initialised GTK
     // — the whole point of the module. Everything identity-derived downstream
     // (app id, bus name, single-instance key, WM_CLASS, cookie store) reads
@@ -258,7 +272,7 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
     // all of it has to happen in this window: they refuse through a blocking
     // native dialog, which deadlocks rather than appears once Tauri has claimed
     // GTK. See `lifecycle`'s module header.
-    let Launching { paths, spec, lock } = prepare(id, &identity);
+    let Launching { paths, spec, lock } = prepare(&source, &identity);
 
     // The app's `actions` groups, granted at runtime, before `Builder` — the
     // only window in which they can be: `add_capability` lives on `Context` and
