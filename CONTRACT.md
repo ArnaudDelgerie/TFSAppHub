@@ -457,3 +457,126 @@ Here they always match. A stock Flex project elsewhere still holds the recipe's
 request that mints a cookie. The fix is configuration — give each environment a
 `MERCURE_PUBLIC_URL` that matches how it is served — not a runtime check for
 whether a host is present.
+
+---
+
+## 5. The app's own state, and what it is isolated from
+
+### One data directory per app, keyed by its identifier
+
+```
+<OS data dir>/TFSApp/<identifier>/
+  data/
+    app.db          the SQLite database DATABASE_URL points at
+    app.secret      APP_SECRET in plaintext — only on a machine with no keyring
+    secrets.json    the app's declared secrets (§7), same condition
+    config.json     which version last wrote all of this
+  cache/            APP_CACHE_DIR — may be emptied at any launch (§3)
+  build/            APP_BUILD_DIR — same
+  log/              APP_LOG_DIR — persists, rotated
+  sessions/         APP_SESSION_DIR — persists
+```
+
+The path derives from `identifier` **alone**. Not from where the host binary
+lives, not from the handle you type, not from the source the app was installed
+from. That is a guarantee and not an implementation accident: it means the app's
+data belongs to the app rather than to whatever put it on this machine, and
+reinstalling from a different source, or arriving by a different route, opens
+onto the same database, the same secret and the same sessions.
+
+The identifier directory is `0700` and `app.secret`, where it exists at all, is
+`0600` — enforced on every launch rather than only at creation, so an older
+installation is tightened on its next run. `app.db` is the app's to create; the
+`0700` directory is what keeps it away from other local users.
+
+### `APP_SECRET` persists, and where it lives depends on the machine
+
+`APP_SECRET` is resolved once and reused on every subsequent launch, so signed
+values — CSRF tokens, remember-me cookies, signed URIs — keep validating across
+restarts. It lives in the OS keyring when one is reachable, probed with a
+throwaway round-trip before any real secret is touched, and falls back to a
+plaintext `0600` file when the probe fails. `TFS_KEYRING_AVAILABLE` (§3) reports
+which happened, for this launch.
+
+Two consequences an app author should know rather than discover:
+
+**The fallback file is deliberately not encrypted.** With no keyring reachable
+there is nowhere secure to keep an encryption key, so encrypting it would be
+theatre. Degraded but functional beat silently losing the secret on every
+restart.
+
+**A backend flip resets the secret.** If a launch cannot reach the keyring that
+held it — or the reverse, after a launch that had fallen back — the other
+backend generates a fresh one, and everything previously signed stops validating
+once. This is rare, non-destructive (the user logs in again) and accepted rather
+than papered over.
+
+A pre-existing plaintext secret is migrated into the keyring on the first launch
+that can reach one, and the file is deleted in the same launch once the write is
+confirmed. Keeping it "just in case" would defeat the keyring.
+
+### Sessions are per-app, if the app opts in
+
+`APP_SESSION_DIR` is this app's own, and it persists. Using it is the app's
+choice:
+
+```yaml
+framework:
+    session:
+        save_path: '%env(APP_SESSION_DIR)%'
+```
+
+The host provides the directory and the variable; it never patches the app's
+configuration. The same is true of `APP_CACHE_DIR`, `APP_BUILD_DIR` and
+`APP_LOG_DIR`.
+
+### Cookies do not leak between apps
+
+HTTP cookies are keyed by host only — the port is ignored — so two apps on
+`127.0.0.1` would trample each other's session cookie if their webviews shared
+one cookie store. They do not: each app's webview storage is keyed by its
+`identifier`, so app A's cookies never reach app B's backend. With per-app
+session directories as a second, server-side layer, even a cookie that did
+arrive would find its session file in a directory it cannot name.
+
+This is verified end to end rather than asserted: two apps differing only in
+their identity fields, opened side by side, logging in to one leaves the other
+anonymous, in both directions, with separate cookie files and separate session
+files on disk.
+
+### One live app per identifier, whoever launched it
+
+Two servers writing one SQLite file is the failure mode this rules out. The
+guarantee is stated in terms of the app, not of the program that started it:
+**at most one live instance of a given `identifier` on a machine at a time**.
+A second launch does not get a second server — it surfaces the app that is
+already running.
+
+Stating it that way matters because "whoever launched it" is not hypothetical.
+An app installed here and the same app arriving by another route resolve to the
+same identifier, hence to the same data directory, hence to the same lock; the
+hand-off between two *different binaries* was measured, and it holds. An app may
+rely on there never being a second writer on its database.
+
+### Secrets are namespaced, not isolated — read this before storing one
+
+Each app's secrets go into the OS keyring under its own `identifier` as the
+service name. **That keeps two apps from colliding. It does not keep them from
+reading each other.**
+
+The Secret Service authorises per login session: any process running as this
+user can list and read any service's entries. This is not something the hub
+introduces and not something it can remove — the same read succeeds between any
+two applications on the desktop that use the same keyring. Key prefixing would
+not help, because a reader lists entries rather than guessing their names.
+
+Where the host *is* strict is in what it hands to the app's own code: a webview
+reaches its secret store through the window it belongs to and can never name
+another app's. There is no "give me app X's secret" call, and there will not be
+one. What no host can prevent is an app asking the keyring directly, exactly as
+any program on the machine can.
+
+The only real fix is sandboxing the processes, which is a change of distribution
+format and is not on the roadmap. Read per-`identifier` storage as tidiness, not
+as secrecy, and do not store in it something whose disclosure to another
+application on the same machine would be a breach.
