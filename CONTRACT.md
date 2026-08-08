@@ -626,9 +626,17 @@ guarantee is stated in terms of the app, not of the program that started it:
 A second launch does not get a second server — it surfaces the app that is
 already running.
 
+That holds through the handover, too, not only on either side of it: a launch
+arriving while the live instance is shutting down does not surface it — a
+process mid-teardown is not "already running" in the sense this guarantee
+means — and it does not race it for the data directory either. It waits,
+bounded, for the shutdown to finish, then starts a new one. An app author
+reads the whole guarantee as one sentence: there is never a second writer, and
+a relaunch is never handed a backend that is already on its way out.
+
 Stating it that way matters because "whoever launched it" is not hypothetical.
 An app installed here and the same app arriving by another route resolve to the
-same identifier, hence to the same data directory, hence to the same lock; the
+same identifier, hence to the same data directory, hence to the same locks; the
 hand-off between two *different binaries* was measured, and it holds. An app may
 rely on there never being a second writer on its database.
 

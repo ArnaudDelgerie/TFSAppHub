@@ -250,7 +250,7 @@ fn prepare(source: &OpenChildSource, identity: &Identity) -> Launching {
     // it either way (plan 009 step 1). The two sources part ways here too: an
     // installed launch runs every guard, a dev one skips the version guard and
     // writes no `data/config.json` — see `lifecycle::prepare_dev_launch`.
-    let lock = match &spec.source {
+    let locks = match &spec.source {
         launch::Source::Installed { .. } => lifecycle::prepare_launch(
             &spec.label,
             &data_dir,
@@ -267,15 +267,16 @@ fn prepare(source: &OpenChildSource, identity: &Identity) -> Launching {
         ),
     };
 
-    Launching { paths, spec, lock }
+    Launching { paths, spec, locks }
 }
 
 /// What the guards leave for the launch itself: where the app is, what it
-/// declares, and the liveness lock proving this process is its live instance.
+/// declares, and the locks proving this process is its live instance
+/// ([`lifecycle::LaunchLocks`]).
 struct Launching {
     paths: paths::Paths,
     spec: launch::LaunchSpec,
-    lock: Option<std::fs::File>,
+    locks: Option<lifecycle::LaunchLocks>,
 }
 
 /// Open the app installed as `id`, under `identity`.
@@ -299,7 +300,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
     // all of it has to happen in this window: they refuse through a blocking
     // native dialog, which deadlocks rather than appears once Tauri has claimed
     // GTK. See `lifecycle`'s module header.
-    let Launching { paths, spec, lock } = prepare(&source, &identity);
+    let Launching { paths, spec, locks } = prepare(&source, &identity);
 
     // The app's `actions` groups, granted at runtime, before `Builder` — the
     // only window in which they can be: `add_capability` lives on `Context` and
@@ -404,7 +405,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
                     paths,
                     spec,
                     identity,
-                    lock,
+                    locks,
                     app_origin,
                     splash_label,
                 );
@@ -430,11 +431,16 @@ fn serve(
     paths: paths::Paths,
     spec: launch::LaunchSpec,
     identity: Identity,
-    lock: Option<std::fs::File>,
+    locks: Option<lifecycle::LaunchLocks>,
     app_origin: window::AppOriginSlot,
     splash_label: String,
 ) {
     use tauri::Manager;
+
+    let (liveness_lock, serving_lock) = match locks {
+        Some(locks) => (Some(locks.liveness), Some(locks.serving)),
+        None => (None, None),
+    };
 
     let manifest = &spec.manifest;
     if manifest.splash_path.is_some() {
@@ -477,7 +483,8 @@ fn serve(
         &spec.app_dir,
         &environment,
         manifest,
-        lock,
+        liveness_lock,
+        serving_lock,
         &app,
     ) {
         Ok(started) => started,

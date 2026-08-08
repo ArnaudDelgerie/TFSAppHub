@@ -81,7 +81,8 @@ pub fn run(id: &str) -> i32 {
 /// someone at a terminal who typed one word and got nothing. The one state that
 /// is *not* a refusal is `needs-revalidation`: the app's dependencies were
 /// resolved against a PHP that has since moved, which is a reason to revalidate
-/// (plan 012) and not a reason to keep the user out of their own data.
+/// (the hub self-update and lazy revalidation plan, not yet written — see
+/// `000-index.md`) and not a reason to keep the user out of their own data.
 pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
     let installed = registry::load(paths)?;
     let entry = installed

@@ -207,10 +207,11 @@ Each app pays its own FrankenPHP startup. That is the cost, and it is accepted.
 ### The launch sequence, and why the order is what it is
 
 1. The lifecycle guards run **before the builder exists**: the version decision
-   against the data record, the static-port conflict check, and the sidecar
-   liveness lock with its crash-orphan reap. Not a style choice — these refusals
-   show a blocking native dialog, and once Tauri has claimed GTK a raw dialog
-   deadlocks rather than appears.
+   against the data record, the static-port conflict check, and the serving and
+   liveness locks — hand off at once to a live sibling, wait out a dying one, or
+   take both locks and reap a crashed one's pid file. Not a style choice — these
+   refusals show a blocking native dialog, and once Tauri has claimed GTK a raw
+   dialog deadlocks rather than appears.
 2. The **splash window is created first**, before the sidecar is spawned and long
    before `/healthz` answers.
 3. The Caddyfile is written into the app's data directory, then
@@ -241,13 +242,33 @@ environment, which is exactly what lets one file serve every installed app.
 
 ### Process supervision and teardown
 
-The sidecar's liveness is proven with a non-blocking exclusive flock held by the
-launcher for its whole lifetime, released by the operating system if it dies
-without tearing anything down. Acquiring it means any previous launcher is
-confirmed dead, so a pid found in the pid file can be reaped. A live sibling
-holding it is what makes a second `open` of the same app surface the first
-instead of starting a second server — `CONTRACT.md` §5's per-identifier
-guarantee, mechanically.
+Two non-blocking exclusive flocks, both held by the launcher for its whole
+lifetime, answer two different questions.
+
+The **liveness lock** answers "does this process still own this data dir".
+Released only by the operating system, whenever this process ends — never by
+any code in it — because that is the sole release that is genuinely
+simultaneous with the process actually being gone. Acquiring it means any
+previous launcher is confirmed dead, so a pid found in the pid file can be
+reaped.
+
+The **serving lock** answers "will handing this launch's argv to that process
+get you a window right now". Released explicitly, at the very top of
+teardown, alongside `tauri-plugin-single-instance`'s own bus name — both
+before a single child process is signalled — so a sibling that has just begun
+shutting down stops claiming to serve within milliseconds of the signal or
+window-close that started it, long before the SIGTERM-then-SIGKILL escalation
+below actually finishes.
+
+A launch probes both, in that order. A live sibling holding the serving lock
+is what makes a second `open` of the same app surface the first instead of
+starting a second server — `CONTRACT.md` §5's per-identifier guarantee,
+mechanically. A sibling holding only the liveness lock — its serving claim
+already released, still mid-teardown — is not a live sibling to hand off to:
+the arriving launch waits, bounded, for the liveness lock to free, then starts
+its own. Without that second lock a closed window and a gone process were the
+same signal, and a launch arriving in the gap between them attached to a
+backend already dying instead of starting a fresh one.
 
 The worker's pid is the second line of that pid file, which is what lets the
 next launch reap it if this process never gets the chance. Teardown stops the

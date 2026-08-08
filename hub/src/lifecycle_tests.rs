@@ -1,12 +1,168 @@
-use std::fs;
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
 
 use super::{
-    lifecycle_decision, prepare_dev_launch, read_data_version, write_data_version,
-    LifecycleDecisionError, LifecycleError, LifecycleEvent,
+    acquire_launch_locks, decide_launch, lifecycle_decision, prepare_dev_launch, read_data_version,
+    serving_lock_path, write_data_version, LaunchDecision, LaunchLockError, LifecycleDecisionError,
+    LifecycleError, LifecycleEvent,
 };
 
 fn version(text: &str) -> semver::Version {
     semver::Version::parse(text).expect("a semver version")
+}
+
+/// Spawn a controlled child that holds an exclusive flock on `path` until
+/// killed — the same shell lock-file idiom `core`'s own process tests use
+/// (see that crate's `process_tests.rs` for why: a single process holds the
+/// lock via its own fd for its whole life, so killing it releases the lock at
+/// once with nothing orphaned behind it). Blocks until the lock is observed
+/// held so the caller never races it.
+fn spawn_lock_holder(path: &Path) -> std::process::Child {
+    let child = Command::new("sh")
+        .args([
+            "-c",
+            r#"exec 9>"$1"; flock -n 9 || exit 1; exec sleep 30"#,
+            "sh",
+        ])
+        .arg(path)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        if tfsapp_core::process::try_lock_file(path).unwrap().is_none() {
+            return child;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    child
+}
+
+fn kill_and_wait(mut child: std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// --- decide_launch -----------------------------------------------------------
+//
+// Pure and total over its two inputs (see the plan's Overview): every one of
+// the four combinations is covered rather than just the three named outcomes,
+// so `serving_held` alone deciding `HandOff` regardless of `liveness_held` is
+// itself part of what is asserted.
+
+#[test]
+fn decide_launch_hands_off_when_serving_is_held_and_liveness_is_free() {
+    assert_eq!(decide_launch(true, false), LaunchDecision::HandOff);
+}
+
+#[test]
+fn decide_launch_hands_off_when_both_locks_are_held() {
+    assert_eq!(decide_launch(true, true), LaunchDecision::HandOff);
+}
+
+#[test]
+fn decide_launch_waits_when_serving_is_free_and_liveness_is_held() {
+    assert_eq!(decide_launch(false, true), LaunchDecision::Wait);
+}
+
+#[test]
+fn decide_launch_launches_when_both_locks_are_free() {
+    assert_eq!(decide_launch(false, false), LaunchDecision::Launch);
+}
+
+// --- acquire_launch_locks / the serving lock ----------------------------------
+
+#[test]
+fn a_sibling_holding_the_serving_lock_is_a_hand_off() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let pid_file = data_dir.path().join("sidecar.pid");
+    let holder = spawn_lock_holder(&serving_lock_path(data_dir.path()));
+
+    let start = Instant::now();
+    let locks = acquire_launch_locks(
+        &pid_file,
+        data_dir.path(),
+        "dev.local.demo",
+        Duration::from_secs(5),
+    )
+    .expect("hand-off is not an error");
+
+    assert!(
+        locks.is_none(),
+        "a live sibling holding the serving lock is a hand-off"
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "a hand-off must pay nothing — it must not wait at all"
+    );
+
+    kill_and_wait(holder);
+}
+
+#[test]
+fn a_sibling_holding_only_the_liveness_lock_is_waited_out_then_succeeds() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let pid_file = data_dir.path().join("sidecar.pid");
+    let mut holder = spawn_lock_holder(&tfsapp_core::process::lock_path(&pid_file));
+
+    let waiting = {
+        let pid_file = pid_file.clone();
+        let data_dir = data_dir.path().to_path_buf();
+        thread::spawn(move || {
+            acquire_launch_locks(
+                &pid_file,
+                &data_dir,
+                "dev.local.demo",
+                Duration::from_secs(5),
+            )
+        })
+    };
+    thread::sleep(Duration::from_millis(150));
+    assert!(
+        !waiting.is_finished(),
+        "it must still be waiting on the dying sibling"
+    );
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+
+    let locks = waiting
+        .join()
+        .expect("the waiter did not panic")
+        .expect("a lock released mid-wait is not an error")
+        .expect("the launch proceeds once the sibling is gone");
+
+    // Genuinely held, not a dropped-and-forgotten probe: a third acquisition
+    // of either lock must be excluded for as long as `locks` is alive.
+    assert!(
+        tfsapp_core::process::try_lock_file(&serving_lock_path(data_dir.path()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        tfsapp_core::process::try_lock_file(&tfsapp_core::process::lock_path(&pid_file))
+            .unwrap()
+            .is_none()
+    );
+    drop(locks);
+}
+
+#[test]
+fn a_sibling_that_outlives_the_wait_budget_is_a_timeout() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let pid_file = data_dir.path().join("sidecar.pid");
+    let holder = spawn_lock_holder(&tfsapp_core::process::lock_path(&pid_file));
+
+    let budget = Duration::from_millis(200);
+    let error = acquire_launch_locks(&pid_file, data_dir.path(), "dev.local.demo", budget)
+        .expect_err("a sibling that never lets go must not be waited out forever");
+
+    assert!(matches!(error, LaunchLockError::Timeout(b) if b == budget));
+
+    kill_and_wait(holder);
 }
 
 // --- lifecycle_decision --------------------------------------------------
@@ -135,6 +291,50 @@ fn a_dev_launch_takes_the_lock_and_writes_no_version_record() {
     // `app_version` in their own tree must never be refused a launch or
     // have a stray record written under it.
     assert!(!data_subdir.join("config.json").exists());
+}
+
+#[test]
+fn prepare_dev_launch_hands_off_when_a_sibling_holds_the_serving_lock() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let data_subdir = data_dir.path().join("data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    let holder = spawn_lock_holder(&serving_lock_path(data_dir.path()));
+
+    let locks = prepare_dev_launch(data_dir.path(), &data_subdir, "dev.local.demo", None);
+
+    assert!(
+        locks.is_none(),
+        "a live sibling holding the serving lock is a hand-off"
+    );
+    kill_and_wait(holder);
+}
+
+#[test]
+fn prepare_dev_launch_waits_for_a_dying_sibling_then_succeeds() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let data_subdir = data_dir.path().join("data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    let pid_file = data_dir.path().join("sidecar.pid");
+    let mut holder = spawn_lock_holder(&tfsapp_core::process::lock_path(&pid_file));
+
+    let waiting = {
+        let data_dir = data_dir.path().to_path_buf();
+        let data_subdir = data_subdir.clone();
+        thread::spawn(move || prepare_dev_launch(&data_dir, &data_subdir, "dev.local.demo", None))
+    };
+    thread::sleep(Duration::from_millis(150));
+    assert!(
+        !waiting.is_finished(),
+        "it must still be waiting on the dying sibling"
+    );
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+
+    let locks = waiting.join().expect("the waiter did not panic");
+    assert!(
+        locks.is_some(),
+        "the wait ends and the launch proceeds once the sibling is gone"
+    );
 }
 
 #[test]

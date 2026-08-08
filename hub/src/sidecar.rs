@@ -58,10 +58,22 @@ pub struct Sidecar {
     pub shutting_down: Arc<AtomicBool>,
     pub pid_file: PathBuf,
     /// The liveness lock (CONTRACT.md §6), acquired before `Builder` by
-    /// `lifecycle::prepare_launch` and moved in here. Dropping it releases it —
-    /// including when this process dies without ever running `stop`, which is
-    /// exactly how the next launch learns it is free to reap.
+    /// `lifecycle::prepare_launch` and moved in here. **Never dropped by any
+    /// code in this struct** — see [`Sidecar::stop`] for why: the operating
+    /// system releasing it at process death is the only release that is
+    /// genuinely simultaneous with the bus names going away. So this field is
+    /// genuinely never read after construction, which is the point rather
+    /// than an oversight — held purely so its lifetime is this struct's.
+    #[allow(dead_code)]
     pub lock: Option<fs::File>,
+    /// The serving lock ([`crate::lifecycle::serving_lock_path`]), acquired
+    /// alongside `lock` by the same launch and moved in here by the same
+    /// route, for the same reason: one place decides what this process
+    /// claims. Unlike `lock` it *is* released early, by
+    /// `lifecycle::stop_sidecar_and_exit` — taking it out of this struct
+    /// before `stop` runs — because answering "will hand you a window" has to
+    /// stop the instant teardown begins, not once the process actually exits.
+    pub serving: Option<fs::File>,
 }
 
 impl Sidecar {
@@ -89,7 +101,16 @@ impl Sidecar {
         }
 
         let _ = fs::remove_file(&self.pid_file);
-        self.lock.take();
+
+        // No `self.lock.take()` here — deliberately. Every way this process
+        // ends, ordinary or crashed, bottoms out in `std::process::exit`
+        // (Tauri's own `run` loop does it after `app.exit()`, and the fatal
+        // paths call it directly), which does not run the destructors of
+        // what is still on the heap. An explicit drop here would therefore be
+        // worthless on exactly the paths that matter. The liveness lock is
+        // released the one way that is real regardless of how this process
+        // ends: the OS closing every fd when it dies. See the field's own
+        // doc comment.
     }
 }
 
@@ -118,15 +139,17 @@ pub fn write_caddyfile(data_dir: &Path) -> std::io::Result<PathBuf> {
 
 /// Spawn the app's backend, and answer with it and the URL it serves.
 ///
-/// `lock` is the liveness lock this launch already holds; it is stored, never
-/// acquired here, so there is exactly one place in the codebase that decides
-/// whether this process is the app's live instance.
+/// `lock` and `serving` are the liveness and serving locks this launch
+/// already holds; both are stored, never acquired here, so there is exactly
+/// one place in the codebase — `lifecycle::acquire_launch_locks` — that
+/// decides what this process claims.
 pub fn start(
     toolchain: &Toolchain,
     app_dir: &Path,
     environment: &AppEnvironment,
     manifest: &crate::manifest::Manifest,
     lock: Option<fs::File>,
+    serving: Option<fs::File>,
     app: &tauri::AppHandle,
 ) -> Result<(Sidecar, String), Box<dyn std::error::Error>> {
     let async_worker = manifest.async_worker;
@@ -246,6 +269,7 @@ pub fn start(
             shutting_down,
             pid_file,
             lock,
+            serving,
         },
         url,
     ))
