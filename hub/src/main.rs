@@ -437,16 +437,10 @@ fn serve(
 ) {
     use tauri::Manager;
 
-    // The serving lock is managed on its own, separately from the liveness
-    // one `sidecar::start` below stores in `Sidecar`: plan 011 step 4 is what
-    // threads it into `Sidecar` alongside the liveness lock and releases it
-    // at the top of teardown. Until then it is simply held for this
-    // process's whole life, which is a safe — if not yet optimal — home for
-    // it: released by the OS at exit exactly like the liveness lock is today.
-    let liveness_lock = locks.map(|locks| {
-        app.manage(locks.serving);
-        locks.liveness
-    });
+    let (liveness_lock, serving_lock) = match locks {
+        Some(locks) => (Some(locks.liveness), Some(locks.serving)),
+        None => (None, None),
+    };
 
     let manifest = &spec.manifest;
     if manifest.splash_path.is_some() {
@@ -490,6 +484,7 @@ fn serve(
         &environment,
         manifest,
         liveness_lock,
+        serving_lock,
         &app,
     ) {
         Ok(started) => started,

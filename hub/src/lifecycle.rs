@@ -536,10 +536,38 @@ fn stop_sidecar(app: &tauri::AppHandle) {
     }
 }
 
+/// Release everything this process claims to be *serving*, before anything
+/// downstream is signalled: the serving lock, so an arriving launch's probe
+/// (`acquire_launch_locks`) stops finding a live instance to hand off to, and
+/// the single-instance D-Bus name, so `tauri-plugin-single-instance` stops
+/// routing new launches here at all.
+///
+/// Both ahead of [`stop_sidecar`], deliberately: "stop claiming to serve" and
+/// "have finished tearing down" are seconds apart under the
+/// SIGTERM-then-SIGKILL escalation `SERVING_WAIT_BUDGET` is sized against,
+/// and an arriving launch has no reason to wait out either just because this
+/// process has not finished dying yet.
+fn release_serving_claim(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    if let Some(sidecar) = app.try_state::<std::sync::Mutex<crate::sidecar::Sidecar>>() {
+        if let Ok(mut sidecar) = sidecar.lock() {
+            sidecar.serving.take();
+        }
+    }
+    // Blocking (a real D-Bus call), which is exactly why every caller of
+    // `stop_sidecar_and_exit` runs it off the GTK main thread already — see
+    // that function's own doc comment. The window closing this teardown is
+    // hidden by the time either caller gets here, so nothing on screen is
+    // waiting on it.
+    tauri_plugin_single_instance::destroy(app);
+}
+
 /// Stop the sidecar and exit — the one shutdown body, shared by the last window
 /// closing and by a signal, so a `SIGTERM` tears the app down exactly the way
 /// the user closing it does.
 fn stop_sidecar_and_exit(app: &tauri::AppHandle) {
+    release_serving_claim(app);
     stop_sidecar(app);
     app.exit(0);
 }
