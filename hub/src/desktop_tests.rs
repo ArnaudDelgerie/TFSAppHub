@@ -40,6 +40,7 @@ fn the_rendered_entry_matches_the_specification_field_for_field() {
          Exec=\"/home/user/.local/share/TFSApp/hub/bin/tfsapp-hub\" open tfsapp-test\n\
          Icon=/opt/apps/tfsapp-test/icon.png\n\
          Terminal=false\n\
+         StartupNotify=true\n\
          StartupWMClass=dev.local.tfsapp-test\n\
          X-TFSApp-Id=tfsapp-test\n"
     );

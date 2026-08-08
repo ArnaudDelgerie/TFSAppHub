@@ -52,6 +52,13 @@ pub fn render(id: &str, identity: &Identity, hub_executable: &Path) -> String {
         ));
     }
     entry.push_str("Terminal=false\n");
+    // `open <id>` returns as soon as it has re-executed the `__open` child,
+    // and that child inherits `DESKTOP_STARTUP_ID` / the xdg-activation token
+    // through its environment — so it is the process that would consume it,
+    // which is the argument for shipping this. Decided by measurement on the
+    // user's GNOME session (plan file, step 6) rather than by this argument
+    // alone: dropped instead if the launch spinner hangs to its timeout.
+    entry.push_str("StartupNotify=true\n");
     entry.push_str(&format!(
         "StartupWMClass={}\n",
         escape_value(&identity.identifier)
