@@ -41,7 +41,7 @@ use std::{
     process::Command,
 };
 
-use tfsapp_core::sidecar::command_with_env;
+use tfsapp_core::sidecar::{command_with_env, path_to_string};
 
 use crate::{
     paths::{Paths, PathsError},
@@ -193,16 +193,80 @@ impl Toolchain {
         self.wait(command, &format!("bin/console {}", arguments.join(" ")))
     }
 
-    /// A `frankenphp php-cli` command carrying `envs` plus the shim.
-    fn php(&self, envs: &[(&str, String)]) -> Command {
-        let mut command = command_with_env(&self.frankenphp, envs);
-        command.arg("php-cli");
+    /// One `bin/console` invocation whose output goes to a **log file** rather
+    /// than to the terminal.
+    ///
+    /// The same command as [`Toolchain::console`], for the moment that has no
+    /// terminal to write to: a launch. An app opened from a desktop entry has
+    /// nowhere for stdout to go, so a lifecycle command failing there would
+    /// otherwise leave nothing behind but an exit code. Each run is headed with
+    /// `=== [event] command ===` in `commands.log`, appended never truncated, so
+    /// several launches stay comparable in one file.
+    ///
+    /// `event` is the same word the station uses in its own header lines
+    /// (`pre-install`, `messenger-setup`, …) — the file is read by people who
+    /// know that vocabulary, and inventing a second one here would only make the
+    /// two hosts' logs harder to compare.
+    pub fn console_logged(
+        &self,
+        app_dir: &Path,
+        envs: &[(&str, String)],
+        arguments: &str,
+        log_file: &Path,
+        event: &str,
+    ) -> Result<(), PhpError> {
+        let arguments: Vec<&str> = arguments.split_whitespace().collect();
+        if arguments.is_empty() {
+            return Ok(());
+        }
+        let label = format!("bin/console {}", arguments.join(" "));
 
-        // Both, because they are read by different code: `PHP_BINARY` is what
-        // `PhpExecutableFinder` consults first, and `PATH` is what a script
-        // that plainly spells `php` uses. Prepended rather than replacing PATH
-        // — Composer legitimately reaches for `git`, `unzip` and friends.
-        command.env("PHP_BINARY", &self.shim);
+        tfsapp_core::log::append_log(log_file, &format!("=== [{event}] {label} ==="));
+
+        let mut command = self.php(envs);
+        command
+            .arg(app_dir.join("bin/console"))
+            .args(&arguments)
+            .current_dir(app_dir);
+
+        let output = command.output().map_err(|source| {
+            tfsapp_core::log::append_log(log_file, &format!("spawn error: {source}"));
+            PhpError::Unstartable {
+                label: label.clone(),
+                source,
+            }
+        })?;
+        tfsapp_core::log::append_log(log_file, &String::from_utf8_lossy(&output.stdout));
+        tfsapp_core::log::append_log(log_file, &String::from_utf8_lossy(&output.stderr));
+
+        if !output.status.success() {
+            return Err(PhpError::FailedLogged {
+                label,
+                detail: match output.status.code() {
+                    Some(code) => format!("exited with status {code}"),
+                    None => "was killed by a signal".to_string(),
+                },
+                log_file: log_file.to_path_buf(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The two variables that point anything looking for PHP at the shim.
+    ///
+    /// Both, because they are read by different code: `PHP_BINARY` is what
+    /// `PhpExecutableFinder` consults first, and `PATH` is what a script that
+    /// plainly spells `php` uses. `PATH` is prepended to, never replaced —
+    /// Composer legitimately reaches for `git`, `unzip` and friends.
+    ///
+    /// Exposed rather than kept inside [`Toolchain::php`] because the sidecar
+    /// and the Messenger worker need them just as much: both are PHP processes
+    /// that can shell out to PHP, and both would otherwise land on the host's
+    /// interpreter — or, on the machine with no PHP at all that the hub exists
+    /// to serve, on nothing. See `.project/station-findings.md` #3, which
+    /// measured it.
+    pub fn shim_env(&self) -> Vec<(&'static str, String)> {
+        let mut variables = vec![("PHP_BINARY", path_to_string(&self.shim))];
         if let Some(directory) = self.shim.parent() {
             let path = match std::env::var_os("PATH") {
                 Some(existing) => {
@@ -212,9 +276,18 @@ impl Toolchain {
                 }
                 None => directory.as_os_str().to_os_string(),
             };
-            command.env("PATH", path);
+            variables.push(("PATH", path.to_string_lossy().into_owned()));
         }
+        variables
+    }
 
+    /// A `frankenphp php-cli` command carrying `envs` plus the shim.
+    fn php(&self, envs: &[(&str, String)]) -> Command {
+        let mut command = command_with_env(&self.frankenphp, envs);
+        command.arg("php-cli");
+        for (key, value) in self.shim_env() {
+            command.env(key, value);
+        }
         command
     }
 
@@ -248,10 +321,28 @@ impl Toolchain {
 pub enum PhpError {
     Platform(PlatformError),
     Paths(PathsError),
-    NoComposer { path: PathBuf },
-    Io { path: PathBuf, source: io::Error },
-    Unstartable { label: String, source: io::Error },
-    Failed { label: String, detail: String },
+    NoComposer {
+        path: PathBuf,
+    },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Unstartable {
+        label: String,
+        source: io::Error,
+    },
+    Failed {
+        label: String,
+        detail: String,
+    },
+    /// A command whose output went to a log file rather than the terminal — so
+    /// unlike [`PhpError::Failed`], the message has to say where to read it.
+    FailedLogged {
+        label: String,
+        detail: String,
+        log_file: PathBuf,
+    },
 }
 
 impl fmt::Display for PhpError {
@@ -274,6 +365,15 @@ impl fmt::Display for PhpError {
             // this line says which one stopped and how, and does not try to
             // repeat what it said.
             Self::Failed { label, detail } => write!(formatter, "`{label}` {detail}"),
+            Self::FailedLogged {
+                label,
+                detail,
+                log_file,
+            } => write!(
+                formatter,
+                "`{label}` {detail}. See {} for its full output.",
+                log_file.display()
+            ),
         }
     }
 }

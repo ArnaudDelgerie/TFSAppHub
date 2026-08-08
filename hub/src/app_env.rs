@@ -33,11 +33,22 @@ use crate::{
     paths::{Paths, PathsError},
 };
 
-/// The §3 variables, plus the one path a caller needs in its own right.
+/// Which moment is assembling this environment.
 ///
-/// The resolved port is deliberately *not* a field: nothing in an install binds
-/// it, and `APP_PORT` already carries it. Plan 007, which does bind it, is the
-/// one that should decide how it wants to hold the value.
+/// The variables are identical either way — that is the point of §3, and an app
+/// must not be able to tell an install's `bin/console` from a launch's. What
+/// differs is what the assembly *does to the data dir* on its way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// An `install` or `update`: warm what the app's own commands are about to
+    /// build, and throw nothing away.
+    Install,
+    /// A launch: wipe `cache/` and `build/`, and rotate the logs before anything
+    /// opens them.
+    Launch,
+}
+
+/// The §3 variables, plus the paths a caller needs in their own right.
 pub struct AppEnvironment {
     /// Ready for `core`'s `command_with_env`.
     pub vars: Vec<(&'static str, String)>,
@@ -51,22 +62,41 @@ pub struct AppEnvironment {
     /// rebuilding the path at each call site is how two of them end up
     /// disagreeing.
     pub data_subdir: PathBuf,
+    /// `<data_dir>/log/` — where `commands.log` and `sidecar.log` land. The one
+    /// place a launch failure can be read from afterwards, which is why every
+    /// message that mentions a failure names a file in here.
+    pub log_dir: PathBuf,
+    /// The port `APP_PORT`/`APP_ORIGIN` were built from, for the caller that has
+    /// to poll `/healthz` on it and point a window at it. Reading it back out of
+    /// `vars` would work and would be one string parse away from a launch that
+    /// silently polls the wrong port.
+    pub port: u16,
 }
 
 /// Assemble CONTRACT.md §3 for `manifest`'s app, installed at `app_dir`.
 ///
-/// Creates the data dir and its four subdirectories, and nothing else. In
-/// particular it does **not** wipe `cache/` and `build/` the way the station
-/// does on every launch: over there the wipe is a remedy for a random
-/// `/tmp/.mount_*` path baking itself into the compiled container, a cause the
-/// hub does not have (it runs apps from a stable real path). Whether to wipe at
-/// *launch* is plan 007's decision to make and measure; an install is not a
-/// launch, and wiping here would only throw away the cache the install just
-/// warmed.
+/// Creates the data dir and its four subdirectories. What else it does depends
+/// on [`Mode`], and only one of the two differences is interesting.
+///
+/// **The launch-time cache wipe is the station's workaround, kept deliberately.**
+/// Over there `cache/` and `build/` are emptied on every launch because a random
+/// `/tmp/.mount_*` AppImage path bakes itself into the compiled Symfony
+/// container, and reusing it across an upgrade is how a stale container survives.
+/// The hub does not have that cause: it runs apps from a stable real path (see
+/// `paths.rs`). So a persistent warm cache is *possible* here — which is not the
+/// same as proven, and claiming it needs its own measurement. Until then the hub
+/// pays the same cost the station pays, because the failure mode of getting this
+/// wrong is a user running last version's compiled container against this
+/// version's code. Plan 007 keeps the wipe on purpose and says so; dropping it is
+/// its own plan.
+///
+/// An install is not a launch: wiping there would throw away the very cache the
+/// install's own `cache:warmup` just built.
 pub fn resolve(
     paths: &Paths,
     manifest: &Manifest,
     app_dir: &Path,
+    mode: Mode,
 ) -> Result<AppEnvironment, EnvError> {
     let data_dir = paths.create_app_data_dir(&manifest.identifier)?;
     let data_subdir = data_dir.join("data");
@@ -74,6 +104,13 @@ pub fn resolve(
     let build_dir = data_dir.join("build");
     let log_dir = data_dir.join("log");
     let sessions_dir = data_dir.join("sessions");
+    if mode == Mode::Launch {
+        // Best-effort: a directory that cannot be removed is recreated below and
+        // the launch carries on, rather than refusing to open the app over a
+        // cache it could not clear.
+        let _ = fs::remove_dir_all(&cache_dir);
+        let _ = fs::remove_dir_all(&build_dir);
+    }
     for directory in [
         &data_subdir,
         &cache_dir,
@@ -85,6 +122,13 @@ pub fn resolve(
             path: directory.clone(),
             source,
         })?;
+    }
+    if mode == Mode::Launch {
+        // Once per launch, and here rather than anywhere later: this is the one
+        // point both `commands.log`'s first write and `sidecar.log`'s fd open
+        // are still ahead of, which is what a size-based rotation needs to be
+        // true to rotate the file rather than the file's replacement.
+        tfsapp_core::log::rotate_logs(&log_dir);
     }
 
     // The same resolution packaged mode makes, `data/config.json`'s
@@ -172,6 +216,8 @@ pub fn resolve(
         vars,
         data_dir,
         data_subdir,
+        log_dir,
+        port,
     })
 }
 

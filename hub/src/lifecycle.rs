@@ -312,6 +312,116 @@ pub fn fatal_startup_error(message: &str) -> ! {
     std::process::exit(1);
 }
 
+/// Every fatal error after `.setup()` has been reached: stop the sidecar, show
+/// the app's own dialog, exit.
+///
+/// **It must run on its own thread, never on the calling one.** The dialog
+/// plugin dispatches the real dialog to the main thread and blocks the caller
+/// waiting for the answer. Called from `.setup()` — which *is* the main thread —
+/// that queued work could never run: the event loop cannot reach the iteration
+/// that would dispatch it while the callback waiting on its result is still on
+/// the stack. The dialog would silently never render and the process would hang
+/// for ever. The station reproduced exactly that live before fixing it the same
+/// way, which is why every call site here spawns and returns immediately.
+pub fn fatal_post_setup_error(app: tauri::AppHandle, message: String) {
+    use tauri_plugin_dialog::DialogExt;
+
+    std::thread::spawn(move || {
+        stop_sidecar(&app);
+        app.dialog()
+            .message(&message)
+            .title("TFSApp Hub: startup error")
+            .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+            .blocking_show();
+        eprintln!("tfsapp-hub: {message}");
+        std::process::exit(1);
+    });
+}
+
+/// Stop the managed sidecar, if this process ever got as far as having one.
+fn stop_sidecar(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    if let Some(sidecar) = app.try_state::<std::sync::Mutex<crate::sidecar::Sidecar>>() {
+        if let Ok(mut sidecar) = sidecar.lock() {
+            sidecar.stop();
+        }
+    }
+}
+
+/// Stop the sidecar and exit — the one shutdown body, shared by the last window
+/// closing and by a signal, so a `SIGTERM` tears the app down exactly the way
+/// the user closing it does.
+fn stop_sidecar_and_exit(app: &tauri::AppHandle) {
+    stop_sidecar(app);
+    app.exit(0);
+}
+
+/// The window-close handler.
+///
+/// On the *last* window's close request the default synchronous close is vetoed
+/// — otherwise it races the teardown below — the window is hidden at once so the
+/// user sees their click land, and the sidecar is stopped off the GTK main
+/// thread. That last part matters: teardown escalates SIGTERM to SIGKILL over up
+/// to three seconds, and doing that on the main thread would freeze a window
+/// that is still on screen.
+///
+/// A window closing while others remain closes only itself: the backend belongs
+/// to the app, not to any one of its windows.
+pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
+    use tauri::Manager;
+
+    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        // The closing window is still open at this point, so its own label is
+        // excluded — the question is whether anything *else* would be left.
+        let others_remain = window
+            .app_handle()
+            .webview_windows()
+            .into_keys()
+            .any(|label| label != window.label());
+
+        if !others_remain
+            && window
+                .try_state::<std::sync::Mutex<crate::sidecar::Sidecar>>()
+                .is_some()
+        {
+            api.prevent_close();
+            let _ = window.hide();
+            let app = window.app_handle().clone();
+            std::thread::spawn(move || stop_sidecar_and_exit(&app));
+        }
+    }
+}
+
+/// Turn a `SIGINT`/`SIGTERM` into the same orderly shutdown as closing the last
+/// window.
+///
+/// Without it the default disposition applies: this process dies on the spot,
+/// `Sidecar::stop` never runs, and FrankenPHP — plus the Messenger worker —
+/// survives as an orphan holding the app's database open. The safety nets still
+/// hold (the OS releases the liveness lock, so the next launch reaps it), but
+/// nothing reclaims those processes in the meantime.
+///
+/// A handler may only make async-signal-safe calls, so it writes one byte to a
+/// pipe and the reaction happens on an ordinary thread — `core`'s self-pipe
+/// machinery, unchanged.
+pub fn install_shutdown_on_signal(app: &tauri::AppHandle) {
+    let read_fd = match tfsapp_core::process::install_signal_forwarding() {
+        Ok(fd) => fd,
+        Err(error) => {
+            // Not fatal: the app runs exactly as it would have, orphans and
+            // all, rather than refusing to open over a failed pipe.
+            eprintln!("tfsapp-hub: cannot install signal handling: {error}");
+            return;
+        }
+    };
+    let app = app.clone();
+    tfsapp_core::process::spawn_on_signal(read_fd, move || {
+        println!("Received a termination signal, stopping the backend");
+        stop_sidecar_and_exit(&app);
+    });
+}
+
 #[derive(Debug)]
 pub enum LifecycleError {
     Io {

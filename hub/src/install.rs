@@ -210,7 +210,7 @@ fn prepare(
     manifest: &Manifest,
     app_dir: &Path,
 ) -> Result<(), InstallError> {
-    let environment = app_env::resolve(paths, manifest, app_dir)?;
+    let environment = app_env::resolve(paths, manifest, app_dir, app_env::Mode::Install)?;
     // Named before the first command runs, because the next thing on screen is
     // a migration writing a database into it — under `identifier`, which is
     // what makes it the same data dir a packaged install of this app uses.

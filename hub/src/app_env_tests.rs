@@ -1,6 +1,6 @@
 use std::{os::unix::fs::PermissionsExt, path::Path};
 
-use super::resolve;
+use super::{resolve, Mode};
 use crate::{manifest, paths::Paths};
 
 fn manifest_with(extra: &str) -> manifest::Manifest {
@@ -33,8 +33,13 @@ fn every_variable_the_contract_lists_is_injected() {
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
 
-    let environment = resolve(&paths, &manifest_with(""), Path::new("/apps/demo"))
-        .expect("the environment resolves");
+    let environment = resolve(
+        &paths,
+        &manifest_with(""),
+        Path::new("/apps/demo"),
+        Mode::Install,
+    )
+    .expect("the environment resolves");
 
     for key in [
         "TFS_APP_IDENTIFIER",
@@ -80,8 +85,13 @@ fn the_data_the_app_reads_hangs_off_identifier_and_nothing_else() {
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
 
-    let environment = resolve(&paths, &manifest_with(""), Path::new("/apps/whatever"))
-        .expect("the environment resolves");
+    let environment = resolve(
+        &paths,
+        &manifest_with(""),
+        Path::new("/apps/whatever"),
+        Mode::Install,
+    )
+    .expect("the environment resolves");
 
     let expected = base.path().join("TFSApp").join("dev.local.demo");
     assert_eq!(environment.data_dir, expected);
@@ -113,7 +123,13 @@ fn the_async_worker_toggle_reaches_both_the_transport_and_the_app() {
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
 
-    let off = resolve(&paths, &manifest_with(""), Path::new("/apps/demo")).expect("it resolves");
+    let off = resolve(
+        &paths,
+        &manifest_with(""),
+        Path::new("/apps/demo"),
+        Mode::Install,
+    )
+    .expect("it resolves");
     assert_eq!(value(&off.vars, "MESSENGER_TRANSPORT_DSN"), "sync://");
     assert_eq!(value(&off.vars, "TFS_ASYNC_WORKER"), "0");
 
@@ -121,6 +137,7 @@ fn the_async_worker_toggle_reaches_both_the_transport_and_the_app() {
         &paths,
         &manifest_with(r#", "async_worker": true"#),
         Path::new("/apps/demo"),
+        Mode::Install,
     )
     .expect("it resolves");
     assert_eq!(
@@ -139,13 +156,19 @@ fn a_pinned_port_is_honoured_and_an_absent_one_is_picked() {
         &paths,
         &manifest_with(r#", "app_port": 8123"#),
         Path::new("/apps/demo"),
+        Mode::Install,
     )
     .expect("it resolves");
     assert_eq!(value(&pinned.vars, "APP_PORT"), "8123");
     assert_eq!(value(&pinned.vars, "APP_ORIGIN"), "http://127.0.0.1:8123");
 
-    let dynamic =
-        resolve(&paths, &manifest_with(""), Path::new("/apps/demo")).expect("it resolves");
+    let dynamic = resolve(
+        &paths,
+        &manifest_with(""),
+        Path::new("/apps/demo"),
+        Mode::Install,
+    )
+    .expect("it resolves");
     let picked: u16 = value(&dynamic.vars, "APP_PORT")
         .parse()
         .expect("a port number");
@@ -158,8 +181,20 @@ fn the_secret_is_the_same_one_the_next_command_will_read() {
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
 
-    let first = resolve(&paths, &manifest_with(""), Path::new("/apps/demo")).expect("it resolves");
-    let second = resolve(&paths, &manifest_with(""), Path::new("/apps/demo")).expect("it resolves");
+    let first = resolve(
+        &paths,
+        &manifest_with(""),
+        Path::new("/apps/demo"),
+        Mode::Install,
+    )
+    .expect("it resolves");
+    let second = resolve(
+        &paths,
+        &manifest_with(""),
+        Path::new("/apps/demo"),
+        Mode::Install,
+    )
+    .expect("it resolves");
 
     assert_eq!(
         value(&first.vars, "APP_SECRET"),
