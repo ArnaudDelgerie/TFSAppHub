@@ -39,6 +39,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use tfsapp_core::ports::DataConfig;
@@ -195,8 +196,11 @@ pub fn prepare_launch(
     app_version: &str,
     app_port: Option<u16>,
 ) -> Option<fs::File> {
-    let lock =
-        tfsapp_core::process::cleanup_previous_sidecar(&data_dir.join("sidecar.pid"), identifier);
+    let lock = tfsapp_core::process::cleanup_previous_sidecar(
+        &data_dir.join("sidecar.pid"),
+        identifier,
+        Duration::ZERO,
+    );
 
     // A live sibling holds the lock: this process must not run the guards, must
     // not touch the data dir, and must not bind anything.
@@ -234,8 +238,11 @@ pub fn prepare_dev_launch(
     identifier: &str,
     app_port: Option<u16>,
 ) -> Option<fs::File> {
-    let lock =
-        tfsapp_core::process::cleanup_previous_sidecar(&data_dir.join("sidecar.pid"), identifier);
+    let lock = tfsapp_core::process::cleanup_previous_sidecar(
+        &data_dir.join("sidecar.pid"),
+        identifier,
+        Duration::ZERO,
+    );
 
     lock.as_ref()?;
 

@@ -34,6 +34,53 @@ fn kill_and_wait(mut child: std::process::Child) {
     let _ = child.wait();
 }
 
+// --- cleanup_previous_sidecar ------------------------------------------------
+
+#[test]
+fn cleanup_previous_sidecar_zero_budget_is_the_old_non_blocking_behaviour() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("sidecar.pid");
+    let holder = spawn_lock_holder(&lock_path(&pid_file));
+
+    let start = Instant::now();
+    let lock = cleanup_previous_sidecar(&pid_file, "test-identifier", Duration::ZERO);
+
+    assert!(lock.is_none());
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "must not have polled"
+    );
+
+    kill_and_wait(holder);
+}
+
+#[test]
+fn cleanup_previous_sidecar_waits_for_a_lock_released_mid_flight_then_reaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("sidecar.pid");
+    // A pid that cannot exist, so the reap silently refuses rather than
+    // signalling anything — this test is about the wait and the pid-file
+    // removal, not the reap decision itself, which `reap_decision` covers.
+    fs::write(&pid_file, "999999999\n").unwrap();
+    let mut holder = spawn_lock_holder(&lock_path(&pid_file));
+
+    let waiting = {
+        let pid_file = pid_file.clone();
+        thread::spawn(move || {
+            cleanup_previous_sidecar(&pid_file, "test-identifier", Duration::from_secs(2))
+        })
+    };
+    thread::sleep(Duration::from_millis(150));
+    assert!(!waiting.is_finished(), "it must still be waiting");
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+
+    let lock = waiting.join().expect("the waiter did not panic");
+
+    assert!(lock.is_some());
+    assert!(!pid_file.exists(), "a reaped pid file is removed");
+}
+
 // --- lock_path -------------------------------------------------------------
 
 #[test]
@@ -106,6 +153,66 @@ fn lock_file_exclusive_waits_for_the_holder_instead_of_failing() {
         .join()
         .expect("the waiter did not panic")
         .expect("the lock is taken once the holder is gone");
+}
+
+// --- lock_file_exclusive_timeout ----------------------------------------------
+
+#[test]
+fn lock_file_exclusive_timeout_none_while_the_holder_is_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("serving.lock");
+    let holder = spawn_lock_holder(&path);
+
+    assert!(
+        lock_file_exclusive_timeout(&path, Duration::from_millis(300))
+            .unwrap()
+            .is_none()
+    );
+
+    kill_and_wait(holder);
+}
+
+#[test]
+fn lock_file_exclusive_timeout_returns_the_held_lock_once_the_holder_releases_mid_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("serving.lock");
+    let mut holder = spawn_lock_holder(&path);
+
+    let waiting = {
+        let path = path.clone();
+        thread::spawn(move || lock_file_exclusive_timeout(&path, Duration::from_secs(2)))
+    };
+    thread::sleep(Duration::from_millis(150));
+    assert!(!waiting.is_finished(), "it must still be waiting");
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+
+    let held = waiting
+        .join()
+        .expect("the waiter did not panic")
+        .expect("no I/O error")
+        .expect("the lock is taken once the holder is gone");
+    // Genuinely excludes a third acquisition: the file that comes back is
+    // still the one holding the flock, not a dropped-and-forgotten handle.
+    assert!(try_lock_file(&path).unwrap().is_none());
+    drop(held);
+}
+
+#[test]
+fn lock_file_exclusive_timeout_zero_budget_behaves_like_try_lock_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("serving.lock");
+    let holder = spawn_lock_holder(&path);
+
+    assert!(lock_file_exclusive_timeout(&path, Duration::ZERO)
+        .unwrap()
+        .is_none());
+
+    kill_and_wait(holder);
+
+    assert!(lock_file_exclusive_timeout(&path, Duration::ZERO)
+        .unwrap()
+        .is_some());
 }
 
 // --- wait_for_lock_release ---------------------------------------------------

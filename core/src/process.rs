@@ -13,23 +13,35 @@ use std::{
 
 /// Reap a stale FrankenPHP sidecar left by a previous crash, identified by
 /// the pid persisted under `pid_file`, and take over its liveness lock for
-/// this launch. Returns the held lock on success; `None` means a live
-/// sibling instance already holds it, in which case `pid_file` is left
-/// untouched — nothing is signalled. Called exactly once per launch: from
-/// `main()` pre-`Builder` for packaged mode (the lock is then threaded
-/// through `.setup()` into `Sidecar`), or from `start_dev_sidecar` for dev.
+/// this launch. Returns the held lock on success; `None` means the lock is
+/// still held after `wait` — either a live sibling instance holds it for
+/// good, or one was dying and did not finish within `wait` — in which case
+/// `pid_file` is left untouched and nothing is signalled. Called exactly once
+/// per launch: from `main()` pre-`Builder` for packaged mode (the lock is
+/// then threaded through `.setup()` into `Sidecar`), or from
+/// `start_dev_sidecar` for dev.
 ///
-/// Liveness is proven with a non-blocking exclusive flock on
-/// `<pid_file>.lock`, held by the launcher process for its whole lifetime
-/// (see `Sidecar`) and released automatically by the OS if it dies or
-/// crashes without running `Sidecar::stop`. Acquiring the lock here means
-/// any previous launcher is confirmed dead, so a pid found in `pid_file` is
-/// by definition orphaned. Even then, a pid is only ever signalled if its
-/// `/proc/<pid>/environ` still carries `identifier` — closing the window
-/// where the OS has recycled that pid onto another project's live
-/// FrankenPHP.
-pub fn cleanup_previous_sidecar(pid_file: &Path, identifier: &str) -> Option<File> {
-    let lock = try_lock_file(&lock_path(pid_file)).ok().flatten()?;
+/// Liveness is proven with an exclusive flock on `<pid_file>.lock`, held by
+/// the launcher process for its whole lifetime (see `Sidecar`) and released
+/// automatically by the OS if it dies or crashes without running
+/// `Sidecar::stop`. Acquiring the lock here means any previous launcher is
+/// confirmed dead, so a pid found in `pid_file` is by definition orphaned.
+/// Even then, a pid is only ever signalled if its `/proc/<pid>/environ` still
+/// carries `identifier` — closing the window where the OS has recycled that
+/// pid onto another project's live FrankenPHP.
+///
+/// `wait` is the budget given to [`lock_file_exclusive_timeout`] for the lock
+/// to free up before giving up — `Duration::ZERO` behaves exactly as the
+/// unconditional [`try_lock_file`] this function used before it took a
+/// budget: one non-blocking attempt, no polling. The reap, the liveness
+/// proof and the pid-file removal stay one indivisible act on any budget: a
+/// caller that wants to wait for a dying sibling has no separate entry point
+/// to reach for, because splitting the wait from the reap would let a second
+/// wait-then-reap sequence run the reap twice.
+pub fn cleanup_previous_sidecar(pid_file: &Path, identifier: &str, wait: Duration) -> Option<File> {
+    let lock = lock_file_exclusive_timeout(&lock_path(pid_file), wait)
+        .ok()
+        .flatten()?;
 
     if let Ok(contents) = fs::read_to_string(pid_file) {
         for line in contents.lines() {
@@ -271,6 +283,35 @@ pub fn lock_file_exclusive(path: &Path) -> std::io::Result<File> {
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(error);
         }
+    }
+}
+
+/// Take an exclusive lock on `path`, waiting up to `timeout` for a holder to
+/// release it — the bounded sibling of [`lock_file_exclusive`]. `Ok(Some(file))`
+/// means the lock was acquired within `timeout`; hold `file` for as long as
+/// the lock must be held, exactly as [`try_lock_file`]. `Ok(None)` means
+/// `timeout` elapsed with the lock still held by someone else.
+///
+/// [`wait_for_lock_release`] cannot serve this: it only *observes* the lock
+/// free and drops it again at once, which leaves a gap between that
+/// observation and a caller's own later acquisition attempt — long enough for
+/// a third arrival to take the lock first, in between. This function never
+/// lets go of the lock between seeing it free and answering with it: the
+/// underlying `try_lock_file` call that finds it free is the same call that
+/// takes it, so there is nothing to walk into.
+pub fn lock_file_exclusive_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> std::io::Result<Option<File>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(file) = try_lock_file(path)? {
+            return Ok(Some(file));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
