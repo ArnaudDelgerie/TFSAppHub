@@ -68,6 +68,40 @@ fn the_app_data_dir_is_a_sibling_of_the_hub_root_not_a_child() {
 }
 
 #[test]
+fn the_hub_executable_path_sits_beside_the_php_shim() {
+    let (base, paths) = temp_paths();
+
+    assert_eq!(
+        paths.hub_executable_path(),
+        base.path().join("TFSApp/hub/bin/tfsapp-hub")
+    );
+    assert_eq!(
+        paths.hub_executable_path().parent(),
+        paths.php_shim_path().parent()
+    );
+}
+
+#[test]
+fn the_applications_dir_is_a_sibling_of_the_vendor_dir() {
+    let (base, paths) = temp_paths();
+
+    assert_eq!(paths.applications_dir(), base.path().join("applications"));
+    assert_eq!(paths.applications_dir().parent(), Some(base.path()));
+}
+
+#[test]
+fn the_desktop_entry_path_is_named_after_the_identifier() {
+    let (base, paths) = temp_paths();
+
+    assert_eq!(
+        paths
+            .desktop_entry_path("dev.local.tfsapp-test")
+            .expect("a safe identifier"),
+        base.path().join("applications/dev.local.tfsapp-test.desktop")
+    );
+}
+
+#[test]
 fn an_id_that_is_not_one_path_component_is_refused() {
     let (_base, paths) = temp_paths();
 
@@ -80,6 +114,23 @@ fn an_id_that_is_not_one_path_component_is_refused() {
             "unexpected error for {id:?}: {error}"
         );
     }
+}
+
+#[test]
+fn a_desktop_entry_path_for_a_traversing_identifier_is_refused() {
+    let (_base, paths) = temp_paths();
+
+    let error = paths
+        .desktop_entry_path("../../evil")
+        .expect_err("a traversing identifier must not name a desktop entry");
+
+    assert!(matches!(
+        error,
+        PathsError::UnsafeSegment {
+            kind: "app identifier",
+            ..
+        }
+    ));
 }
 
 #[test]

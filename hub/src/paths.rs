@@ -56,6 +56,21 @@ pub const BIN_DIR: &str = "bin";
 /// by anything looking for a PHP interpreter (see `php.rs`).
 pub const PHP_SHIM_FILE: &str = "php";
 
+/// The hub's own stable executable name, beside the `php` shim.
+///
+/// Its existence is what keeps a generated `.desktop` entry's `Exec=` valid
+/// after the user tidies `~/Downloads`: the entry never names the AppImage or
+/// binary the hub happened to run from, only this copy (`hub_bin.rs`). Hub
+/// self-update replaces this same file, which is the other half of the reason
+/// it lives under the hub's own root rather than next to a per-app path.
+pub const HUB_EXECUTABLE_FILE: &str = "tfsapp-hub";
+
+/// The XDG applications directory's name, under the OS data dir.
+pub const APPLICATIONS_DIR: &str = "applications";
+
+/// A generated `.desktop` entry's extension.
+pub const DESKTOP_ENTRY_EXTENSION: &str = "desktop";
+
 /// The registry file's name under the hub root.
 pub const REGISTRY_FILE: &str = "registry.json";
 
@@ -130,6 +145,42 @@ impl Paths {
     /// would be an unpleasant surprise.
     pub fn php_shim_path(&self) -> PathBuf {
         self.hub_root().join(BIN_DIR).join(PHP_SHIM_FILE)
+    }
+
+    /// `<OS data dir>/TFSApp/hub/bin/tfsapp-hub` — a stable, runnable copy of
+    /// the hub, kept current by `hub_bin::ensure_current` and named by every
+    /// generated `.desktop` entry's `Exec=`.
+    ///
+    /// Beside [`Paths::php_shim_path`] under the hub's own `bin/`, for the
+    /// same reason that shim lives there: it is the hub's plumbing, not an
+    /// app's, and it must outlive whatever download directory the running
+    /// image came from.
+    pub fn hub_executable_path(&self) -> PathBuf {
+        self.hub_root().join(BIN_DIR).join(HUB_EXECUTABLE_FILE)
+    }
+
+    /// `<OS data dir>/applications/` — the XDG directory a `.desktop` entry
+    /// has to live in to be found by the shell's grid and search.
+    ///
+    /// A **sibling** of `TFSApp/`, like [`Paths::webkit_data_dir`] and for the
+    /// same class of reason: it belongs to the desktop environment, not to
+    /// this project. Pure, like that function — the hub creates it on write
+    /// and never cleans, chmods or enumerates it.
+    pub fn applications_dir(&self) -> PathBuf {
+        self.data_dir_base.join(APPLICATIONS_DIR)
+    }
+
+    /// `<applications dir>/<identifier>.desktop`.
+    ///
+    /// Named after `identifier` rather than the hub-local `id`: it is the
+    /// filename GNOME matches first against `_GTK_APPLICATION_ID`
+    /// (`.project/plan/003-runtime-identity.md` step 5), and a
+    /// `tfsapp-`-prefixed name would miss that key entirely.
+    pub fn desktop_entry_path(&self, identifier: &str) -> Result<PathBuf, PathsError> {
+        Ok(self.applications_dir().join(format!(
+            "{}.{DESKTOP_ENTRY_EXTENSION}",
+            safe_segment("app identifier", identifier)?
+        )))
     }
 
     /// `<OS data dir>/TFSApp/hub/registry.json`.
