@@ -580,3 +580,105 @@ The only real fix is sandboxing the processes, which is a change of distribution
 format and is not on the roadmap. Read per-`identifier` storage as tidiness, not
 as secrecy, and do not store in it something whose disclosure to another
 application on the same machine would be a breach.
+
+---
+
+## 6. Lifecycle
+
+An app declares, under `commands`, what has to run when it arrives on a machine
+and when a newer version of it does:
+
+```json
+{
+  "commands": {
+    "pre-install":  ["doctrine:migrations:migrate --no-interaction"],
+    "post-install": ["app:seed-defaults"],
+    "pre-update":   ["doctrine:migrations:migrate --no-interaction"],
+    "post-update":  []
+  }
+}
+```
+
+### The guarantee
+
+**The commands of an event run once per install or update, in declared order,
+before the user first sees the app, with §3's environment.** Every one of them
+runs as `bin/console <args>` through the interpreter that serves the app, with
+the app's own directory as the working directory. The first non-zero exit stops
+the rest of the list and fails the whole event, naming the event, the command,
+its exit status and where its output was captured.
+
+*When* an event happens is the host's to decide, because only a host knows what
+its own moments are. What the app is promised is the ordering and the
+environment, not a wall-clock relationship to a window opening.
+
+**A `post-` command may not assume its own app is reachable over HTTP.** This is
+the one thing worth reading twice, because it is the clause most likely to be
+assumed the other way. A `post-install` that curls its own routes, or that
+expects a booted HTTP kernel to answer it, is outside the contract. Everything a
+lifecycle command needs it must reach directly — the database, the filesystem,
+the container — exactly as any console command does.
+
+### The four events
+
+| Key | Means |
+| --- | --- |
+| `pre-install` | This app is arriving on this machine for the first time. |
+| `post-install` | Same occasion, after the `pre-` list. |
+| `pre-update` | A newer version of this app is replacing an older one, over the same data. |
+| `post-update` | Same occasion, after the `pre-` list. |
+
+Which event a moment is gets decided by comparing the app's `app_version`
+against the version recorded in its data directory. No record means install; a
+newer version means update; an equal one means neither, and nothing runs. A
+recorded version *newer* than the app being run is a downgrade: it has no
+lifecycle event, and it is refused rather than guessed at — running old code
+against data a newer version wrote is how a database gets corrupted quietly.
+
+**The record is never written speculatively.** It is updated only after the
+event's last command has succeeded, so a failure leaves the previous record — or
+none at all, on a first install — in place, and the next attempt replays the
+*whole* event rather than resuming from the command that failed. There is no
+partial state to reason about.
+
+**Today the hub runs the install event and refuses the update.** `install`
+executes `pre-install` then `post-install`, in order, with the full environment
+and no server running, on a terminal where a failure is legible. Per-app update
+is a queued plan; until it lands, `pre-update` and `post-update` may be declared
+but never run, and an installed snapshot found to be newer than its own record is
+refused with the command that resolves it named. When update does land, it owns
+one guarantee this section deliberately does not state on its behalf: an update
+must never leave the app's database between two versions.
+
+That install-time placement is better than it had to be. A migration and a cache
+warm-up run once, while someone is watching a terminal that can print an error,
+instead of inside a launch where every failure has to become a dialog.
+
+### There are no build hooks
+
+Two further keys existed on the archived per-app packaging route,
+`pre-build` and `post-build`, running arbitrary shell on the developer's machine
+during a build. They do not exist here and will not be added.
+
+The hub has no per-app build step to hook into — that is the point of installing
+from source with a bundled interpreter — and the boundary is deliberate:
+**the developer builds on their machine; the host installs, serves and
+restarts.** A host that ran an app's build commands would be a build tool with a
+window attached, and every asset pipeline in the world already has a `--watch`.
+
+Nothing is lost by it. Assets belong in the app's repository, built and
+committed by whatever built them; `composer install` runs at install time with
+the very interpreter that will later serve the app, which is the only build-like
+step the contract needs.
+
+### Command strings are argv, never a shell
+
+Each entry is a `bin/console` argument string, split on whitespace and passed as
+`argv` directly. There is **no shell interpretation** — no pipes, no
+redirection, no variable expansion, no `&&`. Two consequences, both intended:
+a manifest cannot become a shell-injection vector, and only `bin/console`
+commands can be declared, never arbitrary executables.
+
+This is stricter than it would need to be if these commands only ever ran on
+their author's machine. They do not: they run on a user's machine, from a
+manifest that user did not write.
