@@ -24,13 +24,16 @@ the very interpreter that will later serve the app — and per-app update falls 
 of `git fetch` for free.
 
 Status: **it installs, and it opens.** `install` snapshots a local project,
-resolves its dependencies with the bundled PHP, runs its lifecycle commands and
-registers it; `open` gives that app a real window on its own FrankenPHP, with
-its own data directory and its own cookie store, so two apps open side by side
-stay isolated; `list` and `remove` close the loop. Not there yet:
-`run <id> <alias>`, desktop entries, and update/rollback. Git sources are
-recognised and refused with a message saying so, rather than pretended. The
-design record and the plan queue live under the git-ignored `.project/`.
+resolves its dependencies with the bundled PHP, runs its lifecycle commands,
+registers it and — by default — writes it a `.desktop` entry, so it opens from
+the shell's own grid and search under its own name and icon, with no terminal
+and the hub not otherwise running; `open` gives that app a real window on its
+own FrankenPHP, with its own data directory and its own cookie store, so two
+apps open side by side stay isolated; `list` and `remove` close the loop, the
+latter taking the entry with it. Not there yet: `run <id> <alias>` and
+update/rollback. Git sources are recognised and refused with a message saying
+so, rather than pretended. The design record and the plan queue live under the
+git-ignored `.project/`.
 
 ## Build
 
