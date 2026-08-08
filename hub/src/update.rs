@@ -22,8 +22,10 @@
 //! from its own `tfsapp.config.json`, and `source_revision` answers the very
 //! common case of a developer who changed the tree without bumping the version.
 //! All of it needs the resolver `source.rs` has not grown yet and the applier
-//! `update <id>` will be — plans 011 and 012 — and "a newer version exists"
-//! means nothing until something can act on it.
+//! `update <id>` will be — the per-app update and rollback plan, and the hub
+//! self-update and lazy revalidation plan after it, neither written yet (see
+//! `000-index.md`) — and "a newer version exists" means nothing until
+//! something can act on it.
 //!
 //! CONTRACT.md §7 states this the way it should have been stated all along: the
 //! result says what changed and nothing about how to apply it, because how an

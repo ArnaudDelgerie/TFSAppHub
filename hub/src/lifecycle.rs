@@ -24,7 +24,8 @@
 //! event: someone dropped a newer AppImage over the same data dir, and a launch
 //! is the only moment that can notice. The hub has an explicit `update <id>`
 //! which owns that event — it replaces the snapshot, runs `pre-update`/
-//! `post-update` and records the new version at its success point (plan 011).
+//! `post-update` and records the new version at its success point (the
+//! per-app update and rollback plan, not yet written — see `000-index.md`).
 //! So the same observation means something different here: an installed snapshot
 //! newer than the record is not an update in progress, it is an update that
 //! never completed, or a tree edited under the hub. Opening it would run the app
