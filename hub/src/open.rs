@@ -50,7 +50,14 @@ pub fn run(id: &str) -> i32 {
         }
     };
 
-    match resolve(&paths, id).and_then(|resolved| launch(&resolved)) {
+    let launched = resolve(&paths, id).and_then(|resolved| {
+        for warning in &resolved.warnings {
+            eprintln!("tfsapp-hub: warning: {warning}");
+        }
+        launch(&resolved)
+    });
+
+    match launched {
         Ok(pid) => {
             println!("Opening {id} (pid {pid}).");
             EXIT_OK
@@ -86,6 +93,11 @@ pub struct Resolved {
     /// `<OS data dir>/TFSApp/<identifier>/`. Named, not created — creating it is
     /// the child's job, once it is actually going to run the app.
     pub data_dir: PathBuf,
+    /// What the manifest parse wanted to say. Carried out rather than printed
+    /// where it is produced, because both the parent and the child resolve the
+    /// same app and only one of them is attached to the terminal the user typed
+    /// in — printing at the source would say everything twice.
+    pub warnings: Vec<String>,
 }
 
 /// Look the app up and check it can be opened at all.
@@ -125,7 +137,6 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<Resolved, OpenError> {
     }
 
     let loaded = manifest::load(&app_dir)?;
-    loaded.report_warnings();
     let manifest = loaded.manifest;
 
     // The registry's `identifier` and the snapshot's must agree, because they
@@ -151,6 +162,7 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<Resolved, OpenError> {
         manifest,
         identity,
         data_dir,
+        warnings: loaded.warnings,
     })
 }
 

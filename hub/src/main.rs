@@ -9,6 +9,7 @@ mod app_env;
 mod cli;
 mod identity;
 mod install;
+mod lifecycle;
 mod list;
 mod manifest;
 mod open;
@@ -177,17 +178,67 @@ fn print_platform() -> i32 {
     }
 }
 
+/// Re-resolve the app in its own process and run every launch guard against it.
+///
+/// The parent already resolved all of this before spawning us, and this is not
+/// that work repeated for its own sake: the parent proved the app *can* be
+/// opened, cheaply and at the terminal, so a mistyped id never costs a window.
+/// What happens here is the part that has to happen in the process that will
+/// actually hold the app — the liveness lock is held by *this* pid, and the port
+/// is bound to prove it is free to *this* process.
+///
+/// A failure exits through `lifecycle::fatal_startup_error`, which is the only
+/// thing that reaches a user who launched from a desktop entry.
+fn prepare(id: &str, identity: &Identity) -> Option<std::fs::File> {
+    let paths = match paths::Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+    };
+    let resolved = match open::resolve(&paths, id) {
+        Ok(resolved) => resolved,
+        Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+    };
+
+    // `0700` on every launch, not only on creation: the directory holds the
+    // app's database and its `APP_SECRET`, so an installation created by an
+    // older host or recreated by hand gets tightened on its next use.
+    let data_dir = match paths.create_app_data_dir(&identity.identifier) {
+        Ok(data_dir) => data_dir,
+        Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+    };
+    let data_subdir = data_dir.join("data");
+    if let Err(error) = std::fs::create_dir_all(&data_subdir) {
+        lifecycle::fatal_startup_error(&format!("{}: {error}", data_subdir.display()));
+    }
+
+    lifecycle::prepare_launch(
+        id,
+        &data_dir,
+        &data_subdir,
+        &identity.identifier,
+        &resolved.manifest.app_version,
+        resolved.manifest.app_port,
+    )
+}
+
 /// Open one window under `identity`, for the app installed as `id`.
 ///
-/// The window still lands on the checked-in placeholder page: the lifecycle
-/// guards, the sidecar and the real backend arrive in this plan's later steps,
-/// and nothing here should pretend otherwise in the meantime.
+/// The window still lands on the checked-in placeholder page: the sidecar and
+/// the real backend arrive in this plan's later steps, and nothing here should
+/// pretend otherwise in the meantime. The guards in front of it are real.
 fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
     // Before the `Builder` exists, and so before anything has initialised GTK
     // — the whole point of the module. Everything identity-derived downstream
     // (app id, bus name, single-instance key, WM_CLASS, cookie store) reads
-    // what this call leaves behind.
+    // what this call leaves behind. First of all, so that even a guard's own
+    // refusal dialog below carries this app's identity rather than the hub's.
     identity::apply(&identity, &mut context);
+
+    // Everything from here to `Builder` is CONTRACT.md §6's launch guards, and
+    // all of it has to happen in this window: they refuse through a blocking
+    // native dialog, which deadlocks rather than appears once Tauri has claimed
+    // GTK. See `lifecycle`'s module header.
+    let sidecar_lock = prepare(id, &identity);
 
     let relaunched = id.to_string();
     tauri::Builder::default()
@@ -227,4 +278,10 @@ fn open_window(id: &str, identity: Identity, mut context: tauri::Context) {
         })
         .run(context)
         .expect("failed to run the app window");
+
+    // Held until here — dropping it releases the sidecar liveness lock, which is
+    // what tells the *next* launch of this app that nothing of it is running any
+    // more. Step 3 of this plan moves it into the `Sidecar` it belongs to, whose
+    // teardown releases it at the right moment rather than at the last one.
+    drop(sidecar_lock);
 }

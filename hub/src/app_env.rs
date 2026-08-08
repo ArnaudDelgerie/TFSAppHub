@@ -44,6 +44,13 @@ pub struct AppEnvironment {
     /// `<OS data dir>/TFSApp/<identifier>/` — where the app's own data lands,
     /// which is what an install has to be able to name to the user.
     pub data_dir: PathBuf,
+    /// `<data_dir>/data/` — the app's own writable subdirectory: its SQLite
+    /// database, its `APP_SECRET`, and `config.json`, the record of which
+    /// version last wrote all of it (CONTRACT.md §6). Carried out because the
+    /// caller that finishes an install event has to stamp that record, and
+    /// rebuilding the path at each call site is how two of them end up
+    /// disagreeing.
+    pub data_subdir: PathBuf,
 }
 
 /// Assemble CONTRACT.md §3 for `manifest`'s app, installed at `app_dir`.
@@ -161,7 +168,11 @@ pub fn resolve(
     // *running*, and an install starts none. Present-but-dead would be worse
     // than absent — an app would open a connection to nothing.
 
-    Ok(AppEnvironment { vars, data_dir })
+    Ok(AppEnvironment {
+        vars,
+        data_dir,
+        data_subdir,
+    })
 }
 
 #[derive(Debug)]
