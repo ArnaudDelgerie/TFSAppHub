@@ -216,12 +216,23 @@ fn prepare(source: &OpenChildSource, identity: &Identity) -> Launching {
         Err(message) => lifecycle::fatal_startup_error(&message),
     };
 
-    // `0700` on every launch, not only on creation: the directory holds the
-    // app's database and its `APP_SECRET`, so an installation created by an
-    // older host or recreated by hand gets tightened on its next use.
-    let data_dir = match paths.create_app_data_dir(&identity.identifier) {
-        Ok(data_dir) => data_dir,
-        Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+    // `spec.state_root`, created the way its own source needs: `0700` on every
+    // launch for an installed app, because the directory holds the app's
+    // database and its `APP_SECRET` and an installation created by an older
+    // host or recreated by hand gets tightened on its next use; a plain
+    // `var/` for a dev session, which needs no such tightening — it is the
+    // developer's own project directory (CONTRACT.md's dev section).
+    let data_dir = match &spec.source {
+        launch::Source::Installed { .. } => match paths.create_app_data_dir(&identity.identifier) {
+            Ok(data_dir) => data_dir,
+            Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+        },
+        launch::Source::Live => match std::fs::create_dir_all(&spec.state_root) {
+            Ok(()) => spec.state_root.clone(),
+            Err(error) => {
+                lifecycle::fatal_startup_error(&format!("{}: {error}", spec.state_root.display()))
+            }
+        },
     };
     let data_subdir = data_dir.join("data");
     if let Err(error) = std::fs::create_dir_all(&data_subdir) {
@@ -420,8 +431,17 @@ fn serve(
         );
     }
 
-    let environment = match app_env::resolve(&paths, manifest, &spec.app_dir, app_env::Mode::Launch)
-    {
+    let env_mode = match spec.source {
+        launch::Source::Installed { .. } => app_env::Mode::Launch,
+        launch::Source::Live => app_env::Mode::Dev,
+    };
+    let environment = match app_env::resolve(
+        manifest,
+        &spec.app_dir,
+        &identity.identifier,
+        &spec.state_root,
+        env_mode,
+    ) {
         Ok(environment) => environment,
         Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
     };
