@@ -43,6 +43,18 @@ pub const DEV_IDENTIFIER_PREFIX: &str = "dev.";
 /// same marker on the child directly, so the one rule
 /// `core::process::terminate_if_identifier_matches` already checks
 /// everywhere else holds here too.
+///
+/// **Nor can it use `spawn_signal_forwarder`'s own `terminate` relay**, for a
+/// second, unrelated reason found live in step 6's own verification: the
+/// child already owns a bounded, escalating teardown of its own
+/// (`lifecycle::install_shutdown_on_signal` stops the worker, then the
+/// server, each with up to 3s of SIGTERM-then-SIGKILL — up to ~6s together).
+/// Relaying through `terminate` would impose a second, shorter 3s budget on
+/// top of that one, and the outer budget would win the race: it SIGKILLs the
+/// child before the child's own teardown reaches the server, orphaning it.
+/// `core::process::signal_terminate_once` sends the one signal and returns;
+/// the wait below is `child.wait()`, which blocks on the child's *own* budget
+/// instead of imposing a second one.
 pub fn run(path: &str) -> i32 {
     let spec = match resolve(path) {
         Ok(spec) => spec,
@@ -79,11 +91,15 @@ pub fn run(path: &str) -> i32 {
     };
 
     match tfsapp_core::process::install_signal_forwarding() {
-        Ok(read_fd) => tfsapp_core::process::spawn_signal_forwarder(
-            read_fd,
-            child.id(),
-            spec.identity.identifier.clone(),
-        ),
+        Ok(read_fd) => {
+            let child_pid = child.id();
+            let identifier = spec.identity.identifier.clone();
+            tfsapp_core::process::spawn_on_signal(read_fd, move || {
+                if tfsapp_core::process::process_environ_has_identifier(child_pid, &identifier) {
+                    tfsapp_core::process::signal_terminate_once(child_pid);
+                }
+            });
+        }
         Err(error) => {
             // Not fatal, and degrades the same way
             // `lifecycle::install_shutdown_on_signal` does: the session runs
