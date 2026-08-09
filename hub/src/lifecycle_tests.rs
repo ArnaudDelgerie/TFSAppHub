@@ -7,9 +7,10 @@ use std::{
 };
 
 use super::{
-    acquire_launch_locks, decide_launch, lifecycle_decision, prepare_dev_launch, probe_run_lock,
-    read_data_version, serving_lock_path, veto_exit, write_data_version, LaunchDecision,
-    LaunchLockError, LifecycleDecisionError, LifecycleError, LifecycleEvent, RunLockHeld,
+    acquire_launch_locks, decide_launch, dialog_is_warranted, lifecycle_decision,
+    prepare_dev_launch, probe_run_lock, read_data_version, serving_lock_path, veto_exit,
+    write_data_version, LaunchDecision, LaunchLockError, LifecycleDecisionError, LifecycleError,
+    LifecycleEvent, RunLockHeld,
 };
 
 fn version(text: &str) -> semver::Version {
@@ -419,4 +420,20 @@ fn probe_run_lock_held_with_no_record_names_nothing() {
     let held = probe_run_lock(data_dir.path()).expect("no I/O error");
 
     assert_eq!(held, RunLockHeld::Held { alias: None });
+}
+
+// --- dialog_is_warranted --------------------------------------------------
+
+#[test]
+fn no_dialog_when_stderr_is_a_terminal() {
+    // A developer at a terminal wants the line where they typed the command,
+    // not a modal to dismiss.
+    assert!(!dialog_is_warranted(true));
+}
+
+#[test]
+fn a_dialog_when_stderr_is_not_a_terminal() {
+    // A `.desktop` launch has no stderr anyone will read — the dialog is the
+    // whole answer there.
+    assert!(dialog_is_warranted(false));
 }

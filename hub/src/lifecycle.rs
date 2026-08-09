@@ -571,26 +571,55 @@ fn check_port(app_port: Option<u16>, data_subdir: &Path) {
     }
 }
 
-/// Every fatal pre-`Builder` startup error's single exit: a blocking native
-/// dialog, then the same text on stderr, then exit 1.
+/// Whether a failed launch's message should also raise a native dialog, given
+/// whether stderr is a terminal.
 ///
-/// Both, because there are two audiences and they never overlap. A user who
-/// double-clicked a desktop entry has no stderr — without the dialog the app
-/// just fails to open, silently, which is the worst outcome this whole module
-/// exists to avoid. A developer at a terminal wants the line where they typed
-/// the command, not a modal to dismiss.
+/// Pure, and the one thing worth testing directly: get this backwards and
+/// either a developer's typo pops a modal to dismiss, or a `.desktop` launch's
+/// failure lands nowhere anyone will see it. The two audiences the plan this
+/// module implements is named for do not overlap in practice — a terminal
+/// user has a place for the line to land and a `.desktop` launch has none —
+/// but that is an empirical fact about how the hub is invoked, not a
+/// guarantee, which is why it is checked rather than assumed.
+fn dialog_is_warranted(stderr_is_terminal: bool) -> bool {
+    !stderr_is_terminal
+}
+
+/// A failed launch's single reporter, used on both sides of `open`'s re-exec
+/// (plan 015): `tfsapp-hub: {message}` on stderr always, and the same blocking
+/// native dialog `fatal_startup_error` already used, but only when stderr is
+/// not a terminal ([`std::io::IsTerminal`]) — see [`dialog_is_warranted`] for
+/// the decision itself.
 ///
-/// Safe here, and only here: `rfd` drives GTK itself, so this is sound exactly
-/// while `tauri::Builder` has not claimed it yet. Anything fatal after that
-/// point needs the app's own dialog plugin, off the main thread.
-pub fn fatal_startup_error(message: &str) -> ! {
-    rfd::MessageDialog::new()
-        .set_title("TFSApp Hub: startup error")
-        .set_description(message)
-        .set_level(rfd::MessageLevel::Error)
-        .set_buttons(rfd::MessageButtons::Ok)
-        .show();
+/// **Safe on both sides of the re-exec, for the same reason on each.**
+/// `rfd` is sound exactly while `tauri::Builder` has not claimed GTK yet
+/// (`fatal_startup_error`'s own doc comment). The child calls this before
+/// `Builder` is ever built, same as before this plan; the parent never builds
+/// one at all, so it is sound there for the whole of its life. Two different
+/// situations that both cash out the same way — worth stating so the next
+/// reader does not have to re-derive it from the warning in the other
+/// comment.
+///
+/// Does not exit: `open::run`'s parent-side caller has an exit code of its
+/// own to return, which is `main`'s to give back and the CLI tests read.
+pub fn report_launch_failure(message: &str) {
+    use std::io::IsTerminal;
+
+    if dialog_is_warranted(std::io::stderr().is_terminal()) {
+        rfd::MessageDialog::new()
+            .set_title("TFSApp Hub: startup error")
+            .set_description(message)
+            .set_level(rfd::MessageLevel::Error)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
     eprintln!("tfsapp-hub: {message}");
+}
+
+/// Every fatal pre-`Builder` startup error's single exit: [`report_launch_failure`],
+/// then exit 1.
+pub fn fatal_startup_error(message: &str) -> ! {
+    report_launch_failure(message);
     std::process::exit(1);
 }
 

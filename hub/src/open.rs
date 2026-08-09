@@ -41,11 +41,17 @@ use crate::{
 };
 
 /// The whole command, parent side. Returns the process's exit code.
+///
+/// Every refusal below goes through [`lifecycle::report_launch_failure`], the
+/// same reporter the child's own fatal errors use: a line on stderr always,
+/// and a native dialog too when stderr is not a terminal, because a launch
+/// started from a desktop entry has no terminal for the line to land on (see
+/// this module's doc comment's table).
 pub fn run(id: &str) -> i32 {
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
         Err(error) => {
-            eprintln!("tfsapp-hub: {error}");
+            crate::lifecycle::report_launch_failure(&error.to_string());
             return EXIT_FAILED;
         }
     };
@@ -63,7 +69,7 @@ pub fn run(id: &str) -> i32 {
             EXIT_OK
         }
         Err(error) => {
-            eprintln!("tfsapp-hub: {error}");
+            crate::lifecycle::report_launch_failure(&error.to_string());
             EXIT_FAILED
         }
     }
