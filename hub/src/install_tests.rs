@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    check_id_free, check_identifier_free, check_port_free, lifecycle_event_for_install, resolve_id,
-    snapshot, validate, InstallError,
+    check_data_dir_available, check_id_free, check_identifier_free, check_port_free,
+    lifecycle_event_for_install, resolve_id, snapshot, validate, InstallError,
 };
 use crate::{
     lifecycle::LifecycleEvent,
@@ -209,6 +209,62 @@ fn an_id_collision_keeps_its_own_message_rather_than_being_swallowed() {
     // identifier check alone would have let this through.
     check_identifier_free(&registry, "dev.local.someone-else")
         .expect("an unrelated identifier is free");
+}
+
+// --- check_data_dir_available (plan 016 step 4, CONTRACT.md §6) -----------
+
+#[test]
+fn a_live_window_refuses_the_install() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let pid_file = data_dir.path().join("sidecar.pid");
+    // Held in this test's own process, exactly as `lifecycle_tests.rs` holds
+    // it for its own probe tests: `flock` is per open file description, so a
+    // second, fresh open of the same path still sees it held.
+    let _holder = tfsapp_core::process::try_lock_file(&tfsapp_core::process::lock_path(&pid_file))
+        .expect("no I/O error")
+        .expect("the lock is free to take");
+
+    let error = check_data_dir_available("demo", data_dir.path())
+        .expect_err("a live window owns this data dir");
+
+    assert!(
+        matches!(error, InstallError::DataDirInUse { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("demo"), "{error}");
+}
+
+#[test]
+fn an_active_run_command_refuses_naming_the_alias() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let run_lock_path = data_dir.path().join("run.lock");
+    let _holder = tfsapp_core::process::try_lock_file(&run_lock_path)
+        .expect("no I/O error")
+        .expect("the lock is free to take");
+    fs::write(&run_lock_path, "migrate\n1234").expect("a run.lock record");
+
+    let error = check_data_dir_available("demo", data_dir.path())
+        .expect_err("an active run command owns this data dir");
+
+    assert!(
+        matches!(error, InstallError::DataDirInUse { .. }),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("migrate"), "{message}");
+    assert!(message.contains("run --stop demo"), "{message}");
+}
+
+#[test]
+fn a_crashed_instance_does_not_lock_the_app_out_of_reinstall() {
+    // The liveness lock releases the instant the process holding it dies —
+    // including an ungraceful death — so nothing here re-creates that state:
+    // a fresh, untouched data dir already looks exactly like one a crash
+    // left behind.
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+
+    check_data_dir_available("demo", data_dir.path())
+        .expect("a crashed instance must not lock the app out of reinstall");
 }
 
 #[test]
