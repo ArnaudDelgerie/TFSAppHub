@@ -147,6 +147,22 @@ no_bundled_wayland() {
   [[ -z "$(find "$1" -iname 'libwayland-*' -print -quit)" ]]
 }
 
+# The highest GLIBC_x.y symbol version any ELF file under AppDir root $1
+# imports — the actual floor a machine needs to run every binary and every
+# bundled shared library this AppImage carries, not just the toolkit
+# libraries FROZEN_SONAMES names below. `readelf -V` lists both required
+# (verneed) and defined (verdef) symbol versions; scanning both is safe here
+# because nothing bundled *defines* a GLIBC_* version — glibc itself is never
+# bundled, it is the one ABI every one of these binaries assumes the host
+# provides. GNU `sort -V` orders the dotted x.y version strings correctly.
+highest_glibc_requirement() {
+  local root="$1" file
+  while IFS= read -r -d '' file; do
+    file -b "$file" 2>/dev/null | grep -q ELF || continue
+    readelf -V "$file" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+'
+  done < <(find "$root" -type f -print0) | sed 's/^GLIBC_//' | sort -Vu | tail -1
+}
+
 # Captured once, up front: piping a live `ldconfig -p` straight into an awk
 # that `exit`s on its first match closes the pipe while ldconfig is still
 # writing, which SIGPIPEs it — fatal under this script's `pipefail`. Reusing
@@ -307,6 +323,24 @@ for appimage in "${appimages[@]}"; do
   # until the next rebuild. Written from verify_root (the final artifact),
   # not the pre-repack tree, so the record matches what actually shipped.
   test -f /etc/os-release || { echo "No /etc/os-release on the build host — cannot record its OS release." >&2; exit 1; }
+
+  # The glibc floor: measured from whatever produced this image, with no
+  # knowledge of *how* — a local `make build` and a containerised one write
+  # this exact same field, and this script never asks which one it was. It is
+  # what a user meets as a loader error before a single line of the hub's own
+  # code runs, so it belongs beside the artifact rather than in a document
+  # they would have to go and find (see README.md "It does not start").
+  glibc_floor="$(highest_glibc_requirement "$verify_root")"
+  if [[ -z "$glibc_floor" ]]; then
+    echo "No GLIBC_x.y symbol version found in any bundled ELF in $appimage — cannot record its glibc floor." >&2
+    exit 1
+  fi
+  build_host_glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $NF}')"
+  if [[ -z "$build_host_glibc" ]]; then
+    echo "getconf GNU_LIBC_VERSION gave no version on the build host — cannot record it." >&2
+    exit 1
+  fi
+
   version_record="${appimage%.AppImage}.versions.txt"
   {
     echo "# Frozen renderer/toolkit versions bundled into $(basename "$appimage")"
@@ -315,6 +349,11 @@ for appimage in "${appimages[@]}"; do
     echo "# never reach them. Only a rebuild changes this file."
     # shellcheck disable=SC1091  # /etc/os-release is a runtime file, not a repo source to follow
     echo "build_host_os=$(. /etc/os-release && echo "$PRETTY_NAME")"
+    echo "build_host_glibc=$build_host_glibc"
+    # The minimum glibc a machine needs to run this AppImage at all — below
+    # it, every binary here fails in the dynamic loader before any of the
+    # hub's own error handling can run.
+    echo "glibc_floor=$glibc_floor"
     for soname in "${FROZEN_SONAMES[@]}"; do
       resolve_library_version "$soname" "$verify_root"
     done
