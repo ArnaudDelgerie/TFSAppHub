@@ -127,27 +127,61 @@ open. In order:
 2. Read and validate the manifest. Missing required fields, a wrong type on a
    known key, or a non-semver `app_version` all stop here, naming the file and
    the field. An unknown key warns and does not stop anything.
-3. Copy the tree to `apps/<id>/`, minus the app's own runtime droppings.
-4. Assemble the app's environment (`CONTRACT.md` §3) and create its data
+3. Four gates, all against the already-loaded registry or the data directory
+   `identifier` names — none of them write anything, so a refusal here costs
+   nothing:
+   - settle the hub-local `id` and refuse a collision (`check_id_free`);
+   - refuse a second `id` for an `identifier` another entry already carries
+     (`check_identifier_free`) — the registry is keyed on `id`, the data on
+     `identifier`, and this is what keeps that mapping one-to-one;
+   - refuse a port another installed app already pinned (`check_port_free`);
+   - refuse a data directory a live window or an active `run` command still
+     owns (`check_data_dir_available`) — `install` is that directory's third
+     writer, reading the same two locks `open`'s launch guard and `run`'s own
+     rule 3 already do.
+4. Decide which lifecycle event (`CONTRACT.md` §6) this install may run,
+   against the version the data directory's own record holds — `None` means a
+   first install, and only `record == app_version` survives past this point;
+   a record naming a newer version is refused as a downgrade, and one naming
+   an older version is refused as the update event, which `install` does not
+   run (see below). The confirmation prompt names the record's version when
+   one exists, so it is a question the user can actually answer.
+5. Copy the tree to `apps/<id>/`, minus the app's own runtime droppings.
+6. Assemble the app's environment (`CONTRACT.md` §3) and create its data
    directory. The path is printed before anything writes into it, because the
    next thing on screen is a migration writing a database.
-5. `composer install` with the bundled interpreter.
-6. Run `pre-install` then `post-install`, in order, stopping at the first
-   failure.
-7. Record the app in the registry, with the platform fingerprint of the hub that
+7. `composer install` with the bundled interpreter — every event, since
+   dependencies are the freshly copied tree's own and not a lifecycle command.
+8. Run `pre-install` then `post-install`, in order, stopping at the first
+   failure — **only** when step 4 decided this is a first install. A record
+   equal to the app's own version (the reinstall-after-`remove` path) runs
+   neither.
+9. Record the app in the registry, with the platform fingerprint of the hub that
    installed it.
-8. Write the version record into the data directory — **only** once every step
-   above has succeeded.
-9. Refresh the stable copy of the hub itself, and write the app's `.desktop`
-   entry — best-effort, and skipped together by `--no-desktop-entry`.
+10. Write the version record into the data directory — **only** once every
+    step above has succeeded, and every event, including an equal record
+    rewriting itself.
+11. Refresh the stable copy of the hub itself, and write the app's `.desktop`
+    entry — best-effort, and skipped together by `--no-desktop-entry`.
 
-Step 8 is the one worth defending. The record is what decides whether a later
+Step 10 is the one worth defending. The record is what decides whether a later
 moment is an install, an update, or a downgrade to refuse, and writing it
 speculatively would make a failed install look like a completed one. A failure
 leaves the directory undated, so the next attempt replays the whole event rather
 than resuming into the middle of it.
 
-Step 9 runs **last**, after the app is registered and ready, for the same
+**Why step 4 refuses the update event rather than running it.** A record
+older than the app being installed is, by `CONTRACT.md` §6's own definition,
+the update event — and it would be tempting to have `install` run
+`pre-update`/`post-update` there instead of refusing. It must not, for one
+reason: §6 also hands that event a guarantee this repo has not built yet — an
+update must never leave the app's database between two versions, which the
+station buys with a pre-update snapshot it can roll back to. Running the
+event without that property would be worse than refusing it, so `install`
+refuses instead, naming `update <id>` as the command that will own this once
+it exists.
+
+Step 11 runs **last**, after the app is registered and ready, for the same
 reason registration itself runs last: an entry advertising an app whose
 `composer install` failed would sit in the user's application grid pointing at
 nothing. The app is usable from the CLI before it is advertised anywhere else.
@@ -485,6 +519,13 @@ that last wrote it. Three properties it owes its callers:
 
 There is deliberately no format-version field; the hub version already recorded
 answers the same question without inviting a migration framework.
+
+The registry is keyed on `id`, the hub-local handle; the data directory, the
+keyring namespace, the WebKit data directory and the `.desktop` entry are all
+keyed on `identifier`, the app's own. `install` enforces that mapping being
+one-to-one (`check_identifier_free`, plan 016): a second `id` for an
+`identifier` another entry already carries is refused before anything is
+written, since the two installs would otherwise share all four.
 
 ### The platform fingerprint
 

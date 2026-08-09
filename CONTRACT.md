@@ -776,13 +776,25 @@ none at all, on a first install — in place, and the next attempt replays the
 *whole* event rather than resuming from the command that failed. There is no
 partial state to reason about.
 
-**Today the hub runs the install event and refuses the update.** `install`
-executes `pre-install` then `post-install`, in order, with the full environment
-and no server running, on a terminal where a failure is legible. Per-app update
-is a queued plan; until it lands, `pre-update` and `post-update` may be declared
-but never run, and an installed snapshot found to be newer than its own record is
-refused with the command that resolves it named. When update does land, it owns
-one guarantee this section deliberately does not state on its behalf: an update
+**Today the hub runs the install event and refuses the update.** Which event a
+moment is gets decided at install time too, against the same data directory a
+launch reads — the one a plain `remove` (without `--purge`) deliberately
+leaves behind. No record means an install, and `install` executes
+`pre-install` then `post-install`, in order, with the full environment and no
+server running, on a terminal where a failure is legible. A record equal to
+the app's own version means neither event, and install runs no lifecycle
+command over it — the ordinary reinstall-after-`remove` path, where Composer
+and the version record are the only things that still run. Per-app update is
+a queued plan;
+until it lands, `pre-update` and `post-update` may be declared but never run,
+and a data directory recording a version *older* than the one being installed
+is refused as the update event, naming the command that will own it once it
+exists — install never runs `pre-update`/`post-update` in its place. A record
+*newer* than the one being installed is a downgrade, and `install` refuses it
+exactly as a launch does, naming both versions and the directory: running old
+code against data a newer version wrote is how a database gets corrupted
+quietly, whichever host notices it first. When update does land, it owns one
+guarantee this section deliberately does not state on its behalf: an update
 must never leave the app's database between two versions.
 
 That install-time placement is better than it had to be. A migration and a cache
