@@ -4,8 +4,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{check_id_free, check_port_free, resolve_id, snapshot, validate, InstallError};
+use super::{
+    check_id_free, check_port_free, lifecycle_event_for_install, resolve_id, snapshot, validate,
+    InstallError,
+};
 use crate::{
+    lifecycle::LifecycleEvent,
     paths::Paths,
     registry::{now_timestamp, Platform, Registry, RegistryEntry, Source, SourceKind, State},
 };
@@ -316,6 +320,66 @@ fn the_snapshot_refuses_to_write_over_an_existing_tree() {
         matches!(error, InstallError::DirectoryInTheWay { .. }),
         "{error}"
     );
+}
+
+// --- lifecycle_event_for_install (plan 016 step 1, CONTRACT.md §6) ---------
+
+#[test]
+fn no_record_is_the_install_event() {
+    let event = lifecycle_event_for_install(None, "1.0.0", Path::new("/data/demo"))
+        .expect("no record lets the install proceed");
+    assert_eq!(event, LifecycleEvent::Install);
+}
+
+#[test]
+fn an_equal_record_is_neither_event() {
+    let event = lifecycle_event_for_install(Some("1.0.0"), "1.0.0", Path::new("/data/demo"))
+        .expect("an equal record is not refused");
+    assert_eq!(event, LifecycleEvent::None);
+}
+
+#[test]
+fn an_older_record_is_refused_as_the_update_event_install_does_not_own() {
+    let error = lifecycle_event_for_install(Some("1.0.0"), "1.1.0", Path::new("/data/demo"))
+        .expect_err("install does not run the update event");
+
+    assert!(matches!(error, InstallError::DataOlderThanSource { .. }), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("1.0.0") && message.contains("1.1.0"), "{message}");
+    assert!(message.contains("/data/demo"), "{message}");
+}
+
+#[test]
+fn a_newer_record_is_refused_as_a_downgrade() {
+    let error = lifecycle_event_for_install(Some("2.0.0"), "1.0.0", Path::new("/data/demo"))
+        .expect_err("a downgrade is refused rather than guessed at");
+
+    assert!(matches!(error, InstallError::DataNewerThanSource { .. }), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("2.0.0") && message.contains("1.0.0"), "{message}");
+    // Names the directory to delete by hand — `remove --purge` cannot reach
+    // data whose app is no longer registered.
+    assert!(message.contains("/data/demo"), "{message}");
+    assert!(message.contains("--purge"), "{message}");
+}
+
+#[test]
+fn an_unreadable_record_refuses_via_the_existing_lifecycle_error() {
+    // Row 5 of the table needs no new code: `read_data_version`'s own error
+    // already becomes `InstallError::Lifecycle` through the `From` impl
+    // `install()` calls with `?` — this proves that composition rather than
+    // re-testing `read_data_version` itself (see `lifecycle_tests.rs`).
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let data_subdir = data_dir.path().join("data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    fs::write(data_subdir.join("config.json"), "{ not json").expect("a broken record");
+
+    let error: InstallError = crate::lifecycle::read_data_version(&data_subdir)
+        .expect_err("an unreadable record")
+        .into();
+
+    assert!(matches!(error, InstallError::Lifecycle(_)), "{error}");
+    assert!(error.to_string().contains("config.json"), "{error}");
 }
 
 /// A registry holding one app, pinning `app_port` or not.

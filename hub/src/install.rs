@@ -34,7 +34,7 @@ use crate::{
     app_env::{self, EnvError},
     cli::{EXIT_FAILED, EXIT_OK},
     desktop, hub_bin,
-    lifecycle::{self, LifecycleError},
+    lifecycle::{self, LifecycleDecisionError, LifecycleError, LifecycleEvent},
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
     paths::{Paths, PathsError},
     php::{self, PhpError, Toolchain},
@@ -441,6 +441,61 @@ pub fn check_port_free(registry: &Registry, app_port: Option<u16>) -> Result<(),
     }
 }
 
+/// Decide which lifecycle event (CONTRACT.md §6) this install may run under,
+/// from the data directory's own record — the four-row table from the
+/// Overview, and nothing else. No I/O: `recorded` is `read_data_version`'s own
+/// result, already read by the caller; `data_dir` is named only in the
+/// refusals' messages, as the directory a user would delete or wait out.
+///
+/// `app_version` is taken as already-validated semver — `validate` runs
+/// before this is ever called and refuses anything else (CONTRACT.md §2) —
+/// so the parse below cannot fail in practice.
+///
+/// An equal record answers `Ok(LifecycleEvent::None)`: the reinstall-after-
+/// `remove` path, and the event under which `prepare` (below) runs no
+/// lifecycle command at all.
+fn lifecycle_event_for_install(
+    recorded: Option<&str>,
+    app_version: &str,
+    data_dir: &Path,
+) -> Result<LifecycleEvent, InstallError> {
+    let current = semver::Version::parse(app_version)
+        .expect("validate() already refused a non-canonical app_version");
+
+    match lifecycle::lifecycle_decision(recorded, &current) {
+        // The hub's `install` does not own the update event (CONTRACT.md §6):
+        // it would need a pre-update database snapshot this repo has not
+        // ported (see the module header of `lifecycle.rs`), so it refuses
+        // rather than adopting `pre-update`/`post-update`.
+        Ok(LifecycleEvent::Update) => Err(InstallError::DataOlderThanSource {
+            recorded: recorded
+                .expect("an Update decision is only reached when a record exists")
+                .to_string(),
+            current: current.to_string(),
+            data_dir: data_dir.to_path_buf(),
+        }),
+        Ok(event) => Ok(event),
+        Err(LifecycleDecisionError::Downgrade { recorded, current }) => {
+            Err(InstallError::DataNewerThanSource {
+                recorded: recorded.to_string(),
+                current: current.to_string(),
+                data_dir: data_dir.to_path_buf(),
+            })
+        }
+        // The data dir's `version` field parses as JSON but not as semver —
+        // the same "cannot be trusted" class `read_data_version`'s own
+        // `MalformedDataConfig` already covers for a file that does not even
+        // parse as JSON, reused here rather than inventing a second flavour
+        // of "the record is corrupt".
+        Err(LifecycleDecisionError::InvalidVersion(error)) => {
+            Err(InstallError::Lifecycle(LifecycleError::MalformedDataConfig {
+                path: lifecycle::data_config_path(&data_dir.join("data")),
+                detail: error.to_string(),
+            }))
+        }
+    }
+}
+
 /// Read `root`'s manifest and check the tree is an app the hub can install.
 ///
 /// The `app_version` semver check is the hub's half of the station's
@@ -576,6 +631,23 @@ pub enum InstallError {
         id: String,
         location: String,
     },
+    /// The data directory records a version *newer* than the source being
+    /// installed — a downgrade, refused rather than guessed at (CONTRACT.md
+    /// §6): running old code against data a newer version wrote is how a
+    /// database gets corrupted quietly.
+    DataNewerThanSource {
+        recorded: String,
+        current: String,
+        data_dir: PathBuf,
+    },
+    /// The data directory records a version *older* than the source being
+    /// installed — the update event (CONTRACT.md §6), which `install` does
+    /// not own.
+    DataOlderThanSource {
+        recorded: String,
+        current: String,
+        data_dir: PathBuf,
+    },
     /// `apps/<id>/` exists with no registry entry to explain it.
     DirectoryInTheWay {
         path: PathBuf,
@@ -634,6 +706,31 @@ impl fmt::Display for InstallError {
                 formatter,
                 "{id} is already installed, from {location}. Pick another handle with \
                  --as <id>, or remove that one first."
+            ),
+            Self::DataNewerThanSource {
+                recorded,
+                current,
+                data_dir,
+            } => write!(
+                formatter,
+                "{} was last written by app version {recorded}, but {current} is being \
+                 installed — running old code against data a newer version wrote is how a \
+                 database gets corrupted quietly (CONTRACT.md §6). Delete that directory by \
+                 hand if you mean to start over: `remove --purge` cannot reach it, since no \
+                 app is registered under this identifier to purge.",
+                data_dir.display()
+            ),
+            Self::DataOlderThanSource {
+                recorded,
+                current,
+                data_dir,
+            } => write!(
+                formatter,
+                "{} was last written by app version {recorded}, and {current} is newer — that \
+                 moment is the update event (CONTRACT.md §6), which `install` does not run. \
+                 Per-app update is a separate, not-yet-landed command; installing here would \
+                 run the wrong hooks — or none — over data already in place.",
+                data_dir.display()
             ),
             Self::DirectoryInTheWay { path } => write!(
                 formatter,
