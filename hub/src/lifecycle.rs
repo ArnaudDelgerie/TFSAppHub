@@ -637,11 +637,14 @@ fn stop_sidecar(app: &tauri::AppHandle) {
 /// the single-instance D-Bus name, so `tauri-plugin-single-instance` stops
 /// routing new launches here at all.
 ///
-/// Both ahead of [`stop_sidecar`], deliberately: "stop claiming to serve" and
-/// "have finished tearing down" are seconds apart under the
-/// SIGTERM-then-SIGKILL escalation `SERVING_WAIT_BUDGET` is sized against,
-/// and an arriving launch has no reason to wait out either just because this
-/// process has not finished dying yet.
+/// Both ahead of [`destroy_windows`] and [`stop_sidecar`], deliberately:
+/// "stop claiming to serve" and "have finished tearing down" are still two
+/// different moments, and an arriving launch has no reason to wait out the
+/// second just because this process has not finished dying yet. Plan 014 made
+/// the gap small — a third of a second rather than six — but not zero, and it
+/// is not a latency target: `CONTRACT.md` §5 needs a launch that arrives
+/// inside it to wait rather than attach, at any width. It is still taken on
+/// every close-then-immediate-reopen (plan 014 step 4, twenty out of twenty).
 fn release_serving_claim(app: &tauri::AppHandle) {
     use tauri::Manager;
 
@@ -769,9 +772,20 @@ fn stop_sidecar_and_exit(app: &tauri::AppHandle) {
 /// On the *last* window's close request the default synchronous close is vetoed
 /// — otherwise it races the teardown below — the window is hidden at once so the
 /// user sees their click land, and the sidecar is stopped off the GTK main
-/// thread. That last part matters: teardown escalates SIGTERM to SIGKILL over up
-/// to three seconds, and doing that on the main thread would freeze a window
-/// that is still on screen.
+/// thread.
+///
+/// **That last part matters even now that teardown is fast.** It signals
+/// processes and waits on them, and none of those waits has a ceiling worth
+/// putting on the thread that paints: a wedged FrankenPHP still costs the
+/// SIGTERM-then-SIGKILL escalation, and a client holding a stream still costs
+/// Caddy's grace period. On the main thread any of those would freeze a window
+/// that is still on screen. The reason survives the number that used to
+/// motivate it — plan 014 removed a six-second floor, not the argument for
+/// where this work runs.
+///
+/// The hiding is why teardown has to destroy this window itself: hidden is not
+/// closed, and a hidden webview keeps its connection to the backend the
+/// teardown is about to stop. See [`destroy_windows`].
 ///
 /// A window closing while others remain closes only itself: the backend belongs
 /// to the app, not to any one of its windows.

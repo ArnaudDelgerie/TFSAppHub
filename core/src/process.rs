@@ -187,21 +187,27 @@ fn process_group_id(pid: u32) -> Option<u32> {
 /// Send SIGTERM to `pid`'s process group, then escalate to SIGKILL if
 /// anything in it is still running 3s later (plan 061: the group, not just
 /// `pid` itself, so a FrankenPHP grandchild or a `run` alias's own child
-/// can't survive its parent's teardown). Some orphaned FrankenPHP processes —
-/// observed running from an AppImage's squashfs-mounted `/tmp/.mount_*` path
-/// — don't respond to a plain SIGTERM at all, so a single `kill` is not
-/// enough to guarantee the stale sidecar is actually gone. The target is
-/// decided once, up front, and reused for both signals — the group either got
-/// the same members for both, or `pid` itself already exited and the second
-/// signal is a no-op.
+/// can't survive its parent's teardown). The target is decided once, up
+/// front, and reused for both signals — the group either got the same members
+/// for both, or `pid` itself already exited and the second signal is a no-op.
 ///
-/// The escalation is an exception path, not the ordinary one (plan 014). It
-/// used to fire on every single call, including on processes that had obeyed
-/// the SIGTERM within milliseconds, because the poll below asked
+/// **The escalation is an exception path, not the ordinary one** (plan 014).
+/// It used to fire on every single call, including on processes that had
+/// obeyed the SIGTERM within milliseconds, because the poll below asked
 /// `process_exists` — which counted an unreaped zombie as a live process, and
 /// nothing reaps one while this function is the thing standing between the
 /// signal and the caller's own `child.wait()`. The poll now asks
 /// [`SignalTarget::has_live_process`], for which a corpse is gone.
+///
+/// This doc used to carry an anecdote about orphaned FrankenPHP processes
+/// "observed running from an AppImage's squashfs-mounted `/tmp/.mount_*`
+/// path" not responding to a plain SIGTERM at all. It is deleted rather than
+/// kept, because plan 014 found a cause for exactly that observation which has
+/// nothing to do with packaging — a webview holding a Mercure stream open
+/// against Caddy's graceful shutdown — and fixed it, after which no FrankenPHP
+/// has been seen ignoring a SIGTERM on any path. Keeping the anecdote would
+/// leave a plausible explanation standing in front of the real one. If it is
+/// ever reproduced again, it is a new finding and gets written down as one.
 pub fn terminate(pid: u32) {
     let target = signal_target(pid, process_group_id(pid));
     let operand = target.operand();
