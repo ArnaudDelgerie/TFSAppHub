@@ -51,7 +51,9 @@ half each, if you want them separately.)
 
 - **Rust** + the Tauri CLI (`cargo install tauri-cli`, or `cargo tauri` v2).
 - Linux build deps for Tauri v2 / WebKitGTK (`libwebkit2gtk-4.1-dev`,
-  `libgtk-3-dev`, `libdbus-1-dev`, `build-essential`, `curl`, …).
+  `libgtk-3-dev`, `libdbus-1-dev`, `librsvg2-dev`, `build-essential`, `curl`,
+  `file` — `appimagetool` shells out to it, and so does this repo's own
+  `fix-appimage-bundle.sh`, …).
 - **curl** (to fetch the FrankenPHP sidecar and composer.phar).
 - **rustfmt** and **clippy** (`rustup component add rustfmt clippy`) and
   **shellcheck** — needed for `make check`. A missing Rust component fails with
