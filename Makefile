@@ -6,7 +6,7 @@
 #   make resources
 #   make check
 
-.PHONY: resources sidecar composer check
+.PHONY: resources sidecar composer check build
 
 # Everything the hub ships that is not built from source. Both halves are
 # runtime prerequisites, not packaging ones: the hub installs and runs every
@@ -39,3 +39,10 @@ check:
 	cargo clippy --all-targets --all-features -- -D warnings
 	build/scripts/run-tests.sh
 	shellcheck build/scripts/*.sh
+
+# The hub's own TFSAppHub_<version>_amd64.AppImage under
+# hub/target/release/bundle/appimage/. Requires `make resources` first — see
+# build-hub.sh's own up-front check — and the local Tauri/AppImage toolchain
+# (see README.md Prerequisites).
+build:
+	build/scripts/build-hub.sh
