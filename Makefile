@@ -6,7 +6,7 @@
 #   make resources
 #   make check
 
-.PHONY: resources sidecar composer check build
+.PHONY: resources sidecar composer check build release
 
 # Everything the hub ships that is not built from source. Both halves are
 # runtime prerequisites, not packaging ones: the hub installs and runs every
@@ -41,8 +41,16 @@ check:
 	shellcheck build/scripts/*.sh
 
 # The hub's own TFSAppHub_<version>_amd64.AppImage under
-# hub/target/release/bundle/appimage/. Requires `make resources` first — see
-# build-hub.sh's own up-front check — and the local Tauri/AppImage toolchain
-# (see README.md Prerequisites).
+# target/release/bundle/appimage/ (the workspace's shared target/, not
+# hub/target/). Requires `make resources` first — see build-hub.sh's own
+# up-front check — and the local Tauri/AppImage toolchain (see README.md
+# Prerequisites).
 build:
 	build/scripts/build-hub.sh
+
+# Build (or reuse) the AppImage, then publish it and its SHA256SUMS.txt to the
+# releases repo as GitHub release assets. Requires `gh auth login` and a
+# "## <version>" section in CHANGELOG.md matching hub/Cargo.toml's version.
+# Never runs unattended — see release.sh's own header for the full flow.
+release:
+	build/scripts/release.sh
