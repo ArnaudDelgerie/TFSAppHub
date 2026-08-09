@@ -7,9 +7,9 @@ use std::{
 };
 
 use super::{
-    acquire_launch_locks, decide_launch, lifecycle_decision, prepare_dev_launch, read_data_version,
-    serving_lock_path, write_data_version, LaunchDecision, LaunchLockError, LifecycleDecisionError,
-    LifecycleError, LifecycleEvent,
+    acquire_launch_locks, decide_launch, lifecycle_decision, prepare_dev_launch, probe_run_lock,
+    read_data_version, serving_lock_path, write_data_version, LaunchDecision, LaunchLockError,
+    LifecycleDecisionError, LifecycleError, LifecycleEvent, RunLockHeld,
 };
 
 fn version(text: &str) -> semver::Version {
@@ -349,4 +349,50 @@ fn a_malformed_record_is_refused_rather_than_read_as_absent() {
         error.to_string().contains("config.json"),
         "names the file: {error}"
     );
+}
+
+// --- probe_run_lock (plan 013's rule 3 launch-side refusal) ------------------
+
+#[test]
+fn probe_run_lock_free_when_nothing_holds_it() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+
+    let held = probe_run_lock(data_dir.path()).expect("no I/O error");
+
+    assert_eq!(held, RunLockHeld::Free);
+}
+
+#[test]
+fn probe_run_lock_held_names_the_alias_from_the_record() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let run_lock_path = data_dir.path().join("run.lock");
+    let _holder = tfsapp_core::process::try_lock_file(&run_lock_path)
+        .unwrap()
+        .unwrap();
+    fs::write(&run_lock_path, "mcp-serve\n1234").expect("a run.lock record");
+
+    let held = probe_run_lock(data_dir.path()).expect("no I/O error");
+
+    assert_eq!(
+        held,
+        RunLockHeld::Held {
+            alias: Some("mcp-serve".to_string())
+        }
+    );
+}
+
+#[test]
+fn probe_run_lock_held_with_no_record_names_nothing() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let run_lock_path = data_dir.path().join("run.lock");
+    // Held, but with nothing ever written to it — the narrow window between
+    // `run`'s own lock acquisition and its first write, or a lock file this
+    // probe races with a concurrent writer on.
+    let _holder = tfsapp_core::process::try_lock_file(&run_lock_path)
+        .unwrap()
+        .unwrap();
+
+    let held = probe_run_lock(data_dir.path()).expect("no I/O error");
+
+    assert_eq!(held, RunLockHeld::Held { alias: None });
 }

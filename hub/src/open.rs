@@ -98,7 +98,7 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
         }
         State::NeedsRevalidation => eprintln!(
             "tfsapp-hub: warning: {id} was installed against PHP {} and the hub now runs \
-             something else. Opening it anyway; its dependencies have not been re-resolved.",
+             something else. Continuing anyway; its dependencies have not been re-resolved.",
             entry.platform
         ),
         State::Ready => {}

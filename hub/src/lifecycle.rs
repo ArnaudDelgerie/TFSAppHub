@@ -358,6 +358,20 @@ pub fn prepare_launch(
     };
     locks.as_ref()?;
 
+    // Rule 3's launch-side refusal (plan 013, CONTRACT.md §6's "Running a
+    // declared command"): a `run` command holding `run.lock` for this app
+    // owns its data dir just as much as a live window does, so a window must
+    // not open over it — a `bin/console` command opening the app's SQLite
+    // while a window is being spawned into it is the same hazard `run.rs`'s
+    // own rule 3 exists to prevent, read the other way round. Placed here,
+    // after `acquire_launch_locks` has already decided to launch rather than
+    // hand off: a launch that hands off to a live sibling
+    // (`LaunchDecision::HandOff`, `locks.as_ref()?` above) must never reach
+    // this check, since it is the ordinary "second window on an app that is
+    // already up" case and a `concurrent` alias legitimately running beside
+    // that window would otherwise be blocked by it.
+    check_run_lock(id, data_dir);
+
     let event = check_version(id, data_subdir, app_version);
     // A data dir with no record at all, under an app the hub installed: the
     // install event already ran, at install time, so there is nothing to run
@@ -380,6 +394,11 @@ pub fn prepare_launch(
 /// is written (plan 009 step 4). Lifecycle hooks stay out of both:
 /// `pre-install`/`post-install`/`pre-update`/`post-update` belong to
 /// `install`/`update`, and a dev launch is neither.
+///
+/// Nor does the rule 3 `run.lock` probe (plan 013) reach here: a dev
+/// session's `run.lock` would live under its own project's `var/`, not under
+/// `data_dir`, and `run <id> <alias>` takes a hub-local `id` a dev session
+/// never has — nothing in the hub ever writes one for it.
 ///
 /// `id` and `data_subdir` from [`prepare_launch`] have no dev counterpart to
 /// pass, since there is no version guard here to name an app to or a
@@ -455,6 +474,62 @@ fn check_version(id: &str, data_subdir: &Path, app_version: &str) -> LifecycleEv
                 config_file.display()
             ))
         }
+    }
+}
+
+/// What [`probe_run_lock`] found: `Free` means a launch may proceed.
+/// `Held { alias }` means `run.lock` is held — `alias` is whatever its record
+/// could tell us, from the alias name it was written with down to `None` when
+/// the lock is held but its record could not be read (a race with `run`'s own
+/// acquisition-time write, or a legacy/corrupt file) — the caller still
+/// refuses either way, just with a shorter message when there is nothing to
+/// name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunLockHeld {
+    Free,
+    Held { alias: Option<String> },
+}
+
+/// Probe `<data_dir>/run.lock` (plan 013, CONTRACT.md §6): the pure,
+/// Result-returning half of [`check_run_lock`], kept apart from it exactly as
+/// [`acquire_launch_locks`] is kept apart from [`prepare_launch`] — so a held
+/// lock, a free one, and an unreadable record are each a unit test with no
+/// process willing to exit under it.
+///
+/// Never retains the lock — probe and drop, the same "never retain, just
+/// observe" pattern [`tfsapp_core::process::is_owner_live`] uses for the
+/// liveness lock.
+fn probe_run_lock(data_dir: &Path) -> std::io::Result<RunLockHeld> {
+    let run_lock_path = data_dir.join("run.lock");
+    if tfsapp_core::process::try_lock_file(&run_lock_path)?.is_some() {
+        return Ok(RunLockHeld::Free);
+    }
+    let alias = fs::read_to_string(&run_lock_path)
+        .ok()
+        .and_then(|contents| crate::run::parse_run_lock(&contents))
+        .map(|record| record.alias);
+    Ok(RunLockHeld::Held { alias })
+}
+
+/// Rule 3's launch-side refusal (plan 013, CONTRACT.md §6): refuse to open a
+/// window while a `run` command holds `run.lock` for this app, naming the
+/// active alias when [`probe_run_lock`] found one and pointing at the way to
+/// release it either way.
+fn check_run_lock(id: &str, data_dir: &Path) {
+    match probe_run_lock(data_dir) {
+        Ok(RunLockHeld::Free) => {}
+        Ok(RunLockHeld::Held { alias: Some(alias) }) => fatal_startup_error(&format!(
+            "{id} cannot open a window while its \"{alias}\" run command is active — stop it \
+             first with `tfsapp-hub run --stop {id}`."
+        )),
+        Ok(RunLockHeld::Held { alias: None }) => fatal_startup_error(&format!(
+            "{id} cannot open a window while a run command is active — stop it first with \
+             `tfsapp-hub run --stop {id}`."
+        )),
+        Err(error) => fatal_startup_error(&format!(
+            "cannot probe {}: {error}",
+            data_dir.join("run.lock").display()
+        )),
     }
 }
 

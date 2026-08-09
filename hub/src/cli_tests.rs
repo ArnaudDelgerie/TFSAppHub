@@ -170,6 +170,19 @@ fn run_takes_an_app_before_its_alias() {
 }
 
 #[test]
+fn run_with_no_alias_lists_the_apps_declared_aliases() {
+    // The hub's own addition to the station's grammar: the station discovers
+    // aliases through `--help`, which the hub cannot do since they belong to
+    // an app and not to the binary.
+    assert_eq!(
+        command("run demo"),
+        Command::Run(RunInvocation::List {
+            id: "demo".to_string()
+        })
+    );
+}
+
+#[test]
 fn forwarded_arguments_are_not_the_hubs_to_read() {
     // The point of the form: `--force` here is the app command's flag, and the
     // hub reading it as one of its own would corrupt the invocation it exists
@@ -221,10 +234,10 @@ fn a_malformed_invocation_names_the_right_form() {
         ("export demo", "export <id> <path>"),
         ("import demo /tmp/x.tar.gz --purge", "import <id> <path>"),
         ("update demo --ref", "update <id>"),
-        ("run demo", "run <id> <alias>"),
-        ("run --stop", "run <id> <alias>"),
-        ("run --stop demo console", "run <id> <alias>"),
-        ("run --stop --replace demo console", "run <id> <alias>"),
+        ("run", "run <id>"),
+        ("run --stop", "run <id>"),
+        ("run --stop demo console", "run <id>"),
+        ("run --stop --replace demo console", "run <id>"),
         ("--update --now", "--update [--yes]"),
         ("--version extra", "--version"),
     ];
@@ -263,7 +276,6 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         "update demo",
         "export demo /tmp/demo",
         "import demo /tmp/demo.tar.gz",
-        "run demo console",
     ] {
         assert!(
             !command(line).is_implemented(),
@@ -278,6 +290,10 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         "install ../TFSAppTest",
         "open demo",
         "remove demo",
+        "run demo",
+        "run demo console",
+        "run --stop demo",
+        "run --replace demo console",
     ] {
         assert!(command(line).is_implemented(), "{line:?} works today");
     }
