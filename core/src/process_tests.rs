@@ -396,16 +396,18 @@ fn terminate_if_identifier_matches_leaves_a_wrong_identifier_process_alive() {
 
 #[test]
 fn terminate_if_identifier_matches_terminates_and_a_reaper_reaps_a_matching_process() {
-    // Two opposite constraints must both hold for this test to prove
-    // anything: `process_exists` reads `/proc/<pid>`, which still exists for
-    // an unreaped zombie, so without a reaper `terminate` would poll for the
-    // full 3s and then SIGKILL a corpse regardless of whether the guard
-    // worked; but `process_environ_has_identifier` returns false for a
-    // zombie (its `environ` is no longer readable), so a reaper that won the
-    // race before the check would make the guard wrongly refuse. Starting
-    // the reaper thread here, blocked in `wait()` while the child is still
-    // alive, satisfies both: the identity check below runs on a live
-    // process, and reaping only happens once `terminate` actually signals it.
+    // The reaper is here for one reason, and since plan 014 only one:
+    // `process_environ_has_identifier` returns false for a zombie (its
+    // `environ` is no longer readable), so a reaper that won the race before
+    // the guard's own check would make it wrongly refuse. Starting the thread
+    // here, blocked in `wait()` while the child is still alive, means reaping
+    // can only happen once `terminate` has actually signalled it — and it
+    // leaves no corpse behind for the rest of the suite.
+    //
+    // It is **not** needed to keep `terminate` from escalating any more: the
+    // poll no longer counts an unreaped zombie as a live process. That was
+    // the second constraint this comment used to name, and it was a defect
+    // being worked around rather than a property of the test.
     let mut child = spawn_child_with_identifier("test-identifier");
     let pid = child.id();
     let reaper = thread::spawn(move || {
@@ -416,6 +418,157 @@ fn terminate_if_identifier_matches_terminates_and_a_reaper_reaps_a_matching_proc
     reaper.join().unwrap();
 
     assert!(!process_exists(pid));
+}
+
+// --- process_exists ----------------------------------------------------------
+
+#[test]
+fn process_exists_true_for_a_live_process() {
+    let child = spawn_child_with_identifier("test-identifier");
+    assert!(process_exists(child.id()));
+    kill_and_wait(child);
+}
+
+#[test]
+fn process_exists_false_for_an_unreaped_zombie() {
+    // The whole of plan 014's cause 1: the child is dead, but this process
+    // has not `wait`ed on it, so `/proc/<pid>` is still there — and a corpse
+    // is not something a caller polling this can wait for or kill again.
+    let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+    let pid = child.id();
+    wait_for_state(pid, 'Z');
+
+    assert!(!process_exists(pid));
+
+    child.wait().unwrap();
+}
+
+#[test]
+fn process_exists_false_for_a_pid_that_never_existed() {
+    assert!(!process_exists(999_999_999));
+}
+
+#[test]
+fn stat_state_reads_past_a_command_name_containing_spaces_and_parentheses() {
+    // The classic misparse: splitting on whitespace picks a fragment of the
+    // executable name instead of the state.
+    assert_eq!(stat_state("42 (sh (2) x) Z 1 42 0").unwrap(), 'Z');
+    assert_eq!(stat_state("42 (frankenphp) S 1 42 0").unwrap(), 'S');
+    assert_eq!(stat_live_group("42 (sh (2) x) S 1 7 0"), Some(7));
+    assert_eq!(stat_live_group("42 (sh (2) x) Z 1 7 0"), None);
+}
+
+/// Block until `/proc/<pid>/stat` reports `state`, so a test never races the
+/// kernel's own bookkeeping. Gives up quietly after a second — the assertion
+/// that follows is what reports the failure, with a better message than a
+/// panic in here would.
+fn wait_for_state(pid: u32, state: char) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        if process_state(pid) == Some(state) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// --- terminate ---------------------------------------------------------------
+
+/// Spawn a process-group leader (as every sidecar is, via
+/// [`set_own_process_group`]) running `script`, and wait until it is really
+/// its own group's leader before handing it back.
+fn spawn_group_leader(script: &str) -> std::process::Child {
+    let mut command = Command::new("sh");
+    command.args(["-c", script]);
+    set_own_process_group(&mut command);
+    let child = command.spawn().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        if process_group_id(child.id()) == Some(child.id()) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    child
+}
+
+#[test]
+fn terminate_returns_at_once_when_the_group_obeys_the_sigterm() {
+    // Plan 014, cause 1, as the teardown itself meets it: nothing reaps the
+    // child while `terminate` runs — the caller's own `child.wait()` comes
+    // after — so the poll is looking at a zombie for the whole of its budget.
+    // It must still answer "gone", and in milliseconds.
+    let mut child = spawn_group_leader("sleep 30");
+    let pid = child.id();
+
+    let start = Instant::now();
+    terminate(pid);
+    let elapsed = start.elapsed();
+
+    // Well under the 3s budget, which is also what proves no escalation line
+    // was printed: that line is only ever reached after the deadline.
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "terminate polled for {elapsed:?} on a process that obeyed at once"
+    );
+    child.wait().unwrap();
+}
+
+#[test]
+fn terminate_still_escalates_for_a_group_member_outliving_a_corpse_leader() {
+    // The regression the narrowed predicate could have hidden: the leader is
+    // a corpse within milliseconds, but a member of its group — a FrankenPHP
+    // worker, here a `sleep` that ignores SIGTERM exactly as one that never
+    // finishes draining does — is still running, and the group SIGKILL is the
+    // only thing that gets it.
+    let mut child = spawn_group_leader(r#"trap "" TERM; sleep 30 & exit 0"#);
+    let leader = child.id();
+    wait_for_state(leader, 'Z');
+    assert!(
+        group_has_live_process(leader),
+        "the member must still be running while its leader is already a corpse"
+    );
+
+    let start = Instant::now();
+    terminate(leader);
+
+    assert!(
+        start.elapsed() >= Duration::from_secs(3),
+        "it must have spent the whole budget before escalating"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while group_has_live_process(leader) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !group_has_live_process(leader),
+        "the group SIGKILL must have reached the member"
+    );
+    child.wait().unwrap();
+}
+
+// --- reap_decision on a corpse -----------------------------------------------
+
+#[test]
+fn reap_decision_refuses_silently_rather_than_loudly_for_a_zombie_in_a_pid_file() {
+    // The second face of cause 1 (plan 014): `/proc/<zombie>/environ` is
+    // `EACCES`, so the identity check answers false — which used to combine
+    // with a `process_exists` that answered true into
+    // `RefuseIdentityMismatch`, printing "likely reused by an unrelated
+    // process" about a pid nothing had recycled.
+    let mut child = spawn_child_with_identifier("test-identifier");
+    let pid = child.id();
+    child.kill().unwrap();
+    wait_for_state(pid, 'Z');
+
+    let decision = reap_decision(
+        process_exists(pid),
+        process_environ_has_identifier(pid, "test-identifier"),
+    );
+
+    assert!(matches!(decision, ReapDecision::RefuseAlreadyGone));
+    child.wait().unwrap();
 }
 
 // --- spawn_on_signal --------------------------------------------------------

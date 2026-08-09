@@ -246,11 +246,13 @@ fn stop_active_run_stops_a_matching_child_and_frees_the_lock() {
     let pid = holder.id();
     std::fs::write(&run_lock_path, format_run_lock("mcp-serve", Some(pid))).unwrap();
     // Started before `stop_active_run`, blocked in `wait()` on the still-alive
-    // holder: without a reaper, `terminate`'s own `process_exists` poll keeps
-    // seeing the killed holder's zombie `/proc` entry and always escalates to
-    // a needless SIGKILL after the full 3s; with one, reaping happens the
-    // instant SIGTERM lands, so `terminate` observes the process gone almost
-    // at once.
+    // holder. Since plan 014 it is no longer what keeps `terminate` from
+    // escalating — its poll stopped counting an unreaped zombie as a live
+    // process — but it is still what keeps the guard honest: the identity
+    // check `stop_active_run` makes reads `/proc/<pid>/environ`, which a
+    // corpse no longer has, so the holder must be reaped only once the signal
+    // has actually been sent, never before. It also leaves no zombie behind
+    // for the rest of the suite.
     let reaper = std::thread::spawn(move || {
         let _ = holder.wait();
     });
