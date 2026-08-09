@@ -1,5 +1,43 @@
 use super::*;
 
+// --- append_stdio ------------------------------------------------------
+
+#[test]
+fn append_stdio_appends_without_truncating_existing_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hub.log");
+    fs::write(&path, "existing-line\n").unwrap();
+
+    let (stdout, _stderr) = append_stdio(&path).unwrap();
+    let status = std::process::Command::new("sh")
+        .args(["-c", "printf 'new-line\\n'"])
+        .stdout(stdout)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let contents = fs::read_to_string(&path).unwrap();
+    assert_eq!(contents, "existing-line\nnew-line\n");
+}
+
+#[test]
+fn append_stdio_stdout_and_stderr_share_one_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hub.log");
+
+    let (stdout, stderr) = append_stdio(&path).unwrap();
+    let status = std::process::Command::new("sh")
+        .args(["-c", "printf 'out-line\\n'; printf 'err-line\\n' >&2"])
+        .stdout(stdout)
+        .stderr(stderr)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let contents = fs::read_to_string(&path).unwrap();
+    assert_eq!(contents, "out-line\nerr-line\n");
+}
+
 // --- sidecar_log_stdio -----------------------------------------------------
 
 #[test]

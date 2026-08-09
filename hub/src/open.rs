@@ -4,8 +4,16 @@
 //! re-executes the hub binary as a child carrying that app's identity; the child
 //! is the one that mutates its runtime identity (see `identity.rs`), boots the
 //! app's sidecar and opens the window. The parent's only job is to resolve, to
-//! fail fast with a message a terminal user can act on, and to get out of the
-//! way.
+//! fail fast in a way **both** a terminal user and a desktop-entry launch can
+//! act on (plan 015 — see [`crate::lifecycle::report_launch_failure`]), and to
+//! get out of the way.
+//!
+//! **The child's stdio is redirected, not inherited (plan 015).** The parent
+//! returns as soon as it has the pid, so a terminal that ran `open` has
+//! already moved on by the time the child has anything routine to say; its
+//! stdout and stderr go to `<state_root>/log/hub.log` instead (`launch`,
+//! below). `dev` and `run` are the two paths where a terminal genuinely stays
+//! attached for the child's whole life, and inheritance is still right there.
 //!
 //! It is not one process serving N apps, and that was decided rather than
 //! defaulted (see `.project/plan/007-open-an-installed-app.md`'s Overview, which
@@ -37,15 +45,21 @@ use crate::{
     launch::{LaunchSpec, Source},
     manifest::{self, ManifestError},
     paths::{Paths, PathsError},
-    registry::{self, RegistryError, State},
+    registry::{self, now_timestamp, RegistryError, State},
 };
 
 /// The whole command, parent side. Returns the process's exit code.
+///
+/// Every refusal below goes through [`lifecycle::report_launch_failure`], the
+/// same reporter the child's own fatal errors use: a line on stderr always,
+/// and a native dialog too when stderr is not a terminal, because a launch
+/// started from a desktop entry has no terminal for the line to land on (see
+/// this module's doc comment's table).
 pub fn run(id: &str) -> i32 {
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
         Err(error) => {
-            eprintln!("tfsapp-hub: {error}");
+            crate::lifecycle::report_launch_failure(&error.to_string());
             return EXIT_FAILED;
         }
     };
@@ -54,7 +68,7 @@ pub fn run(id: &str) -> i32 {
         for warning in &resolved.warnings {
             eprintln!("tfsapp-hub: warning: {warning}");
         }
-        launch(&resolved)
+        launch(&paths, &resolved)
     });
 
     match launched {
@@ -63,7 +77,7 @@ pub fn run(id: &str) -> i32 {
             EXIT_OK
         }
         Err(error) => {
-            eprintln!("tfsapp-hub: {error}");
+            crate::lifecycle::report_launch_failure(&error.to_string());
             EXIT_FAILED
         }
     }
@@ -175,21 +189,108 @@ pub fn child_args(spec: &LaunchSpec) -> Vec<String> {
 
 /// Re-execute this binary as the app's own process, and answer with its pid.
 ///
-/// stdio is inherited on purpose: the child's own startup messages are the ones
-/// worth reading, and a terminal user who typed `open` should see them where
-/// they typed it. A `.desktop` launch inherits nothing useful either way, which
-/// is why the child's fatal errors also go through a native dialog rather than
-/// through stderr alone.
-fn launch(spec: &LaunchSpec) -> Result<u32, OpenError> {
+/// stdio is **not** inherited: the parent returns as soon as it has the pid
+/// (see this module's doc comment's table), so a terminal that ran `open` has
+/// already been handed back by the time the child has anything to say —
+/// inheriting would write the child's routine lines to a prompt nobody is
+/// reading any more. The child's stdout and stderr are redirected to
+/// `<state_root>/log/hub.log` instead, appended across launches with a dated
+/// header marking where this one starts; stdin is nulled. `dev` is the path
+/// where inheritance is still right, because its parent stays in the
+/// foreground and waits for the child.
+fn launch(paths: &Paths, spec: &LaunchSpec) -> Result<u32, OpenError> {
     let executable = std::env::current_exe().map_err(OpenError::NoExecutable)?;
     let mut command = Command::new(&executable);
     command.args(child_args(spec));
     tfsapp_core::process::set_own_process_group(&mut command);
 
-    command
+    let hub_log = prepare_hub_log(paths, &spec.identity.identifier, &mut command);
+
+    let pid = command
         .spawn()
         .map(|child| child.id())
-        .map_err(|source| OpenError::Unstartable { executable, source })
+        .map_err(|source| OpenError::Unstartable { executable, source })?;
+
+    if let Some(hub_log) = hub_log {
+        tfsapp_core::log::append_log(
+            &hub_log,
+            &launch_header(&now_timestamp(), "open", &spec.label, pid),
+        );
+    }
+
+    Ok(pid)
+}
+
+/// Points `command`'s stdio at `<state_root>/log/hub.log`, creating the
+/// directory and rotating the file first. Returns the log path on success, so
+/// the caller can write the launch header to it once the child's pid is
+/// known; `None` means every line below already explained itself on stderr
+/// and `command` was left with its default (inherited) stdio.
+///
+/// **Best-effort, on purpose.** A launch is not refused, and output is not
+/// dropped, just because its log file could not be opened — inherited stdio
+/// that nobody is watching is still a better outcome than `/dev/null` (see
+/// this module's doc comment's table for who normally reads it instead).
+///
+/// The directory is created through [`Paths::create_app_data_dir`] rather
+/// than a bare `create_dir_all`, so its `0700` (CONTRACT.md §5) is applied by
+/// whoever gets there first — this parent, or the child a moment later —
+/// with no window in which the app's data directory exists at the umask's
+/// permissions. Rotation happens here, before the file is opened for the
+/// child: `app_env::resolve`'s own `rotate_logs` runs in the child, after
+/// this fd is already open, and renaming a file out from under an open
+/// `O_APPEND` handle would silently send the whole session's lines into
+/// `hub.log.1` instead of `hub.log`.
+fn prepare_hub_log(paths: &Paths, identifier: &str, command: &mut Command) -> Option<PathBuf> {
+    let warn = |context: String, error: &dyn fmt::Display| {
+        eprintln!(
+            "tfsapp-hub: warning: {context}: {error}; the app's output will go to this \
+             terminal instead."
+        );
+    };
+
+    let data_dir = match paths.create_app_data_dir(identifier) {
+        Ok(dir) => dir,
+        Err(error) => {
+            warn(
+                "cannot prepare the app's data directory".to_string(),
+                &error,
+            );
+            return None;
+        }
+    };
+    let log_dir = data_dir.join("log");
+    if let Err(error) = std::fs::create_dir_all(&log_dir) {
+        warn(format!("cannot create {}", log_dir.display()), &error);
+        return None;
+    }
+
+    let hub_log = log_dir.join("hub.log");
+    tfsapp_core::log::rotate_log(&hub_log);
+
+    match tfsapp_core::log::append_stdio(&hub_log) {
+        Ok((stdout, stderr)) => {
+            command
+                .stdout(stdout)
+                .stderr(stderr)
+                .stdin(std::process::Stdio::null());
+            Some(hub_log)
+        }
+        Err(error) => {
+            warn(format!("cannot open {}", hub_log.display()), &error);
+            None
+        }
+    }
+}
+
+/// The one line `hub.log` gets per launch: an RFC 3339 `timestamp`, the
+/// `command`, the `app` and the child's `pid`. `hub.log` spans every launch of
+/// that app and the lines that follow this one carry no timestamp of their
+/// own — this is the marker that makes them readable without touching a
+/// single `println!`. Pure, with the timestamp passed in rather than read
+/// from the clock here, so it is testable on a fixed value.
+fn launch_header(timestamp: &str, command: &str, app: &str, pid: u32) -> String {
+    format!("=== {timestamp} {command} {app} (pid {pid}) ===")
 }
 
 /// Everything that can stop an `open` before the app's own process exists.

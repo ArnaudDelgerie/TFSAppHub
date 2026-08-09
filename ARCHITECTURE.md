@@ -190,8 +190,8 @@ hub's own root rather than beside a per-app path.
 **One OS process per open app.** `open <id>` resolves the app, then re-executes
 the hub binary as a child carrying that app's identity. The child mutates its
 runtime identity, boots the app's sidecar and opens the window; the parent
-resolves, fails fast with a message a terminal user can act on, and gets out of
-the way without holding the shell.
+resolves, fails fast in a way both a terminal user and a desktop-entry launch
+can act on, and gets out of the way without holding the shell.
 
 This was decided, not defaulted. A single process serving N apps, or a single
 shared FrankenPHP, were both considered and rejected:
@@ -229,6 +229,33 @@ registered.
 Step 3's order is load-bearing too: `messenger:setup-transports` runs before
 anything is spawned, so an app that declares a worker without the Doctrine
 Messenger bridge fails with no sidecar to tear down.
+
+### Where each process's output goes, and who reads a failure
+
+Three processes write output during a launch, and each has a different
+audience (plan 015):
+
+- **The app's own sidecar** — FrankenPHP and the Messenger worker — always
+  writes to `<state_root>/log/sidecar.log`. It never had a terminal to write
+  to in the first place: it is a grandchild, spawned by the child long after
+  the parent that had one has returned.
+- **`open`'s own detached child** writes its routine lines — `is listening
+  at`, the teardown lines — to `<state_root>/log/hub.log`, beside
+  `sidecar.log`. Its parent returns as soon as it has the pid, so by the time
+  the child has anything to say, a terminal that ran `open` has already moved
+  on; inheriting would write those lines to a prompt nobody is reading. `dev`
+  and `run` are the two paths where a terminal genuinely stays attached for
+  the child's whole life, and both keep inheriting stdio unchanged.
+- **A fatal startup error**, on either side of `open`'s re-exec, goes through
+  one reporter: a line on stderr always, and the same blocking native dialog
+  only when stderr is not a terminal (`std::io::IsTerminal`). A developer's
+  typo at a terminal gets the line where they typed it; a `.desktop` launch,
+  which has no stderr anyone will read, gets the dialog instead of failing
+  silently. The decision is sound on both sides of the re-exec for two
+  different reasons that land on the same rule: `rfd` is safe exactly while
+  nothing has claimed GTK yet, which is true of the child before
+  `tauri::Builder` runs and true of the parent for the whole of its life,
+  since it never builds one at all.
 
 ### The Caddyfile is written per app, per launch
 

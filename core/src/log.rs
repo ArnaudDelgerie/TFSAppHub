@@ -32,27 +32,31 @@ pub fn append_log(log_file: &Path, content: &str) {
     }
 }
 
-/// Packaged mode only (plan 031): `<data dir>/log/sidecar.log`, appended to,
-/// never truncated — the same shape as `commands.log`, for the same reason
-/// (multiple launches, and the server plus a recycled Messenger worker, must
-/// stay comparable in one file rather than each clobbering the last). Two
-/// independent `Stdio` handles — one for stdout, one for stderr — from the
-/// same opened `File`, so a caller can hand one to each without fighting over
-/// a single owned value; both still append to the same underlying file
-/// (`try_clone` shares the OS file description, and therefore the `O_APPEND`
-/// file offset, not just the fd number). Dev mode never calls this — it
-/// keeps inheriting the developer's own terminal stdio, same as before this
-/// plan.
-pub fn sidecar_log_stdio(
-    log_dir: &Path,
-) -> std::io::Result<(std::process::Stdio, std::process::Stdio)> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_dir.join("sidecar.log"))?;
+/// Two independent `Stdio` handles onto `path` — one for stdout, one for
+/// stderr — from the same `File`, opened for append and created if missing.
+/// Both still append to the same underlying file (`try_clone` shares the OS
+/// file description, and therefore the `O_APPEND` file offset, not just the
+/// fd number), so a caller can hand one to each without fighting over a
+/// single owned value. Shared by the sidecar (`sidecar_log_stdio`, below) and
+/// by `open`'s own detached child (plan 015), whose routine output has no
+/// terminal to land on once the parent has returned.
+pub fn append_stdio(path: &Path) -> std::io::Result<(std::process::Stdio, std::process::Stdio)> {
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
     let stdout = std::process::Stdio::from(file.try_clone()?);
     let stderr = std::process::Stdio::from(file);
     Ok((stdout, stderr))
+}
+
+/// Packaged mode only (plan 031): `<data dir>/log/sidecar.log`, appended to,
+/// never truncated — the same shape as `commands.log`, for the same reason
+/// (multiple launches, and the server plus a recycled Messenger worker, must
+/// stay comparable in one file rather than each clobbering the last). Dev
+/// mode never calls this — it keeps inheriting the developer's own terminal
+/// stdio, same as before this plan.
+pub fn sidecar_log_stdio(
+    log_dir: &Path,
+) -> std::io::Result<(std::process::Stdio, std::process::Stdio)> {
+    append_stdio(&log_dir.join("sidecar.log"))
 }
 
 /// `path.{generation}` — the sibling rotation uses for `path`'s older
@@ -92,6 +96,13 @@ pub fn rotate_log(path: &Path) {
 /// called early in both launch paths — before `commands.log` is written and
 /// before `sidecar_log_stdio` opens the sidecar's fd (plan 038) — so a
 /// long-lived install's `log/` stays bounded instead of growing forever.
+///
+/// **`hub.log` is deliberately not among them (plan 015).** This runs in the
+/// *child*, after the *parent* has already opened `hub.log`'s fd for the
+/// child's own stdio; renaming it out from under that open `O_APPEND` handle
+/// here would silently send the whole session's lines into `hub.log.1`
+/// instead of `hub.log`. The parent rotates `hub.log` itself, with a plain
+/// `rotate_log` call, before it opens that fd — see `open::prepare_hub_log`.
 pub fn rotate_logs(log_dir: &Path) {
     rotate_log(&log_dir.join("commands.log"));
     rotate_log(&log_dir.join("sidecar.log"));
