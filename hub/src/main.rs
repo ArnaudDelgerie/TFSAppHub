@@ -429,8 +429,15 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             Ok(())
         })
         .on_window_event(lifecycle::on_window_event)
-        .run(context)
-        .expect("failed to run the app window");
+        // `build` + `run` rather than `Builder::run(context)`, which is the
+        // same thing with an empty callback: the hub needs the callback. See
+        // `lifecycle::veto_exit` — teardown destroys this process's windows
+        // before signalling the backend, and an event loop that finds itself
+        // with no windows left would otherwise end the process on the spot,
+        // orphaning the FrankenPHP that has not been signalled yet.
+        .build(context)
+        .expect("failed to build the app window")
+        .run(lifecycle::on_run_event);
 }
 
 /// Everything between the splash appearing and the app answering, off the main

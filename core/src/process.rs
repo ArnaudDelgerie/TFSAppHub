@@ -142,6 +142,25 @@ impl SignalTarget {
             SignalTarget::Pid(pid) => pid.to_string(),
         }
     }
+
+    /// Whether anything this target covers can still run — `terminate`'s poll
+    /// question, and it has to be asked about the *whole* target rather than
+    /// about the leader alone (plan 014). Narrowing a group's poll to its
+    /// leader would answer "gone" the instant the leader became a corpse and
+    /// silently drop the group SIGKILL that catches a FrankenPHP worker
+    /// outliving its parent.
+    ///
+    /// `killpg(pgid, 0)` cannot serve as the test: a zombie leader keeps its
+    /// group non-empty as far as the kernel is concerned, so it would answer
+    /// "still there" for a group whose every member is a corpse — the exact
+    /// mistake this plan removes from `process_exists`. Scanning `/proc` is
+    /// what lets the state of each member be part of the question.
+    fn has_live_process(&self) -> bool {
+        match self {
+            SignalTarget::Group(pgid) => group_has_live_process(*pgid),
+            SignalTarget::Pid(pid) => process_exists(*pid),
+        }
+    }
 }
 
 /// Pure decision behind `SignalTarget` above, factored out so the fallback
@@ -165,27 +184,47 @@ fn process_group_id(pid: u32) -> Option<u32> {
     }
 }
 
-/// Send SIGTERM to `pid`'s process group, then escalate to SIGKILL if it
-/// hasn't exited within 3s (plan 061: the group, not just `pid` itself, so a
-/// FrankenPHP grandchild or a `run` alias's own child can't survive its
-/// parent's teardown). Some orphaned FrankenPHP processes — observed running
-/// from an AppImage's squashfs-mounted `/tmp/.mount_*` path — don't respond
-/// to a plain SIGTERM at all, so a single `kill` is not enough to guarantee
-/// the stale sidecar is actually gone. The target is decided once, up front,
-/// and reused for both signals — the group either got the same members for
-/// both, or `pid` itself already exited and the second signal is a no-op.
+/// Send SIGTERM to `pid`'s process group, then escalate to SIGKILL if
+/// anything in it is still running 3s later (plan 061: the group, not just
+/// `pid` itself, so a FrankenPHP grandchild or a `run` alias's own child
+/// can't survive its parent's teardown). The target is decided once, up
+/// front, and reused for both signals — the group either got the same members
+/// for both, or `pid` itself already exited and the second signal is a no-op.
+///
+/// **The escalation is an exception path, not the ordinary one** (plan 014).
+/// It used to fire on every single call, including on processes that had
+/// obeyed the SIGTERM within milliseconds, because the poll below asked
+/// `process_exists` — which counted an unreaped zombie as a live process, and
+/// nothing reaps one while this function is the thing standing between the
+/// signal and the caller's own `child.wait()`. The poll now asks
+/// [`SignalTarget::has_live_process`], for which a corpse is gone.
+///
+/// This doc used to carry an anecdote about orphaned FrankenPHP processes
+/// "observed running from an AppImage's squashfs-mounted `/tmp/.mount_*`
+/// path" not responding to a plain SIGTERM at all. It is deleted rather than
+/// kept, because plan 014 found a cause for exactly that observation which has
+/// nothing to do with packaging — a webview holding a Mercure stream open
+/// against Caddy's graceful shutdown — and fixed it, after which no FrankenPHP
+/// has been seen ignoring a SIGTERM on any path. Keeping the anecdote would
+/// leave a plausible explanation standing in front of the real one. If it is
+/// ever reproduced again, it is a new finding and gets written down as one.
 pub fn terminate(pid: u32) {
-    let operand = signal_target(pid, process_group_id(pid)).operand();
+    let target = signal_target(pid, process_group_id(pid));
+    let operand = target.operand();
     let _ = Command::new("kill").arg("--").arg(&operand).status();
 
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if !process_exists(pid) {
+        if !target.has_live_process() {
             return;
         }
-        thread::sleep(Duration::from_millis(200));
+        // 20ms rather than the 200ms this poll used while it could never
+        // observe anything but its own deadline: the whole cost of a
+        // successful teardown is now the interval this loop rounds up to, and
+        // it is paid twice (worker, then server) on every window close.
+        thread::sleep(Duration::from_millis(20));
     }
-    if process_exists(pid) {
+    if target.has_live_process() {
         println!("pid {pid} did not exit after SIGTERM, sending SIGKILL");
         let _ = Command::new("kill")
             .arg("-9")
@@ -213,8 +252,81 @@ pub fn signal_terminate_once(pid: u32) {
     let _ = Command::new("kill").arg("--").arg(&operand).status();
 }
 
+/// Whether there is a process at `pid` that can still **do** something.
+///
+/// Not `Path::new("/proc/<pid>").exists()`, and the difference is the whole of
+/// plan 014: a process that has exited but whose parent has not yet `wait`ed
+/// on it keeps its `/proc` entry — and its pid — until it is reaped, so the
+/// cheap test answers "alive" for a corpse. Every caller here asks this
+/// question in order to decide whether to keep waiting or to escalate to a
+/// SIGKILL, and a corpse is not something either can act on: it will not run
+/// another instruction, it cannot be killed again, and the only thing that
+/// makes it disappear is a `wait` its own parent owes it. `terminate` polling
+/// this predicate on its own child is exactly that case — it stands between
+/// the signal and the `child.wait()` that would reap it — which is why it
+/// escalated to SIGKILL on every teardown for as long as this read `/proc`
+/// existence.
+///
+/// So: a `Z` state is gone, and an unreadable or missing entry is gone too, as
+/// it always was. Do not "simplify" this back to an existence check.
 pub fn process_exists(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    process_state(pid).is_some_and(|state| state != 'Z')
+}
+
+/// `pid`'s state field from `/proc/<pid>/stat` (`R`, `S`, `D`, `Z`, `T`, …),
+/// or `None` when there is no readable entry at all.
+///
+/// Parsed from the **last** `)` rather than by splitting on whitespace: the
+/// second field is the executable name, in parentheses, and it may itself
+/// contain spaces and parentheses (`sh (2)`), which is the classic way of
+/// misreading this file.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat_state(&stat)
+}
+
+/// The pure half of [`process_state`], over one `/proc/<pid>/stat` line.
+fn stat_state(stat: &str) -> Option<char> {
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    after_comm.split_whitespace().next()?.chars().next()
+}
+
+/// The pure half of [`group_has_live_process`], over one `/proc/<pid>/stat`
+/// line: `Some(pgrp)` when the entry describes a process that can still run,
+/// `None` for a corpse or an unparseable line. `pgrp` is the fourth field
+/// after the executable name (state, ppid, pgrp).
+fn stat_live_group(stat: &str) -> Option<u32> {
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    let mut fields = after_comm.split_whitespace();
+    if fields.next()?.starts_with('Z') {
+        return None;
+    }
+    fields.next()?;
+    fields.next()?.parse().ok()
+}
+
+/// Whether any process in the group `pgid` is still in a state where it can
+/// run — [`SignalTarget::has_live_process`]'s group case, and see its comment
+/// for why the kernel's own `killpg(pgid, 0)` cannot answer this.
+///
+/// A `/proc` entry that vanishes mid-scan is simply skipped: a process that
+/// exited while being read is one this poll would rather not have seen.
+fn group_has_live_process(pgid: u32) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        // Without `/proc` nothing here can answer anything; claiming the group
+        // is empty would skip the SIGKILL escalation, so claim the opposite.
+        return true;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+            && fs::read_to_string(entry.path().join("stat"))
+                .ok()
+                .and_then(|stat| stat_live_group(&stat))
+                == Some(pgid)
+    })
 }
 
 /// `<pid_file>.lock` — kept separate from `pid_file` itself so the lock's

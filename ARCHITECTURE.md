@@ -257,8 +257,7 @@ get you a window right now". Released explicitly, at the very top of
 teardown, alongside `tauri-plugin-single-instance`'s own bus name — both
 before a single child process is signalled — so a sibling that has just begun
 shutting down stops claiming to serve within milliseconds of the signal or
-window-close that started it, long before the SIGTERM-then-SIGKILL escalation
-below actually finishes.
+window-close that started it, rather than once it is actually gone.
 
 A launch probes both, in that order. A live sibling holding the serving lock
 is what makes a second `open` of the same app surface the first instead of
@@ -270,10 +269,36 @@ its own. Without that second lock a closed window and a gone process were the
 same signal, and a launch arriving in the gap between them attached to a
 backend already dying instead of starting a fresh one.
 
+**Teardown runs in one order, and every step of it is load-bearing**: the
+serving claim is released, then this process's webview windows are *destroyed*,
+then the worker is stopped, then the server, and only then does the process
+exit. The middle step is the one that is not obvious. Closing the last window
+hides it rather than closing it, so the user's click lands while the work
+happens off the GTK main thread — and a hidden webview still holds its
+connection to the backend. The server's stop is graceful: it drains its
+connections, the always-mounted Mercure hub makes one of them a stream, and a
+stream never drains. So for as long as the client is alive, the server waits
+for it and dies by `SIGKILL` instead of shutting down. The client goes first,
+and the whole teardown takes about a third of a second.
+
+For clients this process does not own — a browser opened on the app's port, a
+`run` command mid-request — the bound is Caddy's own `grace_period` (§4), not
+ours. The `SIGTERM`-then-`SIGKILL` escalation is what remains for something
+genuinely stuck: an exception path, not the ordinary one.
+
 The worker's pid is the second line of that pid file, which is what lets the
-next launch reap it if this process never gets the chance. Teardown stops the
-worker before the server. Children are killed as a process group, so nothing
-survives a window closing.
+next launch reap it if this process never gets the chance. Children are killed
+as a process group, so nothing survives a window closing — and a process that
+has exited but has not yet been reaped is treated as gone rather than as
+running, which is what lets the escalation stay an exception instead of firing
+on every close.
+
+Destroying the last window has one consequence worth stating, because it is
+invisible and fatal: an event loop with no windows left asks to exit, and would
+end the process mid-teardown, orphaning a FrankenPHP that has not been
+signalled yet. The hub's run callback vetoes exactly that exit, and only while
+a teardown is in flight, leaving its own `app.exit(0)` as the one thing that
+ends the process.
 
 A third lock joins these two once a `run` command exists — see "Running a
 declared command" below for what it answers and how a launch reads it.
@@ -477,7 +502,7 @@ the flag, is what the test pins — forwarded arguments are the app's — becaus
 every other host-level flag sits in the same trap the day an app declares an
 alias that takes one.
 
-## Three measurements that shaped the code
+## Four measurements that shaped the code
 
 Recorded because each one explains why a piece of code looks the way it does,
 and each was silent enough that it would otherwise be "simplified" away.
@@ -495,7 +520,17 @@ the host's own flag parser sees it.
 
 **`PHP_BINARY` is empty under `frankenphp php-cli`.** See the shim above.
 
-All three were found here rather than reasoned about, and the reason is
+**`/proc/<pid>` outlives the process, so "is it still running" answered yes for
+a corpse.** Nothing in this process reaps a child while the code that signalled
+it is still waiting on it, so a child that obeyed its `SIGTERM` in 260 ms kept
+its `/proc` entry for the whole three-second budget and was then `SIGKILL`ed
+after the fact. Every teardown ended that way; both budgets were spent in full,
+every time, and the six seconds were read as "FrankenPHP and the worker are slow
+to stop" for two plans. `process_exists` reads `/proc/<pid>/stat`'s state field
+for that reason, and the escalation went from being the rule to being an
+exception path.
+
+All four were found here rather than reasoned about, and the reason is
 structural: the hub is the first thing to run this code path **twice in one
 process image, from argv rather than from a build**, which makes it the first
 place a silent default is visible as a difference.

@@ -551,7 +551,26 @@ request that mints a cookie. The fix is configuration — give each environment 
 `MERCURE_PUBLIC_URL` that matches how it is served — not a runtime check for
 whether a host is present.
 
----
+### A request in flight gets two seconds when the app closes
+
+Closing the app stops its server gracefully: requests already being handled are
+allowed to finish, and **two seconds** is how long they get. Past that the
+connection is closed under them, and the process exits regardless.
+
+The bound exists because the alternative is unbounded. A graceful stop waits for
+its connections to drain, and a Mercure subscription is a stream that never
+drains — so without a limit, one subscriber anywhere on the machine could hold
+an app open for as long as it liked. The host's own escalation would eventually
+kill it, but by then nothing has shut down cleanly: PHP's shutdown functions
+never run and buffered writes are lost, which is the outcome the bound exists to
+avoid, not to cause.
+
+Two seconds is not a budget to design against. It is generous for a loopback
+request against a local SQLite database and deliberately short of the host's own
+kill deadline, so the ordinary close is clean. **An app that needs to finish
+something longer than a request must not do it in a request**: that is what §2's
+`async_worker` and §6's `run` are for. Work still running in a stream or a
+long-poll when the user closes the window is work that will be cut off.
 
 ## 5. The app's own state, and what it is isolated from
 

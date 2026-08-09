@@ -82,6 +82,21 @@ impl Sidecar {
     /// Worker before server: the worker talks to the app's database through the
     /// same files the server holds open, and stopping the server first would
     /// leave a consumer running against a backend that has gone.
+    ///
+    /// **It assumes this process's webview windows are already gone** — an
+    /// ordering constraint `lifecycle::stop_sidecar_and_exit` owns and this
+    /// function cannot check (plan 014). The server's stop is graceful: Caddy
+    /// drains its connections, the always-mounted Mercure hub makes one of them
+    /// a stream, and a stream never drains — so called with a live webview
+    /// still attached, the SIGTERM below is ignored for as long as that window
+    /// exists and the server dies by SIGKILL every time. Every caller reaches
+    /// this through `stop_sidecar`, and the ordinary path
+    /// (`stop_sidecar_and_exit`) destroys the windows first.
+    ///
+    /// `fatal_post_setup_error` is the one caller that cannot: it still has a
+    /// dialog to show, and it needs a window to show it over. It pays Caddy's
+    /// grace period for that, which is bounded (`Caddyfile.desktop`,
+    /// `CONTRACT.md` §4) and is one of the reasons that bound exists.
     pub fn stop(&mut self) {
         // Before the kill, never after: a supervisor that learns of the
         // shutdown only afterwards respawns the worker we just stopped.
