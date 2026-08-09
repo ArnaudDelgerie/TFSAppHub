@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    check_id_free, check_port_free, lifecycle_event_for_install, resolve_id, snapshot, validate,
-    InstallError,
+    check_id_free, check_identifier_free, check_port_free, lifecycle_event_for_install, resolve_id,
+    snapshot, validate, InstallError,
 };
 use crate::{
     lifecycle::LifecycleEvent,
@@ -166,6 +166,49 @@ fn a_directory_with_no_entry_behind_it_is_refused_rather_than_reused() {
         matches!(error, InstallError::DirectoryInTheWay { .. }),
         "{error}"
     );
+}
+
+#[test]
+fn a_second_id_for_the_same_identifier_is_refused_naming_the_first() {
+    let mut registry = Registry::default();
+    registry.upsert(RegistryEntry {
+        identifier: "dev.local.demo".to_string(),
+        ..registered("first", "/home/arnaud/Dev/Demo")
+    });
+
+    let error = check_identifier_free(&registry, "dev.local.demo")
+        .expect_err("dev.local.demo is already installed as \"first\"");
+
+    assert!(
+        matches!(error, InstallError::IdentifierTaken { .. }),
+        "{error}"
+    );
+    // Naming the holder is the point: `--as` invites exactly this mistake,
+    // and the user needs to know which existing install they would collide
+    // with.
+    assert!(error.to_string().contains("first"), "{error}");
+
+    check_identifier_free(&registry, "dev.local.other")
+        .expect("a distinct identifier is unaffected");
+}
+
+#[test]
+fn an_id_collision_keeps_its_own_message_rather_than_being_swallowed() {
+    // `install()` calls `check_id_free` before `check_identifier_free` — an
+    // `id` collision is a different, and more specific, thing to tell the
+    // user than an `identifier` collision would be, so it must not be
+    // reported as one.
+    let (_base, paths) = temp_paths();
+    let mut registry = Registry::default();
+    registry.upsert(registered("demo", "/home/arnaud/Dev/Demo"));
+
+    let error = check_id_free(&registry, &paths, "demo").expect_err("demo is taken");
+
+    assert!(matches!(error, InstallError::IdTaken { .. }), "{error}");
+    // The same registry's `identifier` is free under a different `id`, so the
+    // identifier check alone would have let this through.
+    check_identifier_free(&registry, "dev.local.someone-else")
+        .expect("an unrelated identifier is free");
 }
 
 #[test]

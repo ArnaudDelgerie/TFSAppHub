@@ -115,6 +115,7 @@ fn install(
     // one's collision check was a moment stale.
     let installed = registry::load(paths)?;
     check_id_free(&installed, paths, &id)?;
+    check_identifier_free(&installed, &manifest.identifier)?;
     check_port_free(&installed, manifest.app_port)?;
 
     // The fourth gate: which lifecycle event (CONTRACT.md §6) this install
@@ -439,6 +440,32 @@ pub fn check_id_free(registry: &Registry, paths: &Paths, id: &str) -> Result<(),
     Ok(())
 }
 
+/// Refuse an install whose manifest's `identifier` already belongs to another
+/// registered `id`.
+///
+/// `identifier`, not `id`, is what the data directory, the keyring namespace,
+/// the WebKit data directory and the `.desktop` entry are all keyed on. Two
+/// registry entries sharing one `identifier` would share all four, and the
+/// second install would silently overwrite the first's `.desktop` entry
+/// (`paths::desktop_entry_path`). Checked on the same already-loaded registry
+/// [`check_id_free`] reads, and called right after it: a collision here
+/// explains the data directory better than any version mismatch the
+/// lifecycle gate below would find, so it is reported first.
+pub fn check_identifier_free(registry: &Registry, identifier: &str) -> Result<(), InstallError> {
+    if let Some(entry) = registry
+        .apps
+        .iter()
+        .find(|entry| entry.identifier == identifier)
+    {
+        return Err(InstallError::IdentifierTaken {
+            identifier: identifier.to_string(),
+            id: entry.id.clone(),
+        });
+    }
+
+    Ok(())
+}
+
 /// Refuse an install whose manifest pins a port another installed app has
 /// already claimed.
 ///
@@ -671,6 +698,11 @@ pub enum InstallError {
         id: String,
         location: String,
     },
+    /// Another registered `id` already carries this `identifier`.
+    IdentifierTaken {
+        identifier: String,
+        id: String,
+    },
     /// The data directory records a version *newer* than the source being
     /// installed — a downgrade, refused rather than guessed at (CONTRACT.md
     /// §6): running old code against data a newer version wrote is how a
@@ -746,6 +778,13 @@ impl fmt::Display for InstallError {
                 formatter,
                 "{id} is already installed, from {location}. Pick another handle with \
                  --as <id>, or remove that one first."
+            ),
+            Self::IdentifierTaken { identifier, id } => write!(
+                formatter,
+                "{identifier} is already installed as {id} — the two would share its data \
+                 directory and its .desktop entry. --as gives this install a different \
+                 hub-local handle, not a different app: remove {id} first, or check this is \
+                 genuinely a different app before installing it."
             ),
             Self::DataNewerThanSource {
                 recorded,
