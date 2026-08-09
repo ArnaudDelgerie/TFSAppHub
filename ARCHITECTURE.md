@@ -275,6 +275,9 @@ next launch reap it if this process never gets the chance. Teardown stops the
 worker before the server. Children are killed as a process group, so nothing
 survives a window closing.
 
+A third lock joins these two once a `run` command exists — see "Running a
+declared command" below for what it answers and how a launch reads it.
+
 ### Worker supervision
 
 An app that declares off-window work gets a consumer on its queue, recycled on
@@ -301,6 +304,67 @@ Every window enforces the same classification:
 
 No in-app popup is ever created. An external link belongs in the browser where
 the user has their bookmarks, their sessions and an address bar.
+
+## Running a declared command
+
+`run <id> <alias>` executes one of an app's own declared `bin/console`
+commands in the foreground, from `hub/src/run.rs` — a transplant of the
+station's own module, with one thing added in front of it: which app.
+Everything it stands on already lived in `core::process` (the locks, the
+signal machinery, the process-group teardown), because the station had
+already built and measured it; the hub's own addition is the app-resolution
+step, and the fact that it has two apps' worth of this state to keep apart —
+`run.lock` is keyed on the app's own `identifier`, the same key the two locks
+above already use, so two different apps running commands at once costs
+nothing.
+
+### A third lock, and which question each of the three answers
+
+| Lock | Answers | Read by |
+| --- | --- | --- |
+| `serving.lock` | Will handing this launch's argv to that process get you a window right now? | a launch's own hand-off probe |
+| `sidecar.pid.lock` (the liveness lock) | Does a process still own this data dir at all? | a launch's reap, and `run`'s own rule-3 concurrency probe |
+| `run.lock` | Is a `run` command already active for this app? | `run`'s own rule 2, and a launch's rule-3-in-reverse refusal |
+
+Rule 3's "is a window live" probe deliberately reads the **liveness** lock,
+not the serving one: a process mid-teardown still owns the data dir, and a
+`bin/console` command opening the app's SQLite while its server is being
+killed is the same hazard as one opening it next to a live server. A launch's
+own refusal reads `run.lock` the other way round — only once it has already
+decided to launch (past the serving/liveness probe above), never against a
+sibling it is about to hand off to, since a `concurrent` alias legitimately
+running beside an already-open window must not be blocked by a second window
+opening beside it.
+
+`run.lock`'s content is not just a flock — it is a small record, `<alias>`
+then `<alias>\n<pid>` once the child is spawned, so a refusal elsewhere can
+name which alias is active rather than just the file. `run --stop`/`--replace`
+read that record to know what to signal.
+
+### Forwarding a signal past `Child::wait()`'s own retry
+
+`std::process::Child::wait()` silently retries when the underlying wait is
+interrupted by a caught signal, which means a thread blocked in it never
+learns that `SIGINT`/`SIGTERM` arrived — a handler alone cannot forward what
+the thread actually waiting never sees. The fix is the standard self-pipe
+trick: the signal handler itself only writes one byte to a pipe (the one
+thing sound to do inside a handler), and a *separate* thread blocks reading
+that pipe and reacts once a byte arrives, leaving the thread in `wait()`
+alone. `core::process::install_signal_forwarding` sets the pipe and the
+handlers up once; `spawn_signal_forwarder` and the coexistence watchdog
+(`spawn_coexistence_watchdog`) are two different reasons to terminate the
+child, sharing the one mechanism — the first reacting to a caught signal, the
+second to a poll of the liveness lock.
+
+### Hub-side, and never `tauri`
+
+`run.rs` depends on nothing from `tauri` — not the crate, not a running
+`Builder`, not GTK. It runs to completion and exits before any window could
+exist, exactly like `install`/`list`/`remove`. That is not a style
+preference: a `run` command is an interactive terminal subcommand with the
+terminal's own stdio inherited, and the app it runs beside may or may not
+have a window open at all — nothing about it belongs behind the point where
+Tauri claims the process.
 
 ## The bundled interpreter
 

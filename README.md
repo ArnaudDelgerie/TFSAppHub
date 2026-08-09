@@ -5,7 +5,7 @@ from their source, using its own bundled FrankenPHP as the PHP interpreter.
 
 Since **2026-08-08 it is the only host**. `TFSAppWorkstation`, which used to build
 one standalone AppImage per app and to host the dev loop, is archived; the dev loop
-moves here (`tfsapp-hub dev <path>`, not built yet). The point of that move: writing
+moved here (`tfsapp-hub dev <path>`). The point of that move: writing
 a TFSApp will need no Rust toolchain, no Tauri CLI and no GTK dev libraries — just
 the hub and a Symfony project.
 
@@ -42,9 +42,12 @@ search under its own name and icon, with no terminal and the hub not
 otherwise running; `open` gives that app a real window on its own FrankenPHP,
 with its own data directory and its own cookie store, so two apps open side
 by side stay isolated; `list` and `remove` close the loop, the latter taking
-the entry with it. Not there yet: `run <id> <alias>`, update/rollback, and
-hub self-update (`make release` publishes an AppImage today; nothing yet
-downloads and swaps one in). Git sources are recognised and refused with a
+the entry with it; `run <id> <alias>` runs one of an app's own declared
+`bin/console` commands in the foreground, alongside `run --stop`/
+`run --replace` to release one without a manual `kill`. Not there yet:
+update/rollback, and hub self-update (`make release` publishes an AppImage
+today; nothing yet downloads and swaps one in). Git sources are recognised
+and refused with a
 message saying so, rather than pretended. The design record and the plan
 queue live under the git-ignored `.project/`.
 
@@ -149,7 +152,7 @@ bundled interpreter.
 Install here is a **snapshot**: editing the original source has no effect until
 an explicit `update`, which is what makes `composer install`, migrations and a
 warm persistent cache meaningful — and exactly what makes it useless as a dev
-loop. The dev loop is its own mode (`dev <path>`, not built yet), and it serves
+loop. The dev loop is its own mode (`dev <path>`), and it serves
 live source **in place**: it watches nothing, compiles nothing and builds no
 assets. Your build tool already has a `--watch`.
 

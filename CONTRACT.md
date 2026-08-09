@@ -266,6 +266,31 @@ hardcodes one transport, while an app using Symfony Scheduler consumes
 list, and it is owned by the background-worker plan rather than by this
 document. What that plan may not change is the two paragraphs above.
 
+### `run`
+
+Named `bin/console` aliases a user runs directly and interactively —
+`tfsapp-hub run <id> <alias> [args...]` — as opposed to `commands`' four
+launch-time hooks (§6), which the host runs unattended around an install or
+an update:
+
+```json
+{
+  "run": {
+    "mcp-serve": { "command": "app:run:mcp-serve", "concurrent": true },
+    "cleanup":   { "command": "app:run:cleanup" }
+  }
+}
+```
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `command` | string, required | A `bin/console` argument string, split on whitespace and passed as `argv` directly — same no-shell-interpretation rule as `commands` (§6). |
+| `concurrent` | boolean, optional | Default `false`. Whether this alias may run alongside an already-open window of the same app — see "Running a declared command" (§6) for the full gating. |
+
+Each top-level key is the alias name a user types. `tfsapp-hub run <id>` with
+no alias lists them back, naming each one's command and whether it is
+`concurrent`. Running one is covered in §6.
+
 ### Keys this contract does not define
 
 Unknown top-level keys are warned about and ignored (see "Standing rules"). One
@@ -767,6 +792,54 @@ This is stricter than it would need to be if these commands only ever ran on
 their author's machine. They do not: they run on a user's machine, from a
 manifest that user did not write.
 
+### Running a declared command
+
+`run` aliases (§2) are not part of the install/update lifecycle above — they
+are commands a user runs directly, interactively, in the foreground:
+`tfsapp-hub run <id> <alias> [args...]`, alongside `run --stop <id>` and
+`run --replace <id> <alias> [args...]` as the way to release one without a
+manual `kill`. Four rules govern it.
+
+**Rule 1 — the app layer must be up to date.** A `run` command refuses unless
+the app's data directory records the version it is actually running — the
+same check a launch makes. A missing record, an older one, or a newer one (a
+downgrade) each refuse, naming the way out: open the app once, update it, or
+resolve the downgrade by hand. `run --stop` is exempt — recovering an
+installation stuck on a stale app layer is one of its own jobs, and stopping
+whatever holds the command's lock never touches this record.
+
+**Rule 2 — at most one `run` command per app at a time.** An exclusive lock
+on the app's own data directory, the same directory two different apps never
+share (§5) — so two apps running commands at once costs nothing, and a
+second `run` of the *same* app is refused, naming the lock. `run --stop`
+reads the lock's own record and stops whatever it names; `run --replace`
+folds a stop into an ordinary start, and is safe to reach for unconditionally
+since a free lock makes it a no-op.
+
+**Rule 3 — per-alias concurrency permission, the app is always owner-first.**
+Each alias's `concurrent` flag (§2) decides whether it may run alongside an
+already-open window of the same app: `false` (the default) refuses to start
+while a window is live, and may only run on its own; `true` may start either
+way, and — started beside a live window — is stopped the moment that window
+closes. Regardless of the flag, a `run` command holding its app's lock
+refuses a *subsequent* window from opening, naming the active alias and
+`run --stop`. The only way to have both at once is app-first: open the
+window, then start a `concurrent` alias.
+
+**Self-contained-command boundary.** A `run` command gets everything the
+server gets from §3 — `DATABASE_URL`, `APP_SECRET`, the writable directories
+— re-resolved fresh for each invocation. What it does not get is the live
+app's own HTTP endpoint: its own `APP_PORT` need not be a running window's,
+so a command that needs to reach the app over HTTP is outside the contract.
+
+**What `--stop`/`--replace` do not promise.** The `run` *command's own
+process* is never force-killed, only what it started — `run --stop` against
+one wedged somewhere other than waiting on its own child reports that the
+lock did not release, rather than guessing at what to kill next. A lock
+record with no pid yet — the narrow window between it being taken and the
+command actually starting — is reported as such, not assumed to be either
+free or wedged.
+
 ---
 
 ## 7. Native capabilities: `actions`
@@ -980,13 +1053,6 @@ Both are covered where they belong — §3's `TFS_ASYNC_WORKER` and
 `TFS_KEYRING_AVAILABLE` — and both are listed here because they are the same
 rule: the app declares the maximum, the machine delivers what it can, and the
 environment says which.
-
-### Declared but not yet runnable
-
-`run` aliases are parsed and validated, and the command that runs one is a
-queued plan. An app may declare them; nothing runs them yet. This is stated
-rather than left silent so that an alias which appears to do nothing is
-recognisable as an unbuilt feature and not as a broken declaration.
 
 ---
 
