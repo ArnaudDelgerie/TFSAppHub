@@ -309,6 +309,20 @@ The hub ships one FrankenPHP and one `composer.phar`, fetched at build time by
 every app with them, so no system-wide PHP is required — and nothing works
 without them.
 
+**Resolved in packaged/dev/system order.** `platform::bundled_frankenphp` and
+`php::bundled_composer` each return an ordered list of candidates: the
+packaged AppImage's own resource dir first — read via
+`tauri::utils::platform::resource_dir`, which needs no `AppHandle` and so
+works from `install`, a headless CLI command that runs before any
+`tauri::Builder` exists — then `<hub>/resources/`, where `make sidecar` and
+`make composer` download them for a build run from source.
+`core::sidecar::resolve_frankenphp_binary` walks that list and falls back to
+a system-wide `/usr/bin/frankenphp` if neither resolves (`composer.phar` has
+no such fallback — the hub never runs an app's Composer with anything but its
+own). A candidate only counts when it is a real, non-empty file — `hub/build.rs`
+writes 0-byte stubs at both paths so a fresh clone still compiles before
+`make resources` has run, and a stub must never be mistaken for the download.
+
 ### The `PHP_BINARY` shim
 
 `frankenphp php-cli` reports **no path for itself**: `PHP_BINARY` is empty.
@@ -428,19 +442,37 @@ The hub is packaged once, as an AppImage, and that build decides the
 compatibility floor for the entire fleet — it is the only binary anyone links.
 An AppImage's portability comes down to two numbers, the glibc it was linked
 against and the WebKitGTK ABI it expects, and both come from the builder's
-machine.
+machine. Rather than fighting that with a pinned build base of its own, the
+floor is simply **a property of whatever built the image**, measured and
+recorded beside the artifact in `.versions.txt` — the highest `GLIBC_x.y`
+symbol version any bundled ELF imports, the build host's own glibc, the OS,
+and the frozen version of every WebKit/GTK/GLib library the bundle carries.
+No single release covers every distribution a user might be on; the answer
+offered to whoever it fails is `build/compose.yaml`'s `docker compose run --rm
+build`, with `BASE_IMAGE` set to a base older than the one that produced the
+release (see README.md's "It does not start"). The container is a wrapper
+around exactly `make build` / `make check` and nothing else knows it exists —
+no branch anywhere in `build/scripts/` or in Rust asks whether it is running
+inside one.
 
-So the build belongs in a container with a pinned base image, which turns that
-floor from a property of whoever ran `make build` into something chosen, stated
-and reproducible. Note that this deliberately does **not** produce a build
-tailored to the host: it produces one older than the host, which is the point.
-
-Neither the container nor the AppImage recipe exists yet. Four things are known
-before writing them: `appimagetool` wants FUSE and it is the first thing that
-breaks; the build must run as a user matching the host's uid/gid or the repo
-comes back root-owned; the downloaded resources and the Cargo cache want to be
-mounted volumes rather than baked layers; and opening a real window stays outside
-the container, as it already stays outside `make check`.
+**`cargo tauri build` gets three things wrong, repaired after the fact by
+`build/scripts/fix-appimage-bundle.sh`.** linuxdeploy runs `patchelf` (rpath →
+`$ORIGIN`) on every ELF file it bundles, which corrupts the FrankenPHP
+sidecar — a static-PIE Go binary whose rewritten program headers SIGSEGV on
+every exec (a known upstream patchelf limitation) — so the pristine binary is
+copied back in after the fact. Its GTK plugin writes an `apprun-hooks` script
+that hard-forces `GDK_BACKEND=x11`, pinning the whole app to XWayland on a
+Wayland session; the hook is rewritten to defer to the session's own backend.
+And `.DirIcon` is written as an absolute symlink into the *build machine's*
+own AppDir path, broken the moment the image is mounted anywhere else; it is
+replaced with a relative symlink to the icon named by the AppImage's own
+`.desktop` `Icon=` line. The pass also deletes every bundled `libwayland-*`:
+unlike the WebKit/GTK stack, the Wayland *client* library is an ABI the
+running session owns, and freezing a copy older than the host's own
+Mesa/compositor is a known way to fail on a newer distribution — so the
+dynamic linker is left to fall through to the session's own copy instead.
+Every repair is verified against the repacked artifact, not assumed from the
+input to the repack.
 
 ## Source layout
 
