@@ -32,7 +32,9 @@ mod update;
 mod window;
 mod worker;
 
-use cli::{Command, OpenChildSource, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE};
+use cli::{
+    Command, OpenChildSource, RunInvocation, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE,
+};
 use identity::Identity;
 
 fn main() {
@@ -121,6 +123,18 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             purge,
             assume_yes,
         } => remove::run(&id, purge, assume_yes),
+        // The three forms share one `run.rs`, routed here by which
+        // `RunInvocation` `cli::parse_run` built — see that module's own
+        // header for why the app-resolution step in front of all three is
+        // the only genuinely new thing plan 013 adds.
+        Command::Run(RunInvocation::List { id }) => run::list(&id),
+        Command::Run(RunInvocation::Stop { id }) => run::stop(&id),
+        Command::Run(RunInvocation::Start {
+            id,
+            alias,
+            args,
+            replace,
+        }) => run::start(&id, &alias, &args, replace),
         Command::Platform => print_platform(),
         // The app's own process, re-executed by `open <id>` (and, once plan 009
         // lands `dev`'s own foreground parent, by `dev <path>`) above.

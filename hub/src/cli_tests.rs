@@ -276,7 +276,6 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         "update demo",
         "export demo /tmp/demo",
         "import demo /tmp/demo.tar.gz",
-        "run demo console",
     ] {
         assert!(
             !command(line).is_implemented(),
@@ -291,6 +290,10 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         "install ../TFSAppTest",
         "open demo",
         "remove demo",
+        "run demo",
+        "run demo console",
+        "run --stop demo",
+        "run --replace demo console",
     ] {
         assert!(command(line).is_implemented(), "{line:?} works today");
     }

@@ -54,6 +54,13 @@ pub enum Mode {
     /// wipes `cache/`/`build/`: Symfony's dev container invalidates itself on
     /// file change, which is the mechanism that makes the dev loop cheap.
     Dev,
+    /// A `run <id> <alias>` command (plan 013): `prod`/`APP_DEBUG=0` and the
+    /// real `APP_SECRET`, exactly like `Launch` — but neither wipes `cache/`/
+    /// `build/` nor rotates the logs. A `concurrent` alias started beside a
+    /// live window would otherwise be wiping the compiled container that
+    /// window is serving out of, and rotating `sidecar.log` out from under a
+    /// process holding it open would rotate the file's replacement instead.
+    Run,
 }
 
 /// The dev session's fixed, throwaway `APP_SECRET` (CONTRACT.md's dev
@@ -161,12 +168,16 @@ pub fn resolve(
             source,
         })?;
     }
-    if mode != Mode::Install {
+    if matches!(mode, Mode::Launch | Mode::Dev) {
         // Once per launch — installed or dev — and here rather than anywhere
         // later: this is the one point both `commands.log`'s first write and
         // `sidecar.log`'s fd open are still ahead of, which is what a
         // size-based rotation needs to be true to rotate the file rather than
-        // the file's replacement.
+        // the file's replacement. `Run` is deliberately excluded: rotating
+        // `sidecar.log` out from under a process already holding it open (a
+        // `concurrent` alias beside a live window) would rotate the file's
+        // replacement instead of the file itself — see `Mode::Run`'s own doc
+        // comment.
         tfsapp_core::log::rotate_logs(&log_dir);
     }
 
@@ -204,7 +215,7 @@ pub fn resolve(
     // (`actions.secrets`, `TFS_KEYRING_AVAILABLE` below) stays real.
     let app_secret = match mode {
         Mode::Dev => DEV_APP_SECRET.to_string(),
-        Mode::Install | Mode::Launch => {
+        Mode::Install | Mode::Launch | Mode::Run => {
             crate::secrets::resolve_app_secret(&secret_store, &data_subdir)
                 .map_err(|error| EnvError::Secret(error.to_string()))?
         }
@@ -217,7 +228,7 @@ pub fn resolve(
 
     let (app_env, app_debug) = match mode {
         Mode::Dev => ("dev", "1"),
-        Mode::Install | Mode::Launch => ("prod", "0"),
+        Mode::Install | Mode::Launch | Mode::Run => ("prod", "0"),
     };
 
     let vars = vec![

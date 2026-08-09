@@ -188,28 +188,28 @@ pub const SURFACE: &[Spec] = &[
         form: "run <id>",
         summary: "List an app's declared run aliases.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "run",
         form: "run <id> <alias> [args...]",
         summary: "Run an app-declared command in the foreground.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "run",
         form: "run --stop <id>",
         summary: "Stop whatever run command that app is running.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "run",
         form: "run --replace <id> <alias> [args...]",
         summary: "Stop an active run command, then start <alias> in its place.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
 ];
 

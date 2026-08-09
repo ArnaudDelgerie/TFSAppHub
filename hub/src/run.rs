@@ -30,11 +30,6 @@
 //! imperative flow (app resolution, the lock, the spawn, the signal
 //! forwarding) is plan 013 step 2's addition.
 
-// Step 1 lands the pure decisions with no caller yet — `main::dispatch` does
-// not route `Command::Run` until step 2 wires the imperative flow around
-// them. Remove the allow once that lands, rather than letting it linger.
-#![allow(dead_code)]
-
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use crate::{
@@ -247,6 +242,351 @@ pub fn stop_active_run(data_dir: &Path, identifier: &str) -> std::io::Result<Sto
             alias: record.alias,
             pid,
         })
+    }
+}
+
+// --- The imperative flow ----------------------------------------------------
+//
+// Everything above is pure; everything below touches the registry, the
+// filesystem and a process. The app-resolution step in front of all three
+// forms — `open::resolve` — is what plan 013's Overview means by "the hub has
+// two apps' worth of state to keep apart": it already refuses `broken`, warns
+// on `needs-revalidation` and proves the registry's identifier and the
+// installed snapshot's agree, so none of that has to be re-derived here.
+
+use std::io::{Seek, SeekFrom, Write};
+
+use crate::{
+    app_env,
+    cli::{EXIT_FAILED, EXIT_OK},
+    open,
+    paths::Paths,
+    php,
+};
+
+/// `run <id>` with no alias: list the app's declared aliases (the hub's own
+/// addition to the station's grammar — see `cli::RunInvocation::List`). The
+/// station discovers its aliases through `--help`, which the hub cannot do
+/// since they belong to an app and not to the binary.
+pub fn list(id: &str) -> i32 {
+    let paths = match Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    let spec = match open::resolve(&paths, id) {
+        Ok(spec) => spec,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    for warning in &spec.warnings {
+        eprintln!("tfsapp-hub: warning: {warning}");
+    }
+
+    println!("{id}'s declared run aliases:");
+    println!("{}", format_alias_list(&spec.manifest.run));
+    EXIT_OK
+}
+
+/// `run --stop <id>`/the stop half of `run --replace <id> <alias>`'s whole
+/// imperative flow: packaged-only in spirit — an app must be installed to
+/// have a `run.lock` at all — but deliberately **not** gated on rule 1's
+/// version check above: recovering an installation whose app layer is stale
+/// is one of this command's own jobs, so it must work even then.
+pub fn stop(id: &str) -> i32 {
+    let paths = match Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    let spec = match open::resolve(&paths, id) {
+        Ok(spec) => spec,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    for warning in &spec.warnings {
+        eprintln!("tfsapp-hub: warning: {warning}");
+    }
+
+    let identifier = &spec.identity.identifier;
+    let data_dir = match paths.create_app_data_dir(identifier) {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+
+    match stop_active_run(&data_dir, identifier) {
+        Ok(outcome) => {
+            let run_lock_path = data_dir.join("run.lock");
+            println!(
+                "tfsapp-hub: {}",
+                stop_outcome_message(&outcome, &run_lock_path)
+            );
+            if stop_outcome_succeeded(&outcome) {
+                EXIT_OK
+            } else {
+                EXIT_FAILED
+            }
+        }
+        Err(error) => {
+            eprintln!("tfsapp-hub: cannot stop the active run command: {error}");
+            EXIT_FAILED
+        }
+    }
+}
+
+/// `run <id> <alias> [args...]`/`run --replace <id> <alias> [args...]`'s
+/// whole imperative flow (CONTRACT.md §6's "Running a declared command"):
+/// resolves the alias against the installed manifest, gates on the app layer
+/// being up to date (rule 1), on being the only active `run` command for
+/// *this* app (rule 2, an exclusive `run.lock` flock keyed on the app's own
+/// `identifier` — a different app's `run.lock` is a different file and is
+/// unaffected) and on the per-alias concurrency permission (rule 3), then
+/// spawns the declared `bin/console` command in the foreground — inherited
+/// stdio, `SIGINT`/`SIGTERM` forwarded, a coexistence watchdog when a window
+/// was already live at start — and exits with its status.
+///
+/// This is the one hub command whose exit code is the child's rather than the
+/// hub's own: a child that happens to exit `2` is indistinguishable from a
+/// usage error, and that is accepted here exactly as the station accepts it.
+/// Every hub-side failure below exits `EXIT_FAILED` instead.
+pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 {
+    let paths = match Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    let spec = match open::resolve(&paths, id) {
+        Ok(spec) => spec,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    for warning in &spec.warnings {
+        eprintln!("tfsapp-hub: warning: {warning}");
+    }
+
+    let Some(alias) = spec.manifest.run.get(alias_name) else {
+        eprintln!(
+            "tfsapp-hub: unknown run alias \"{alias_name}\" for {id}.\nDeclared aliases:\n{}",
+            format_alias_list(&spec.manifest.run)
+        );
+        return EXIT_FAILED;
+    };
+
+    let identifier = spec.identity.identifier.clone();
+    let data_dir = match paths.create_app_data_dir(&identifier) {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    let data_subdir = data_dir.join("data");
+
+    // Rule 1 (CONTRACT.md §6): the app layer must already be migrated —
+    // proven by `data/config.json`'s recorded version matching this app's
+    // own, the same file the launch-time version guard reads.
+    let config_file = crate::lifecycle::data_config_path(&data_subdir);
+    let recorded = match crate::lifecycle::read_data_version(&data_subdir) {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    let current = match semver::Version::parse(&spec.manifest.app_version) {
+        Ok(current) => current,
+        // The installer refuses a non-semver `app_version`, so reaching this
+        // means the installed snapshot's manifest was edited since.
+        Err(error) => {
+            eprintln!(
+                "tfsapp-hub: {id} declares version {:?}, which is not valid semver ({error}) — \
+                 reinstall the app.",
+                spec.manifest.app_version
+            );
+            return EXIT_FAILED;
+        }
+    };
+    if let VersionGate::Refuse(message) =
+        check_version_gate(id, &config_file, recorded.as_deref(), &current)
+    {
+        eprintln!("tfsapp-hub: {message}");
+        return EXIT_FAILED;
+    }
+
+    // `--replace`: stop whatever currently holds `run.lock` before rule 2
+    // below gets a chance to refuse over it. Runs after the version gate (a
+    // stale app layer must still refuse a plain `run <id> <alias>`) but
+    // before rule 2 (there would be nothing left to stop once it already
+    // refused). A free lock makes this a no-op (`stop_active_run` itself
+    // reports `NotRunning`), so `--replace` is safe to pass unconditionally.
+    if replace {
+        match stop_active_run(&data_dir, &identifier) {
+            Ok(outcome) if stop_outcome_succeeded(&outcome) => {}
+            Ok(outcome) => {
+                eprintln!(
+                    "tfsapp-hub: cannot replace \"{alias_name}\": {}",
+                    stop_outcome_message(&outcome, &data_dir.join("run.lock"))
+                );
+                return EXIT_FAILED;
+            }
+            Err(error) => {
+                eprintln!("tfsapp-hub: cannot stop the active run command: {error}");
+                return EXIT_FAILED;
+            }
+        }
+    }
+
+    // Rule 2 (CONTRACT.md §6): at most one `run` command per app at a time —
+    // the same non-blocking exclusive-flock primitive the sidecar liveness
+    // lock uses, just a different file. Held for this process's whole
+    // lifetime (bound to `run_lock`), released on drop — including if this
+    // process dies without a clean exit.
+    let run_lock_path = data_dir.join("run.lock");
+    let mut run_lock = match tfsapp_core::process::try_lock_file(&run_lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            eprintln!(
+                "tfsapp-hub: another run command is already active for {id} ({})",
+                run_lock_path.display()
+            );
+            return EXIT_FAILED;
+        }
+        Err(error) => {
+            eprintln!(
+                "tfsapp-hub: cannot acquire {}: {error}",
+                run_lock_path.display()
+            );
+            return EXIT_FAILED;
+        }
+    };
+    // Recorded so a would-be app-launch refusal (step 3) can name the active
+    // alias rather than just the lock path. No pid yet — the child hasn't
+    // been spawned; rewritten with the pid right after it is, below.
+    let _ = run_lock.set_len(0);
+    let _ = run_lock.write_all(format_run_lock(alias_name, None).as_bytes());
+
+    // Rule 3 (CONTRACT.md §6): probe whether an app window is already live —
+    // the exact same liveness lock the launcher itself uses. A window live
+    // and this alias not declared `concurrent` refuses outright: the app is
+    // always owner-first, so the only way to get both running is opening the
+    // window first, then starting a `concurrent` alias.
+    let pid_file = data_dir.join("sidecar.pid");
+    let owner_live = match tfsapp_core::process::is_owner_live(&pid_file) {
+        Ok(owner_live) => owner_live,
+        Err(error) => {
+            eprintln!("tfsapp-hub: cannot probe {}: {error}", pid_file.display());
+            return EXIT_FAILED;
+        }
+    };
+    if owner_live && !alias.concurrent {
+        eprintln!(
+            "tfsapp-hub: \"{alias_name}\" cannot run while {id} is running (it is not declared \
+             concurrent) — close the app first, or declare this alias concurrent."
+        );
+        return EXIT_FAILED;
+    }
+
+    // Execution: the exact same `<bundled frankenphp> php-cli <app_dir>/
+    // bin/console …` invocation shape and env the lifecycle commands use, but
+    // with the terminal's own stdio inherited (`Command`'s default) rather
+    // than captured, since `run` is an interactive foreground subcommand, not
+    // a silent hook.
+    let environment = match app_env::resolve(
+        &spec.manifest,
+        &spec.app_dir,
+        &identifier,
+        &data_dir,
+        app_env::Mode::Run,
+    ) {
+        Ok(environment) => environment,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    let toolchain = match php::toolchain(&paths) {
+        Ok(toolchain) => toolchain,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    let mut envs = environment.vars.clone();
+    envs.extend(toolchain.shim_env());
+
+    let console = spec.app_dir.join("bin/console");
+    let alias_argv: Vec<&str> = alias.command.split_whitespace().collect();
+
+    let signal_read_fd = match tfsapp_core::process::install_signal_forwarding() {
+        Ok(fd) => fd,
+        Err(error) => {
+            eprintln!("tfsapp-hub: cannot install signal forwarding: {error}");
+            return EXIT_FAILED;
+        }
+    };
+
+    let mut command = tfsapp_core::sidecar::command_with_env(&toolchain.frankenphp, &envs);
+    command
+        .arg("php-cli")
+        .arg(&console)
+        .args(&alias_argv)
+        .args(args)
+        .current_dir(&spec.app_dir);
+    tfsapp_core::process::set_own_process_group(&mut command);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("tfsapp-hub: cannot start \"{}\": {error}", alias.command);
+            return EXIT_FAILED;
+        }
+    };
+    let child_pid = child.id();
+
+    // Rewrite `run.lock`'s record with the now-known child pid. Reuses the
+    // same handle the lock-acquisition-time write used above, so it must
+    // `seek` back to the start in addition to `set_len(0)` — `set_len`
+    // truncates but does not move the file cursor.
+    let _ = run_lock.set_len(0);
+    let _ = run_lock.seek(SeekFrom::Start(0));
+    let _ = run_lock.write_all(format_run_lock(alias_name, Some(child_pid)).as_bytes());
+
+    // Both detached threads below get their own clone of `identifier`: each
+    // reacts an unbounded time after `child_pid` was recorded, so it
+    // re-checks `/proc/<child_pid>/environ` immediately before signalling
+    // rather than trusting a pid that may since have been reaped and
+    // recycled onto an unrelated process.
+    tfsapp_core::process::spawn_signal_forwarder(signal_read_fd, child_pid, identifier.clone());
+
+    // Coexistence watchdog (rule 3): only when a window was already live at
+    // this command's own start — reachable only by a `concurrent` alias,
+    // since a non-concurrent one already refused above.
+    if owner_live {
+        tfsapp_core::process::spawn_coexistence_watchdog(pid_file, child_pid, identifier);
+    }
+
+    let status = child.wait();
+    drop(run_lock);
+    match status {
+        Ok(status) => status.code().unwrap_or(EXIT_FAILED),
+        Err(error) => {
+            eprintln!("tfsapp-hub: cannot wait for \"{}\": {error}", alias.command);
+            EXIT_FAILED
+        }
     }
 }
 
