@@ -343,9 +343,15 @@ fn an_older_record_is_refused_as_the_update_event_install_does_not_own() {
     let error = lifecycle_event_for_install(Some("1.0.0"), "1.1.0", Path::new("/data/demo"))
         .expect_err("install does not run the update event");
 
-    assert!(matches!(error, InstallError::DataOlderThanSource { .. }), "{error}");
+    assert!(
+        matches!(error, InstallError::DataOlderThanSource { .. }),
+        "{error}"
+    );
     let message = error.to_string();
-    assert!(message.contains("1.0.0") && message.contains("1.1.0"), "{message}");
+    assert!(
+        message.contains("1.0.0") && message.contains("1.1.0"),
+        "{message}"
+    );
     assert!(message.contains("/data/demo"), "{message}");
 }
 
@@ -354,9 +360,15 @@ fn a_newer_record_is_refused_as_a_downgrade() {
     let error = lifecycle_event_for_install(Some("2.0.0"), "1.0.0", Path::new("/data/demo"))
         .expect_err("a downgrade is refused rather than guessed at");
 
-    assert!(matches!(error, InstallError::DataNewerThanSource { .. }), "{error}");
+    assert!(
+        matches!(error, InstallError::DataNewerThanSource { .. }),
+        "{error}"
+    );
     let message = error.to_string();
-    assert!(message.contains("2.0.0") && message.contains("1.0.0"), "{message}");
+    assert!(
+        message.contains("2.0.0") && message.contains("1.0.0"),
+        "{message}"
+    );
     // Names the directory to delete by hand — `remove --purge` cannot reach
     // data whose app is no longer registered.
     assert!(message.contains("/data/demo"), "{message}");
@@ -532,6 +544,133 @@ fn an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order() {
     assert_eq!(
         fs::read_to_string(log).expect("a hook trace"),
         "doctrine:migrations:migrate\nabout\n"
+    );
+}
+
+/// Write `data/config.json` under `identifier`'s data dir before an install
+/// runs against it — the state a plain `remove` (no `--purge`) leaves behind.
+fn seed_data_record(paths: &Paths, identifier: &str, version: &str) {
+    let data_dir = paths
+        .create_app_data_dir(identifier)
+        .expect("a data dir to seed");
+    let data_subdir = data_dir.join("data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    crate::lifecycle::write_data_version(&data_subdir, version).expect("a seeded record");
+}
+
+#[test]
+fn a_data_dir_recording_a_newer_version_refuses_before_anything_is_copied_or_registered() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    runnable_app_tree(source.path(), "{}"); // app_version 0.6.0
+    seed_data_record(&paths, "dev.local.demo", "9.9.9");
+
+    let error = super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect_err("a record newer than the source is a downgrade");
+
+    assert!(
+        matches!(error, InstallError::DataNewerThanSource { .. }),
+        "{error}"
+    );
+    assert!(
+        !paths.app_dir("demo").expect("an app dir").exists(),
+        "nothing may be copied before a version refusal"
+    );
+    assert!(
+        crate::registry::load(&paths)
+            .expect("a readable registry")
+            .apps
+            .is_empty(),
+        "nothing may be registered before a version refusal"
+    );
+}
+
+#[test]
+fn a_data_dir_recording_an_older_version_refuses_as_the_update_event() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    runnable_app_tree(source.path(), "{}"); // app_version 0.6.0
+    seed_data_record(&paths, "dev.local.demo", "0.1.0");
+
+    let error = super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect_err("a record older than the source is the update event, not install's to run");
+
+    assert!(
+        matches!(error, InstallError::DataOlderThanSource { .. }),
+        "{error}"
+    );
+    assert!(
+        !paths.app_dir("demo").expect("an app dir").exists(),
+        "nothing may be copied before a version refusal"
+    );
+    assert!(
+        crate::registry::load(&paths)
+            .expect("a readable registry")
+            .apps
+            .is_empty(),
+        "nothing may be registered before a version refusal"
+    );
+}
+
+#[test]
+fn a_record_of_the_same_version_installs_and_runs_no_lifecycle_command() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    runnable_app_tree(
+        source.path(),
+        r#"{"pre-install": ["doctrine:migrations:migrate"], "post-install": ["about"]}"#,
+    );
+    seed_data_record(&paths, "dev.local.demo", "0.6.0");
+
+    let id = super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("an equal record installs, the reinstall-after-remove path");
+
+    assert_eq!(id.as_deref(), Some("demo"));
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    // Composer still ran: dependencies are not a lifecycle command.
+    assert!(app_dir.join("vendor/autoload.php").is_file());
+    // …but neither hook did, unlike a first install of the same manifest
+    // (`an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order`).
+    let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
+    assert!(
+        !log.exists(),
+        "an equal record must run no lifecycle command"
     );
 }
 

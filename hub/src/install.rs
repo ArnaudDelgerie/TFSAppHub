@@ -117,6 +117,16 @@ fn install(
     check_id_free(&installed, paths, &id)?;
     check_port_free(&installed, manifest.app_port)?;
 
+    // The fourth gate: which lifecycle event (CONTRACT.md §6) this install
+    // may run, decided against the data directory `remove` (without
+    // `--purge`) may have left behind — read, never created: a gate that
+    // creates the directory it is inspecting would leave a trace behind a
+    // refusal. `identifier`-keyed, not `id`-keyed, which is exactly why this
+    // can catch a stale directory a *different* `id` is about to reuse.
+    let data_dir = paths.app_data_dir(&manifest.identifier)?;
+    let recorded = lifecycle::read_data_version(&data_dir.join("data"))?;
+    let event = lifecycle_event_for_install(recorded.as_deref(), &manifest.app_version, &data_dir)?;
+
     // Resolved before the copy — and before the question, since an install
     // nothing could finish is not worth asking about. The fingerprint comes
     // from the same interpreter that is about to run the app's PHP, which is
@@ -125,7 +135,15 @@ fn install(
     let platform = platform::probe(&toolchain.frankenphp)?.fingerprint();
 
     let app_dir = paths.app_dir(&id)?;
-    announce(&id, manifest, &resolved, &app_dir, paths, no_desktop_entry)?;
+    announce(
+        &id,
+        manifest,
+        &resolved,
+        &app_dir,
+        paths,
+        no_desktop_entry,
+        recorded.as_deref(),
+    )?;
     if !prompt::confirmed(assume_yes) {
         println!("Aborted — nothing was installed.");
         return Ok(None);
@@ -135,7 +153,7 @@ fn install(
     // Everything from here runs the app's own PHP, so everything from here can
     // fail in ways the hub does not control. One place to undo the copy, rather
     // than an `if` after each step.
-    if let Err(error) = prepare(paths, &toolchain, manifest, &app_dir) {
+    if let Err(error) = prepare(paths, &toolchain, manifest, &app_dir, event) {
         let _ = fs::remove_dir_all(&app_dir);
         return Err(error);
     }
@@ -208,6 +226,7 @@ fn announce(
     app_dir: &Path,
     paths: &Paths,
     no_desktop_entry: bool,
+    recorded: Option<&str>,
 ) -> Result<(), InstallError> {
     println!(
         "Install {} {} as \"{id}\":",
@@ -219,6 +238,12 @@ fn announce(
         "  data dir  {}",
         paths.app_data_dir(&manifest.identifier)?.display()
     );
+    // Named so the confirmation below is one the user can actually answer:
+    // by this point the version gate already refused a mismatch, so the only
+    // record left to see here is one an equal reinstall runs no hook over.
+    if let Some(recorded) = recorded {
+        println!("            already holds data written by version {recorded}");
+    }
     if !no_desktop_entry {
         println!(
             "  entry     {}",
@@ -236,13 +261,20 @@ fn announce(
 }
 
 /// Bring the copied tree to a state the app can run from: its dependencies,
-/// then its own install-time lifecycle commands.
+/// then — only when `event` is [`LifecycleEvent::Install`] — its own
+/// install-time lifecycle commands.
 ///
-/// **Which hooks run here, and why these.** The hub's `install` *is* the
-/// contract's install event (CONTRACT.md §6): the app is arriving on this
-/// machine for the first time under this host, so `pre-install` and
-/// `post-install` are the two lists that apply. `pre-update`/`post-update`
-/// belong to `update <id>`, which is a later plan's command.
+/// **Which hooks run here, and why these.** The hub's `install` is the
+/// contract's install event (CONTRACT.md §6) only when the data directory
+/// says so: `event` was decided by `lifecycle_event_for_install`, above this
+/// function, against the data `remove` (without `--purge`) may have left
+/// behind. An [`LifecycleEvent::Install`] runs `pre-install` then
+/// `post-install`, in that order; [`LifecycleEvent::None`] — an equal
+/// record, the reinstall-after-`remove` path — runs neither, exactly as
+/// CONTRACT.md §6 states it. The event can never resolve to `Update` here:
+/// `lifecycle_event_for_install` already turned that case into a refusal
+/// before `prepare` was ever called, so `pre-update`/`post-update` stay
+/// unreachable from `install`, which is not their event.
 ///
 /// The station runs `post-install` after `/healthz` answers `200`, because over
 /// there the install event happens *during a launch* and there is a sidecar up
@@ -256,6 +288,7 @@ fn prepare(
     toolchain: &Toolchain,
     manifest: &Manifest,
     app_dir: &Path,
+    event: LifecycleEvent,
 ) -> Result<(), InstallError> {
     // `0700` on every install, not only on the first: an app reinstalled after
     // an older host created it laxly gets tightened here rather than staying
@@ -273,22 +306,29 @@ fn prepare(
     // what makes it the same data dir a packaged install of this app uses.
     println!("Its data lives in {}", environment.data_dir.display());
 
+    // Runs whichever event this is: dependencies are the freshly copied tree's
+    // own, not a lifecycle command, and an app with none to install still
+    // needs its vendor dir populated.
     toolchain.composer_install(app_dir, &environment.vars)?;
 
-    for command in manifest
-        .commands
-        .pre_install
-        .iter()
-        .chain(&manifest.commands.post_install)
-    {
-        toolchain.console(app_dir, &environment.vars, command)?;
+    if event == LifecycleEvent::Install {
+        for command in manifest
+            .commands
+            .pre_install
+            .iter()
+            .chain(&manifest.commands.post_install)
+        {
+            toolchain.console(app_dir, &environment.vars, command)?;
+        }
     }
 
     // The install event's success point (CONTRACT.md §6): the data dir records
     // which version of the app last wrote it, and it is written **only** once
     // every hook above has succeeded — a failed install leaves the dir undated,
     // so the next attempt starts the whole event over rather than believing it
-    // already ran.
+    // already ran. Runs whichever event this is, same as `composer_install`
+    // above: an equal record is rewritten to the same value, preserving
+    // `port_override` exactly as `write_data_version` already does.
     //
     // This is the record `open`'s version guard reads, and the same file a
     // packaged AppImage of this app writes and reads: one data dir, one record,
@@ -487,12 +527,12 @@ fn lifecycle_event_for_install(
         // `MalformedDataConfig` already covers for a file that does not even
         // parse as JSON, reused here rather than inventing a second flavour
         // of "the record is corrupt".
-        Err(LifecycleDecisionError::InvalidVersion(error)) => {
-            Err(InstallError::Lifecycle(LifecycleError::MalformedDataConfig {
+        Err(LifecycleDecisionError::InvalidVersion(error)) => Err(InstallError::Lifecycle(
+            LifecycleError::MalformedDataConfig {
                 path: lifecycle::data_config_path(&data_dir.join("data")),
                 detail: error.to_string(),
-            }))
-        }
+            },
+        )),
     }
 }
 
