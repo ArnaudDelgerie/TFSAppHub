@@ -421,13 +421,12 @@ fn resources_present() -> bool {
         crate::php::bundled_composer(),
     ]
     .into_iter()
-    .filter(|path| !path.is_file())
+    .filter(|candidates| !candidates.iter().any(|path| path.is_file()))
     .collect();
 
-    for path in &missing {
+    for candidates in &missing {
         eprintln!(
-            "skipped: {} is not there — run `make resources` to cover this one",
-            path.display()
+            "skipped: none of {candidates:?} are there — run `make resources` to cover this one"
         );
     }
     missing.is_empty()

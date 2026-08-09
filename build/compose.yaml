@@ -1,0 +1,86 @@
+# Two services, one image, one purpose each: `build` runs `make resources &&
+# make build` (see below for why `make resources` is spelled out here rather
+# than left to the Dockerfile — see its own header), `check` runs
+# `make check`. Neither does anything the local targets of the same name
+# don't already do; every container-only decision is explained where it is
+# made, here or in the Dockerfile.
+#
+# Usage (from this directory, build/):
+#   docker compose run --rm build
+#   docker compose run --rm check
+#   BASE_IMAGE=debian:12 docker compose run --rm build       # a lower floor
+#   UID=$(id -u) GID=$(id -g) docker compose run --rm build  # see below
+#
+# Switching BASE_IMAGE against an already-populated target/ (mounted below,
+# shared with a local `make build`) silently reuses the *previous* base's
+# compiled binary: cargo's own fingerprint tracks the rustc version, flags and
+# source hash, never which container produced them, so a matching rustc
+# across bases looks unchanged to it and the AppImage ends up carrying a
+# tfsapp-hub still linked against the *other* base's glibc. Run
+# `rm -rf ../target` (or `cargo clean`) before the first build against a
+# different BASE_IMAGE, or the recorded glibc_floor will lie.
+#
+# `$UID`/`$GID` are bash's own special variables, not exported to a
+# subprocess's environment — so compose cannot read them without you passing
+# them explicitly. The default below (1000:1000) is what an ordinary
+# single-user Linux desktop's first account gets; anyone else has to say so,
+# or target/ and hub/resources come back owned by a uid Docker invented
+# rather than by them.
+#
+# appimagetool (bundled inside linuxdeploy, which `cargo tauri build` shells
+# out to) wants FUSE to *run* an AppImage the ordinary way, and this container
+# has none. `--device /dev/fuse` would need the host to have it and the
+# container to run with a capability most CI runners and rootless Docker
+# don't grant — a much bigger ask than the alternative: every AppImage tool
+# involved here (linuxdeploy itself, its gtk plugin, and this repo's own
+# fix-appimage-bundle.sh) already understands `APPIMAGE_EXTRACT_AND_RUN=1`,
+# which unsquashes instead of mounting. Set once below, for both services.
+# Bases known to carry libwebkit2gtk-4.1-dev and libgtk-3-dev out of the box
+# (checked 2026-08-09, see the Dockerfile for the rest of the package list):
+# ubuntu:24.04 (glibc 2.39 — this default, matching this project's own release
+# floor) and debian:12 (glibc 2.36, both packages in the default main/bookworm
+# repos — no backports needed). A base missing either package is unusable
+# as-is, documented rather than worked around: this file makes no attempt to
+# add a repository or backport a package for a base that lacks one.
+x-service: &service
+  build:
+    context: ..
+    dockerfile: build/Dockerfile
+    args:
+      BASE_IMAGE: ${BASE_IMAGE:-ubuntu:24.04}
+  working_dir: /workspace
+  user: "${UID:-1000}:${GID:-1000}"
+  environment:
+    APPIMAGE_EXTRACT_AND_RUN: "1"
+  volumes:
+    # The whole repo, live — not a COPY at image-build time. hub/resources
+    # and target/ are ordinary subdirectories of it, so mounting the repo
+    # once is what makes both persist across runs and share the exact
+    # sidecar/composer.phar download and build cache a local `make build`
+    # already populated — the reason plan 012 step 6 calls them out by name.
+    - ..:/workspace
+    # The crate registry cache only (not the whole ~/.cargo — see the
+    # Dockerfile's comment on $CARGO_HOME for why), reused from whoever
+    # invoked this rather than redownloaded fresh on the first container run.
+    - ${HOME}/.cargo/registry:/usr/local/cargo/registry
+    # linuxdeploy + its plugins, likewise — ~15-30 MB `cargo tauri build`
+    # would otherwise fetch again on every container run.
+    - ${HOME}/.cache/tauri:/home/builder/.cache/tauri
+
+services:
+  # `make build` refuses when hub/resources/{frankenphp,composer.phar} are
+  # missing or empty (see build-hub.sh) — spelled out here, in compose, so
+  # the Dockerfile's own CMD stays exactly `make build` and a fresh clone's
+  # first container run still populates them, the same idempotent download
+  # `make resources` already is outside a container.
+  build:
+    <<: *service
+    command: sh -c "make resources && make build"
+
+  # `make check` needs no display and opens no window, same as it does
+  # outside a container — run-tests.sh stands up its own ephemeral Secret
+  # Service (dbus-run-session + gnome-keyring-daemon, both installed in the
+  # Dockerfile) and never touches a host keyring either way.
+  check:
+    <<: *service
+    command: make check

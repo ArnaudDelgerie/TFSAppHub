@@ -82,16 +82,47 @@ impl Probe {
     }
 }
 
-/// `<hub>/resources/frankenphp` — the interpreter `make sidecar` downloads.
+/// `bundle.resources` places `resources/frankenphp` and `resources/composer.phar`
+/// under `<AppDir>/usr/lib/<productName>/` — the AppImage's own resource dir.
+/// `tauri::utils::platform::resource_dir` reads it back from `APPDIR`, which the
+/// AppImage runtime exports before `AppRun` hands off, so this needs no
+/// `AppHandle` — the reason it can run from `install`, a headless CLI command
+/// with no `tauri::Builder` in sight. `None` outside an AppImage (`APPDIR` unset
+/// and no `../lib/<productName>` beside the binary): that is the ordinary case
+/// for `cargo run` and `cargo test`, and callers fall through to the dev path.
 ///
-/// Resolved from the crate directory, which is where it lives while the hub is
-/// run from a build. The packaged AppImage will resolve it from Tauri's own
-/// resource dir instead, and that belongs to the plan that adds
-/// `bundle.resources` — the hub declares none today, so there is no packaged
-/// path to look in yet. `resolve_frankenphp_binary` already covers the
-/// system-wide `/usr/bin/frankenphp` fallback either way.
-pub fn bundled_frankenphp() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/frankenphp")
+/// `resource_dir` only reads `PackageInfo.name`, so a `PackageInfo` is built
+/// here by hand instead of invoking `tauri::generate_context!()` a second time
+/// (which would re-embed the icon and re-parse `tauri.conf.json` for nothing).
+/// `PACKAGE_NAME` has to equal `tauri.conf.json`'s `"productName"` exactly — the
+/// AppImage bundler names the resource dir after it — and
+/// `platform_tests::the_package_name_matches_tauri_conf_json` is the guard
+/// against the two drifting apart.
+pub(crate) fn packaged_resource_dir() -> Option<PathBuf> {
+    const PACKAGE_NAME: &str = "TFSAppHub";
+    let package_info = tauri::PackageInfo {
+        name: PACKAGE_NAME.to_string(),
+        version: semver::Version::new(0, 0, 0),
+        authors: "",
+        description: "",
+        crate_name: "",
+    };
+    tauri::utils::platform::resource_dir(&package_info, &tauri::Env::default()).ok()
+}
+
+/// Ordered candidates for the bundled FrankenPHP: the packaged AppImage's
+/// resource dir first, then `<hub>/resources/frankenphp` — `make sidecar`'s
+/// download, and where the crate lives while run from a build.
+/// `resolve_frankenphp_binary` picks the first that is a real, non-empty,
+/// executable file, and covers the system-wide `/usr/bin/frankenphp` fallback
+/// either way.
+pub fn bundled_frankenphp() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(resource_dir) = packaged_resource_dir() {
+        candidates.push(resource_dir.join("resources/frankenphp"));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/frankenphp"));
+    candidates
 }
 
 /// The fingerprint of the interpreter this hub actually runs apps with.

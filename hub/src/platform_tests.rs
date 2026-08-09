@@ -101,16 +101,15 @@ fn the_bundled_interpreter_answers_for_itself() {
     // where `make sidecar` has never run, and the 170 MB download is not
     // something a unit test should trigger. The manual counterpart is
     // `tfsapp-hub __platform`, eyeballed against the binary's own `php -m`.
-    let binary = bundled_frankenphp();
-    if !binary.is_file() {
+    let candidates = bundled_frankenphp();
+    let Some(binary) = candidates.iter().find(|path| path.is_file()) else {
         eprintln!(
-            "skipped: {} is not there — run `make sidecar` to cover this one",
-            binary.display()
+            "skipped: none of {candidates:?} are there — run `make sidecar` to cover this one"
         );
         return;
-    }
+    };
 
-    let probed = probe(&binary).expect("the bundled FrankenPHP answers");
+    let probed = probe(binary).expect("the bundled FrankenPHP answers");
 
     assert!(
         probed.php_version.starts_with('8'),
@@ -126,6 +125,38 @@ fn the_bundled_interpreter_answers_for_itself() {
         );
     }
     assert_eq!(probed.fingerprint(), probed.fingerprint());
+}
+
+#[test]
+fn bundled_frankenphp_lists_the_dev_path_last() {
+    // Whatever `packaged_resource_dir()` finds (or doesn't, outside an
+    // AppImage) `<hub>/resources/frankenphp` — `make sidecar`'s download — has
+    // to stay in the list, as the final fallback for a build from source.
+    let candidates = bundled_frankenphp();
+    let dev_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/frankenphp");
+    assert_eq!(candidates.last(), Some(&dev_path));
+}
+
+#[test]
+fn the_package_name_matches_tauri_conf_json() {
+    // `packaged_resource_dir()` builds a `PackageInfo` by hand rather than
+    // re-running `tauri::generate_context!()`, and hardcodes the one field
+    // `resource_dir` actually reads. This is the guard against that constant
+    // drifting from `tauri.conf.json`'s own `productName` — the AppImage
+    // bundler names the resource dir after that field, not after this one.
+    let conf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");
+    let conf = std::fs::read_to_string(&conf_path)
+        .unwrap_or_else(|error| panic!("{}: {error}", conf_path.display()));
+    let conf: serde_json::Value = serde_json::from_str(&conf).expect("valid JSON");
+    let product_name = conf["productName"]
+        .as_str()
+        .expect("tauri.conf.json declares \"productName\"");
+
+    // Mirrors the private `PACKAGE_NAME` constant in `platform.rs` — kept
+    // local to this test rather than exported, since nothing else needs it.
+    const PACKAGE_NAME: &str = "TFSAppHub";
+    assert_eq!(product_name, PACKAGE_NAME);
 }
 
 #[test]
