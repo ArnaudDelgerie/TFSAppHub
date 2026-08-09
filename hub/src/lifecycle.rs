@@ -639,11 +639,108 @@ fn release_serving_claim(app: &tauri::AppHandle) {
     tauri_plugin_single_instance::destroy(app);
 }
 
+/// How long [`destroy_windows`] waits for the event loop to confirm this
+/// process's windows are actually gone. Generous, because it is never spent:
+/// destroying a window is a message to an event loop that is idle by then, and
+/// the wait ends the moment it has been processed. It exists so a wedged main
+/// thread costs the teardown a bounded delay rather than a hang.
+const WINDOW_DESTROY_BUDGET: Duration = Duration::from_secs(2);
+
+/// Set for the whole of [`stop_sidecar_and_exit`], read by [`on_run_event`].
+///
+/// Process-global rather than carried in state because it describes the
+/// process itself — there is exactly one teardown, and the question it answers
+/// ("did *we* ask for this exit?") is asked from the event loop, which has no
+/// route to anything the teardown thread owns.
+static TEARDOWN_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether an `ExitRequested` must be vetoed. Pure, so the one case that
+/// matters is a unit test rather than a live window.
+///
+/// `code` is `None` when the event loop raised it itself — every window gone —
+/// and `Some` when this process asked, through `app.exit`. During a teardown
+/// the first is [`destroy_windows`]'s own doing and must not end the process:
+/// FrankenPHP has not been signalled yet at that point, and letting the event
+/// loop exit here would orphan it. Outside a teardown it is left alone, so a
+/// splash closed before the sidecar ever existed still ends the process exactly
+/// as it does today rather than hanging with nothing on screen.
+pub fn veto_exit(code: Option<i32>, teardown_in_flight: bool) -> bool {
+    code.is_none() && teardown_in_flight
+}
+
+/// The event-loop callback, and the only reason this app needs one: see
+/// [`veto_exit`].
+pub fn on_run_event(_app: &tauri::AppHandle, event: tauri::RunEvent) {
+    if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+        if veto_exit(
+            code,
+            TEARDOWN_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst),
+        ) {
+            api.prevent_exit();
+        }
+    }
+}
+
+/// Destroy every webview window this process owns, and wait until the event
+/// loop confirms they are gone.
+///
+/// **This is what makes FrankenPHP's shutdown graceful** (plan 014). Caddy's
+/// stop drains its connections, the Mercure hub is always mounted, a
+/// subscription is a stream, and a stream never drains — so as long as this
+/// process's own WebView still holds a connection to the app's port, the
+/// server waits for a client that is never going to let go, and dies by
+/// SIGKILL every time. `on_window_event` only *hides* the window, deliberately,
+/// so the client is alive and connected for the entire teardown unless
+/// something takes it away.
+///
+/// `destroy()`, never `close()`: `close()` fires `CloseRequested`, which lands
+/// straight back in [`on_window_event`] and would spawn a second teardown on
+/// top of this one. `destroy()` closes without emitting anything (confirmed in
+/// `tauri-runtime-wry`: `WindowMessage::Destroy` goes to `on_window_close`,
+/// where `WindowMessage::Close` goes through `on_close_requested`).
+///
+/// It runs on the teardown thread, not the main one — plan 011's constraint,
+/// unchanged. `destroy()` only posts a message to the event loop, so the work
+/// itself lands on the main thread and this waits for it, which is the shape
+/// that plan allows.
+fn destroy_windows(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    for window in app.webview_windows().into_values() {
+        let _ = window.destroy();
+    }
+
+    let deadline = std::time::Instant::now() + WINDOW_DESTROY_BUDGET;
+    while std::time::Instant::now() < deadline {
+        if app.webview_windows().is_empty() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Not fatal: the server is asked to stop either way, and the escalation is
+    // there for exactly this. Said out loud because it means the next line in
+    // the log — FrankenPHP taking its full budget — has a cause worth knowing.
+    eprintln!(
+        "tfsapp-hub: a window did not go away within {}s; the backend may take longer to stop",
+        WINDOW_DESTROY_BUDGET.as_secs()
+    );
+}
+
 /// Stop the sidecar and exit — the one shutdown body, shared by the last window
 /// closing and by a signal, so a `SIGTERM` tears the app down exactly the way
 /// the user closing it does.
+///
+/// The order is the whole of plan 014's step 2. The serving claim goes first,
+/// so nothing is routed here any more; then the client, so the server has
+/// nothing left to drain; only then is the server asked to stop. Between the
+/// second and the third, this process has no window and is not yet dead —
+/// which is why [`on_run_event`] has to veto the event loop's own attempt to
+/// exit in that gap.
 fn stop_sidecar_and_exit(app: &tauri::AppHandle) {
+    TEARDOWN_IN_FLIGHT.store(true, std::sync::atomic::Ordering::SeqCst);
     release_serving_claim(app);
+    destroy_windows(app);
     stop_sidecar(app);
     app.exit(0);
 }

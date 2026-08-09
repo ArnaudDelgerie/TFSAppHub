@@ -8,8 +8,8 @@ use std::{
 
 use super::{
     acquire_launch_locks, decide_launch, lifecycle_decision, prepare_dev_launch, probe_run_lock,
-    read_data_version, serving_lock_path, write_data_version, LaunchDecision, LaunchLockError,
-    LifecycleDecisionError, LifecycleError, LifecycleEvent, RunLockHeld,
+    read_data_version, serving_lock_path, veto_exit, write_data_version, LaunchDecision,
+    LaunchLockError, LifecycleDecisionError, LifecycleError, LifecycleEvent, RunLockHeld,
 };
 
 fn version(text: &str) -> semver::Version {
@@ -72,6 +72,30 @@ fn decide_launch_waits_when_serving_is_free_and_liveness_is_held() {
 #[test]
 fn decide_launch_launches_when_both_locks_are_free() {
     assert_eq!(decide_launch(false, false), LaunchDecision::Launch);
+}
+
+// --- veto_exit ----------------------------------------------------------------
+
+#[test]
+fn veto_exit_vetoes_the_event_loop_running_out_of_windows_mid_teardown() {
+    // `destroy_windows` empties the event loop's own window store, which is
+    // what raises this. Letting it through would end the process before
+    // FrankenPHP has been signalled at all.
+    assert!(veto_exit(None, true));
+}
+
+#[test]
+fn veto_exit_lets_our_own_app_exit_through_mid_teardown() {
+    // The last line of the teardown. Vetoing this one would leave a process
+    // with no window and nothing left to do, for ever.
+    assert!(!veto_exit(Some(0), true));
+}
+
+#[test]
+fn veto_exit_leaves_a_windowless_exit_alone_outside_a_teardown() {
+    // A splash closed before the sidecar ever existed: `on_window_event` does
+    // not veto that close, and the process is right to end there.
+    assert!(!veto_exit(None, false));
 }
 
 // --- acquire_launch_locks / the serving lock ----------------------------------
