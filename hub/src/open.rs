@@ -4,8 +4,16 @@
 //! re-executes the hub binary as a child carrying that app's identity; the child
 //! is the one that mutates its runtime identity (see `identity.rs`), boots the
 //! app's sidecar and opens the window. The parent's only job is to resolve, to
-//! fail fast with a message a terminal user can act on, and to get out of the
-//! way.
+//! fail fast in a way **both** a terminal user and a desktop-entry launch can
+//! act on (plan 015 — see [`crate::lifecycle::report_launch_failure`]), and to
+//! get out of the way.
+//!
+//! **The child's stdio is redirected, not inherited (plan 015).** The parent
+//! returns as soon as it has the pid, so a terminal that ran `open` has
+//! already moved on by the time the child has anything routine to say; its
+//! stdout and stderr go to `<state_root>/log/hub.log` instead (`launch`,
+//! below). `dev` and `run` are the two paths where a terminal genuinely stays
+//! attached for the child's whole life, and inheritance is still right there.
 //!
 //! It is not one process serving N apps, and that was decided rather than
 //! defaulted (see `.project/plan/007-open-an-installed-app.md`'s Overview, which

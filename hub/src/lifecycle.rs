@@ -576,11 +576,11 @@ fn check_port(app_port: Option<u16>, data_subdir: &Path) {
 ///
 /// Pure, and the one thing worth testing directly: get this backwards and
 /// either a developer's typo pops a modal to dismiss, or a `.desktop` launch's
-/// failure lands nowhere anyone will see it. The two audiences the plan this
-/// module implements is named for do not overlap in practice — a terminal
-/// user has a place for the line to land and a `.desktop` launch has none —
-/// but that is an empirical fact about how the hub is invoked, not a
-/// guarantee, which is why it is checked rather than assumed.
+/// failure lands nowhere anyone will see it. A terminal user and a
+/// `.desktop` launch do not overlap in practice — one has a place for the
+/// line to land, the other has none — but that is an empirical fact about
+/// how the hub is invoked, not a guarantee, which is why it is checked here
+/// rather than assumed.
 fn dialog_is_warranted(stderr_is_terminal: bool) -> bool {
     !stderr_is_terminal
 }

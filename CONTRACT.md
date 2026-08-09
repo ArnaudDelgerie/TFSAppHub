@@ -589,6 +589,13 @@ long-poll when the user closes the window is work that will be cut off.
   sessions/         APP_SESSION_DIR — persists
 ```
 
+`log/` is `APP_LOG_DIR`, and it is not the app's alone: the host writes its own
+rotated logs into the same directory — `sidecar.log` (FrankenPHP and the
+Messenger worker's own output), `commands.log` (declared lifecycle commands,
+§6) and `hub.log` (`open`'s own routine output, for a launch with no terminal
+to read it — plan 015). An app that names one of its own files the same loses
+it to a rotation it never asked for; pick something else.
+
 This is the installed layout. A dev session's equivalent lives under the
 project's own `var/` instead of an OS data directory, keyed by `dev.<identifier>`
 rather than `identifier` — see §9, which is also where the isolation guarantees

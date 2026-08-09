@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+An app launched from its desktop entry, whose launch then fails — a renamed
+snapshot, a broken dependency, anything `open` refuses — now puts a native
+dialog on screen naming the app and the way out, where before it silently
+failed to open with nothing on screen at all. The same failure from a
+terminal still prints one line and raises no dialog. And `open`'s routine
+output — `is listening at`, the teardown lines — no longer lands on a
+terminal the shell has already moved on from: it goes to `log/hub.log`
+beside the app's other logs (CONTRACT.md §5), with a dated header per
+launch. `dev` and `run` are unaffected — their terminal stays attached for
+the whole of the child's life, and both still print everything there.
+
 Closing an app's window now tears its backend down in about a third of a
 second, where it took 6.3 s — and tears it down *gracefully*, which it never
 once did. Two independent causes, both of them invisible from the outside: a

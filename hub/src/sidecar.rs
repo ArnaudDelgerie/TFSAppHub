@@ -216,7 +216,9 @@ pub fn start(
     // The app's own stdout and stderr have nowhere to go when it was launched
     // from a desktop entry, so they are redirected rather than inherited. The
     // file is appended to, never truncated: several launches, plus a recycled
-    // worker, have to stay comparable in one file.
+    // worker, have to stay comparable in one file. `open`'s own detached
+    // child gets the same treatment, for the same reason, into `hub.log`
+    // beside this file — see `open::prepare_hub_log` (plan 015).
     let (stdout, stderr) = log::sidecar_log_stdio(&environment.log_dir).map_err(|error| {
         format!(
             "Cannot open {}: {error}",
