@@ -165,12 +165,31 @@ pub fn write_data_version(data_subdir: &Path, version: &str) -> Result<(), Lifec
 }
 
 /// How long an arriving launch waits for a dying sibling's liveness lock to
-/// free up (`LaunchDecision::Wait`) before refusing. Named next to what it
-/// tracks: plan 011 step 1 measured the two-stage SIGTERM-then-SIGKILL
-/// teardown at 3.15s with no `async_worker` and 6.28–6.40s with one — two
-/// sequential `terminate()` calls, each escalating past its own 3s budget on
-/// the machine it was measured on — so this is that worst case plus margin
-/// for scheduling jitter, not a number picked by feel.
+/// free up (`LaunchDecision::Wait`) before refusing.
+///
+/// **It is not sized against the ordinary teardown, and that is deliberate.**
+/// A teardown now takes 0.28–0.35s on an app with `async_worker` and
+/// 0.07–0.13s without (plan 014 step 4, ten runs each), so this budget is
+/// essentially never reached. What it has to cover is the *slow* teardown,
+/// because the two outcomes are not symmetric: waiting longer than necessary
+/// costs a spinner, while refusing too early costs a launch that would have
+/// succeeded a moment later — and the refusal is a dialog the user has to
+/// dismiss and retry.
+///
+/// So it is the sum of the bounded waits a teardown can spend, each of them a
+/// constant in this tree rather than a measurement: 2s for the webview windows
+/// to go (`WINDOW_DESTROY_BUDGET`), then up to 3s for the worker and up to 3s
+/// for the server (`tfsapp_core::process::terminate`'s own escalation, twice,
+/// in sequence). Eight seconds of ceiling, plus margin for scheduling jitter.
+/// Past that, "it may be stuck" is the true statement rather than an
+/// impatient one.
+///
+/// The version of this comment before plan 014 cited plan 011's measured
+/// 3.15s/6.28–6.40s and claimed not to be a number picked by feel. Those
+/// numbers were two SIGKILL escalations firing on every single teardown — a
+/// defect, measured — so the claim was false in the one way a comment must not
+/// be. Both halves of the defect are gone; the number happens to land in the
+/// same place, for a reason that can now be checked against the code.
 const SERVING_WAIT_BUDGET: Duration = Duration::from_secs(10);
 
 /// `<data_dir>/serving.lock` (CONTRACT.md §6) — beside `sidecar.pid` and
