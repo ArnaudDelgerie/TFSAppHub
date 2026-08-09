@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use super::{child_args, resolve, OpenError};
+use super::{child_args, launch_header, prepare_hub_log, resolve, OpenError};
 use crate::{
     launch::Source as LaunchSource,
     paths::Paths,
@@ -272,4 +272,81 @@ fn an_app_with_no_icon_passes_no_icon_argument() {
     // Rather than an empty `--icon ""`, which the child would have to tell apart
     // from a path it failed to read.
     assert!(!args.iter().any(|argument| argument == "--icon"));
+}
+
+// --- launch_header -----------------------------------------------------
+
+#[test]
+fn launch_header_names_the_timestamp_command_app_and_pid() {
+    let header = launch_header("2026-08-09T12:00:00Z", "open", "demo", 4242);
+
+    assert_eq!(header, "=== 2026-08-09T12:00:00Z open demo (pid 4242) ===");
+}
+
+// --- prepare_hub_log -----------------------------------------------------
+
+#[test]
+fn prepare_hub_log_creates_the_dir_and_points_stdio_at_hub_log() {
+    let (_base, paths) = temp_paths();
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "printf 'child-line\\n'"]);
+
+    let hub_log = prepare_hub_log(&paths, "dev.local.demo", &mut command)
+        .expect("hub.log opened against a writable temp root");
+
+    assert_eq!(
+        hub_log,
+        paths
+            .app_data_dir("dev.local.demo")
+            .expect("a data dir path")
+            .join("log")
+            .join("hub.log")
+    );
+    let status = command.status().expect("the child ran");
+    assert!(status.success());
+    assert_eq!(fs::read_to_string(&hub_log).unwrap(), "child-line\n");
+}
+
+#[test]
+fn prepare_hub_log_rotates_an_oversized_file_before_opening_it() {
+    let (_base, paths) = temp_paths();
+    let data_dir = paths
+        .create_app_data_dir("dev.local.demo")
+        .expect("a created data dir");
+    let log_dir = data_dir.join("log");
+    fs::create_dir_all(&log_dir).expect("a created log dir");
+    let hub_log = log_dir.join("hub.log");
+    fs::write(
+        &hub_log,
+        vec![b'x'; tfsapp_core::log::MAX_LOG_BYTES as usize],
+    )
+    .unwrap();
+
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "printf 'fresh-line\\n'"]);
+    prepare_hub_log(&paths, "dev.local.demo", &mut command)
+        .expect("hub.log opened against a writable temp root");
+    command.status().expect("the child ran");
+
+    assert!(log_dir.join("hub.log.1").exists());
+    assert_eq!(fs::read_to_string(&hub_log).unwrap(), "fresh-line\n");
+}
+
+#[test]
+fn prepare_hub_log_falls_back_to_inherited_stdio_when_the_dir_cannot_be_created() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base, paths) = temp_paths();
+    let mut perms = fs::metadata(base.path()).unwrap().permissions();
+    perms.set_mode(0o500);
+    fs::set_permissions(base.path(), perms.clone()).unwrap();
+
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "true"]);
+    let hub_log = prepare_hub_log(&paths, "dev.local.demo", &mut command);
+
+    perms.set_mode(0o700);
+    fs::set_permissions(base.path(), perms).unwrap();
+
+    assert!(hub_log.is_none());
 }
