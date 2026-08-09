@@ -4,8 +4,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{check_id_free, check_port_free, resolve_id, snapshot, validate, InstallError};
+use super::{
+    check_data_dir_available, check_id_free, check_identifier_free, check_port_free,
+    lifecycle_event_for_install, resolve_id, snapshot, validate, InstallError,
+};
 use crate::{
+    lifecycle::LifecycleEvent,
     paths::Paths,
     registry::{now_timestamp, Platform, Registry, RegistryEntry, Source, SourceKind, State},
 };
@@ -165,6 +169,105 @@ fn a_directory_with_no_entry_behind_it_is_refused_rather_than_reused() {
 }
 
 #[test]
+fn a_second_id_for_the_same_identifier_is_refused_naming_the_first() {
+    let mut registry = Registry::default();
+    registry.upsert(RegistryEntry {
+        identifier: "dev.local.demo".to_string(),
+        ..registered("first", "/home/arnaud/Dev/Demo")
+    });
+
+    let error = check_identifier_free(&registry, "dev.local.demo")
+        .expect_err("dev.local.demo is already installed as \"first\"");
+
+    assert!(
+        matches!(error, InstallError::IdentifierTaken { .. }),
+        "{error}"
+    );
+    // Naming the holder is the point: `--as` invites exactly this mistake,
+    // and the user needs to know which existing install they would collide
+    // with.
+    assert!(error.to_string().contains("first"), "{error}");
+
+    check_identifier_free(&registry, "dev.local.other")
+        .expect("a distinct identifier is unaffected");
+}
+
+#[test]
+fn an_id_collision_keeps_its_own_message_rather_than_being_swallowed() {
+    // `install()` calls `check_id_free` before `check_identifier_free` — an
+    // `id` collision is a different, and more specific, thing to tell the
+    // user than an `identifier` collision would be, so it must not be
+    // reported as one.
+    let (_base, paths) = temp_paths();
+    let mut registry = Registry::default();
+    registry.upsert(registered("demo", "/home/arnaud/Dev/Demo"));
+
+    let error = check_id_free(&registry, &paths, "demo").expect_err("demo is taken");
+
+    assert!(matches!(error, InstallError::IdTaken { .. }), "{error}");
+    // The same registry's `identifier` is free under a different `id`, so the
+    // identifier check alone would have let this through.
+    check_identifier_free(&registry, "dev.local.someone-else")
+        .expect("an unrelated identifier is free");
+}
+
+// --- check_data_dir_available (plan 016 step 4, CONTRACT.md §6) -----------
+
+#[test]
+fn a_live_window_refuses_the_install() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let pid_file = data_dir.path().join("sidecar.pid");
+    // Held in this test's own process, exactly as `lifecycle_tests.rs` holds
+    // it for its own probe tests: `flock` is per open file description, so a
+    // second, fresh open of the same path still sees it held.
+    let _holder = tfsapp_core::process::try_lock_file(&tfsapp_core::process::lock_path(&pid_file))
+        .expect("no I/O error")
+        .expect("the lock is free to take");
+
+    let error = check_data_dir_available("demo", data_dir.path())
+        .expect_err("a live window owns this data dir");
+
+    assert!(
+        matches!(error, InstallError::DataDirInUse { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("demo"), "{error}");
+}
+
+#[test]
+fn an_active_run_command_refuses_naming_the_alias() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let run_lock_path = data_dir.path().join("run.lock");
+    let _holder = tfsapp_core::process::try_lock_file(&run_lock_path)
+        .expect("no I/O error")
+        .expect("the lock is free to take");
+    fs::write(&run_lock_path, "migrate\n1234").expect("a run.lock record");
+
+    let error = check_data_dir_available("demo", data_dir.path())
+        .expect_err("an active run command owns this data dir");
+
+    assert!(
+        matches!(error, InstallError::DataDirInUse { .. }),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("migrate"), "{message}");
+    assert!(message.contains("run --stop demo"), "{message}");
+}
+
+#[test]
+fn a_crashed_instance_does_not_lock_the_app_out_of_reinstall() {
+    // The liveness lock releases the instant the process holding it dies —
+    // including an ungraceful death — so nothing here re-creates that state:
+    // a fresh, untouched data dir already looks exactly like one a crash
+    // left behind.
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+
+    check_data_dir_available("demo", data_dir.path())
+        .expect("a crashed instance must not lock the app out of reinstall");
+}
+
+#[test]
 fn a_tree_missing_what_an_app_needs_is_refused_before_anything_is_copied() {
     for missing in ["composer.json", "bin/console", "public/index.php"] {
         let root = tempfile::tempdir().expect("a temp dir");
@@ -318,6 +421,78 @@ fn the_snapshot_refuses_to_write_over_an_existing_tree() {
     );
 }
 
+// --- lifecycle_event_for_install (plan 016 step 1, CONTRACT.md §6) ---------
+
+#[test]
+fn no_record_is_the_install_event() {
+    let event = lifecycle_event_for_install(None, "1.0.0", Path::new("/data/demo"))
+        .expect("no record lets the install proceed");
+    assert_eq!(event, LifecycleEvent::Install);
+}
+
+#[test]
+fn an_equal_record_is_neither_event() {
+    let event = lifecycle_event_for_install(Some("1.0.0"), "1.0.0", Path::new("/data/demo"))
+        .expect("an equal record is not refused");
+    assert_eq!(event, LifecycleEvent::None);
+}
+
+#[test]
+fn an_older_record_is_refused_as_the_update_event_install_does_not_own() {
+    let error = lifecycle_event_for_install(Some("1.0.0"), "1.1.0", Path::new("/data/demo"))
+        .expect_err("install does not run the update event");
+
+    assert!(
+        matches!(error, InstallError::DataOlderThanSource { .. }),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("1.0.0") && message.contains("1.1.0"),
+        "{message}"
+    );
+    assert!(message.contains("/data/demo"), "{message}");
+}
+
+#[test]
+fn a_newer_record_is_refused_as_a_downgrade() {
+    let error = lifecycle_event_for_install(Some("2.0.0"), "1.0.0", Path::new("/data/demo"))
+        .expect_err("a downgrade is refused rather than guessed at");
+
+    assert!(
+        matches!(error, InstallError::DataNewerThanSource { .. }),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("2.0.0") && message.contains("1.0.0"),
+        "{message}"
+    );
+    // Names the directory to delete by hand — `remove --purge` cannot reach
+    // data whose app is no longer registered.
+    assert!(message.contains("/data/demo"), "{message}");
+    assert!(message.contains("--purge"), "{message}");
+}
+
+#[test]
+fn an_unreadable_record_refuses_via_the_existing_lifecycle_error() {
+    // Row 5 of the table needs no new code: `read_data_version`'s own error
+    // already becomes `InstallError::Lifecycle` through the `From` impl
+    // `install()` calls with `?` — this proves that composition rather than
+    // re-testing `read_data_version` itself (see `lifecycle_tests.rs`).
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let data_subdir = data_dir.path().join("data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    fs::write(data_subdir.join("config.json"), "{ not json").expect("a broken record");
+
+    let error: InstallError = crate::lifecycle::read_data_version(&data_subdir)
+        .expect_err("an unreadable record")
+        .into();
+
+    assert!(matches!(error, InstallError::Lifecycle(_)), "{error}");
+    assert!(error.to_string().contains("config.json"), "{error}");
+}
+
 /// A registry holding one app, pinning `app_port` or not.
 fn registry_with(id: &str, app_port: Option<u16>) -> Registry {
     let mut registry = Registry::default();
@@ -468,6 +643,133 @@ fn an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order() {
     assert_eq!(
         fs::read_to_string(log).expect("a hook trace"),
         "doctrine:migrations:migrate\nabout\n"
+    );
+}
+
+/// Write `data/config.json` under `identifier`'s data dir before an install
+/// runs against it — the state a plain `remove` (no `--purge`) leaves behind.
+fn seed_data_record(paths: &Paths, identifier: &str, version: &str) {
+    let data_dir = paths
+        .create_app_data_dir(identifier)
+        .expect("a data dir to seed");
+    let data_subdir = data_dir.join("data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    crate::lifecycle::write_data_version(&data_subdir, version).expect("a seeded record");
+}
+
+#[test]
+fn a_data_dir_recording_a_newer_version_refuses_before_anything_is_copied_or_registered() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    runnable_app_tree(source.path(), "{}"); // app_version 0.6.0
+    seed_data_record(&paths, "dev.local.demo", "9.9.9");
+
+    let error = super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect_err("a record newer than the source is a downgrade");
+
+    assert!(
+        matches!(error, InstallError::DataNewerThanSource { .. }),
+        "{error}"
+    );
+    assert!(
+        !paths.app_dir("demo").expect("an app dir").exists(),
+        "nothing may be copied before a version refusal"
+    );
+    assert!(
+        crate::registry::load(&paths)
+            .expect("a readable registry")
+            .apps
+            .is_empty(),
+        "nothing may be registered before a version refusal"
+    );
+}
+
+#[test]
+fn a_data_dir_recording_an_older_version_refuses_as_the_update_event() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    runnable_app_tree(source.path(), "{}"); // app_version 0.6.0
+    seed_data_record(&paths, "dev.local.demo", "0.1.0");
+
+    let error = super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect_err("a record older than the source is the update event, not install's to run");
+
+    assert!(
+        matches!(error, InstallError::DataOlderThanSource { .. }),
+        "{error}"
+    );
+    assert!(
+        !paths.app_dir("demo").expect("an app dir").exists(),
+        "nothing may be copied before a version refusal"
+    );
+    assert!(
+        crate::registry::load(&paths)
+            .expect("a readable registry")
+            .apps
+            .is_empty(),
+        "nothing may be registered before a version refusal"
+    );
+}
+
+#[test]
+fn a_record_of_the_same_version_installs_and_runs_no_lifecycle_command() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    runnable_app_tree(
+        source.path(),
+        r#"{"pre-install": ["doctrine:migrations:migrate"], "post-install": ["about"]}"#,
+    );
+    seed_data_record(&paths, "dev.local.demo", "0.6.0");
+
+    let id = super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("an equal record installs, the reinstall-after-remove path");
+
+    assert_eq!(id.as_deref(), Some("demo"));
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    // Composer still ran: dependencies are not a lifecycle command.
+    assert!(app_dir.join("vendor/autoload.php").is_file());
+    // …but neither hook did, unlike a first install of the same manifest
+    // (`an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order`).
+    let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
+    assert!(
+        !log.exists(),
+        "an equal record must run no lifecycle command"
     );
 }
 

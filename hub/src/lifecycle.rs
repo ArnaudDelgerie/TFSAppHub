@@ -503,8 +503,13 @@ fn check_version(id: &str, data_subdir: &Path, app_version: &str) -> LifecycleEv
 /// acquisition-time write, or a legacy/corrupt file) — the caller still
 /// refuses either way, just with a shorter message when there is nothing to
 /// name.
+///
+/// `pub(crate)`, not private: plan 016's `install::check_data_dir_available`
+/// reads this same lock before writing into a data directory, and it must be
+/// the one reader of what "held" means — never a second probe with its own,
+/// possibly diverging, idea of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RunLockHeld {
+pub(crate) enum RunLockHeld {
     Free,
     Held { alias: Option<String> },
 }
@@ -518,7 +523,7 @@ enum RunLockHeld {
 /// Never retains the lock — probe and drop, the same "never retain, just
 /// observe" pattern [`tfsapp_core::process::is_owner_live`] uses for the
 /// liveness lock.
-fn probe_run_lock(data_dir: &Path) -> std::io::Result<RunLockHeld> {
+pub(crate) fn probe_run_lock(data_dir: &Path) -> std::io::Result<RunLockHeld> {
     let run_lock_path = data_dir.join("run.lock");
     if tfsapp_core::process::try_lock_file(&run_lock_path)?.is_some() {
         return Ok(RunLockHeld::Free);

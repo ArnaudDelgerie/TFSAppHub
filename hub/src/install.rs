@@ -34,7 +34,7 @@ use crate::{
     app_env::{self, EnvError},
     cli::{EXIT_FAILED, EXIT_OK},
     desktop, hub_bin,
-    lifecycle::{self, LifecycleError},
+    lifecycle::{self, LifecycleDecisionError, LifecycleError, LifecycleEvent},
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
     paths::{Paths, PathsError},
     php::{self, PhpError, Toolchain},
@@ -115,7 +115,23 @@ fn install(
     // one's collision check was a moment stale.
     let installed = registry::load(paths)?;
     check_id_free(&installed, paths, &id)?;
+    check_identifier_free(&installed, &manifest.identifier)?;
     check_port_free(&installed, manifest.app_port)?;
+
+    // The data directory this install would write into — `identifier`-keyed,
+    // read but never created here: a gate that creates the directory it is
+    // inspecting would leave a trace behind a refusal. `remove` without
+    // `--purge` is what usually puts something here for a *different*,
+    // no-longer-registered `id` to walk into.
+    let data_dir = paths.app_data_dir(&manifest.identifier)?;
+    // The third writer's own version of the guard `open` and `run` already
+    // enforce: nothing may install into a data directory a live window or an
+    // active `run` command still owns.
+    check_data_dir_available(&id, &data_dir)?;
+    // Which lifecycle event (CONTRACT.md §6) this install may run, decided
+    // against whatever version record survived a `remove`.
+    let recorded = lifecycle::read_data_version(&data_dir.join("data"))?;
+    let event = lifecycle_event_for_install(recorded.as_deref(), &manifest.app_version, &data_dir)?;
 
     // Resolved before the copy — and before the question, since an install
     // nothing could finish is not worth asking about. The fingerprint comes
@@ -125,7 +141,15 @@ fn install(
     let platform = platform::probe(&toolchain.frankenphp)?.fingerprint();
 
     let app_dir = paths.app_dir(&id)?;
-    announce(&id, manifest, &resolved, &app_dir, paths, no_desktop_entry)?;
+    announce(
+        &id,
+        manifest,
+        &resolved,
+        &app_dir,
+        paths,
+        no_desktop_entry,
+        recorded.as_deref(),
+    )?;
     if !prompt::confirmed(assume_yes) {
         println!("Aborted — nothing was installed.");
         return Ok(None);
@@ -135,7 +159,7 @@ fn install(
     // Everything from here runs the app's own PHP, so everything from here can
     // fail in ways the hub does not control. One place to undo the copy, rather
     // than an `if` after each step.
-    if let Err(error) = prepare(paths, &toolchain, manifest, &app_dir) {
+    if let Err(error) = prepare(paths, &toolchain, manifest, &app_dir, event) {
         let _ = fs::remove_dir_all(&app_dir);
         return Err(error);
     }
@@ -208,6 +232,7 @@ fn announce(
     app_dir: &Path,
     paths: &Paths,
     no_desktop_entry: bool,
+    recorded: Option<&str>,
 ) -> Result<(), InstallError> {
     println!(
         "Install {} {} as \"{id}\":",
@@ -219,6 +244,12 @@ fn announce(
         "  data dir  {}",
         paths.app_data_dir(&manifest.identifier)?.display()
     );
+    // Named so the confirmation below is one the user can actually answer:
+    // by this point the version gate already refused a mismatch, so the only
+    // record left to see here is one an equal reinstall runs no hook over.
+    if let Some(recorded) = recorded {
+        println!("            already holds data written by version {recorded}");
+    }
     if !no_desktop_entry {
         println!(
             "  entry     {}",
@@ -236,13 +267,20 @@ fn announce(
 }
 
 /// Bring the copied tree to a state the app can run from: its dependencies,
-/// then its own install-time lifecycle commands.
+/// then — only when `event` is [`LifecycleEvent::Install`] — its own
+/// install-time lifecycle commands.
 ///
-/// **Which hooks run here, and why these.** The hub's `install` *is* the
-/// contract's install event (CONTRACT.md §6): the app is arriving on this
-/// machine for the first time under this host, so `pre-install` and
-/// `post-install` are the two lists that apply. `pre-update`/`post-update`
-/// belong to `update <id>`, which is a later plan's command.
+/// **Which hooks run here, and why these.** The hub's `install` is the
+/// contract's install event (CONTRACT.md §6) only when the data directory
+/// says so: `event` was decided by `lifecycle_event_for_install`, above this
+/// function, against the data `remove` (without `--purge`) may have left
+/// behind. An [`LifecycleEvent::Install`] runs `pre-install` then
+/// `post-install`, in that order; [`LifecycleEvent::None`] — an equal
+/// record, the reinstall-after-`remove` path — runs neither, exactly as
+/// CONTRACT.md §6 states it. The event can never resolve to `Update` here:
+/// `lifecycle_event_for_install` already turned that case into a refusal
+/// before `prepare` was ever called, so `pre-update`/`post-update` stay
+/// unreachable from `install`, which is not their event.
 ///
 /// The station runs `post-install` after `/healthz` answers `200`, because over
 /// there the install event happens *during a launch* and there is a sidecar up
@@ -256,6 +294,7 @@ fn prepare(
     toolchain: &Toolchain,
     manifest: &Manifest,
     app_dir: &Path,
+    event: LifecycleEvent,
 ) -> Result<(), InstallError> {
     // `0700` on every install, not only on the first: an app reinstalled after
     // an older host created it laxly gets tightened here rather than staying
@@ -273,22 +312,29 @@ fn prepare(
     // what makes it the same data dir a packaged install of this app uses.
     println!("Its data lives in {}", environment.data_dir.display());
 
+    // Runs whichever event this is: dependencies are the freshly copied tree's
+    // own, not a lifecycle command, and an app with none to install still
+    // needs its vendor dir populated.
     toolchain.composer_install(app_dir, &environment.vars)?;
 
-    for command in manifest
-        .commands
-        .pre_install
-        .iter()
-        .chain(&manifest.commands.post_install)
-    {
-        toolchain.console(app_dir, &environment.vars, command)?;
+    if event == LifecycleEvent::Install {
+        for command in manifest
+            .commands
+            .pre_install
+            .iter()
+            .chain(&manifest.commands.post_install)
+        {
+            toolchain.console(app_dir, &environment.vars, command)?;
+        }
     }
 
     // The install event's success point (CONTRACT.md §6): the data dir records
     // which version of the app last wrote it, and it is written **only** once
     // every hook above has succeeded — a failed install leaves the dir undated,
     // so the next attempt starts the whole event over rather than believing it
-    // already ran.
+    // already ran. Runs whichever event this is, same as `composer_install`
+    // above: an equal record is rewritten to the same value, preserving
+    // `port_override` exactly as `write_data_version` already does.
     //
     // This is the record `open`'s version guard reads, and the same file a
     // packaged AppImage of this app writes and reads: one data dir, one record,
@@ -399,6 +445,92 @@ pub fn check_id_free(registry: &Registry, paths: &Paths, id: &str) -> Result<(),
     Ok(())
 }
 
+/// Refuse an install whose manifest's `identifier` already belongs to another
+/// registered `id`.
+///
+/// `identifier`, not `id`, is what the data directory, the keyring namespace,
+/// the WebKit data directory and the `.desktop` entry are all keyed on. Two
+/// registry entries sharing one `identifier` would share all four, and the
+/// second install would silently overwrite the first's `.desktop` entry
+/// (`paths::desktop_entry_path`). Checked on the same already-loaded registry
+/// [`check_id_free`] reads, and called right after it: a collision here
+/// explains the data directory better than any version mismatch the
+/// lifecycle gate below would find, so it is reported first.
+pub fn check_identifier_free(registry: &Registry, identifier: &str) -> Result<(), InstallError> {
+    if let Some(entry) = registry
+        .apps
+        .iter()
+        .find(|entry| entry.identifier == identifier)
+    {
+        return Err(InstallError::IdentifierTaken {
+            identifier: identifier.to_string(),
+            id: entry.id.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Who [`check_data_dir_available`] found already using the data directory.
+#[derive(Debug)]
+pub enum DataDirHolder {
+    /// A live app window holds the sidecar liveness lock (CONTRACT.md §6).
+    Window,
+    /// An active `run` command holds `run.lock` (rule 3). `alias` is
+    /// whatever [`lifecycle::probe_run_lock`] could read from the record —
+    /// `None` in the narrow window between `run`'s own lock acquisition and
+    /// its first write.
+    RunCommand { alias: Option<String> },
+}
+
+/// Refuse an install into a data directory something is already using —
+/// `install` is the data directory's third writer, and observes the same two
+/// locks `open`'s launch guard and `run`'s own rule 3 already read
+/// ([`lifecycle::probe_run_lock`], reused rather than reimplemented, and
+/// [`tfsapp_core::process::is_owner_live`], the same read-only probe
+/// `remove --purge` makes at `remove.rs`). This is the gap plain `remove`
+/// leaves open: it does not check whether the app is running, so a live
+/// window or an active `run` command can survive a `remove` and be exactly
+/// what a following `install` would otherwise run Composer and lifecycle
+/// commands against.
+///
+/// A stale `sidecar.pid` whose owning process is gone must **not** refuse:
+/// [`tfsapp_core::process::is_owner_live`] already answers that correctly (a
+/// dead process holds no lock), so a crashed instance never locks an app out
+/// of being reinstalled.
+pub fn check_data_dir_available(id: &str, data_dir: &Path) -> Result<(), InstallError> {
+    // The ordinary case, by far: a brand new `identifier` has no data
+    // directory at all yet. Neither probe below may create one — both open
+    // their lock file with `create(true)`, which would fail on a missing
+    // *parent* directory rather than silently succeed, so this has to be
+    // checked first rather than left to surface as an I/O error.
+    if !data_dir.is_dir() {
+        return Ok(());
+    }
+
+    let pid_file = data_dir.join("sidecar.pid");
+    if tfsapp_core::process::is_owner_live(&pid_file).unwrap_or(false) {
+        return Err(InstallError::DataDirInUse {
+            id: id.to_string(),
+            data_dir: data_dir.to_path_buf(),
+            holder: DataDirHolder::Window,
+        });
+    }
+
+    match lifecycle::probe_run_lock(data_dir) {
+        Ok(lifecycle::RunLockHeld::Free) => Ok(()),
+        Ok(lifecycle::RunLockHeld::Held { alias }) => Err(InstallError::DataDirInUse {
+            id: id.to_string(),
+            data_dir: data_dir.to_path_buf(),
+            holder: DataDirHolder::RunCommand { alias },
+        }),
+        Err(source) => Err(InstallError::Io {
+            path: data_dir.join("run.lock"),
+            source,
+        }),
+    }
+}
+
 /// Refuse an install whose manifest pins a port another installed app has
 /// already claimed.
 ///
@@ -438,6 +570,61 @@ pub fn check_port_free(registry: &Registry, app_port: Option<u16>) -> Result<(),
             id: entry.id.clone(),
         }),
         None => Ok(()),
+    }
+}
+
+/// Decide which lifecycle event (CONTRACT.md §6) this install may run under,
+/// from the data directory's own record — the four-row table from the
+/// Overview, and nothing else. No I/O: `recorded` is `read_data_version`'s own
+/// result, already read by the caller; `data_dir` is named only in the
+/// refusals' messages, as the directory a user would delete or wait out.
+///
+/// `app_version` is taken as already-validated semver — `validate` runs
+/// before this is ever called and refuses anything else (CONTRACT.md §2) —
+/// so the parse below cannot fail in practice.
+///
+/// An equal record answers `Ok(LifecycleEvent::None)`: the reinstall-after-
+/// `remove` path, and the event under which `prepare` (below) runs no
+/// lifecycle command at all.
+fn lifecycle_event_for_install(
+    recorded: Option<&str>,
+    app_version: &str,
+    data_dir: &Path,
+) -> Result<LifecycleEvent, InstallError> {
+    let current = semver::Version::parse(app_version)
+        .expect("validate() already refused a non-canonical app_version");
+
+    match lifecycle::lifecycle_decision(recorded, &current) {
+        // The hub's `install` does not own the update event (CONTRACT.md §6):
+        // it would need a pre-update database snapshot this repo has not
+        // ported (see the module header of `lifecycle.rs`), so it refuses
+        // rather than adopting `pre-update`/`post-update`.
+        Ok(LifecycleEvent::Update) => Err(InstallError::DataOlderThanSource {
+            recorded: recorded
+                .expect("an Update decision is only reached when a record exists")
+                .to_string(),
+            current: current.to_string(),
+            data_dir: data_dir.to_path_buf(),
+        }),
+        Ok(event) => Ok(event),
+        Err(LifecycleDecisionError::Downgrade { recorded, current }) => {
+            Err(InstallError::DataNewerThanSource {
+                recorded: recorded.to_string(),
+                current: current.to_string(),
+                data_dir: data_dir.to_path_buf(),
+            })
+        }
+        // The data dir's `version` field parses as JSON but not as semver —
+        // the same "cannot be trusted" class `read_data_version`'s own
+        // `MalformedDataConfig` already covers for a file that does not even
+        // parse as JSON, reused here rather than inventing a second flavour
+        // of "the record is corrupt".
+        Err(LifecycleDecisionError::InvalidVersion(error)) => Err(InstallError::Lifecycle(
+            LifecycleError::MalformedDataConfig {
+                path: lifecycle::data_config_path(&data_dir.join("data")),
+                detail: error.to_string(),
+            },
+        )),
     }
 }
 
@@ -576,6 +763,35 @@ pub enum InstallError {
         id: String,
         location: String,
     },
+    /// Another registered `id` already carries this `identifier`.
+    IdentifierTaken {
+        identifier: String,
+        id: String,
+    },
+    /// Something is already using the data directory this install would
+    /// write into.
+    DataDirInUse {
+        id: String,
+        data_dir: PathBuf,
+        holder: DataDirHolder,
+    },
+    /// The data directory records a version *newer* than the source being
+    /// installed — a downgrade, refused rather than guessed at (CONTRACT.md
+    /// §6): running old code against data a newer version wrote is how a
+    /// database gets corrupted quietly.
+    DataNewerThanSource {
+        recorded: String,
+        current: String,
+        data_dir: PathBuf,
+    },
+    /// The data directory records a version *older* than the source being
+    /// installed — the update event (CONTRACT.md §6), which `install` does
+    /// not own.
+    DataOlderThanSource {
+        recorded: String,
+        current: String,
+        data_dir: PathBuf,
+    },
     /// `apps/<id>/` exists with no registry entry to explain it.
     DirectoryInTheWay {
         path: PathBuf,
@@ -634,6 +850,63 @@ impl fmt::Display for InstallError {
                 formatter,
                 "{id} is already installed, from {location}. Pick another handle with \
                  --as <id>, or remove that one first."
+            ),
+            Self::IdentifierTaken { identifier, id } => write!(
+                formatter,
+                "{identifier} is already installed as {id} — the two would share its data \
+                 directory and its .desktop entry. --as gives this install a different \
+                 hub-local handle, not a different app: remove {id} first, or check this is \
+                 genuinely a different app before installing it."
+            ),
+            Self::DataDirInUse {
+                id,
+                data_dir,
+                holder,
+            } => match holder {
+                DataDirHolder::Window => write!(
+                    formatter,
+                    "{} is in use — {id} has a window open right now. Installing over it would \
+                     run Composer and the app's own commands against the database that window \
+                     has open; close {id} first.",
+                    data_dir.display()
+                ),
+                DataDirHolder::RunCommand { alias: Some(alias) } => write!(
+                    formatter,
+                    "{} is in use — {id}'s \"{alias}\" run command is still active. Stop it \
+                     first with `tfsapp-hub run --stop {id}`.",
+                    data_dir.display()
+                ),
+                DataDirHolder::RunCommand { alias: None } => write!(
+                    formatter,
+                    "{} is in use — a run command is still active for {id}. Stop it first with \
+                     `tfsapp-hub run --stop {id}`.",
+                    data_dir.display()
+                ),
+            },
+            Self::DataNewerThanSource {
+                recorded,
+                current,
+                data_dir,
+            } => write!(
+                formatter,
+                "{} was last written by app version {recorded}, but {current} is being \
+                 installed — running old code against data a newer version wrote is how a \
+                 database gets corrupted quietly (CONTRACT.md §6). Delete that directory by \
+                 hand if you mean to start over: `remove --purge` cannot reach it, since no \
+                 app is registered under this identifier to purge.",
+                data_dir.display()
+            ),
+            Self::DataOlderThanSource {
+                recorded,
+                current,
+                data_dir,
+            } => write!(
+                formatter,
+                "{} was last written by app version {recorded}, and {current} is newer — that \
+                 moment is the update event (CONTRACT.md §6), which `install` does not run. \
+                 Per-app update is a separate, not-yet-landed command; installing here would \
+                 run the wrong hooks — or none — over data already in place.",
+                data_dir.display()
             ),
             Self::DirectoryInTheWay { path } => write!(
                 formatter,
