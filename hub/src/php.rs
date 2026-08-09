@@ -48,11 +48,30 @@ use crate::{
     platform::{self, PlatformError},
 };
 
-/// `<hub>/resources/composer.phar` — what `make composer` downloads, beside
-/// the FrankenPHP `make sidecar` fetches. Same resolution rule and same
-/// packaged-mode caveat as [`platform::bundled_frankenphp`].
-pub fn bundled_composer() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/composer.phar")
+/// Ordered candidates for the bundled `composer.phar`: the packaged AppImage's
+/// resource dir first, then `<hub>/resources/composer.phar` — what
+/// `make composer` downloads, beside the FrankenPHP `make sidecar` fetches.
+/// Same packaged/dev ordering as [`platform::bundled_frankenphp`], but no
+/// system-wide fallback: the hub never runs an app's Composer with anything
+/// but its own.
+pub fn bundled_composer() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(resource_dir) = platform::packaged_resource_dir() {
+        candidates.push(resource_dir.join("resources/composer.phar"));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/composer.phar"));
+    candidates
+}
+
+/// The first `bundled_composer()` candidate that is a real, non-empty file —
+/// a `build.rs` stub must never be mistaken for the download.
+fn resolve_composer() -> Result<PathBuf, PhpError> {
+    let candidates = bundled_composer();
+    candidates
+        .iter()
+        .find(|path| tfsapp_core::sidecar::is_present(path))
+        .cloned()
+        .ok_or(PhpError::NoComposer { tried: candidates })
 }
 
 /// Everything the hub needs to run one app's PHP.
@@ -73,11 +92,7 @@ pub struct Toolchain {
 /// same failure as having no shim at all, minus the chance of noticing.
 pub fn toolchain(paths: &Paths) -> Result<Toolchain, PhpError> {
     let frankenphp = platform::hub_frankenphp()?;
-
-    let composer = bundled_composer();
-    if !composer.is_file() {
-        return Err(PhpError::NoComposer { path: composer });
-    }
+    let composer = resolve_composer()?;
 
     let shim = paths.php_shim_path();
     write_shim(&shim, &frankenphp)?;
@@ -322,7 +337,7 @@ pub enum PhpError {
     Platform(PlatformError),
     Paths(PathsError),
     NoComposer {
-        path: PathBuf,
+        tried: Vec<PathBuf>,
     },
     Io {
         path: PathBuf,
@@ -350,12 +365,16 @@ impl fmt::Display for PhpError {
         match self {
             Self::Platform(error) => write!(formatter, "{error}"),
             Self::Paths(error) => write!(formatter, "{error}"),
-            Self::NoComposer { path } => write!(
+            Self::NoComposer { tried } => write!(
                 formatter,
-                "Composer not found at {}. Run `make composer` — the hub installs \
+                "Composer not found (tried {}). Run `make composer` — the hub installs \
                  every app's dependencies with its own PHP and its own Composer, so \
                  nothing installs without it.",
-                path.display()
+                tried
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::Unstartable { label, source } => {

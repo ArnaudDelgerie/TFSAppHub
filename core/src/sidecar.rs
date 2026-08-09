@@ -5,34 +5,57 @@ use std::{
 };
 
 /// The FrankenPHP sidecar: `make sidecar`'s download in dev, a bundled Tauri
-/// resource in packaged mode; a system-wide install is the fallback either way.
-pub fn resolve_frankenphp_binary(bundled: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if is_executable(bundled) {
-        return Ok(bundled.to_path_buf());
+/// resource in packaged mode; a system-wide install is the fallback either
+/// way. `candidates` is tried in order — the caller's job is to put the
+/// packaged path first and the dev path last — and the error names every path
+/// that was tried, including the final system-wide one.
+pub fn resolve_frankenphp_binary(
+    candidates: &[PathBuf],
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    for candidate in candidates {
+        if is_executable(candidate) {
+            return Ok(candidate.clone());
+        }
     }
     let usr_bin = PathBuf::from("/usr/bin/frankenphp");
     if usr_bin.is_file() {
         return Ok(usr_bin);
     }
+    let mut tried: Vec<String> = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    tried.push(usr_bin.display().to_string());
     Err(format!(
-        "FrankenPHP sidecar not found. Run `make sidecar` (tried {} and {}).",
-        bundled.display(),
-        usr_bin.display()
+        "FrankenPHP sidecar not found. Run `make sidecar` (tried {}).",
+        tried.join(", ")
     )
     .into())
+}
+
+/// True when `path` is a real, non-empty file — the presence check every
+/// bundled resource (packaged, dev, or a `build.rs` stub) has to pass before
+/// it is trusted. A stub written only so a fresh clone compiles before
+/// `make resources` has ever run must never be mistaken for the real
+/// download.
+pub fn is_present(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    fs::metadata(path)
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    is_present(path)
+        && fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
 }
 
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
-    path.is_file()
+    is_present(path)
 }
 
 pub fn path_to_string(path: &Path) -> String {
@@ -57,3 +80,7 @@ pub fn make_executable(path: &Path) -> io::Result<()> {
     perms.set_mode(0o755);
     fs::set_permissions(path, perms)
 }
+
+#[cfg(test)]
+#[path = "sidecar_tests.rs"]
+mod tests;
