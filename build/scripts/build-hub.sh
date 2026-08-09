@@ -34,5 +34,7 @@ if [[ ${#appimages[@]} -ne 1 ]]; then
 fi
 APPIMAGE="${appimages[0]}"
 
+"$ROOT_DIR/build/scripts/fix-appimage-bundle.sh" "$APPIMAGE"
+
 SIZE="$(du -h "$APPIMAGE" | cut -f1)"
 echo "Built $APPIMAGE ($SIZE)"
