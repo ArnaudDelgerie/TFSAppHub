@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # Repair what linuxdeploy got wrong inside the hub's own AppImage (called from
-# build-hub.sh right after `cargo tauri build` produces it). Three unrelated
-# defects, one extract/repack pass. Ported from TFSAppWorkstation's script of
-# the same name, reduced to one image — the hub's — instead of one per app,
-# since plan 012 packages the hub itself rather than a per-app build.
+# build-hub.sh right after `cargo tauri build` produces it), and drop one
+# bundled library linuxdeploy got *right* but that the hub does not want
+# frozen. Ported from TFSAppWorkstation's script of the same name, reduced to
+# one image — the hub's — instead of one per app, since plan 012 packages the
+# hub itself rather than a per-app build.
 #
 # 1. The FrankenPHP sidecar. tauri-bundler shells out to linuxdeploy to
 #    assemble the AppImage, and linuxdeploy runs patchelf (rpath -> $ORIGIN) on
@@ -37,10 +38,22 @@ set -euo pipefail
 #    own terms — a `.DirIcon` that pointed at the wrong asset would be no less
 #    broken for being relative.
 #
+# And one deliberate removal, not a repair of anything broken:
+#
+# 4. `libwayland-*`. linuxdeploy bundles the build host's copy alongside the
+#    WebKit/GTK stack it exists to freeze — but the Wayland *client* library is
+#    an ABI the running **session** owns, not the toolkit. A copy frozen older
+#    than the host's own Mesa/compositor is a known way to make the image fail
+#    to start on a newer distribution — the failure mode TFSAppWorkstation's
+#    plan 060 could only flag, never fix. We delete every `libwayland-*` from
+#    the AppDir instead, so the dynamic linker falls through to the session's
+#    own copy — the one built for it — the same way it would for any other
+#    library this AppImage does not carry.
+#
 # Usage: build/scripts/fix-appimage-bundle.sh [appimage-path...]
 # Defaults to every *.AppImage under the hub's own bundle dir when no path is
 # given; a no-op when no AppImage is found there, or when the sidecar, the
-# hook and .DirIcon are already correct.
+# hook, .DirIcon and the absence of libwayland-* are already correct.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PRISTINE="$ROOT_DIR/hub/resources/frankenphp"
@@ -119,14 +132,20 @@ symlink_resolves_inside() {
   [[ "$resolved" == "$root"/* ]]
 }
 
-# WebKit/GTK/GLib libraries the bundle freezes, at minimum.
+# WebKit/GTK/GLib libraries the bundle freezes, at minimum. libwayland-client
+# is deliberately not here — it is deleted below, never frozen (defect 4).
 FROZEN_SONAMES=(
   libwebkit2gtk-4.1.so.0
   libjavascriptcoregtk-4.1.so.0
   libgtk-3.so.0
   libglib-2.0.so.0
-  libwayland-client.so.0
 )
+
+# True (exit 0) when no `libwayland-*` file survives anywhere under AppDir
+# root $1.
+no_bundled_wayland() {
+  [[ -z "$(find "$1" -iname 'libwayland-*' -print -quit)" ]]
+}
 
 # Captured once, up front: piping a live `ldconfig -p` straight into an awk
 # that `exit`s on its first match closes the pipe while ldconfig is still
@@ -201,11 +220,14 @@ for appimage in "${appimages[@]}"; do
   dir_icon_ok=true
   symlink_resolves_inside "$dir_icon" "$workdir/squashfs-root" || dir_icon_ok=false
 
+  wayland_ok=true
+  no_bundled_wayland "$workdir/squashfs-root" || wayland_ok=false
+
   # Repack only when something actually needs fixing — but "already fixed" has
-  # to mean *all three* repairs, otherwise an already-pristine sidecar would
-  # short-circuit the pass and quietly drop the hook or icon fix.
-  if cmp -s "${bundled[0]}" "$PRISTINE" && [[ "$hook_state" == "patched" ]] && [[ "$dir_icon_ok" == true ]]; then
-    echo "$(basename "$appimage"): sidecar, GTK hook and .DirIcon already correct, skipping."
+  # to mean *all four* repairs, otherwise an already-pristine sidecar would
+  # short-circuit the pass and quietly drop one of the others.
+  if cmp -s "${bundled[0]}" "$PRISTINE" && [[ "$hook_state" == "patched" ]] && [[ "$dir_icon_ok" == true ]] && [[ "$wayland_ok" == true ]]; then
+    echo "$(basename "$appimage"): sidecar, GTK hook, .DirIcon and the absence of libwayland-* already correct, skipping."
   else
     cp "$PRISTINE" "${bundled[0]}"
     chmod 755 "${bundled[0]}"
@@ -240,6 +262,11 @@ for appimage in "${appimages[@]}"; do
       fi
       ln -sf "$(basename "$icon_file")" "$dir_icon"
     fi
+    if [[ "$wayland_ok" == false ]]; then
+      while IFS= read -r -d '' lib; do
+        rm -f "$lib"
+      done < <(find "$workdir/squashfs-root" -iname 'libwayland-*' -print0)
+    fi
     OUTPUT="$workdir/fixed.AppImage" ARCH="$(uname -m)" APPIMAGE_EXTRACT_AND_RUN=1 \
       "$APPIMAGETOOL" --appdir "$workdir/squashfs-root" > "$workdir/repack.log" 2>&1 \
       || { echo "Repack failed for $appimage:" >&2; cat "$workdir/repack.log" >&2; exit 1; }
@@ -260,6 +287,8 @@ for appimage in "${appimages[@]}"; do
   case "$(readlink "$verify_root/.DirIcon")" in
     /*) echo "Verification failed: .DirIcon in $appimage is still an absolute symlink." >&2; exit 1 ;;
   esac
+  no_bundled_wayland "$verify_root" \
+    || { echo "Verification failed: $appimage still bundles a libwayland-*." >&2; exit 1; }
 
   # Belt-and-braces beyond the three known defects above: nothing else
   # linuxdeploy produced should be an absolute or dangling symlink either.
@@ -291,7 +320,7 @@ for appimage in "${appimages[@]}"; do
     done
   } >"$version_record.tmp"
   mv "$version_record.tmp" "$version_record"
-  echo "$(basename "$appimage"): sidecar verified pristine, GTK hook defers to the session backend, .DirIcon is relative, frozen versions recorded to $(basename "$version_record")."
+  echo "$(basename "$appimage"): sidecar verified pristine, GTK hook defers to the session backend, .DirIcon is relative, no libwayland-* bundled, frozen versions recorded to $(basename "$version_record")."
   rm -rf "$workdir"
   trap - EXIT
 done
