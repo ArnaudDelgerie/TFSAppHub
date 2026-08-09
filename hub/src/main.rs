@@ -24,6 +24,7 @@ mod platform;
 mod prompt;
 mod registry;
 mod remove;
+mod run;
 mod secrets;
 mod sidecar;
 mod source;

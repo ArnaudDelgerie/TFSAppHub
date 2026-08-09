@@ -185,6 +185,13 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "run",
+        form: "run <id>",
+        summary: "List an app's declared run aliases.",
+        level: Level::App,
+        availability: Availability::NotYet,
+    },
+    Spec {
+        name: "run",
         form: "run <id> <alias> [args...]",
         summary: "Run an app-declared command in the foreground.",
         level: Level::App,
@@ -347,6 +354,13 @@ pub enum OpenChildSource {
 /// them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunInvocation {
+    /// `run <id>` alone: list the app's declared aliases rather than run one.
+    /// The hub's own addition, absent from the station's grammar — the
+    /// station discovers aliases through `--help`, which the hub cannot do
+    /// because the aliases belong to an app and not to the binary.
+    List {
+        id: String,
+    },
     Stop {
         id: String,
     },
@@ -583,15 +597,17 @@ fn parse_run(args: &[String]) -> Result<Command, UsageError> {
         };
     }
 
-    let (id, alias) = match positionals {
-        [id, alias, ..] => (id.clone(), alias.clone()),
-        _ => {
-            return Err(usage_error(
+    let (id, alias) =
+        match positionals {
+            [] => return Err(usage_error(
                 "run",
-                "run needs an app id and an alias — the app first, then its command".to_string(),
-            ))
-        }
-    };
+                "run needs an app id — `run <id>` lists its declared aliases, `run <id> <alias>` \
+                 runs one"
+                    .to_string(),
+            )),
+            [id] => return Ok(Command::Run(RunInvocation::List { id: id.clone() })),
+            [id, alias, ..] => (id.clone(), alias.clone()),
+        };
     let forwarded = &positionals[2..];
 
     // A bare `--` separates the hub's words from the app's. It is optional (the
