@@ -24,10 +24,6 @@
 //! (`install`/`update`, this plan's step 4), which is the one place that
 //! guarantee needs to live.
 
-// `source::resolve`'s `Origin::Release` arm is this module's caller (this
-// plan's step 4); until then nothing in the binary calls it.
-#![allow(dead_code)]
-
 use std::{
     ffi::OsString,
     fmt, fs,

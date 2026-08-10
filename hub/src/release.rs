@@ -13,14 +13,16 @@
 //! timer; `install` and `update` are one-shot commands a human just typed, and
 //! a cache would only hide a release published thirty seconds ago.
 //!
-//! **[`resolve_assets`] cannot yet ask for `<project_name>-<app_version>.tar.gz`
+//! **[`resolve_assets`] cannot ask for `<project_name>-<app_version>.tar.gz`
 //! by its exact name.** That name needs `project_name`, which lives in a
 //! manifest inside the very archive this function is looking for — so the
 //! rule it applies here is what it *can* know before the archive is opened:
-//! exactly one asset ending in `.tar.gz`, and one named `SHA256SUMS.txt`. The
-//! manifest read after extraction (`../plan/018-remote-sources-releases.md`'s
-//! step 4) is what confirms the archive's name was honest; a mismatch there
-//! is a refusal, not a warning.
+//! exactly one asset ending in `.tar.gz`, and one named `SHA256SUMS.txt`. A
+//! misnamed archive is not a security hole — `SHA256SUMS.txt` still has to
+//! name it exactly, so whatever is installed is still what the author
+//! published — only a cosmetic one, and cross-checking it against the
+//! manifest read after extraction is left for whenever that turns out to
+//! matter.
 //!
 //! [`download_to`], [`sha256_file`] and [`verify`] are this plan's step 3:
 //! downloading the assets this module locates and checking them against
@@ -28,10 +30,6 @@
 //! extracts an archive. That hardened walk is `archive.rs`, kept separate
 //! because it is generic tar handling with nothing GitHub-specific left in
 //! it once the bytes are on disk.
-
-// `source::resolve`'s `Origin::Release` arm is this module's caller
-// (this plan's step 4); until then nothing in the binary calls it.
-#![allow(dead_code)]
 
 use std::{collections::HashMap, fmt, fs::File, io, path::Path, time::Duration};
 
@@ -41,7 +39,11 @@ use sha2::{Digest, Sha256};
 /// GitHub rejects API requests with no `User-Agent`.
 const GITHUB_USER_AGENT: &str = "TFSAppHub-release-resolver";
 
-const GITHUB_API_BASE: &str = "https://api.github.com";
+/// `pub(crate)` so `install` and `update` can pass it to `source::resolve`
+/// for real, and their own tests can pass a local stub's URL instead — the
+/// seam already proven at this module's own layer by `_at` and
+/// `release_tests.rs`, extended one layer up.
+pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
 
 /// Timeouts for a `releases/latest` or `releases/tags/<tag>` call — small
 /// JSON, so a hung network must fail fast rather than wedge an `install`.
@@ -75,23 +77,16 @@ pub struct GitHubAsset {
     pub size: u64,
 }
 
-/// `GET /repos/<repo>/releases/latest` against the real GitHub API.
-pub fn fetch_latest_release(repo: &str) -> Result<GitHubRelease, ReleaseError> {
-    fetch_latest_release_at(GITHUB_API_BASE, repo)
-}
-
-/// [`fetch_latest_release`], against `base_url` instead of GitHub's — the seam
-/// tests use to point this at a local stub.
+/// `GET /repos/<repo>/releases/latest`. `install` and `update` always pass
+/// [`GITHUB_API_BASE`] to `source::resolve`, which lands here; their own
+/// tests pass a local stub's URL instead, the same way `release_tests.rs`
+/// uses it directly at this layer.
 pub fn fetch_latest_release_at(base_url: &str, repo: &str) -> Result<GitHubRelease, ReleaseError> {
     fetch_release(&format!("{base_url}/repos/{repo}/releases/latest"))
 }
 
 /// `GET /repos/<repo>/releases/tags/<tag>` — `--ref <tag>`'s own lookup, and
 /// `rollback <id>`'s way back to a previously installed release.
-pub fn fetch_release_by_tag(repo: &str, tag: &str) -> Result<GitHubRelease, ReleaseError> {
-    fetch_release_by_tag_at(GITHUB_API_BASE, repo, tag)
-}
-
 pub fn fetch_release_by_tag_at(
     base_url: &str,
     repo: &str,

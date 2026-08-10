@@ -124,9 +124,9 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "install",
-        form: "install <source> [--as <id>] [--ref <tag|branch|sha>] [--yes] \
+        form: "install <source> [--as <id>] [--ref <tag>] [--yes] \
                [--no-desktop-entry]",
-        summary: "Install an app from a local directory or a git URL.",
+        summary: "Install an app from a local directory or github:owner/repo.",
         level: Level::App,
         availability: Availability::Implemented,
     },
@@ -157,7 +157,7 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "update",
-        form: "update <id> [--ref <tag|branch|sha>] [--force] [--yes]",
+        form: "update <id> [--ref <tag>] [--force] [--yes]",
         summary: "Re-resolve an app's source and update it.",
         level: Level::App,
         availability: Availability::Implemented,

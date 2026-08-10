@@ -17,10 +17,14 @@
 //! local directory the installer can copy — lands here too (plan 006), and it
 //! is the *only* half that may fetch anything. [`current_revision`] never does:
 //! `list` must stay a read of what is already on this machine.
-
-// The observing half has `list` as its caller; the resolving half waits for the
-// installer's own pipeline, later in this same plan. Removed then.
-#![allow(dead_code)]
+//!
+//! For a release, "fetch" means the whole of
+//! `../plan/018-remote-sources-releases.md`'s step 3: `release::fetch_latest_release_at`
+//! or `fetch_release_by_tag_at`, `release::resolve_assets`, `download_to` into
+//! the caller's `scratch` directory, `verify` against `SHA256SUMS.txt`, then
+//! `archive::extract` — in that order, so nothing is extracted until the
+//! checksum matches and nothing is returned until the extraction has been
+//! walked.
 
 use std::{
     fmt, fs, io,
@@ -29,7 +33,11 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use crate::registry::{Source, SourceKind};
+use crate::{
+    archive::{self, ArchiveError},
+    registry::{ReferenceKind, Source, SourceKind},
+    release::{self, ReleaseError},
+};
 
 /// Top-level directories left out of a local source's content hash.
 ///
@@ -63,44 +71,88 @@ pub fn current_revision(source: &Source) -> Revision {
             // can this source be compared against what was installed?
             Err(_) => Revision::Unreachable,
         },
-        // No release source can exist yet (the installer resolves local
-        // paths only), and asking a forge for its latest release would put a
-        // network call inside `list`. Step 4 of this plan gives this arm a
-        // real answer — see its own updated comment there.
+        // `list` must stay a read of what is already on this machine — it
+        // never dials out, so a release source (whose revision can only be
+        // learned by asking the forge) always answers "unreachable" here.
+        // This is not a gap step 4 fills in: it is the boundary this
+        // function exists to hold, and [`resolve`] is the only half of this
+        // module that may ever open a socket.
         SourceKind::Release => Revision::Unreachable,
     }
 }
 
 /// What a `<source>` argument names, decided from the string alone.
 ///
-/// An enum from day one, with the release variant left **unimplemented rather
-/// than unanticipated**: the remote-sources plan then reduces to "fetch a
-/// release into a local directory" in front of a pipeline that already works,
-/// and neither the registry's shape nor the installer's steps have to move.
-/// `classify` does not yet learn the full grammar table
-/// (`../plan/018-remote-sources-releases.md`'s Overview) — that, and the
-/// `index` this carries, land in this plan's step 4.
+/// The test is on the *string*, not on what exists on disk: a URL that names
+/// no directory must still be reported as a release, never as a missing local
+/// path — the two errors send a reader in opposite directions. Anything not
+/// recognisably remote is a local path, so a plain relative directory needs
+/// no scheme and no flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     LocalPath(PathBuf),
-    Release { index: Option<String>, repo: String },
+    /// A repository to fetch a release of. `index` names how it was found —
+    /// `"github"`, the forge acting as its own index today — so a later,
+    /// curated index has somewhere to record its own name instead
+    /// (`../plan/018-remote-sources-releases.md`'s Overview §2).
+    Release {
+        index: Option<String>,
+        repo: String,
+    },
+    /// A git clone URL or scp-like spelling — recognised only so [`resolve`]
+    /// can refuse it well, pointing at the release form instead of reporting
+    /// a mystifying "no such directory".
+    GitSpelling(String),
 }
 
 /// Which kind of source `spec` is, without touching the filesystem.
 ///
-/// The test is on the *string*, not on what exists on disk: a URL that happens
-/// to name no directory must still be reported as a release source someone
-/// cannot use yet, never as a missing local path — the two errors send a
-/// reader in opposite directions. Anything that is not recognisably a remote
-/// is a local path, so a plain relative directory needs no scheme and no flag.
+/// The grammar (`../plan/018-remote-sources-releases.md`'s Overview),
+/// checked in this order because a later rule is a special case of an
+/// earlier one otherwise: a spec ending in `.git` is always a git-clone
+/// spelling first, even if it also happens to start with `github:` or point
+/// at `github.com` — a `.git` suffix is never part of the canonical form, so
+/// seeing one is always the user having pasted the wrong button.
+///
+/// - `git@…` or anything ending in `.git` → [`Origin::GitSpelling`].
+/// - `github:owner/repo` → the canonical [`Origin::Release`].
+/// - `https://github.com/owner/repo` → the same, normalised to it — what a
+///   browser's address bar hands out for a public repository.
+/// - anything else → [`Origin::LocalPath`], as always.
 pub fn classify(spec: &str) -> Origin {
-    let remote = spec.contains("://") || spec.starts_with("git@") || spec.ends_with(".git");
-    match remote {
-        true => Origin::Release {
-            index: None,
-            repo: spec.to_string(),
-        },
-        false => Origin::LocalPath(PathBuf::from(spec)),
+    if spec.starts_with("git@") || spec.ends_with(".git") {
+        return Origin::GitSpelling(spec.to_string());
+    }
+    if let Some(repo) = spec.strip_prefix("github:") {
+        return Origin::Release {
+            index: Some("github".to_string()),
+            repo: repo.to_string(),
+        };
+    }
+    if let Some(repo) = github_https_repo(spec) {
+        return Origin::Release {
+            index: Some("github".to_string()),
+            repo,
+        };
+    }
+    Origin::LocalPath(PathBuf::from(spec))
+}
+
+/// `https://github.com/<owner>/<repo>` (an optional trailing slash tolerated,
+/// nothing else after it) turned into `<owner>/<repo>` — the same repo string
+/// `github:<owner>/<repo>` names. `None` for anything shaped differently,
+/// including a `github.com` URL carrying more path segments than that: this
+/// function only recognises the one shape a browser's address bar produces
+/// for a repository's own page, not every possible GitHub URL.
+fn github_https_repo(spec: &str) -> Option<String> {
+    let rest = spec.strip_prefix("https://github.com/")?;
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let mut segments = rest.split('/');
+    let owner = segments.next().filter(|segment| !segment.is_empty())?;
+    let repo = segments.next().filter(|segment| !segment.is_empty())?;
+    match segments.next() {
+        None => Some(format!("{owner}/{repo}")),
+        Some(_) => None,
     }
 }
 
@@ -124,7 +176,24 @@ pub struct Resolved {
 /// recorded `location` is re-read much later, by a `list` or an `update` run
 /// from some other working directory, and a relative path recorded from today's
 /// cwd would silently point at nothing.
-pub fn resolve(origin: &Origin, reference: Option<&str>) -> Result<Resolved, SourceError> {
+///
+/// `scratch` is where a release is downloaded, verified and extracted before
+/// this function returns — the caller's directory (`paths::Paths::scratch_dir`),
+/// created here if a release needs it and left for the caller to remove once
+/// the install or update this call is part of has finished, on success or on
+/// failure (`../plan/018-remote-sources-releases.md`'s "Where the archive
+/// lands before it is trusted"). The local variant never touches it.
+///
+/// `base_url` is the same seam `release.rs`'s own `_at` functions give
+/// `release_tests.rs`, one layer up: production callers (`install`, `update`)
+/// always pass [`release::GITHUB_API_BASE`]; their own tests point a whole
+/// `install`/`update` run at a local stub through this instead.
+pub fn resolve(
+    origin: &Origin,
+    reference: Option<&str>,
+    scratch: &Path,
+    base_url: &str,
+) -> Result<Resolved, SourceError> {
     match origin {
         Origin::LocalPath(path) => {
             if let Some(reference) = reference {
@@ -164,13 +233,73 @@ pub fn resolve(origin: &Origin, reference: Option<&str>) -> Result<Resolved, Sou
                 revision,
             })
         }
-        // The release client lands in this plan's step 2, and the fetch in
-        // step 4 — until then every release source refuses the same way,
-        // whatever `--ref` was passed.
-        Origin::Release { repo, .. } => {
-            Err(SourceError::ReleaseNotImplemented { repo: repo.clone() })
+        Origin::Release { index, repo } => {
+            resolve_release(repo, index.as_deref(), reference, scratch, base_url)
+        }
+        Origin::GitSpelling(spec) => Err(SourceError::GitSpelling { spec: spec.clone() }),
+    }
+}
+
+/// [`resolve`]'s `Origin::Release` arm: fetch the release (latest, or
+/// `reference`'s tag exactly), resolve its two assets, download and verify
+/// the archive against `SHA256SUMS.txt`, then extract it — in that order, so
+/// nothing is extracted until the checksum matches and nothing is returned
+/// until [`archive::extract`] has walked the whole tree.
+fn resolve_release(
+    repo: &str,
+    index: Option<&str>,
+    reference: Option<&str>,
+    scratch: &Path,
+    base_url: &str,
+) -> Result<Resolved, SourceError> {
+    let release = match reference {
+        Some(tag) => release::fetch_release_by_tag_at(base_url, repo, tag)?,
+        None => release::fetch_latest_release_at(base_url, repo)?,
+    };
+    let assets = release::resolve_assets(&release)?;
+
+    fs::create_dir_all(scratch).map_err(|source| SourceError::Io {
+        path: scratch.to_path_buf(),
+        source,
+    })?;
+    let archive_path = scratch.join(assets.archive_name);
+    release::download_to(assets.archive_url, &archive_path)?;
+
+    let checksums = release::parse_sha256sums(&release::fetch_text(assets.checksums_url)?);
+    let actual = release::sha256_file(&archive_path)?;
+    match release::verify(&checksums, assets.archive_name, &actual) {
+        release::VerifyOutcome::Match => {}
+        release::VerifyOutcome::Mismatch { expected, actual } => {
+            return Err(SourceError::ChecksumMismatch {
+                archive_name: assets.archive_name.to_string(),
+                expected,
+                actual,
+            });
+        }
+        release::VerifyOutcome::MissingEntry => {
+            return Err(SourceError::ChecksumMissing {
+                archive_name: assets.archive_name.to_string(),
+            });
         }
     }
+
+    let root = archive::extract(&archive_path, &scratch.join("extracted"))?;
+    let revision = tree_hash(&root).map_err(|source| SourceError::Unreadable {
+        path: root.clone(),
+        source,
+    })?;
+
+    Ok(Resolved {
+        source: Source {
+            kind: SourceKind::Release,
+            location: repo.to_string(),
+            reference: Some(release.tag_name),
+            reference_kind: Some(ReferenceKind::Tag),
+            index: Some(index.unwrap_or("github").to_string()),
+        },
+        root,
+        revision,
+    })
 }
 
 /// Why a source could not be turned into a directory.
@@ -189,12 +318,40 @@ pub enum SourceError {
     ReferenceOnLocalPath {
         reference: String,
     },
-    /// A spec the grammar table recognises as a release, but that this hub
-    /// cannot fetch yet — `../plan/018-remote-sources-releases.md`'s step 4
-    /// replaces every caller of this arm with a real fetch, and the variant
-    /// goes with it.
-    ReleaseNotImplemented {
-        repo: String,
+    /// A git clone URL or scp-like spelling — recognised so the refusal can
+    /// point at the release form instead of reporting a mystifying "no such
+    /// directory".
+    GitSpelling {
+        spec: String,
+    },
+    /// Fetching the release's metadata, downloading an asset, or reading its
+    /// checksums text failed — the release client's own taxonomy
+    /// (`release::ReleaseError`), reported through this module because a bad
+    /// release is exactly as much a reason `resolve` could not produce a
+    /// directory as a missing local path is.
+    Release(ReleaseError),
+    /// The downloaded archive's SHA-256 does not match the line
+    /// `SHA256SUMS.txt` carries for it — a tampered or corrupted download.
+    /// Nothing under `apps/` is touched: this refusal fires before
+    /// [`archive::extract`] ever runs.
+    ChecksumMismatch {
+        archive_name: String,
+        expected: String,
+        actual: String,
+    },
+    /// `SHA256SUMS.txt` has no line naming the archive at all — a missing
+    /// line is a failure, never a pass by absence.
+    ChecksumMissing {
+        archive_name: String,
+    },
+    /// The archive passed its checksum but could not be safely extracted —
+    /// `archive::ArchiveError`'s own taxonomy (a path escaping the tree, a
+    /// malformed top level).
+    Archive(ArchiveError),
+    /// Creating the scratch directory a release downloads into failed.
+    Io {
+        path: PathBuf,
+        source: io::Error,
     },
 }
 
@@ -216,11 +373,31 @@ impl fmt::Display for SourceError {
                 "--ref {reference} selects a revision of a git source; a local \
                  directory is installed as it stands"
             ),
-            Self::ReleaseNotImplemented { repo } => write!(
+            Self::GitSpelling { spec } => write!(
                 formatter,
-                "{repo} is a release source, and the hub cannot resolve one yet. \
-                 Clone it yourself and install the clone's directory."
+                "{spec} looks like a git clone URL — the hub installs releases, not \
+                 repositories. Use github:owner/repo, or clone it yourself and install \
+                 the clone's directory."
             ),
+            Self::Release(error) => write!(formatter, "{error}"),
+            Self::ChecksumMismatch {
+                archive_name,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{archive_name} does not match the checksum SHA256SUMS.txt carries for it \
+                 (expected {expected}, got {actual}) — the download may be corrupted or \
+                 tampered with. Nothing was installed."
+            ),
+            Self::ChecksumMissing { archive_name } => write!(
+                formatter,
+                "SHA256SUMS.txt has no line for {archive_name} — a release missing an \
+                 entry for its own archive cannot be verified, so it is refused rather \
+                 than installed unverified."
+            ),
+            Self::Archive(error) => write!(formatter, "{error}"),
+            Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
         }
     }
 }
@@ -229,8 +406,23 @@ impl std::error::Error for SourceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Unreadable { source, .. } => Some(source),
+            Self::Release(error) => Some(error),
+            Self::Archive(error) => Some(error),
+            Self::Io { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+impl From<ReleaseError> for SourceError {
+    fn from(error: ReleaseError) -> Self {
+        Self::Release(error)
+    }
+}
+
+impl From<ArchiveError> for SourceError {
+    fn from(error: ArchiveError) -> Self {
+        Self::Archive(error)
     }
 }
 

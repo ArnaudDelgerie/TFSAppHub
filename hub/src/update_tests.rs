@@ -512,3 +512,237 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
         "a resync must still catch the source's own change"
     );
 }
+
+// --- update on a remote source ----------------------------------------------
+//
+// `install_tests.rs`'s own `fixture_release_archive`/`stub_release`,
+// duplicated rather than imported — each `_tests.rs` file is self-contained.
+
+fn fixture_release_archive(top_level: &str, app_version: &str) -> Vec<u8> {
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::fast(),
+    ));
+
+    let mut dir_header = tar::Header::new_gnu();
+    dir_header.set_entry_type(tar::EntryType::Directory);
+    dir_header.set_size(0);
+    dir_header.set_mode(0o755);
+    dir_header
+        .set_path(format!("{top_level}/"))
+        .expect("a dir path");
+    dir_header.set_cksum();
+    builder
+        .append(&dir_header, std::io::empty())
+        .expect("append the top-level dir");
+
+    let manifest = format!(
+        r#"{{
+            "product_name": "Demo App",
+            "identifier": "dev.local.demo",
+            "project_name": "demo",
+            "app_version": "{app_version}"
+        }}"#
+    );
+    append_archive_file(
+        &mut builder,
+        &format!("{top_level}/tfsapp.config.json"),
+        manifest.as_bytes(),
+    );
+    append_archive_file(&mut builder, &format!("{top_level}/composer.json"), b"{}");
+    append_archive_file(
+        &mut builder,
+        &format!("{top_level}/bin/console"),
+        b"#!/usr/bin/env php\n",
+    );
+    append_archive_file(
+        &mut builder,
+        &format!("{top_level}/public/index.php"),
+        b"<?php",
+    );
+
+    builder
+        .into_inner()
+        .expect("finish the tar layer")
+        .finish()
+        .expect("finish the gzip layer")
+}
+
+fn append_archive_file(
+    builder: &mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>,
+    path: &str,
+    content: &[u8],
+) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(content.len() as u64);
+    header.set_mode(0o644);
+    header.set_path(path).expect("a valid file path");
+    header.set_cksum();
+    builder.append(&header, content).expect("append a file");
+}
+
+/// Answers the three requests resolving one release makes, in whatever order
+/// they arrive, then stops.
+fn stub_release(
+    repo: &str,
+    tag: &str,
+    archive_name: &str,
+    archive_bytes: Vec<u8>,
+) -> (String, std::thread::JoinHandle<()>) {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(&archive_bytes);
+    let checksums_body = format!("{:x}  {archive_name}\n", hasher.finalize());
+
+    let server = tiny_http::Server::http("127.0.0.1:0").expect("a local stub server");
+    let port = match server.server_addr() {
+        tiny_http::ListenAddr::IP(address) => address.port(),
+        other => panic!("unexpected listen address: {other:?}"),
+    };
+    let base_url = format!("http://127.0.0.1:{port}");
+    let release_path = format!("/repos/{repo}/releases/latest");
+    let archive_path = format!("/assets/{archive_name}");
+    let release_body = format!(
+        r#"{{"tag_name": "{tag}", "html_url": "{base_url}/releases/tag/{tag}", "assets": [
+            {{"name": "{archive_name}", "browser_download_url": "{base_url}{archive_path}", "size": {archive_size}}},
+            {{"name": "SHA256SUMS.txt", "browser_download_url": "{base_url}/assets/SHA256SUMS.txt", "size": {sums_size}}}
+        ]}}"#,
+        archive_size = archive_bytes.len(),
+        sums_size = checksums_body.len(),
+    );
+
+    let handle = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let request = server.recv().expect("a request");
+            let url = request.url().to_string();
+            if url == release_path {
+                let header =
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .expect("a valid header");
+                request
+                    .respond(
+                        tiny_http::Response::from_string(release_body.clone()).with_header(header),
+                    )
+                    .expect("respond with the release");
+            } else if url == archive_path {
+                request
+                    .respond(tiny_http::Response::from_data(archive_bytes.clone()))
+                    .expect("respond with the archive");
+            } else if url == "/assets/SHA256SUMS.txt" {
+                request
+                    .respond(tiny_http::Response::from_string(checksums_body.clone()))
+                    .expect("respond with the checksums");
+            } else {
+                request
+                    .respond(tiny_http::Response::from_string("not found").with_status_code(404))
+                    .expect("respond 404");
+            }
+        }
+    });
+
+    (base_url, handle)
+}
+
+#[test]
+fn an_update_with_no_ref_moves_to_the_newest_remote_release() {
+    if !resources_present() {
+        return;
+    }
+    let (_base, paths) = temp_paths();
+    let scratch = tempfile::tempdir().expect("a scratch dir");
+
+    let first_archive = fixture_release_archive("demo-0.6.0", "0.6.0");
+    let (first_url, first_handle) =
+        stub_release("example/demo", "v0.6.0", "demo-0.6.0.tar.gz", first_archive);
+    crate::install::install_into(
+        &paths,
+        scratch.path(),
+        &first_url,
+        "github:example/demo",
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the first install");
+    first_handle.join().expect("the first stub finishes");
+
+    let second_archive = fixture_release_archive("demo-0.7.0", "0.7.0");
+    let (second_url, second_handle) = stub_release(
+        "example/demo",
+        "v0.7.0",
+        "demo-0.7.0.tar.gz",
+        second_archive,
+    );
+    super::update_into(
+        &paths,
+        scratch.path(),
+        &second_url,
+        "demo",
+        None,
+        false,
+        true,
+        "0.1.0",
+    )
+    .expect("update moves to the newest release, no --ref needed");
+    second_handle.join().expect("the second stub finishes");
+
+    let entry = registry::load(&paths)
+        .expect("a readable registry")
+        .get("demo")
+        .cloned()
+        .expect("the entry survives");
+    assert_eq!(entry.app_version, "0.7.0");
+    assert_eq!(entry.source.reference.as_deref(), Some("v0.7.0"));
+}
+
+#[test]
+fn an_equal_remote_source_refuses_without_force() {
+    // 017's decision table is source-kind-agnostic (`update_decision` never
+    // reads `SourceKind`) — this is the one place that fires it end to end
+    // over a *remote* source, to prove the table really did carry over
+    // unchanged rather than merely being untested for this kind.
+    if !resources_present() {
+        return;
+    }
+    let (_base, paths) = temp_paths();
+    let scratch = tempfile::tempdir().expect("a scratch dir");
+
+    let archive = fixture_release_archive("demo-0.6.0", "0.6.0");
+    let (install_url, install_handle) =
+        stub_release("example/demo", "v0.6.0", "demo-0.6.0.tar.gz", archive);
+    crate::install::install_into(
+        &paths,
+        scratch.path(),
+        &install_url,
+        "github:example/demo",
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the install");
+    install_handle.join().expect("the install stub finishes");
+
+    let same_archive = fixture_release_archive("demo-0.6.0", "0.6.0");
+    let (update_url, update_handle) =
+        stub_release("example/demo", "v0.6.0", "demo-0.6.0.tar.gz", same_archive);
+    let error = super::update_into(
+        &paths,
+        scratch.path(),
+        &update_url,
+        "demo",
+        None,
+        false,
+        true,
+        "0.1.0",
+    )
+    .expect_err("the same release again refuses without --force");
+    update_handle.join().expect("the update stub finishes");
+
+    assert!(matches!(error, UpdateError::Equal { .. }), "{error}");
+}
