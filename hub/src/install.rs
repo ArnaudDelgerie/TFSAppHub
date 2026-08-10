@@ -621,10 +621,12 @@ fn lifecycle_event_for_install(
         .expect("validate() already refused a non-canonical app_version");
 
     match lifecycle::lifecycle_decision(recorded, &current) {
-        // The hub's `install` does not own the update event (CONTRACT.md §6):
-        // it would need a pre-update database snapshot this repo has not
-        // ported (see the module header of `lifecycle.rs`), so it refuses
-        // rather than adopting `pre-update`/`post-update`.
+        // `install` does not own the update event (CONTRACT.md §6) even
+        // though the machinery for it exists now: `update <id>` is what
+        // snapshots the database and reverts it on failure, and running
+        // `pre-update`/`post-update` here, outside that pipeline, would give
+        // the same event a different guarantee depending on which command
+        // happened to trigger it.
         Ok(LifecycleEvent::Update) => Err(InstallError::DataOlderThanSource {
             recorded: recorded
                 .expect("an Update decision is only reached when a record exists")
@@ -930,8 +932,8 @@ impl fmt::Display for InstallError {
                 formatter,
                 "{} was last written by app version {recorded}, and {current} is newer — that \
                  moment is the update event (CONTRACT.md §6), which `install` does not run. \
-                 Per-app update is a separate, not-yet-landed command; installing here would \
-                 run the wrong hooks — or none — over data already in place.",
+                 Use `tfsapp-hub update <id>` instead: installing here would run the wrong \
+                 hooks — or none — over data already in place.",
                 data_dir.display()
             ),
             Self::DirectoryInTheWay { path } => write!(

@@ -174,12 +174,10 @@ than resuming into the middle of it.
 older than the app being installed is, by `CONTRACT.md` §6's own definition,
 the update event — and it would be tempting to have `install` run
 `pre-update`/`post-update` there instead of refusing. It must not, for one
-reason: §6 also hands that event a guarantee this repo has not built yet — an
-update must never leave the app's database between two versions, which the
-station buys with a pre-update snapshot it can roll back to. Running the
-event without that property would be worse than refusing it, so `install`
-refuses instead, naming `update <id>` as the command that will own this once
-it exists.
+reason: §6 hands that event a guarantee `install` has no snapshot to back —
+an update must never leave the app's database between two versions. `update
+<id>` is the command that owns it (see "Updating", below), and `install`
+refuses instead, naming it.
 
 Step 11 runs **last**, after the app is registered and ready, for the same
 reason registration itself runs last: an entry advertising an app whose
@@ -218,6 +216,74 @@ generation it started with instead of meeting a half-written 170 MB binary or
 an `ETXTBSY`. It is also what hub self-update (queued, not yet built) will
 replace this same file with, which is the other reason it lives under the
 hub's own root rather than beside a per-app path.
+
+## Updating
+
+`update <id> [--ref <tag|branch|sha>] [--force]` re-resolves an app's already
+recorded source and, when it is newer, replaces the installed tree with it —
+the update event (`CONTRACT.md` §6), and the guarantee `install`'s own
+refusal defers: an update must never leave the app's database between two
+versions.
+
+1. Load the registry entry, re-resolve its source (the recorded selector, or
+   `--ref`'s), and validate it exactly as `install` does.
+2. Decide the action (`update_decision`) from the same `lifecycle_decision`
+   `install`/`open`/`run` all read, applied to the registry's recorded
+   `app_version` against the freshly resolved source's own:
+   - a newer source → `Apply`, the update event;
+   - an equal source → refused, naming `--force`;
+   - an equal source with `--force` → `ResyncOnly` — re-copy the code and
+     re-run `composer install`, no lifecycle command, no database snapshot,
+     the existing anchor (if any) left exactly alone;
+   - an older source → refused as a downgrade; `--force` does not unlock it,
+     since it is for a tree edited without bumping the version, not for
+     going backwards;
+   - no record at all → refused; that moment belongs to `install`.
+3. Guard the data directory exactly as `install` does (016's
+   `check_data_dir_available`), then confirm.
+4. `Apply`, in order: snapshot `app.db` (+ `-wal`/`-shm`), retain the
+   outgoing tree at `apps/<id>.previous` (a rename, never a copy — the cost
+   of holding an anchor is one generation of the tree, not a copy pass over
+   it), copy the new tree in, empty the app's own cache/build directories,
+   run `install::prepare` under the update event (`pre-update` then
+   `post-update`), then — only once every step above has succeeded — write
+   the rollback anchor's third half from the *outgoing* registry entry,
+   stamp the registry with the new one, and rewrite the desktop entry.
+5. Any failure from the tree swap onward reverts the whole attempt: the
+   database snapshot is restored, the copied-in tree is removed, the
+   outgoing tree is renamed back — and the registry is never touched, so the
+   next `open` does not know an update was attempted at all.
+
+**The rollback anchor is three halves, or none.** `rollback <id>` refuses
+unless all three are present, naming whichever is missing:
+
+| half | where |
+| --- | --- |
+| the retained source tree | `apps/<id>.previous` |
+| the pre-update database snapshot | `<data>/data/app.db.pre-update` (+ `-wal`/`-shm` twins) |
+| the outgoing registry state | `<data>/data/rollback.json` (`app_version`, `source_revision`, `created_at`) |
+
+The third half exists because the first two cannot answer what it does:
+`source_revision` is hashed over the *source*, while the retained tree was
+copied with `install`'s own excluded paths — recomputing it from the tree
+would produce a different string that means nothing.
+
+A rollback rescue-dumps the current database first, printing its path, then
+restores the snapshot as the live database, deletes the current tree and
+renames `.previous` back in its place, restores `data/config.json` and the
+registry entry to the anchor's recorded version, and rewrites the desktop
+entry. It then **consumes** the anchor — the snapshot and `rollback.json`
+are discarded, and there is no new `.previous` to roll forward into. A
+rollback is one step back; a `.previous` naming the version just left would
+invite a "rollback forward" this plan does not define.
+
+Anchor hygiene runs both directions, so a stale one never outlives the
+install it belonged to: `remove <id>` takes `apps/<id>.previous` with it
+alongside `apps/<id>` itself, and a fresh `install` discards any
+snapshot/`rollback.json` it finds in the data directory it is about to write
+into — a data directory a `remove` without `--purge` left behind can
+otherwise carry a stale anchor into an unrelated later install, one that has
+nothing of its own to roll back to.
 
 ## Opening an app
 
