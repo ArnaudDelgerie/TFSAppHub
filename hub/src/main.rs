@@ -11,6 +11,7 @@ mod bridge;
 mod cli;
 mod desktop;
 mod dev;
+mod gh;
 mod hub_bin;
 mod identity;
 mod install;
