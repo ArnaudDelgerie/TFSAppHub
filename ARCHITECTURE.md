@@ -74,6 +74,7 @@ second consumer exists to justify it. Not for tidiness.
 ```
 <OS data dir>/TFSApp/hub/apps/<id>/          the installed snapshot — what actually runs
 <OS data dir>/TFSApp/hub/registry.json       what is installed, from where, at what version
+<OS data dir>/TFSApp/hub/scratch/<pid>/      a release download/verify/extract, removed on exit
 <OS data dir>/TFSApp/hub/bin/php             the interpreter shim (see below)
 <OS data dir>/TFSApp/hub/bin/tfsapp-hub      the stable hub copy .desktop entries point at
 <OS data dir>/TFSApp/<identifier>/           the app's own data — CONTRACT.md §5
@@ -122,8 +123,9 @@ splitting them is how one of them eventually gets forgotten.
 `install <source>` snapshots a project into the hub's root and makes it ready to
 open. In order:
 
-1. Resolve the source to a directory. A local path is used as it stands; a git
-   source is cloned at a pinned ref (not yet built).
+1. Resolve the source to a directory. A local path is used as it stands; a
+   release source (`github:owner/repo`) is downloaded, verified and extracted
+   into scratch space — see "Resolving a release" below.
 2. Read and validate the manifest. Missing required fields, a wrong type on a
    known key, or a non-semver `app_version` all stop here, naming the file and
    the field. An unknown key warns and does not stop anything.
@@ -186,6 +188,32 @@ nothing. The app is usable from the CLI before it is advertised anywhere else.
 A failure here — the copy or the entry — is a warning naming the path and the
 cause, never a reason to undo an install that has already succeeded.
 
+### Resolving a release
+
+A release source never touches `apps/` directly. `source::resolve` fetches the
+release (latest, or the tag `--ref` names) through the forge's release API,
+then works entirely inside a scratch directory under the hub's own root —
+sized for a multi-hundred-megabyte archive landing on the same filesystem
+`apps/<id>/` is about to receive it, and removed by the caller (`install` or
+`update`) once it is done, on success or failure alike. The order is the
+guarantee:
+
+1. **Download** the release's `<project_name>-<app_version>.tar.gz` asset,
+   streamed to a file — never buffered whole in memory.
+2. **Verify** it against the `SHA256SUMS.txt` asset beside it, hashed the same
+   way. A missing line for the archive's own name is a failure, never a pass
+   by absence.
+3. **Extract**, only once the checksum has matched — every entry checked
+   before it is written (no absolute path, no `..` component, no symlink or
+   hard link resolving outside the extraction root), and the whole archive
+   rejected unless it holds exactly one top-level directory.
+4. **Walk** the extracted tree (`tree_hash`) and read its manifest, which
+   step 2 above validates exactly as it would a local path's.
+
+Nothing about `apps/<id>/` is touched until all four have succeeded — a
+refusal at any point leaves scratch removed by the caller and the app root
+exactly as it was.
+
 **No sidecar runs during an install.** Lifecycle commands get the full
 environment and a real database, on a terminal where a failure is legible — but
 they cannot reach their own app over HTTP, which is exactly what `CONTRACT.md`
@@ -219,8 +247,8 @@ hub's own root rather than beside a per-app path.
 
 ## Updating
 
-`update <id> [--ref <tag|branch|sha>] [--force]` re-resolves an app's already
-recorded source and, when it is newer, replaces the installed tree with it —
+`update <id> [--ref <tag>] [--force]` re-resolves an app's already recorded
+source and, when it is newer, replaces the installed tree with it —
 the update event (`CONTRACT.md` §6), and the guarantee `install`'s own
 refusal defers: an update must never leave the app's database between two
 versions.
