@@ -1,4 +1,9 @@
-use super::{fetch_latest_release_at, resolve_assets, GitHubAsset, GitHubRelease, ReleaseError};
+use std::{collections::HashMap, fs, path::Path};
+
+use super::{
+    download_to, fetch_latest_release_at, fetch_text, parse_sha256sums, resolve_assets,
+    sha256_file, verify, GitHubAsset, GitHubRelease, ReleaseError, VerifyOutcome,
+};
 
 /// Start a `tiny_http` server that answers exactly one request with `status`
 /// and `body`, then stops — enough to stand in for one GitHub API call
@@ -134,4 +139,99 @@ fn a_malformed_json_payload_is_an_invalid_response() {
     handle.join().expect("the stub thread finishes");
 
     assert!(matches!(error, ReleaseError::InvalidResponse(_)));
+}
+
+#[test]
+fn download_to_streams_the_response_body_to_disk() {
+    let (base_url, handle) = stub_once(200, "application/octet-stream", "hello archive");
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let target = temp.path().join("archive.bin");
+
+    download_to(&format!("{base_url}/asset"), &target).expect("a successful download");
+    handle.join().expect("the stub thread finishes");
+
+    assert_eq!(
+        fs::read_to_string(&target).expect("the downloaded file"),
+        "hello archive"
+    );
+}
+
+#[test]
+fn fetch_text_returns_the_response_body_as_a_string() {
+    let (base_url, handle) = stub_once(200, "text/plain", "deadbeef  demo.tar.gz\n");
+
+    let body = fetch_text(&format!("{base_url}/SHA256SUMS.txt")).expect("a successful fetch");
+    handle.join().expect("the stub thread finishes");
+
+    assert_eq!(body, "deadbeef  demo.tar.gz\n");
+}
+
+#[test]
+fn sha256_file_hashes_a_files_bytes_streaming_through_the_hasher() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let path = temp.path().join("content");
+    fs::write(&path, b"hello world").expect("a written fixture");
+
+    let digest = sha256_file(&path).expect("a computed hash");
+    assert_eq!(
+        digest,
+        "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    );
+}
+
+#[test]
+fn sha256_file_reports_a_missing_file_rather_than_panicking() {
+    let error = sha256_file(Path::new("/nonexistent/path/to/nothing")).expect_err("no such file");
+    assert!(matches!(error, ReleaseError::Io(_)));
+}
+
+#[test]
+fn parse_sha256sums_reads_hash_and_name_pairs_case_insensitively() {
+    let body = "DEADBEEF  demo-1.0.0.tar.gz\n\ncafef00d *SHA256SUMS.txt\n";
+
+    let parsed = parse_sha256sums(body);
+
+    assert_eq!(
+        parsed.get("demo-1.0.0.tar.gz").map(String::as_str),
+        Some("deadbeef")
+    );
+    assert_eq!(
+        parsed.get("SHA256SUMS.txt").map(String::as_str),
+        Some("cafef00d")
+    );
+}
+
+#[test]
+fn verify_matches_a_hash_case_insensitively() {
+    let mut expected = HashMap::new();
+    expected.insert("demo.tar.gz".to_string(), "deadbeef".to_string());
+
+    assert_eq!(
+        verify(&expected, "demo.tar.gz", "DEADBEEF"),
+        VerifyOutcome::Match
+    );
+}
+
+#[test]
+fn verify_reports_a_mismatch_for_a_tampered_download() {
+    let mut expected = HashMap::new();
+    expected.insert("demo.tar.gz".to_string(), "deadbeef".to_string());
+
+    assert_eq!(
+        verify(&expected, "demo.tar.gz", "00000000"),
+        VerifyOutcome::Mismatch {
+            expected: "deadbeef".to_string(),
+            actual: "00000000".to_string(),
+        }
+    );
+}
+
+#[test]
+fn verify_reports_a_missing_entry_rather_than_passing_by_absence() {
+    let expected = HashMap::new();
+
+    assert_eq!(
+        verify(&expected, "demo.tar.gz", "deadbeef"),
+        VerifyOutcome::MissingEntry
+    );
 }

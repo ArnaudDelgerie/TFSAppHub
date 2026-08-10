@@ -22,17 +22,21 @@
 //! step 4) is what confirms the archive's name was honest; a mismatch there
 //! is a refusal, not a warning.
 //!
-//! Downloading the assets this module locates, verifying them against
-//! `SHA256SUMS.txt` and extracting them into scratch space is step 3's own
-//! module, not this one — this one only ever reaches GitHub's JSON API.
+//! [`download_to`], [`sha256_file`] and [`verify`] are this plan's step 3:
+//! downloading the assets this module locates and checking them against
+//! `SHA256SUMS.txt`, still with no filesystem trust implied — nothing here
+//! extracts an archive. That hardened walk is `archive.rs`, kept separate
+//! because it is generic tar handling with nothing GitHub-specific left in
+//! it once the bytes are on disk.
 
 // `source::resolve`'s `Origin::Release` arm is this module's caller
 // (this plan's step 4); until then nothing in the binary calls it.
 #![allow(dead_code)]
 
-use std::{fmt, time::Duration};
+use std::{collections::HashMap, fmt, fs::File, io, path::Path, time::Duration};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 /// GitHub rejects API requests with no `User-Agent`.
 const GITHUB_USER_AGENT: &str = "TFSAppHub-release-resolver";
@@ -44,8 +48,15 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The name `build/scripts/publish-app.sh` always writes the checksums asset
-/// under (this plan's step 5).
+/// Timeouts for downloading the archive or `SHA256SUMS.txt` itself — tens of
+/// megabytes rather than a small JSON body, so more patience than the
+/// metadata calls above get.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The name a published release's checksums asset is always found under —
+/// `CONTRACT.md`'s publishing clause, whether the archive was produced by
+/// hand or by `tfsapp-hub publish` (`../plan/019-publish-an-app.md`).
 pub const SHA256SUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
 
 /// The subset of GitHub's release response this resolver reads.
@@ -164,6 +175,129 @@ pub fn resolve_assets(release: &GitHubRelease) -> Result<ResolvedAssets<'_>, Rel
     })
 }
 
+/// A `ureq` agent with the download timeouts — one place so [`download_to`]
+/// and [`fetch_text`] share the same connect/read deadlines, distinct from
+/// [`metadata_agent`]'s tighter ones.
+fn download_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(DOWNLOAD_CONNECT_TIMEOUT)
+        .timeout_read(DOWNLOAD_READ_TIMEOUT)
+        .build()
+}
+
+/// Stream `url` to `path`, following the redirect GitHub's
+/// `browser_download_url` issues to its signed objects host.
+///
+/// A failure here — transport or the local write — leaves `path` as whatever
+/// was written so far; this function does not clean it up. That is deliberate
+/// rather than an omission: the caller's scratch directory is removed
+/// wholesale on any failure (this plan's Overview, "Where the archive lands
+/// before it is trusted"), so a second cleanup here would only be a second
+/// place for that guarantee to drift from the first.
+pub fn download_to(url: &str, path: &Path) -> Result<(), ReleaseError> {
+    let response = download_agent()
+        .get(url)
+        .set("User-Agent", GITHUB_USER_AGENT)
+        .call()
+        .map_err(|error| ReleaseError::Io(format!("download failed: {error}")))?;
+    let mut reader = response.into_reader();
+    let mut file = File::create(path)
+        .map_err(|error| ReleaseError::Io(format!("cannot create {}: {error}", path.display())))?;
+    io::copy(&mut reader, &mut file).map_err(|error| {
+        ReleaseError::Io(format!(
+            "download failed while writing {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Fetch `url` as UTF-8 text — `SHA256SUMS.txt`'s body, small enough to hold
+/// in memory unlike the archive itself.
+pub fn fetch_text(url: &str) -> Result<String, ReleaseError> {
+    download_agent()
+        .get(url)
+        .set("User-Agent", GITHUB_USER_AGENT)
+        .call()
+        .map_err(|error| ReleaseError::Io(format!("fetching checksums failed: {error}")))?
+        .into_string()
+        .map_err(|error| ReleaseError::Io(format!("reading checksums failed: {error}")))
+}
+
+/// The lowercase hex SHA-256 of the file at `path`, streamed through the
+/// hasher via [`io::copy`] so a multi-hundred-megabyte archive is never fully
+/// buffered.
+pub fn sha256_file(path: &Path) -> Result<String, ReleaseError> {
+    let mut file = File::open(path)
+        .map_err(|error| ReleaseError::Io(format!("cannot open {}: {error}", path.display())))?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)
+        .map_err(|error| ReleaseError::Io(format!("cannot read {}: {error}", path.display())))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Parse a `SHA256SUMS.txt` body — `sha256sum`'s own output, one
+/// `<hex>  <filename>` line per file (two spaces in text mode, ` *` in binary
+/// mode) — into a `{filename → lowercase hex hash}` map. Blank lines and
+/// lines with no whitespace separator are skipped; hashes are lowercased so
+/// [`verify`] can compare regardless of the producer's casing.
+pub fn parse_sha256sums(body: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((hash, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        // A leading `*` marks binary mode in `sha256sum` output — not part of
+        // the filename.
+        let filename = rest.strip_prefix('*').unwrap_or(rest);
+        if hash.is_empty() || filename.is_empty() {
+            continue;
+        }
+        map.insert(filename.to_string(), hash.to_ascii_lowercase());
+    }
+    map
+}
+
+/// Outcome of checking a computed hash against a parsed `SHA256SUMS.txt`: the
+/// asset's line is present and matches, present and disagrees, or absent
+/// entirely — three cases a caller reports distinctly. A missing line is
+/// never a pass by absence: it is as much a failure as a mismatch, just a
+/// different one to explain.
+#[derive(Debug, PartialEq)]
+pub enum VerifyOutcome {
+    Match,
+    Mismatch { expected: String, actual: String },
+    MissingEntry,
+}
+
+/// Pure verification: look up `asset_name` in the parsed map and compare its
+/// hash against `computed_hash`, case-insensitively.
+pub fn verify(
+    expected: &HashMap<String, String>,
+    asset_name: &str,
+    computed_hash: &str,
+) -> VerifyOutcome {
+    match expected.get(asset_name) {
+        None => VerifyOutcome::MissingEntry,
+        Some(expected_hash) => {
+            let actual = computed_hash.to_ascii_lowercase();
+            if expected_hash.eq_ignore_ascii_case(&actual) {
+                VerifyOutcome::Match
+            } else {
+                VerifyOutcome::Mismatch {
+                    expected: expected_hash.clone(),
+                    actual,
+                }
+            }
+        }
+    }
+}
+
 /// Why fetching or resolving a release failed — every branch a message a user
 /// can act on, never a bare HTTP status.
 #[derive(Debug)]
@@ -179,6 +313,11 @@ pub enum ReleaseError {
     InvalidResponse(String),
     /// A release exists but is missing one of the two assets it must carry.
     MissingAsset { tag: String, missing: &'static str },
+    /// Downloading an asset, fetching its checksums text, or hashing it back
+    /// off disk failed — network transport or a local I/O error, distinct
+    /// from the metadata calls above because neither "not found" nor "rate
+    /// limited" means anything for a signed, one-shot download URL.
+    Io(String),
 }
 
 impl fmt::Display for ReleaseError {
@@ -203,9 +342,10 @@ impl fmt::Display for ReleaseError {
             ),
             Self::MissingAsset { tag, missing } => write!(
                 formatter,
-                "release {tag} has no {missing} — ask the app's author to publish one with \
-                 build/scripts/publish-app.sh."
+                "release {tag} has no {missing} — ask the app's author to publish one that \
+                 does, with `tfsapp-hub publish` or by hand per CONTRACT.md."
             ),
+            Self::Io(detail) => write!(formatter, "{detail}"),
         }
     }
 }

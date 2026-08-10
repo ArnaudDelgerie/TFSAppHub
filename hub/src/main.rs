@@ -6,6 +6,7 @@
 // `cli.rs` stay at ~215 lines across sixty plans.
 
 mod app_env;
+mod archive;
 mod bridge;
 mod cli;
 mod desktop;
