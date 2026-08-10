@@ -15,13 +15,16 @@
 #![allow(dead_code)]
 
 use std::{
-    fmt, fs,
+    fmt, fs, io,
     path::{Path, PathBuf},
 };
 
 use crate::{
+    archive,
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
     prompt,
+    release::{self, ReleaseError},
+    source,
 };
 
 /// The changelog's filename at the project root (CONTRACT.md §1/§7).
@@ -67,6 +70,166 @@ pub fn run_local_gates(
         repo,
         notes,
     })
+}
+
+/// The two files a published release carries, built into a directory the
+/// caller provides (the hub's scratch directory in production — step 4 — a
+/// temp directory in this module's own tests).
+#[derive(Debug)]
+pub struct Assets {
+    pub archive_path: PathBuf,
+    pub archive_name: String,
+    pub sums_path: PathBuf,
+}
+
+/// Build `<project_name>-<app_version>.tar.gz` and its `SHA256SUMS.txt` into
+/// `destination`, from `project_path`'s tree as it stands right now —
+/// `CONTRACT.md` §1's artefact.
+///
+/// The walk shares [`source::EXCLUDED_FROM_HASH`] with `source::tree_hash`
+/// rather than a second list, which is what buys the property this step
+/// exists for: `tree_hash` of the archive, once extracted, equals
+/// `tree_hash` of the tree it was built from. A symlink whose target would
+/// resolve outside the extracted tree is refused before a byte of the
+/// archive is written, with the exact lexical rule `archive::extract` applies
+/// at the other end (`archive::link_target_escapes`).
+pub fn build_archive(
+    project_path: &Path,
+    project_name: &str,
+    app_version: &str,
+    destination: &Path,
+) -> Result<Assets, PublishError> {
+    fs::create_dir_all(destination).map_err(|source| PublishError::Io {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+
+    let prefix = format!("{project_name}-{app_version}");
+    let archive_name = format!("{prefix}.tar.gz");
+    let archive_path = destination.join(&archive_name);
+
+    let file = fs::File::create(&archive_path).map_err(|source| PublishError::Io {
+        path: archive_path.clone(),
+        source,
+    })?;
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        file,
+        flate2::Compression::default(),
+    ));
+    // Every mainstream tar preserves symlinks by default; this crate's
+    // default is the other way (see `Builder::follow_symlinks`'s own
+    // warning), and following one here would silently swap the byte content
+    // of a symlink `source::tree_hash` never reads for the content of
+    // whatever it points at.
+    builder.follow_symlinks(false);
+
+    let archive_root = PathBuf::from(&prefix);
+    builder
+        .append_dir(&archive_root, project_path)
+        .map_err(|source| PublishError::Io {
+            path: project_path.to_path_buf(),
+            source,
+        })?;
+    append_tree(&mut builder, project_path, &archive_root, 0)?;
+
+    let encoder = builder.into_inner().map_err(|source| PublishError::Io {
+        path: archive_path.clone(),
+        source,
+    })?;
+    encoder.finish().map_err(|source| PublishError::Io {
+        path: archive_path.clone(),
+        source,
+    })?;
+
+    let hash = release::sha256_file(&archive_path)?;
+    let sums_path = destination.join(release::SHA256SUMS_ASSET_NAME);
+    fs::write(&sums_path, format!("{hash}  {archive_name}\n")).map_err(|source| {
+        PublishError::Io {
+            path: sums_path.clone(),
+            source,
+        }
+    })?;
+
+    Ok(Assets {
+        archive_path,
+        archive_name,
+        sums_path,
+    })
+}
+
+/// Append `directory`'s entries under `archive_dir`, sorted, recursing into
+/// subdirectories — the same walk `source::hash_directory` performs, over the
+/// same [`source::EXCLUDED_FROM_HASH`] predicate at `depth == 0`.
+fn append_tree<W: io::Write>(
+    builder: &mut tar::Builder<W>,
+    directory: &Path,
+    archive_dir: &Path,
+    depth: usize,
+) -> Result<(), PublishError> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(directory)
+        .map_err(|source| PublishError::Io {
+            path: directory.to_path_buf(),
+            source,
+        })?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(|source| PublishError::Io {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    entries.sort();
+
+    for entry in entries {
+        let Some(name) = entry.file_name() else {
+            continue;
+        };
+        if depth == 0
+            && source::EXCLUDED_FROM_HASH
+                .iter()
+                .any(|excluded| name == *excluded)
+        {
+            continue;
+        }
+
+        let archive_path = archive_dir.join(name);
+        let metadata = fs::symlink_metadata(&entry).map_err(|source| PublishError::Io {
+            path: entry.clone(),
+            source,
+        })?;
+
+        if metadata.is_symlink() {
+            let target = fs::read_link(&entry).map_err(|source| PublishError::Io {
+                path: entry.clone(),
+                source,
+            })?;
+            if archive::link_target_escapes(&archive_path, &target) {
+                return Err(PublishError::EscapingSymlink { path: entry });
+            }
+            builder
+                .append_path_with_name(&entry, &archive_path)
+                .map_err(|source| PublishError::Io {
+                    path: entry.clone(),
+                    source,
+                })?;
+        } else if metadata.is_dir() {
+            builder
+                .append_dir(&archive_path, &entry)
+                .map_err(|source| PublishError::Io {
+                    path: entry.clone(),
+                    source,
+                })?;
+            append_tree(builder, &entry, &archive_path, depth + 1)?;
+        } else {
+            builder
+                .append_path_with_name(&entry, &archive_path)
+                .map_err(|source| PublishError::Io {
+                    path: entry.clone(),
+                    source,
+                })?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Gate 2: `app_version` must parse as canonical semver — the value a
@@ -228,6 +391,23 @@ pub enum PublishError {
     /// The `actions.secrets.ipc` confirmation was declined, or could not be
     /// asked (see `prompt::confirmed`'s own non-terminal refusal).
     IpcNotConfirmed,
+    /// A symlink in the project tree points outside it — the same lexical
+    /// rule `archive::extract` applies at the other end
+    /// (`archive::link_target_escapes`), applied here before a byte of the
+    /// archive is written.
+    EscapingSymlink {
+        path: PathBuf,
+    },
+    /// Reading the project tree, or writing the archive or its checksums,
+    /// failed.
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    /// Hashing the archive for `SHA256SUMS.txt` failed — `release.rs`'s own
+    /// taxonomy, reported here because it is exactly as much a reason the
+    /// archive could not be produced as an `Io` failure is.
+    Release(ReleaseError),
 }
 
 impl fmt::Display for PublishError {
@@ -274,6 +454,17 @@ impl fmt::Display for PublishError {
                 formatter,
                 "publish aborted — actions.secrets.ipc gate not confirmed."
             ),
+            Self::EscapingSymlink { path } => write!(
+                formatter,
+                "{} is a symlink pointing outside the project tree — the hub's own installer \
+                 would refuse to extract an archive carrying it, so publish refuses to build \
+                 one.",
+                path.display()
+            ),
+            Self::Io { path, source } => {
+                write!(formatter, "{}: {source}", path.display())
+            }
+            Self::Release(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -282,6 +473,8 @@ impl std::error::Error for PublishError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Manifest(error) => Some(error),
+            Self::Io { source, .. } => Some(source),
+            Self::Release(error) => Some(error),
             _ => None,
         }
     }
@@ -290,6 +483,12 @@ impl std::error::Error for PublishError {
 impl From<ManifestError> for PublishError {
     fn from(error: ManifestError) -> Self {
         Self::Manifest(error)
+    }
+}
+
+impl From<ReleaseError> for PublishError {
+    fn from(error: ReleaseError) -> Self {
+        Self::Release(error)
     }
 }
 

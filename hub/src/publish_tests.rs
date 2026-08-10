@@ -1,6 +1,7 @@
-use std::{fs, path::Path};
+use std::{fs, os::unix::fs::symlink, path::Path};
 
-use super::{changelog_section, is_owner_repo_shape, run_local_gates, PublishError};
+use super::{build_archive, changelog_section, is_owner_repo_shape, run_local_gates, PublishError};
+use crate::{archive, release, source};
 
 fn write_manifest(root: &Path, app_version: &str, extra: &str) {
     fs::create_dir_all(root).expect("a project root");
@@ -213,6 +214,102 @@ fn ipc_on_and_undeclinable_in_a_test_refuses_the_gate() {
 
     let error = run_local_gates(project.path(), None).unwrap_err();
     assert!(matches!(error, PublishError::IpcNotConfirmed), "{error}");
+}
+
+fn write_source_files(root: &Path) {
+    fs::create_dir_all(root.join("src")).expect("a src dir");
+    fs::write(root.join("src/main.php"), "<?php\n").expect("a source file");
+    symlink("src/main.php", root.join("link-to-main")).expect("a safe symlink");
+
+    for (dir, file, content) in [
+        ("vendor/pkg", "lib.php", "vendor"),
+        ("var/cache", "entry", "cache"),
+        ("node_modules/pkg", "index.js", "js"),
+        (".git", "HEAD", "ref: refs/heads/main"),
+        ("tfsapp_build", "app.AppImage", "binary"),
+    ] {
+        let dir = root.join(dir);
+        fs::create_dir_all(&dir).expect("an excluded dir");
+        fs::write(dir.join(file), content).expect("a file under an excluded dir");
+    }
+}
+
+#[test]
+fn the_archive_extracts_to_a_tree_hashing_the_same_as_the_source() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    write_manifest(project.path(), "1.2.0", "");
+    write_source_files(project.path());
+    let scratch = tempfile::tempdir().expect("a temp scratch dir");
+
+    let assets = build_archive(project.path(), "demo", "1.2.0", scratch.path())
+        .expect("the archive to build");
+    assert_eq!(assets.archive_name, "demo-1.2.0.tar.gz");
+    assert!(assets.archive_path.is_file());
+    assert!(assets.sums_path.is_file());
+
+    let extracted_into = scratch.path().join("extracted");
+    let root = archive::extract(&assets.archive_path, &extracted_into)
+        .expect("our own installer to accept what we just built");
+
+    assert_eq!(
+        source::tree_hash(&root).expect("a hash of the extracted tree"),
+        source::tree_hash(project.path()).expect("a hash of the source tree"),
+        "the archive must round-trip to the exact tree tree_hash covers"
+    );
+
+    for excluded in ["vendor", "var", "node_modules", ".git", "tfsapp_build"] {
+        assert!(
+            !root.join(excluded).exists(),
+            "{excluded} must not be in the archive"
+        );
+    }
+    assert!(root.join("src/main.php").is_file());
+    assert!(root.join("link-to-main").is_symlink());
+}
+
+#[test]
+fn the_sums_file_verifies_against_the_archive_it_names() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    write_manifest(project.path(), "1.2.0", "");
+    write_source_files(project.path());
+    let scratch = tempfile::tempdir().expect("a temp scratch dir");
+
+    let assets = build_archive(project.path(), "demo", "1.2.0", scratch.path())
+        .expect("the archive to build");
+
+    let sums_body = fs::read_to_string(&assets.sums_path).expect("a readable sums file");
+    assert_eq!(
+        sums_body,
+        format!("{}  {}\n", checksum(&assets), assets.archive_name)
+    );
+
+    let checksums = release::parse_sha256sums(&sums_body);
+    let actual = release::sha256_file(&assets.archive_path).expect("a hash of the built archive");
+    assert_eq!(
+        release::verify(&checksums, &assets.archive_name, &actual),
+        release::VerifyOutcome::Match
+    );
+}
+
+fn checksum(assets: &super::Assets) -> String {
+    release::sha256_file(&assets.archive_path).expect("a hash of the built archive")
+}
+
+#[test]
+fn an_escaping_symlink_is_refused_before_anything_is_uploaded() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    write_manifest(project.path(), "1.2.0", "");
+    write_source_files(project.path());
+    symlink("../../outside", project.path().join("evil")).expect("an escaping symlink");
+    let scratch = tempfile::tempdir().expect("a temp scratch dir");
+
+    let error = build_archive(project.path(), "demo", "1.2.0", scratch.path()).unwrap_err();
+    match &error {
+        PublishError::EscapingSymlink { path } => {
+            assert_eq!(path, &project.path().join("evil"));
+        }
+        other => panic!("expected EscapingSymlink, got {other}"),
+    }
 }
 
 #[test]

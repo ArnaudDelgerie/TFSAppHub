@@ -49,7 +49,14 @@ use crate::{
 /// build, and hashing it would report "changed since install" for a build that
 /// touched no source at all. Top-level only, so a legitimately named `src/var/`
 /// still counts.
-const EXCLUDED_FROM_HASH: &[&str] = &[".git", "vendor", "var", "node_modules", "tfsapp_build"];
+///
+/// `pub(crate)` so `publish.rs`'s archive builder walks under the exact same
+/// predicate `tree_hash` does, rather than a second list that could drift from
+/// it — the property `../plan/019-publish-an-app.md` step 2 exists for is
+/// `tree_hash` of a published archive, once extracted, equalling `tree_hash`
+/// of the tree it was built from.
+pub(crate) const EXCLUDED_FROM_HASH: &[&str] =
+    &[".git", "vendor", "var", "node_modules", "tfsapp_build"];
 
 /// Where a source stands now.
 #[derive(Debug, Clone, PartialEq, Eq)]

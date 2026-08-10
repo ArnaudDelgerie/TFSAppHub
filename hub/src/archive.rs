@@ -135,20 +135,36 @@ fn check_safe_link<R: Read>(
     path: &Path,
     entry_type: EntryType,
 ) -> Result<(), ArchiveError> {
-    let unsafe_link = || ArchiveError::UnsafeLink {
-        path: path.to_path_buf(),
-        kind: if entry_type.is_symlink() {
-            "symlink"
-        } else {
-            "hard link"
-        },
+    let target = entry.link_name().map_err(ArchiveError::Io)?;
+    let escapes = match &target {
+        Some(target) => link_target_escapes(path, target),
+        None => true,
     };
+    if escapes {
+        return Err(ArchiveError::UnsafeLink {
+            path: path.to_path_buf(),
+            kind: if entry_type.is_symlink() {
+                "symlink"
+            } else {
+                "hard link"
+            },
+        });
+    }
+    Ok(())
+}
 
-    let target = entry
-        .link_name()
-        .map_err(ArchiveError::Io)?
-        .ok_or_else(unsafe_link)?;
-
+/// Whether a link recorded at `path` (its own location within the tree),
+/// pointing at `target`, resolves — lexically, with no filesystem access —
+/// outside the tree `path` is rooted in. An absolute target always escapes,
+/// since nothing about the tree's own layout can vouch for what lives at an
+/// absolute path on the machine doing the extracting.
+///
+/// `pub(crate)` so `publish.rs`'s archive builder applies the exact same rule
+/// before writing a symlink entry that `archive::extract` applies before
+/// trusting one: an archive `publish` would build and this module would then
+/// refuse to extract is the one bug `../plan/019-publish-an-app.md` names as
+/// unshippable.
+pub(crate) fn link_target_escapes(path: &Path, target: &Path) -> bool {
     let mut depth: i64 = path.components().count() as i64 - 1;
     for component in target.components() {
         match component {
@@ -157,13 +173,13 @@ fn check_safe_link<R: Read>(
             Component::ParentDir => {
                 depth -= 1;
                 if depth < 0 {
-                    return Err(unsafe_link());
+                    return true;
                 }
             }
-            Component::RootDir | Component::Prefix(_) => return Err(unsafe_link()),
+            Component::RootDir | Component::Prefix(_) => return true,
         }
     }
-    Ok(())
+    false
 }
 
 #[derive(Debug)]
