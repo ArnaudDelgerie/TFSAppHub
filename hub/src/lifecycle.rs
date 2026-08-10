@@ -38,11 +38,12 @@
 //! record these guards read.
 
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use tfsapp_core::ports::DataConfig;
 
 /// Which lifecycle event (CONTRACT.md §6), if any, a launch represents.
@@ -162,6 +163,189 @@ pub fn write_data_version(data_subdir: &Path, version: &str) -> Result<(), Lifec
     let temporary = data_subdir.join("config.json.tmp");
     fs::write(&temporary, json).map_err(io_error(&temporary))?;
     fs::rename(&temporary, &path).map_err(io_error(&path))
+}
+
+/// The rollback anchor's three halves (CONTRACT.md §6 / the per-app update and
+/// rollback plan): the retained source tree, the pre-update database snapshot
+/// and `rollback.json`, and the primitives that produce, restore and consume
+/// them. Ported from the station's `lifecycle.rs`/`rollback.rs`, adapted to
+/// take a `data_subdir` rather than reading a global — this hub has no single
+/// installed app to assume one for.
+///
+/// The three SQLite files an update event's DB snapshot/restore covers: the
+/// main file and its WAL/SHM twins, which may not exist (no hot WAL left by a
+/// crash, or — updating an installation that never created `app.db` — no DB at
+/// all yet).
+pub const DB_FILE_NAMES: [&str; 3] = ["app.db", "app.db-wal", "app.db-shm"];
+
+/// `<data_subdir>/<name>.pre-update` — the snapshot twin of `data_subdir`'s
+/// `name`, written by [`snapshot_db`] before an update event's `pre-update`
+/// hook runs. Consumed by [`restore_db_snapshot`] on a failed update; left in
+/// place as the rollback anchor's database half on a succeeded one.
+pub fn db_snapshot_path(data_subdir: &Path, name: &str) -> PathBuf {
+    data_subdir.join(format!("{name}.pre-update"))
+}
+
+/// Snapshot `app.db` (+ any `-wal`/`-shm` twins) before an update event's
+/// `pre-update` hook runs — the sidecar isn't started yet, so the files are
+/// quiescent. A source file that doesn't exist (no hot WAL from a previous
+/// crash, or no DB at all for a fresh installation) snapshots "absence": any
+/// leftover twin from an earlier attempt is removed rather than left stale, so
+/// [`restore_db_snapshot`] correctly deletes a partially created file on
+/// restore instead of resurrecting an unrelated older one.
+pub fn snapshot_db(data_subdir: &Path) -> io::Result<()> {
+    for name in DB_FILE_NAMES {
+        let source = data_subdir.join(name);
+        let snapshot = db_snapshot_path(data_subdir, name);
+        if source.is_file() {
+            fs::copy(&source, &snapshot)?;
+        } else {
+            let _ = fs::remove_file(&snapshot);
+        }
+    }
+    Ok(())
+}
+
+/// Put `app.db` (+ `-wal`/`-shm`) back to the state [`snapshot_db`] captured: a
+/// present twin is copied back over the live file; an absent one (the source
+/// didn't exist when snapshotted) deletes the live file, so a failed event
+/// that created one along the way is fully reverted — and a `-wal`/`-shm` a
+/// restored main file did not itself bring back is not left beside it to
+/// silently keep committed transactions from the version that was reverted.
+pub fn restore_db_snapshot(data_subdir: &Path) -> io::Result<()> {
+    for name in DB_FILE_NAMES {
+        let target = data_subdir.join(name);
+        let snapshot = db_snapshot_path(data_subdir, name);
+        if snapshot.is_file() {
+            fs::copy(&snapshot, &target)?;
+        } else {
+            let _ = fs::remove_file(&target);
+        }
+    }
+    Ok(())
+}
+
+/// Delete the pre-update snapshot files, without touching the live database —
+/// `rollback <id>`'s own consumption of the anchor's database half, once
+/// [`restore_db_snapshot`] has already put its contents back as the live
+/// database. Best-effort: a file already gone is not an error.
+pub fn discard_db_snapshot(data_subdir: &Path) {
+    for name in DB_FILE_NAMES {
+        let _ = fs::remove_file(db_snapshot_path(data_subdir, name));
+    }
+}
+
+/// `<data_subdir>/<name>.rescue` — where `rollback <id>` copies the *current*
+/// (post-update) database before overwriting it with the restored pre-update
+/// snapshot: a manual-recovery artefact at the new schema, never auto-restored
+/// — moving the data aside, not losing it. A second consecutive rollback
+/// overwrites the previous rescue dump.
+pub fn rescue_dump_path(data_subdir: &Path, name: &str) -> PathBuf {
+    data_subdir.join(format!("{name}.rescue"))
+}
+
+/// `apps/<id>.previous` — the rollback anchor's tree half: the outgoing
+/// `apps/<id>` renamed rather than copied (the per-app update and rollback
+/// plan's Overview — a rename costs one generation of the tree, never a copy
+/// pass over it). Cannot collide with a real app directory:
+/// `install::is_usable_id` rejects a dot in an `id`, so no `id` can ever
+/// resolve to this name itself.
+pub fn previous_tree_path(app_dir: &Path) -> PathBuf {
+    let mut previous = app_dir.as_os_str().to_os_string();
+    previous.push(".previous");
+    PathBuf::from(previous)
+}
+
+/// `<data_subdir>/rollback.json` — the rollback anchor's registry half: what
+/// `rollback <id>` needs to restore the registry entry that the retained tree
+/// and database snapshot cannot answer on their own. `source_revision` is
+/// hashed over the *source* (`source::EXCLUDED_FROM_HASH`), while the retained
+/// tree under `apps/` was copied with `install`'s own excluded paths/names —
+/// recomputing it from the tree would produce a different string that means
+/// nothing, so it is recorded instead.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RollbackAnchor {
+    pub app_version: String,
+    pub source_revision: String,
+    /// RFC 3339, UTC — same convention as the registry's own timestamps
+    /// ([`crate::registry::now_timestamp`]).
+    pub created_at: String,
+}
+
+/// `<data_subdir>/rollback.json`'s path.
+pub fn rollback_anchor_path(data_subdir: &Path) -> PathBuf {
+    data_subdir.join("rollback.json")
+}
+
+/// Write `rollback.json`, atomic temp-file-plus-`rename` like
+/// [`write_data_version`] — a crash or power loss mid-write can never leave a
+/// truncated anchor record behind.
+pub fn write_rollback_anchor(
+    data_subdir: &Path,
+    anchor: &RollbackAnchor,
+) -> Result<(), LifecycleError> {
+    let path = rollback_anchor_path(data_subdir);
+    let json = serde_json::to_string_pretty(anchor).map_err(|error| {
+        LifecycleError::MalformedDataConfig {
+            path: path.clone(),
+            detail: error.to_string(),
+        }
+    })?;
+
+    let io_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| LifecycleError::Io { path, source }
+    };
+    let temporary = data_subdir.join("rollback.json.tmp");
+    fs::write(&temporary, json).map_err(io_error(&temporary))?;
+    fs::rename(&temporary, &path).map_err(io_error(&path))
+}
+
+/// Read `rollback.json`, tolerantly: absent or unparseable both read as
+/// `None` rather than an error — either one means the same thing to a caller
+/// (nothing usable to roll back to), and an unknown key never makes an
+/// otherwise-valid anchor unusable, since `serde` ignores fields this struct
+/// does not declare by default.
+pub fn read_rollback_anchor(data_subdir: &Path) -> Option<RollbackAnchor> {
+    fs::read_to_string(rollback_anchor_path(data_subdir))
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+}
+
+/// Discard `rollback.json` without touching the retained tree or database
+/// snapshot. Best-effort: an already-missing file is not an error.
+pub fn discard_rollback_anchor(data_subdir: &Path) {
+    let _ = fs::remove_file(rollback_anchor_path(data_subdir));
+}
+
+/// Whether `id`'s rollback anchor is actually usable — all three halves
+/// (the retained tree, the retained database snapshot's main file, and
+/// `rollback.json`), or nothing (the plan's Overview: "three halves or no
+/// anchor"). Pure-ish: reads three paths and no more, so a missing tree, a
+/// missing snapshot and a missing `rollback.json` are each a unit test with no
+/// process involved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Anchor {
+    Complete {
+        app_version: String,
+        source_revision: String,
+        created_at: String,
+    },
+    Missing,
+}
+
+pub fn anchor_state(data_subdir: &Path, app_dir: &Path) -> Anchor {
+    let has_tree = previous_tree_path(app_dir).is_dir();
+    let has_snapshot = db_snapshot_path(data_subdir, "app.db").is_file();
+
+    match (has_tree, has_snapshot, read_rollback_anchor(data_subdir)) {
+        (true, true, Some(record)) => Anchor::Complete {
+            app_version: record.app_version,
+            source_revision: record.source_revision,
+            created_at: record.created_at,
+        },
+        _ => Anchor::Missing,
+    }
 }
 
 /// How long an arriving launch waits for a dying sibling's liveness lock to
