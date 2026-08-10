@@ -50,6 +50,20 @@ pub fn extract(archive_path: &Path, destination: &Path) -> Result<PathBuf, Archi
 
     for entry in archive.entries().map_err(ArchiveError::Io)? {
         let mut entry = entry.map_err(ArchiveError::Io)?;
+
+        // `git archive` always writes a PAX global extended header (the
+        // commit's hash, as a comment) ahead of the real entries — the most
+        // ordinary way to build this plan's archive "by hand". The `tar`
+        // crate applies a per-entry (local) pax header to the entry that
+        // follows it transparently, but surfaces the *global* one as a
+        // literal entry of its own, with no path of its own to check. Both
+        // kinds are archive-format bookkeeping, never tree content, so
+        // neither counts toward "exactly one top-level directory".
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_pax_global_extensions() || entry_type.is_pax_local_extensions() {
+            continue;
+        }
+
         let path = entry.path().map_err(ArchiveError::Io)?.into_owned();
 
         let first = check_safe_path(&path)?;
@@ -67,7 +81,6 @@ pub fn extract(archive_path: &Path, destination: &Path) -> Result<PathBuf, Archi
             saw_nested_entry = true;
         }
 
-        let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             check_safe_link(&mut entry, &path, entry_type)?;
         }

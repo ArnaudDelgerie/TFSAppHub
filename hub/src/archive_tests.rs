@@ -88,6 +88,42 @@ fn append_raw_path(builder: &mut Builder<GzEncoder<fs::File>>, raw_path: &str, c
     builder.append(&header, content).expect("append raw entry");
 }
 
+/// `git archive` always prefixes its output with a PAX global extended
+/// header (a `comment=<commit hash>` record) — this is what any app author
+/// building the plan's release archive "by hand" actually gets, and what
+/// this fixture reproduces.
+fn append_pax_global_header(builder: &mut Builder<GzEncoder<fs::File>>) {
+    let content = b"52 comment=0123456789abcdef0123456789abcdef01234567\n";
+    let mut header = Header::new_ustar();
+    header.set_entry_type(EntryType::XGlobalHeader);
+    header.set_size(content.len() as u64);
+    header.set_mode(0o644);
+    header.set_path("pax_global_header").expect("a valid path");
+    header.set_cksum();
+    builder
+        .append(&header, &content[..])
+        .expect("append pax global header");
+}
+
+#[test]
+fn a_git_archive_style_pax_global_header_is_ignored() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let archive = write_archive(temp.path(), "from-git-archive.tar.gz", |builder| {
+        append_pax_global_header(builder);
+        append_dir(builder, "demo-1.0.0/");
+        append_file(builder, "demo-1.0.0/composer.json", b"{}");
+    });
+
+    let destination = temp.path().join("out");
+    let root = extract(&archive, &destination).expect("a clean extraction");
+
+    assert_eq!(root, destination.join("demo-1.0.0"));
+    assert_eq!(
+        fs::read_to_string(root.join("composer.json")).expect("composer.json on disk"),
+        "{}"
+    );
+}
+
 #[test]
 fn a_clean_archive_round_trips_into_its_top_level_directory() {
     let temp = tempfile::tempdir().expect("a temp dir");
