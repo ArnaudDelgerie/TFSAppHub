@@ -23,6 +23,7 @@ mod php;
 mod platform;
 mod prompt;
 mod registry;
+mod release;
 mod remove;
 mod rollback;
 mod run;
