@@ -184,7 +184,11 @@ pub fn run(
 ///
 /// Takes its `Paths` rather than resolving them, matching `install::install`
 /// — what lets the whole pipeline run against a throwaway root in a test.
-fn update(
+///
+/// `pub(crate)` rather than private: `rollback_tests.rs`'s own round-trip
+/// test reuses it to seed an updated app to roll back, rather than
+/// reimplementing an update fixture a second time.
+pub(crate) fn update(
     paths: &Paths,
     id: &str,
     reference: Option<&str>,

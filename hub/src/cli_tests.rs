@@ -111,6 +111,20 @@ fn bare_words_route_to_an_app() {
         }
     );
     assert_eq!(
+        command("rollback demo"),
+        Command::Rollback {
+            id: "demo".to_string(),
+            assume_yes: false,
+        }
+    );
+    assert_eq!(
+        command("rollback demo --yes"),
+        Command::Rollback {
+            id: "demo".to_string(),
+            assume_yes: true,
+        }
+    );
+    assert_eq!(
         command("remove demo"),
         Command::Remove {
             id: "demo".to_string(),
@@ -291,6 +305,7 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         "install ../TFSAppTest",
         "open demo",
         "update demo",
+        "rollback demo",
         "remove demo",
         "run demo",
         "run demo console",

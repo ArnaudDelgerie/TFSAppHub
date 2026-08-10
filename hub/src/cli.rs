@@ -163,6 +163,13 @@ pub const SURFACE: &[Spec] = &[
         availability: Availability::Implemented,
     },
     Spec {
+        name: "rollback",
+        form: "rollback <id> [--yes]",
+        summary: "Undo the last update, restoring the previous version and database.",
+        level: Level::App,
+        availability: Availability::Implemented,
+    },
+    Spec {
         name: "remove",
         form: "remove <id> [--purge] [--yes]",
         summary: "Uninstall an app; --purge also drops its data.",
@@ -311,6 +318,12 @@ pub enum Command {
         /// same escape for a script.
         assume_yes: bool,
     },
+    Rollback {
+        id: String,
+        /// `--yes`: skip the confirmation, same escape as `install` and
+        /// `update` — a rollback also rewrites the database and the tree.
+        assume_yes: bool,
+    },
     Remove {
         id: String,
         purge: bool,
@@ -396,6 +409,7 @@ impl Command {
             Self::Open { .. } => "open",
             Self::Dev { .. } => "dev",
             Self::Update { .. } => "update",
+            Self::Rollback { .. } => "rollback",
             Self::Remove { .. } => "remove",
             Self::Export { .. } => "export",
             Self::Import { .. } => "import",
@@ -511,6 +525,13 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
                 id: options.exactly_one("update", "an app id")?,
                 reference: options.value("--ref"),
                 force: options.flag("--force"),
+                assume_yes: options.assume_yes(),
+            })
+        }
+        "rollback" => {
+            let mut options = options("rollback", rest, &[], &["--yes", "-y"])?;
+            Ok(Command::Rollback {
+                id: options.exactly_one("rollback", "an app id")?,
                 assume_yes: options.assume_yes(),
             })
         }

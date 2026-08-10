@@ -24,6 +24,7 @@ mod platform;
 mod prompt;
 mod registry;
 mod remove;
+mod rollback;
 mod run;
 mod secrets;
 mod sidecar;
@@ -131,6 +132,7 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             assume_yes,
             &context.package_info().version.to_string(),
         ),
+        Command::Rollback { id, assume_yes } => rollback::run(&id, assume_yes),
         Command::Remove {
             id,
             purge,

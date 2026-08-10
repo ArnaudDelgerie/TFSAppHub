@@ -774,6 +774,56 @@ fn a_record_of_the_same_version_installs_and_runs_no_lifecycle_command() {
 }
 
 #[test]
+fn a_fresh_install_discards_any_rollback_anchor_left_in_the_data_directory() {
+    // The state a plain `remove` (no `--purge`) after an `update` leaves
+    // behind: a usable rollback anchor sitting under a data directory that a
+    // later install, under any `id`, is about to write a brand new tree
+    // into. `rollback <id>` reading it afterwards would restore the wrong
+    // code over the right database, so a fresh install has to discard it.
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    runnable_app_tree(source.path(), "{}"); // app_version 0.6.0
+    seed_data_record(&paths, "dev.local.demo", "0.6.0");
+
+    let data_dir = paths.app_data_dir("dev.local.demo").expect("a data dir");
+    let data_subdir = data_dir.join("data");
+    fs::write(data_subdir.join("app.db.pre-update"), b"stale snapshot").expect("a stale snapshot");
+    crate::lifecycle::write_rollback_anchor(
+        &data_subdir,
+        &crate::lifecycle::RollbackAnchor {
+            app_version: "0.5.0".to_string(),
+            source_revision: "sha256:stale".to_string(),
+            created_at: now_timestamp(),
+        },
+    )
+    .expect("a seeded anchor");
+
+    super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("an equal record installs, the reinstall-after-remove path");
+
+    assert!(
+        !data_subdir.join("app.db.pre-update").exists(),
+        "a fresh install has nothing to roll back to"
+    );
+    assert!(
+        !crate::lifecycle::rollback_anchor_path(&data_subdir).exists(),
+        "a fresh install has nothing to roll back to"
+    );
+}
+
+#[test]
 fn a_failing_hook_leaves_no_directory_and_nothing_registered() {
     // The restartability rule, measured: an app whose install failed halfway
     // must not exist at all, or the next attempt meets a tree nobody wrote and

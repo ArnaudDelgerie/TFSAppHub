@@ -121,6 +121,27 @@ fn a_remove_drops_the_tree_and_the_entry_and_keeps_the_data() {
 }
 
 #[test]
+fn a_remove_takes_the_retained_previous_tree_with_it() {
+    // The rollback anchor's tree half: left behind by an `update`, and
+    // exactly the kind of internal bookkeeping a plain `remove` must not
+    // strand — a later install under the same `id` has no legitimate reason
+    // to find a `.previous` sibling waiting for it.
+    let (_base, paths) = temp_paths();
+    installed_snapshot(&paths, "demo");
+    registry::save_entry(&paths, "demo");
+    let previous =
+        crate::lifecycle::previous_tree_path(&paths.app_dir("demo").expect("an app dir"));
+    fs::create_dir_all(&previous).expect("a retained previous tree");
+
+    assert!(remove(&paths, "demo", false, true).expect("it removes"));
+
+    assert!(
+        !previous.exists(),
+        "the retained tree must go with the app dir"
+    );
+}
+
+#[test]
 fn a_purge_takes_the_data_with_it() {
     let (_base, paths) = temp_paths();
     installed_snapshot(&paths, "demo");

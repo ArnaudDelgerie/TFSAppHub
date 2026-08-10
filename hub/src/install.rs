@@ -132,6 +132,15 @@ pub(crate) fn install(
     // enforce: nothing may install into a data directory a live window or an
     // active `run` command still owns.
     check_data_dir_available(&id, &data_dir)?;
+    // A fresh install has nothing to roll back to: any rollback anchor left
+    // behind under this data directory — by an update this `id` ran before a
+    // `remove` without `--purge` — is stale the moment a new tree lands on
+    // top of it, and `rollback <id>` reading it afterwards would restore the
+    // wrong code over the right database. Best-effort, same as every other
+    // anchor-consuming call (`rollback.rs`).
+    let data_subdir = data_dir.join("data");
+    lifecycle::discard_db_snapshot(&data_subdir);
+    lifecycle::discard_rollback_anchor(&data_subdir);
     // Which lifecycle event (CONTRACT.md §6) this install may run, decided
     // against whatever version record survived a `remove`.
     let recorded = lifecycle::read_data_version(&data_dir.join("data"))?;

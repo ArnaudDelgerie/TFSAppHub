@@ -122,6 +122,11 @@ fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool
     println!("  registry entry: removed");
 
     report("installed app", remove_directory(&plan.app_dir));
+    // `apps/<id>.previous` — the rollback anchor's tree half, if `id` ever
+    // had one — goes with it. Silent and best-effort: it is bookkeeping the
+    // anchor owns, not a zone this command's own announcement promises, and
+    // an already-absent one is exactly the common case.
+    crate::update::discard_tree(&plan.app_dir);
     // Code-side, not data — the entry points at a snapshot that is being
     // deleted — so plain `remove` takes it exactly as it takes `apps/<id>/`;
     // `--purge` adds nothing here. The stable hub copy the entry's `Exec=`
