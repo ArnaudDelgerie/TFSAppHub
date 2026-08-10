@@ -251,12 +251,16 @@ pub(crate) fn update(
 /// The registry's own `Source` turned back into the [`Origin`] `source::resolve`
 /// takes. Reads the recorded `kind` rather than re-classifying the location
 /// string: a canonicalised local path would classify the same way regardless,
-/// but reading the kind is what this will need the day a git `location` (a
-/// URL) has to resolve as a git source and not be re-guessed from its string.
+/// but a release's `location` is `owner/repo`, not a spec `classify` has ever
+/// seen again — this is the day that needed a real read of the recorded kind,
+/// not a re-guess from a string.
 fn origin(source: &Source) -> Origin {
     match source.kind {
         SourceKind::LocalPath => Origin::LocalPath(PathBuf::from(&source.location)),
-        SourceKind::Git => Origin::Git(source.location.clone()),
+        SourceKind::Release => Origin::Release {
+            index: source.index.clone(),
+            repo: source.location.clone(),
+        },
     }
 }
 

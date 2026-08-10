@@ -6,13 +6,9 @@
 //! new user's first `list` meets, and answering it with an error would be a bug
 //! rather than a diagnostic.
 //!
-//! Two markers earn their place on a line, both of them answering a question
-//! `app_version` alone cannot:
+//! One marker earns its place on a line, answering a question `app_version`
+//! alone cannot:
 //!
-//! - **`unpinned`** — the source is a branch, so what "installed from there"
-//!   means moves under the app. The trust posture defaults to a tag or a
-//!   commit and allows a branch only if it is *reported* (design source:
-//!   `../TFSAppWorkstation/.project/hub/004-app-sources-and-versioning.md` §6).
 //! - **`changed since install`** — the source tree no longer hashes to what was
 //!   recorded when it was installed, which is the case of a developer who
 //!   edited their project and did not bump `app_version`. Shown only when the
@@ -23,7 +19,7 @@
 use crate::{
     cli::{EXIT_FAILED, EXIT_OK},
     paths::Paths,
-    registry::{self, ReferenceKind, Registry, Source},
+    registry::{self, Registry, Source},
     source::{self, Revision},
 };
 
@@ -117,9 +113,6 @@ fn describe_source(
     }
 
     let mut markers = Vec::new();
-    if source.reference_kind == Some(ReferenceKind::Branch) {
-        markers.push("unpinned");
-    }
     if let Revision::At(current) = revision(source) {
         if current != installed_revision {
             markers.push("changed since install");

@@ -66,6 +66,7 @@ fn registered(id: &str, location: &str) -> RegistryEntry {
             location: location.to_string(),
             reference: None,
             reference_kind: None,
+            index: None,
         },
         app_version: "0.6.0".to_string(),
         source_revision: "sha256:deadbeef".to_string(),

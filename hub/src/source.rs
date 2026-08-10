@@ -63,36 +63,43 @@ pub fn current_revision(source: &Source) -> Revision {
             // can this source be compared against what was installed?
             Err(_) => Revision::Unreachable,
         },
-        // No git source can exist yet (the installer resolves local paths
-        // only), and asking a remote for its head would put a network call
-        // inside `list`. The git sources plan gives this arm a real answer.
-        SourceKind::Git => Revision::Unreachable,
+        // No release source can exist yet (the installer resolves local
+        // paths only), and asking a forge for its latest release would put a
+        // network call inside `list`. Step 4 of this plan gives this arm a
+        // real answer — see its own updated comment there.
+        SourceKind::Release => Revision::Unreachable,
     }
 }
 
 /// What a `<source>` argument names, decided from the string alone.
 ///
-/// An enum from day one, with the git variant left **unimplemented rather than
-/// unanticipated**: the git sources plan then reduces to "fetch a remote into a
-/// local directory" in front of a pipeline that already works, and neither the
-/// registry's shape nor the installer's steps have to move.
+/// An enum from day one, with the release variant left **unimplemented rather
+/// than unanticipated**: the remote-sources plan then reduces to "fetch a
+/// release into a local directory" in front of a pipeline that already works,
+/// and neither the registry's shape nor the installer's steps have to move.
+/// `classify` does not yet learn the full grammar table
+/// (`../plan/018-remote-sources-releases.md`'s Overview) — that, and the
+/// `index` this carries, land in this plan's step 4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     LocalPath(PathBuf),
-    Git(String),
+    Release { index: Option<String>, repo: String },
 }
 
 /// Which kind of source `spec` is, without touching the filesystem.
 ///
 /// The test is on the *string*, not on what exists on disk: a URL that happens
-/// to name no directory must still be reported as a git source someone cannot
-/// use yet, never as a missing local path — the two errors send a reader in
-/// opposite directions. Anything that is not recognisably a remote is a local
-/// path, so a plain relative directory needs no scheme and no flag.
+/// to name no directory must still be reported as a release source someone
+/// cannot use yet, never as a missing local path — the two errors send a
+/// reader in opposite directions. Anything that is not recognisably a remote
+/// is a local path, so a plain relative directory needs no scheme and no flag.
 pub fn classify(spec: &str) -> Origin {
     let remote = spec.contains("://") || spec.starts_with("git@") || spec.ends_with(".git");
     match remote {
-        true => Origin::Git(spec.to_string()),
+        true => Origin::Release {
+            index: None,
+            repo: spec.to_string(),
+        },
         false => Origin::LocalPath(PathBuf::from(spec)),
     }
 }
@@ -151,23 +158,44 @@ pub fn resolve(origin: &Origin, reference: Option<&str>) -> Result<Resolved, Sou
                     // provenance nobody asked for.
                     reference: None,
                     reference_kind: None,
+                    index: None,
                 },
                 root,
                 revision,
             })
         }
-        Origin::Git(url) => Err(SourceError::GitNotImplemented { url: url.clone() }),
+        // The release client lands in this plan's step 2, and the fetch in
+        // step 4 — until then every release source refuses the same way,
+        // whatever `--ref` was passed.
+        Origin::Release { repo, .. } => {
+            Err(SourceError::ReleaseNotImplemented { repo: repo.clone() })
+        }
     }
 }
 
 /// Why a source could not be turned into a directory.
 #[derive(Debug)]
 pub enum SourceError {
-    Missing { path: PathBuf },
-    NotADirectory { path: PathBuf },
-    Unreadable { path: PathBuf, source: io::Error },
-    ReferenceOnLocalPath { reference: String },
-    GitNotImplemented { url: String },
+    Missing {
+        path: PathBuf,
+    },
+    NotADirectory {
+        path: PathBuf,
+    },
+    Unreadable {
+        path: PathBuf,
+        source: io::Error,
+    },
+    ReferenceOnLocalPath {
+        reference: String,
+    },
+    /// A spec the grammar table recognises as a release, but that this hub
+    /// cannot fetch yet — `../plan/018-remote-sources-releases.md`'s step 4
+    /// replaces every caller of this arm with a real fetch, and the variant
+    /// goes with it.
+    ReleaseNotImplemented {
+        repo: String,
+    },
 }
 
 impl fmt::Display for SourceError {
@@ -188,9 +216,9 @@ impl fmt::Display for SourceError {
                 "--ref {reference} selects a revision of a git source; a local \
                  directory is installed as it stands"
             ),
-            Self::GitNotImplemented { url } => write!(
+            Self::ReleaseNotImplemented { repo } => write!(
                 formatter,
-                "{url} is a git source, and the hub cannot resolve one yet. \
+                "{repo} is a release source, and the hub cannot resolve one yet. \
                  Clone it yourself and install the clone's directory."
             ),
         }
