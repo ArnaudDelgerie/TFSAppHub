@@ -130,50 +130,56 @@ pub struct RegistryEntry {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Source {
     pub kind: SourceKind,
-    /// A filesystem path for a local source, a URL for a git one.
+    /// A filesystem path for a local source. For a release, the index's own
+    /// key for the app — today that is `owner/repo`, the forge acting as its
+    /// own index (see [`Source::index`]).
     pub location: String,
-    /// The selector, when there is one: a tag, a commit, or a branch. A plain
-    /// directory has none. Named `ref` in the file, since that is what it is,
-    /// and `reference` in Rust, where `ref` is a keyword.
+    /// The selector, when there is one: a tag. A plain directory has none.
+    /// Named `ref` in the file, since that is what it is, and `reference` in
+    /// Rust, where `ref` is a keyword.
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
-    /// What that selector *is*, recorded by whoever resolved it.
-    ///
-    /// A bare string cannot say whether `main` names a branch or a tag, and
-    /// that is precisely the question `list`'s `unpinned` marker answers — the
-    /// trust posture defaults to a tag or a commit and allows a branch only if
-    /// it is reported as unpinned (design source: `004-app-sources-and-
-    /// versioning.md` §6). Recorded now, while nothing is installed anywhere,
-    /// rather than retrofitted later into users' registries.
+    /// What that selector *is*, recorded by whoever resolved it. Every release
+    /// records `Tag` — there is no other kind of selector a release resolver
+    /// can produce.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_kind: Option<ReferenceKind>,
+    /// Which index resolved this release — `"github"` today, the forge acting
+    /// as its own index. `hub/004` §6 requires recording *which index an app
+    /// came from*, not a resolved URL, since revocation and refresh cannot be
+    /// added later over a field that only remembers a download link. `None`
+    /// for a local source, which has no index at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
 }
 
 /// What a source's `ref` selects.
 ///
-/// Only `Branch` carries a consequence today — it is the one that moves under
-/// an installed app, and so the one `list` marks unpinned. The other two are
-/// spelled out rather than left as "not a branch" so a reader of the file can
-/// tell a resolver that knew a tag from one that recorded nothing.
+/// `Tag` is the only kind a release resolver ever produces — spelled out
+/// rather than left implicit so a reader of the file can tell a resolver that
+/// recorded a selector from one that recorded nothing. `Commit` is declared
+/// but resolved by nobody yet, kept for the same reason `SourceKind::Release`
+/// once was: an enum grown ahead of its resolver rather than retrofitted into
+/// users' registries later.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReferenceKind {
     Tag,
     Commit,
-    Branch,
 }
 
 /// The source kinds the hub anticipates.
 ///
-/// `Git` is declared here but resolved by nobody yet: the design settled on a
-/// small enum from day one, with the git variant *left unimplemented rather
-/// than unanticipated*, so that adding it later is a new resolver and not a new
-/// registry format.
+/// A remote source is always a **release** (`../decision/002-remote-sources-
+/// are-releases.md`): no git client, no branch, no arbitrary commit. The hub
+/// resolves a tag through the forge's release API, verifies the published
+/// archive, and installs the extracted tree exactly as it would a local
+/// directory.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SourceKind {
     LocalPath,
-    Git,
+    Release,
 }
 
 /// Whether an installed app is usable as it stands.

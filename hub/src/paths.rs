@@ -74,6 +74,13 @@ pub const DESKTOP_ENTRY_EXTENSION: &str = "desktop";
 /// The registry file's name under the hub root.
 pub const REGISTRY_FILE: &str = "registry.json";
 
+/// Where a remote source's archive is downloaded, verified and extracted
+/// before anything reaches `apps/` (`../plan/018-remote-sources-releases.md`'s
+/// step 4). Under the hub's own root and not `/tmp`, so a multi-hundred-
+/// megabyte archive lands on the same filesystem `apps/<id>/` is about to
+/// receive it.
+pub const SCRATCH_DIR: &str = "scratch";
+
 /// The registry's lock file, kept beside it rather than being the file itself
 /// so the lock's lifetime never depends on the registry being rewritten — the
 /// same separation `core`'s `process::lock_path` makes for the sidecar pid
@@ -191,6 +198,23 @@ impl Paths {
     /// `<OS data dir>/TFSApp/hub/registry.lock`.
     pub fn registry_lock_path(&self) -> PathBuf {
         self.hub_root().join(REGISTRY_LOCK_FILE)
+    }
+
+    /// `<OS data dir>/TFSApp/hub/scratch/<pid>/` — this process's own
+    /// scratch space for one `install` or `update` of a remote source.
+    ///
+    /// Keyed by this process's pid rather than the `id` being installed:
+    /// resolving a remote source runs *before* an `id` is even chosen — the
+    /// manifest that would name one lives inside the archive being fetched —
+    /// so a pid is the uniqueness two concurrently running `install`/`update`
+    /// invocations already have for free, at no extra cost. The caller
+    /// creates it if a remote fetch needs it and removes it when the command
+    /// ends, on success or on failure; nothing here creates it, matching
+    /// every other path-only method above.
+    pub fn scratch_dir(&self) -> PathBuf {
+        self.hub_root()
+            .join(SCRATCH_DIR)
+            .join(std::process::id().to_string())
     }
 
     /// `<OS data dir>/TFSApp/<identifier>/` — the app's own data dir, byte for

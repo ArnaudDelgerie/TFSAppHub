@@ -66,6 +66,7 @@ fn registered(id: &str, location: &str) -> RegistryEntry {
             location: location.to_string(),
             reference: None,
             reference_kind: None,
+            index: None,
         },
         app_version: "0.6.0".to_string(),
         source_revision: "sha256:deadbeef".to_string(),
@@ -928,4 +929,169 @@ fn no_desktop_entry_writes_neither_the_entry_nor_the_copy() {
         !paths.hub_executable_path().exists(),
         "--no-desktop-entry must not leave a self-copy behind either"
     );
+}
+
+/// A source archive `install_into`'s `Origin::Release` arm can actually
+/// extract: one top-level directory holding the same minimal tree
+/// `app_tree` writes to disk, built straight into memory as a `.tar.gz`.
+fn fixture_release_archive(top_level: &str) -> Vec<u8> {
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::fast(),
+    ));
+
+    let mut dir_header = tar::Header::new_gnu();
+    dir_header.set_entry_type(tar::EntryType::Directory);
+    dir_header.set_size(0);
+    dir_header.set_mode(0o755);
+    dir_header
+        .set_path(format!("{top_level}/"))
+        .expect("a dir path");
+    dir_header.set_cksum();
+    builder
+        .append(&dir_header, std::io::empty())
+        .expect("append the top-level dir");
+
+    let manifest = r#"{
+        "product_name": "Demo App",
+        "identifier": "dev.local.demo",
+        "project_name": "demo",
+        "app_version": "0.6.0"
+    }"#;
+    append_archive_file(
+        &mut builder,
+        &format!("{top_level}/tfsapp.config.json"),
+        manifest.as_bytes(),
+    );
+    append_archive_file(&mut builder, &format!("{top_level}/composer.json"), b"{}");
+    append_archive_file(
+        &mut builder,
+        &format!("{top_level}/bin/console"),
+        b"#!/usr/bin/env php\n",
+    );
+    append_archive_file(
+        &mut builder,
+        &format!("{top_level}/public/index.php"),
+        b"<?php",
+    );
+
+    builder
+        .into_inner()
+        .expect("finish the tar layer")
+        .finish()
+        .expect("finish the gzip layer")
+}
+
+fn append_archive_file(
+    builder: &mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>,
+    path: &str,
+    content: &[u8],
+) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(content.len() as u64);
+    header.set_mode(0o644);
+    header.set_path(path).expect("a valid file path");
+    header.set_cksum();
+    builder.append(&header, content).expect("append a file");
+}
+
+/// A `tiny_http` server that answers the three requests resolving one
+/// release makes, in whatever order they arrive — its metadata, its archive,
+/// and its checksums — then stops. `release_tests.rs`'s own `stub_once`
+/// answers a single request; a release resolution is three.
+fn stub_release(
+    repo: &str,
+    tag: &str,
+    archive_name: &str,
+    archive_bytes: Vec<u8>,
+) -> (String, std::thread::JoinHandle<()>) {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(&archive_bytes);
+    let checksums_body = format!("{:x}  {archive_name}\n", hasher.finalize());
+
+    let server = tiny_http::Server::http("127.0.0.1:0").expect("a local stub server");
+    let port = match server.server_addr() {
+        tiny_http::ListenAddr::IP(address) => address.port(),
+        other => panic!("unexpected listen address: {other:?}"),
+    };
+    let base_url = format!("http://127.0.0.1:{port}");
+    let release_path = format!("/repos/{repo}/releases/latest");
+    let archive_path = format!("/assets/{archive_name}");
+    let release_body = format!(
+        r#"{{"tag_name": "{tag}", "html_url": "{base_url}/releases/tag/{tag}", "assets": [
+            {{"name": "{archive_name}", "browser_download_url": "{base_url}{archive_path}", "size": {archive_size}}},
+            {{"name": "SHA256SUMS.txt", "browser_download_url": "{base_url}/assets/SHA256SUMS.txt", "size": {sums_size}}}
+        ]}}"#,
+        archive_size = archive_bytes.len(),
+        sums_size = checksums_body.len(),
+    );
+
+    let handle = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let request = server.recv().expect("a request");
+            let url = request.url().to_string();
+            if url == release_path {
+                let header =
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .expect("a valid header");
+                request
+                    .respond(
+                        tiny_http::Response::from_string(release_body.clone()).with_header(header),
+                    )
+                    .expect("respond with the release");
+            } else if url == archive_path {
+                request
+                    .respond(tiny_http::Response::from_data(archive_bytes.clone()))
+                    .expect("respond with the archive");
+            } else if url == "/assets/SHA256SUMS.txt" {
+                request
+                    .respond(tiny_http::Response::from_string(checksums_body.clone()))
+                    .expect("respond with the checksums");
+            } else {
+                request
+                    .respond(tiny_http::Response::from_string("not found").with_status_code(404))
+                    .expect("respond 404");
+            }
+        }
+    });
+
+    (base_url, handle)
+}
+
+#[test]
+fn an_install_from_a_remote_release_reaches_ready() {
+    if !resources_present() {
+        return;
+    }
+    let (_base, paths) = temp_paths();
+    let archive = fixture_release_archive("demo-0.6.0");
+    let (base_url, handle) = stub_release("example/demo", "v0.6.0", "demo-0.6.0.tar.gz", archive);
+    let scratch = tempfile::tempdir().expect("a scratch dir");
+
+    let id = super::install_into(
+        &paths,
+        scratch.path(),
+        &base_url,
+        "github:example/demo",
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("it installs");
+    handle.join().expect("the stub thread finishes");
+
+    assert_eq!(id.as_deref(), Some("demo"));
+
+    let registry = crate::registry::load(&paths).expect("a readable registry");
+    let entry = registry.get("demo").expect("a registered entry");
+    assert_eq!(entry.state, State::Ready);
+    assert_eq!(entry.source.kind, SourceKind::Release);
+    assert_eq!(entry.source.location, "example/demo");
+    assert_eq!(entry.source.reference.as_deref(), Some("v0.6.0"));
+    assert_eq!(entry.source.index.as_deref(), Some("github"));
 }

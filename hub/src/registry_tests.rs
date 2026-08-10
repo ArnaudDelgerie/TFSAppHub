@@ -26,6 +26,7 @@ fn entry(id: &str) -> RegistryEntry {
             location: format!("/home/arnaud/Dev/{id}"),
             reference: None,
             reference_kind: None,
+            index: None,
         },
         app_version: "0.6.0".to_string(),
         source_revision: "sha256:deadbeef".to_string(),
@@ -46,10 +47,11 @@ fn a_registry_survives_a_write_and_a_read() {
     registry.upsert(entry("tfsapp-test"));
     registry.upsert(RegistryEntry {
         source: Source {
-            kind: SourceKind::Git,
-            location: "https://github.com/example/app".to_string(),
+            kind: SourceKind::Release,
+            location: "example/app".to_string(),
             reference: Some("v1.4.0".to_string()),
             reference_kind: Some(ReferenceKind::Tag),
+            index: Some("github".to_string()),
         },
         app_port: None,
         state: State::NeedsRevalidation,
@@ -109,10 +111,11 @@ fn the_file_on_disk_uses_the_names_the_design_settled_on() {
     registry.upsert(RegistryEntry {
         state: State::NeedsRevalidation,
         source: Source {
-            kind: SourceKind::Git,
-            location: "https://github.com/example/app".to_string(),
+            kind: SourceKind::Release,
+            location: "example/app".to_string(),
             reference: Some("v1.4.0".to_string()),
             reference_kind: Some(ReferenceKind::Tag),
+            index: Some("github".to_string()),
         },
         ..entry("tfsapp-test")
     });
@@ -120,12 +123,11 @@ fn the_file_on_disk_uses_the_names_the_design_settled_on() {
     let (raw, json) = saved_json(&paths, &registry);
 
     let app = &json["apps"][0];
-    assert_eq!(app["source"]["kind"].as_str(), Some("git"));
+    assert_eq!(app["source"]["kind"].as_str(), Some("release"));
     // `ref` in the file, `reference` in Rust, where `ref` is a keyword.
     assert_eq!(app["source"]["ref"].as_str(), Some("v1.4.0"));
-    // What that ref *is*, which is the question `list`'s unpinned marker asks
-    // and a bare string cannot answer.
     assert_eq!(app["source"]["reference_kind"].as_str(), Some("tag"));
+    assert_eq!(app["source"]["index"].as_str(), Some("github"));
     assert_eq!(app["state"].as_str(), Some("needs-revalidation"));
     assert_eq!(json["hub_version"].as_str(), Some("0.1.0"));
     assert_eq!(json["platform"]["php_version"].as_str(), Some("8.5"));
@@ -151,6 +153,7 @@ fn a_local_source_writes_its_kind_and_no_ref() {
     );
     assert!(json["apps"][0]["source"].get("ref").is_none());
     assert!(json["apps"][0]["source"].get("reference_kind").is_none());
+    assert!(json["apps"][0]["source"].get("index").is_none());
 }
 
 #[test]

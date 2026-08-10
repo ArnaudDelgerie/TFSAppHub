@@ -228,6 +228,7 @@ mod registry {
                 location: "/home/arnaud/Dev/Demo".to_string(),
                 reference: None,
                 reference_kind: None,
+                index: None,
             },
             app_version: "0.6.0".to_string(),
             source_revision: "sha256:deadbeef".to_string(),

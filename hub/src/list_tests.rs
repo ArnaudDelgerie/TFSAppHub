@@ -19,6 +19,7 @@ fn entry(id: &str) -> RegistryEntry {
             location: format!("/home/arnaud/Dev/{id}"),
             reference: None,
             reference_kind: None,
+            index: None,
         },
         app_version: "0.6.0".to_string(),
         source_revision: INSTALLED.to_string(),
@@ -122,37 +123,20 @@ fn an_unreachable_source_says_nothing_rather_than_a_false_stale() {
 }
 
 #[test]
-fn a_branch_source_is_reported_unpinned() {
-    // Allowed, but never silently: what "installed from there" means moves
-    // under the app.
+fn a_release_source_shows_its_tag_and_nothing_off_about_it() {
     let mut entry = entry("demo");
     entry.source = Source {
-        kind: SourceKind::Git,
-        location: "https://example.test/demo.git".to_string(),
-        reference: Some("main".to_string()),
-        reference_kind: Some(ReferenceKind::Branch),
-    };
-
-    let text = render(&registry([entry]), unchanged);
-
-    assert!(text.contains("demo.git@main"), "{text}");
-    assert!(text.contains("unpinned"), "{text}");
-}
-
-#[test]
-fn a_tag_source_is_pinned_and_unremarked() {
-    let mut entry = entry("demo");
-    entry.source = Source {
-        kind: SourceKind::Git,
-        location: "https://example.test/demo.git".to_string(),
+        kind: SourceKind::Release,
+        location: "owner/demo".to_string(),
         reference: Some("v1.4.0".to_string()),
         reference_kind: Some(ReferenceKind::Tag),
+        index: Some("github".to_string()),
     };
 
     let text = render(&registry([entry]), unchanged);
 
-    assert!(text.contains("demo.git@v1.4.0"), "{text}");
-    assert!(!text.contains("unpinned"), "{text}");
+    assert!(text.contains("owner/demo@v1.4.0"), "{text}");
+    assert!(!text.contains('('), "no markers on a quiet app: {text:?}");
 }
 
 #[test]

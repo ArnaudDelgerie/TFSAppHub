@@ -68,7 +68,8 @@ configure the infrastructure.**
 ## 1. What an app must provide
 
 A TFSApp is a Symfony project directory. The hub is pointed at one — a local
-path, or a git repository it clones — and that directory must contain:
+path, or a published release it downloads over HTTPS (see "Publishing a
+release" below) — and that directory must contain:
 
 ```
 path/to/project/
@@ -123,6 +124,33 @@ read-only from the app's point of view: the database, cache, sessions, logs and
 secrets all go to a per-app data directory the hub provides and names in the
 environment (§3, §5). A project that writes into its own `var/` will find that
 directory belongs to the installed snapshot, and that an update replaces it.
+
+### Publishing a release
+
+Everything above is what an app needs to be installed from a local path or a
+clone. **To be installable remotely** —
+`tfsapp-hub install github:owner/repo` — it needs one more thing: a published
+release. An app that never publishes one is not in breach of anything; it
+stays local-only, installed from a directory or a clone, for as long as its
+author wants.
+
+A release is, on the app's own forge repository:
+
+- a tag `v<app_version>` — `--ref` selects a release this way, never a branch
+  or a commit;
+- an asset named `<project_name>-<app_version>.tar.gz`, holding the source
+  tree at that tag exactly as it stands: no `vendor/`, `var/`, `node_modules/`
+  or `.git/`, built frontend assets committed like any other file — the same
+  tree a local install would copy, so no step of the pipeline gets a remote
+  special case;
+- a `SHA256SUMS.txt` beside it, one `<sha256>  <filename>` line naming the
+  archive, checked before a single byte of it reaches the app root;
+- a `## <version>` heading in `CHANGELOG.md` naming what changed.
+
+All four are reachable by hand — a forge's web UI needs nothing more than
+`git archive` and `sha256sum` to publish one. `tfsapp-hub publish
+path/to/project` automates exactly this sequence and is the convenience, never
+the requirement.
 
 ---
 
@@ -295,9 +323,14 @@ no alias lists them back, naming each one's command and whether it is
 
 Unknown top-level keys are warned about and ignored (see "Standing rules"). One
 key escapes that warning without being part of this contract: `releases_repo`,
-which meant something to the archived per-app packaging route and may still sit
-in manifests written against it. The hub accepts it silently and does nothing
-with it. It has no release feed to point at; an app asks about its own updates
+which named the forge repository an app's release lived on for the archived
+per-app packaging route, and may still sit in manifests written against it.
+The hub accepts it silently and does nothing with it — deliberately, not for
+lack of a use: `tfsapp-hub update <id>` resolves what its own registry
+recorded at install time, never a location read out of the source it is about
+to replace. A manifest that could redirect its own future updates would let
+one good release permanently steer every machine that ever installed it. Only
+what the hub itself wrote may steer a fetch; an app asks about its own updates
 through §7, and how an update is *applied* belongs to the host.
 
 ---
@@ -994,12 +1027,15 @@ answer successfully with `status: "unavailable"` rather than throwing, which is
 what lets an app call this on a timer without wrapping it in exception handling.
 
 **Today the hub always answers `unavailable`,** with the reason above: it
-resolves updates itself, through `tfsapp-hub update <id>`, and has no release
-feed to point an app at. The real answer needs the remote-sources resolver
-(queued, `000-index.md`) so a git source's own newest tag can be compared
-against; until then the honest `unavailable` is served over both transports,
-so an app writes its handling once and never learns that anything is
-missing.
+resolves updates itself, through `tfsapp-hub update <id>`. A release-installed
+app does have a feed to compare against now, but a true answer needs a cache
+policy for a check the contract lets an app poll on a timer, a single
+behaviour across how an app was installed (a local install has no feed at
+all), and the handoff that closes the app's window, runs the update and
+reopens it — three things to design together, which is why that answer is its
+own plan (queued, `000-index.md`) rather than a follow-up commit. Until it
+lands, the honest `unavailable` is served over both transports, so an app
+writes its handling once and never learns that anything is missing.
 
 ### The bridge wire contract
 

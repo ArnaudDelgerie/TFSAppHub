@@ -40,7 +40,8 @@ use crate::{
     php::{self, PhpError, Toolchain},
     platform::{self, PlatformError},
     prompt,
-    registry::{self, Registry, RegistryEntry, RegistryError, State},
+    registry::{self, Registry, RegistryEntry, RegistryError, SourceKind, State},
+    release,
     source::{self, SourceError},
 };
 
@@ -105,7 +106,48 @@ pub(crate) fn install(
     no_desktop_entry: bool,
     hub_version: &str,
 ) -> Result<Option<String>, InstallError> {
-    let resolved = source::resolve(&source::classify(source), reference)?;
+    // Named once here rather than resolved deeper in: a release downloads and
+    // extracts into it before this function even knows the app's `id` (that
+    // comes from a manifest inside the very archive being fetched), and
+    // whatever happens below, it is removed on the way out — success,
+    // decline or error alike. A local source never touches it.
+    let scratch = paths.scratch_dir();
+    let result = install_into(
+        paths,
+        &scratch,
+        release::GITHUB_API_BASE,
+        source,
+        id,
+        reference,
+        assume_yes,
+        no_desktop_entry,
+        hub_version,
+    );
+    let _ = fs::remove_dir_all(&scratch);
+    result
+}
+
+/// [`install`]'s pipeline, against `base_url` instead of GitHub's real API —
+/// the seam `install_tests.rs` uses to run a whole install against a local
+/// stub (`source::resolve`'s own doc). Production always calls this with
+/// [`release::GITHUB_API_BASE`], through [`install`] above.
+///
+/// `pub(crate)` rather than private, matching [`install`]: `update_tests.rs`'s
+/// own remote-source tests reuse it to seed an app installed from a stub
+/// release, rather than reimplementing that fixture a second time.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_into(
+    paths: &Paths,
+    scratch: &Path,
+    base_url: &str,
+    source: &str,
+    id: Option<&str>,
+    reference: Option<&str>,
+    assume_yes: bool,
+    no_desktop_entry: bool,
+    hub_version: &str,
+) -> Result<Option<String>, InstallError> {
+    let resolved = source::resolve(&source::classify(source), reference, scratch, base_url)?;
     let loaded = validate(&resolved.root)?;
     // Before anything is written, so a typo in a key is read next to the source
     // it came from rather than after a hundred megabytes of copying.
@@ -254,6 +296,20 @@ fn announce(
         manifest.product_name, manifest.app_version
     );
     println!("  from      {}", resolved.root.display());
+    // Named here rather than left implicit: by the time this prints,
+    // `source::resolve` has already downloaded and checked the archive
+    // against `SHA256SUMS.txt` — a mismatch would have refused before
+    // `announce` was ever reached — so this is the trust prompt's one chance
+    // to say which release that was and that it already passed, before the
+    // user is asked to run its Composer install and lifecycle commands.
+    if resolved.source.kind == SourceKind::Release {
+        if let Some(tag) = &resolved.source.reference {
+            println!(
+                "  release   {}@{tag} — checksum verified against SHA256SUMS.txt",
+                resolved.source.location
+            );
+        }
+    }
     println!("  into      {}", app_dir.display());
     println!(
         "  data dir  {}",

@@ -29,6 +29,7 @@ fn entry(id: &str, state: State) -> RegistryEntry {
             location: format!("/home/arnaud/Dev/{id}"),
             reference: None,
             reference_kind: None,
+            index: None,
         },
         app_version: "0.6.0".to_string(),
         source_revision: "sha256:deadbeef".to_string(),

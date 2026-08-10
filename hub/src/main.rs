@@ -6,6 +6,7 @@
 // `cli.rs` stay at ~215 lines across sixty plans.
 
 mod app_env;
+mod archive;
 mod bridge;
 mod cli;
 mod desktop;
@@ -23,6 +24,7 @@ mod php;
 mod platform;
 mod prompt;
 mod registry;
+mod release;
 mod remove;
 mod rollback;
 mod run;

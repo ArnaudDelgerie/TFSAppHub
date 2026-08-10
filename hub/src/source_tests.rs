@@ -6,6 +6,11 @@ use std::{
 use super::{classify, current_revision, resolve, tree_hash, Origin, Revision, SourceError};
 use crate::registry::{Source, SourceKind};
 
+/// None of this file's `resolve` calls reach the `Origin::Release` arm — every
+/// case here is a local path or a git spelling — so a real base URL is never
+/// dialed; this just has to be *some* string.
+const UNUSED_BASE_URL: &str = "http://unused.invalid";
+
 fn project(root: &Path) {
     fs::create_dir_all(root.join("src")).expect("a source dir");
     fs::write(root.join("tfsapp.config.json"), "{}").expect("a manifest");
@@ -18,6 +23,7 @@ fn local(location: &Path) -> Source {
         location: location.display().to_string(),
         reference: None,
         reference_kind: None,
+        index: None,
     }
 }
 
@@ -120,14 +126,15 @@ fn a_local_source_that_is_gone_is_unreachable_not_an_error() {
 }
 
 #[test]
-fn a_git_source_is_unreachable_until_something_resolves_one() {
+fn a_release_source_is_unreachable_until_something_resolves_one() {
     // `list` must not put a network call behind a listing, and no installer
-    // writes a git source yet. Silence is the honest answer.
+    // writes a release source yet. Silence is the honest answer.
     let source = Source {
-        kind: SourceKind::Git,
-        location: "https://example.test/demo.git".to_string(),
+        kind: SourceKind::Release,
+        location: "example/demo".to_string(),
         reference: Some("v1.4.0".to_string()),
         reference_kind: None,
+        index: Some("github".to_string()),
     };
 
     assert_eq!(current_revision(&source), Revision::Unreachable);
@@ -135,24 +142,49 @@ fn a_git_source_is_unreachable_until_something_resolves_one() {
 
 #[test]
 fn a_string_is_classified_without_touching_the_disk() {
-    // The test is on the string on purpose: a URL that names no directory must
-    // be reported as a git source nobody can use yet, never as a missing local
-    // path — the two errors send a reader in opposite directions.
-    for remote in [
-        "https://github.com/example/demo.git",
+    // git-clone spellings — recognised only so `resolve` can refuse them
+    // well, pointing at the release form instead of a mystifying "no such
+    // directory".
+    for spec in [
         "git@github.com:example/demo",
-        "ssh://git@example.test/demo",
+        "git@github.com:example/demo.git",
+        "https://github.com/example/demo.git",
+        "https://example.test/demo.git",
         "/does/not/exist.git",
     ] {
         assert_eq!(
-            classify(remote),
-            Origin::Git(remote.to_string()),
-            "{remote}"
+            classify(spec),
+            Origin::GitSpelling(spec.to_string()),
+            "{spec}"
         );
     }
 
-    for local in ["../TFSAppTest", "/home/arnaud/Dev/Demo", "."] {
-        assert_eq!(classify(local), Origin::LocalPath(PathBuf::from(local)));
+    // The canonical release form, and the https spelling it normalises to it.
+    let canonical = Origin::Release {
+        index: Some("github".to_string()),
+        repo: "example/demo".to_string(),
+    };
+    assert_eq!(classify("github:example/demo"), canonical);
+    assert_eq!(classify("https://github.com/example/demo"), canonical);
+    assert_eq!(classify("https://github.com/example/demo/"), canonical);
+
+    // Anything else — including a github.com URL carrying more than
+    // owner/repo, and a non-GitHub URL this hub has no grammar row for — is a
+    // local path, as always: the two errors a bad one produces (missing vs.
+    // not-a-release) send a reader in opposite directions, so guessing wrong
+    // here would be worse than a plain "no such directory".
+    for local in [
+        "../TFSAppTest",
+        "/home/arnaud/Dev/Demo",
+        ".",
+        "ssh://git@example.test/demo",
+        "https://github.com/example/demo/tree/main",
+    ] {
+        assert_eq!(
+            classify(local),
+            Origin::LocalPath(PathBuf::from(local)),
+            "{local}"
+        );
     }
 }
 
@@ -164,9 +196,15 @@ fn a_local_directory_resolves_to_an_absolute_path_and_its_revision() {
     let root = tempfile::tempdir().expect("a temp dir");
     project(root.path());
     let roundabout = root.path().join("src").join("..");
+    let scratch = tempfile::tempdir().expect("a scratch dir");
 
-    let resolved =
-        resolve(&classify(&roundabout.display().to_string()), None).expect("it resolves");
+    let resolved = resolve(
+        &classify(&roundabout.display().to_string()),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .expect("it resolves");
 
     assert!(resolved.root.is_absolute(), "{}", resolved.root.display());
     assert_eq!(
@@ -189,32 +227,48 @@ fn a_local_directory_resolves_to_an_absolute_path_and_its_revision() {
 fn a_source_that_cannot_be_installed_says_which_kind_of_problem_it_is() {
     let root = tempfile::tempdir().expect("a temp dir");
     project(root.path());
+    let scratch = tempfile::tempdir().expect("a scratch dir");
 
-    let error = resolve(&classify("/no/such/project"), None).expect_err("it is missing");
+    let error = resolve(
+        &classify("/no/such/project"),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .expect_err("it is missing");
     assert!(matches!(error, SourceError::Missing { .. }), "{error}");
 
     let file = root.path().join("tfsapp.config.json");
-    let error = resolve(&classify(&file.display().to_string()), None)
-        .expect_err("a manifest is not a project root");
+    let error = resolve(
+        &classify(&file.display().to_string()),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .expect_err("a manifest is not a project root");
     assert!(
         matches!(error, SourceError::NotADirectory { .. }),
         "{error}"
     );
 
-    // Recognised, anticipated, and not available: the message says what to do
-    // instead rather than looking like a typo.
-    let error = resolve(&classify("https://example.test/demo.git"), None)
-        .expect_err("git sources wait for their own plan");
-    assert!(
-        matches!(error, SourceError::GitNotImplemented { .. }),
-        "{error}"
-    );
+    // Recognised, and refused well: the message points at the release form
+    // instead of looking like a typo'd local path.
+    let error = resolve(
+        &classify("https://example.test/demo.git"),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .expect_err("a git clone URL is not a release spec");
+    assert!(matches!(error, SourceError::GitSpelling { .. }), "{error}");
 
     // `--ref` selects a revision, and a directory has none — accepting it
     // silently would record a selector that resolved nothing.
     let error = resolve(
         &classify(&root.path().display().to_string()),
         Some("v1.4.0"),
+        scratch.path(),
+        UNUSED_BASE_URL,
     )
     .expect_err("a directory has no ref");
     assert!(

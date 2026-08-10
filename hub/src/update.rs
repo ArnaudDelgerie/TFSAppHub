@@ -33,6 +33,7 @@ use crate::{
     platform::{self, PlatformError},
     prompt,
     registry::{self, RegistryEntry, RegistryError, Source, SourceKind},
+    release,
     source::{self, Origin, SourceError},
 };
 
@@ -196,13 +197,46 @@ pub(crate) fn update(
     assume_yes: bool,
     hub_version: &str,
 ) -> Result<bool, UpdateError> {
+    // Same reasoning as `install::install`'s own wrapper: a release
+    // downloads and extracts into it, and it is removed on the way out
+    // regardless of how this call ends. A local source never touches it.
+    let scratch = paths.scratch_dir();
+    let result = update_into(
+        paths,
+        &scratch,
+        release::GITHUB_API_BASE,
+        id,
+        reference,
+        force,
+        assume_yes,
+        hub_version,
+    );
+    let _ = fs::remove_dir_all(&scratch);
+    result
+}
+
+/// [`update`]'s pipeline, against `base_url` instead of GitHub's real API —
+/// the seam `update_tests.rs` uses to run a whole update against a local
+/// stub. Production always calls this with [`release::GITHUB_API_BASE`],
+/// through [`update`] above.
+#[allow(clippy::too_many_arguments)]
+fn update_into(
+    paths: &Paths,
+    scratch: &Path,
+    base_url: &str,
+    id: &str,
+    reference: Option<&str>,
+    force: bool,
+    assume_yes: bool,
+    hub_version: &str,
+) -> Result<bool, UpdateError> {
     let installed = registry::load(paths)?;
     let entry = installed
         .get(id)
         .ok_or_else(|| UpdateError::NotInstalled { id: id.to_string() })?
         .clone();
 
-    let resolved = source::resolve(&origin(&entry.source), reference)?;
+    let resolved = source::resolve(&origin(&entry.source), reference, scratch, base_url)?;
     let loaded = install::validate(&resolved.root)?;
     loaded.report_warnings();
     let manifest = &loaded.manifest;
@@ -251,12 +285,16 @@ pub(crate) fn update(
 /// The registry's own `Source` turned back into the [`Origin`] `source::resolve`
 /// takes. Reads the recorded `kind` rather than re-classifying the location
 /// string: a canonicalised local path would classify the same way regardless,
-/// but reading the kind is what this will need the day a git `location` (a
-/// URL) has to resolve as a git source and not be re-guessed from its string.
+/// but a release's `location` is `owner/repo`, not a spec `classify` has ever
+/// seen again — this is the day that needed a real read of the recorded kind,
+/// not a re-guess from a string.
 fn origin(source: &Source) -> Origin {
     match source.kind {
         SourceKind::LocalPath => Origin::LocalPath(PathBuf::from(&source.location)),
-        SourceKind::Git => Origin::Git(source.location.clone()),
+        SourceKind::Release => Origin::Release {
+            index: source.index.clone(),
+            repo: source.location.clone(),
+        },
     }
 }
 
@@ -381,6 +419,12 @@ fn apply(
         if let Some(existing) = registry.get_mut(id) {
             existing.app_version = manifest.app_version.clone();
             existing.source_revision = resolved.revision.clone();
+            // The freshly resolved `Source`, not just its revision: a remote
+            // source's `reference` is the tag this update actually landed
+            // on, and it moves on every successful update even when
+            // `location`/`index` do not — leaving the old tag recorded would
+            // have `list` and the next `update` both reasoning from a lie.
+            existing.source = resolved.source.clone();
             existing.platform = platform;
             existing.updated_at = now;
         }
@@ -427,6 +471,10 @@ fn resync_only(
     registry::update(paths, |registry| {
         if let Some(existing) = registry.get_mut(&entry.id) {
             existing.source_revision = resolved.revision.clone();
+            // Same reasoning as `apply`'s own registry write: a resync
+            // re-resolved the source too, and its `Source` — not only its
+            // revision — is what has to be recorded.
+            existing.source = resolved.source.clone();
             existing.updated_at = now;
         }
     })?;
