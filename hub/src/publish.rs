@@ -2,10 +2,11 @@
 //! contract (CONTRACT.md's "Publishing a release",
 //! `../decision/003-the-hub-publishes-apps.md`).
 //!
-//! Written in the gate order `../plan/019-publish-an-app.md`'s Overview table
-//! lists them: gates 1–5 are local and pure over a project directory
-//! ([`run_local_gates`]); gates 6–9 are `gh.rs`'s `Gh`; then the archive and
-//! its sums ([`build_archive`]), the announcement, the confirmation, and
+//! Written in the gate order `../plan/019-publish-an-app.md`'s (revised)
+//! Overview table lists them: gates 1–8 are local — 1, 2, 7 and 8 pure over
+//! the project directory, 3–6 one `git.rs` call each ([`run_local_gates`]);
+//! gates 9–11 are `gh.rs`'s `Gh`; then the archive and its sums
+//! ([`build_archive`]), the announcement, the confirmation, and
 //! `gh release create`. [`run`] is the command `main.rs` reaches.
 
 use std::{
@@ -17,6 +18,7 @@ use crate::{
     archive,
     cli::{EXIT_FAILED, EXIT_OK},
     gh::{Gh, GhError},
+    git::{Commit, Git, GitError},
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
     paths::Paths,
     prompt,
@@ -27,50 +29,56 @@ use crate::{
 /// The changelog's filename at the project root (CONTRACT.md §1/§7).
 pub const CHANGELOG_FILE: &str = "CHANGELOG.md";
 
-/// What gates 1–5 produce for the steps after them: the loaded manifest, the
-/// resolved `owner/repo`, and the release notes (the changelog section,
+/// What gates 1–8 produce for the steps after them: the loaded manifest, the
+/// commit [`git::Git::ensure_pushed`] proved is on the forge (which names the
+/// target repository too), and the release notes (the changelog section,
 /// verbatim).
 #[derive(Debug)]
 pub struct LocalGates {
     pub loaded: Loaded,
-    pub repo: String,
-    /// `"--repo"` or `"releases_repo"` — which of the two named [`Self::repo`],
-    /// echoed in the announcement so a manifest's stale value is never used
-    /// silently (the plan's "Which repository, and what happens to
-    /// `releases_repo`").
-    pub repo_source: &'static str,
+    pub commit: Commit,
     pub notes: String,
 }
 
-/// Run every local gate, in the Overview's order: load the manifest (1),
-/// check `app_version` is canonical semver (2), resolve the target
-/// repository (3), extract the changelog section for this version (4), and —
-/// only when `actions.secrets.ipc` is on — block on a confirmation with no
-/// `--yes` escape (5).
+/// Run every gate up to (not including) the `gh` seam, in the Overview
+/// table's order: load the manifest (1), check `app_version` is canonical
+/// semver (2), the `git` gate — a work tree, a clean project directory, a
+/// pushed upstream, and the repository it names (3–6) — extract the
+/// changelog section for this version (7), and — only when
+/// `actions.secrets.ipc` is on — block on a confirmation with no `--yes`
+/// escape (8).
 ///
-/// Nothing here touches the network: gates 6–9 (the `gh` seam) are a later
-/// step's function, run only once every gate here has passed.
+/// Nothing here touches `gh`: gates 9–11 are a later step in
+/// [`publish_into`], run only once every gate here has passed.
 pub fn run_local_gates(
     project_path: &Path,
     repo: Option<&str>,
+    git: &Git,
 ) -> Result<LocalGates, PublishError> {
     let loaded = manifest::load(project_path)?;
     // Before any further gate runs, so a typo in a key is read next to the
-    // project it came from rather than after the changelog and repository
-    // have both been resolved — the same ordering `install`'s own pipeline
-    // uses.
+    // project it came from rather than after the git and changelog gates
+    // have both run — the same ordering `install`'s own pipeline uses.
     loaded.report_warnings();
     let manifest_path = project_path.join(MANIFEST_FILE);
 
     validate_version(&loaded.manifest, &manifest_path)?;
-    let (repo, repo_source) = resolve_repo(repo, &loaded.manifest, &manifest_path)?;
+
+    if let Some(repo) = repo {
+        if !is_owner_repo_shape(repo) {
+            return Err(PublishError::InvalidRepoShape {
+                repo: repo.to_string(),
+            });
+        }
+    }
+    let commit = git.ensure_pushed(project_path, repo)?;
+
     let notes = changelog_gate(project_path, &loaded.manifest.app_version)?;
     confirm_ipc_secrets(&loaded.manifest)?;
 
     Ok(LocalGates {
         loaded,
-        repo,
-        repo_source,
+        commit,
         notes,
     })
 }
@@ -262,6 +270,7 @@ pub fn run(project_path: &str, repo: Option<&str>, assume_yes: bool) -> i32 {
         Path::new(project_path),
         repo,
         assume_yes,
+        &Git::new(),
         &Gh::new(),
     ) {
         Ok(true) => EXIT_OK,
@@ -275,20 +284,21 @@ pub fn run(project_path: &str, repo: Option<&str>, assume_yes: bool) -> i32 {
     }
 }
 
-/// The pipeline, in the Overview table's order: gates 1–5
-/// ([`run_local_gates`]), gates 6–9 (`gh`, below), the archive and its sums
+/// The pipeline, in the Overview table's order: gates 1–8
+/// ([`run_local_gates`]), gates 9–11 (`gh`, below), the archive and its sums
 /// built into scratch, the announcement, the confirmation, then
 /// `gh release create`. `false` means the user declined — everything up to
 /// that point already ran, but nothing was uploaded.
 ///
-/// Takes `Paths` and a [`Gh`] rather than resolving/constructing them,
-/// matching `update::update` — what lets the whole pipeline run in a test
-/// against a throwaway scratch directory and a fake `gh`.
+/// Takes `Paths`, a [`Git`] and a [`Gh`] rather than resolving/constructing
+/// them, matching `update::update` — what lets the whole pipeline run in a
+/// test against a throwaway scratch directory and fake `git`/`gh`.
 pub(crate) fn publish(
     paths: &Paths,
     project_path: &Path,
     repo: Option<&str>,
     assume_yes: bool,
+    git: &Git,
     gh: &Gh,
 ) -> Result<bool, PublishError> {
     // Same reasoning as `install::install`'s own wrapper: the archive and its
@@ -296,7 +306,7 @@ pub(crate) fn publish(
     // how this call ends — the hub writes nothing into the project itself
     // (the plan's "Where it is built, and what is left behind").
     let scratch = paths.scratch_dir();
-    let result = publish_into(&scratch, project_path, repo, assume_yes, gh);
+    let result = publish_into(&scratch, project_path, repo, assume_yes, git, gh);
     let _ = fs::remove_dir_all(&scratch);
     result
 }
@@ -306,16 +316,16 @@ fn publish_into(
     project_path: &Path,
     repo: Option<&str>,
     assume_yes: bool,
+    git: &Git,
     gh: &Gh,
 ) -> Result<bool, PublishError> {
-    let gates = run_local_gates(project_path, repo)?;
+    let gates = run_local_gates(project_path, repo, git)?;
     let manifest = &gates.loaded.manifest;
     let tag = format!("v{}", manifest.app_version);
 
     gh.ensure_installed()?;
     gh.ensure_authenticated()?;
-    gh.ensure_tag_pushed(&gates.repo, &tag)?;
-    gh.ensure_no_existing_release(&gates.repo, &tag)?;
+    gh.ensure_no_existing_release(&gates.commit.repo, &tag)?;
 
     let assets = build_archive(
         project_path,
@@ -336,20 +346,21 @@ fn publish_into(
     }
 
     let url = gh.create_release(
-        &gates.repo,
+        &gates.commit.repo,
         &tag,
         &notes_path,
+        &gates.commit.sha,
         &assets.archive_name,
         &assets.archive_path,
         &assets.sums_path,
     )?;
 
-    println!("Published {tag} on {}", gates.repo);
+    println!("Published {tag} on {}", gates.commit.repo);
     println!("  {url}");
     println!();
     println!(
         "Users install it with: tfsapp-hub install github:{}",
-        gates.repo
+        gates.commit.repo
     );
 
     Ok(true)
@@ -357,12 +368,16 @@ fn publish_into(
 
 /// Say what is about to be published, in the terms the user will have to
 /// reason about afterwards — `update::announce`'s counterpart for `publish`.
-/// Names where `gates.repo` came from (never uses it silently — the plan's
-/// "Which repository, and what happens to `releases_repo`"), and closes on
-/// the one sentence that is this command's residual risk: the archive is the
-/// working tree in front of the hub right now, not the tag.
+/// Names the repository, branch and commit the `git` gate proved is on the
+/// forge — a statement now, not the warning earlier revisions of this plan
+/// printed, since gates 3–6 are what makes it true.
 fn announce(gates: &LocalGates, tag: &str, assets: &Assets) {
-    println!("Repository  {} (from {})", gates.repo, gates.repo_source);
+    println!("Repository  {}", gates.commit.repo);
+    println!(
+        "Commit      {} (branch {})",
+        &gates.commit.sha[..gates.commit.sha.len().min(12)],
+        gates.commit.branch
+    );
     println!("Tag         {tag}");
     println!(
         "Archive     {} ({} bytes)",
@@ -375,11 +390,6 @@ fn announce(gates: &LocalGates, tag: &str, assets: &Assets) {
     for line in gates.notes.lines() {
         println!("  {line}");
     }
-    println!();
-    println!(
-        "This archives the working tree in front of the hub right now — not the tag {tag}. \
-         Publish from a clean checkout of the tag you just pushed."
-    );
 }
 
 /// Gate 2: `app_version` must parse as canonical semver — the value a
@@ -396,44 +406,10 @@ fn validate_version(manifest: &Manifest, manifest_path: &Path) -> Result<(), Pub
     Ok(())
 }
 
-/// Gate 3: `--repo` wins; otherwise the manifest's `releases_repo`; otherwise
-/// a refusal naming both ways to supply one. Whichever wins, its shape is
-/// checked before it is trusted any further.
-fn resolve_repo(
-    explicit: Option<&str>,
-    manifest: &Manifest,
-    manifest_path: &Path,
-) -> Result<(String, &'static str), PublishError> {
-    let (repo, source) = match explicit {
-        Some(repo) => (repo.to_string(), "--repo"),
-        None => match manifest
-            .releases_repo
-            .as_deref()
-            .map(str::trim)
-            .filter(|repo| !repo.is_empty())
-        {
-            Some(repo) => (repo.to_string(), "releases_repo"),
-            None => {
-                return Err(PublishError::NoRepository {
-                    path: manifest_path.to_path_buf(),
-                })
-            }
-        },
-    };
-
-    if !is_owner_repo_shape(&repo) {
-        return Err(PublishError::InvalidRepoShape {
-            repo,
-            source,
-            path: manifest_path.to_path_buf(),
-        });
-    }
-
-    Ok((repo, source))
-}
-
 /// Whether `repo` is exactly one non-empty `owner`, a `/`, and one non-empty
-/// `repo` — no leading, trailing or doubled slash.
+/// `repo` — no leading, trailing or doubled slash. Applied to `--repo` before
+/// it is trusted, since [`Git::ensure_pushed`]'s own remote-URL resolution
+/// produces this shape by construction and needs no second check.
 fn is_owner_repo_shape(repo: &str) -> bool {
     let mut segments = repo.split('/');
     let owner = segments.next().filter(|segment| !segment.is_empty());
@@ -441,7 +417,7 @@ fn is_owner_repo_shape(repo: &str) -> bool {
     owner.is_some() && name.is_some() && segments.next().is_none()
 }
 
-/// Gate 4: `CHANGELOG.md` must exist at the project root and carry a heading
+/// Gate 7: `CHANGELOG.md` must exist at the project root and carry a heading
 /// for `version`. The matched section becomes the release notes, verbatim.
 fn changelog_gate(project_path: &Path, version: &str) -> Result<String, PublishError> {
     let path = project_path.join(CHANGELOG_FILE);
@@ -489,7 +465,7 @@ fn changelog_section(contents: &str, version: &str) -> Option<String> {
     Some(lines[start + 1..end].join("\n").trim().to_string())
 }
 
-/// Gate 5: `actions.secrets.ipc` off is silent. On, it blocks on a
+/// Gate 8: `actions.secrets.ipc` off is silent. On, it blocks on a
 /// confirmation whose wording is carried over from the station's
 /// `release.sh` — and, deliberately, has no `--yes` escape: a release ships
 /// this setting to every user who installs it.
@@ -509,7 +485,7 @@ fn confirm_ipc_secrets(manifest: &Manifest) -> Result<(), PublishError> {
     }
 }
 
-/// Everything gates 1–5 can refuse over.
+/// Everything gates 1–11 can refuse over.
 #[derive(Debug)]
 pub enum PublishError {
     Manifest(ManifestError),
@@ -519,16 +495,13 @@ pub enum PublishError {
         version: String,
         detail: String,
     },
-    /// Neither `--repo` nor the manifest's `releases_repo` named a target.
-    NoRepository {
-        path: PathBuf,
-    },
-    /// Whichever of `--repo`/`releases_repo` won is not `owner/repo`.
+    /// `--repo` is not `owner/repo`.
     InvalidRepoShape {
         repo: String,
-        source: &'static str,
-        path: PathBuf,
     },
+    /// Gates 3–6: the project is not committed and pushed — `git.rs`'s own
+    /// taxonomy.
+    Git(GitError),
     /// No `CHANGELOG.md` at the project root at all.
     MissingChangelog {
         path: PathBuf,
@@ -558,7 +531,7 @@ pub enum PublishError {
     /// taxonomy, reported here because it is exactly as much a reason the
     /// archive could not be produced as an `Io` failure is.
     Release(ReleaseError),
-    /// Gates 6–9, or the final `gh release create`, refused — `gh.rs`'s own
+    /// Gates 9–11, or the final `gh release create`, refused — `gh.rs`'s own
     /// taxonomy.
     Gh(GhError),
 }
@@ -578,19 +551,10 @@ impl fmt::Display for PublishError {
                  (CONTRACT.md §2).",
                 path.display()
             ),
-            Self::NoRepository { path } => write!(
-                formatter,
-                "no target repository — pass --repo owner/repo, or add \"releases_repo\": \
-                 \"owner/repo\" to {} (CONTRACT.md §2).",
-                path.display()
-            ),
-            Self::InvalidRepoShape { repo, source, path } => {
-                let origin = match *source {
-                    "releases_repo" => format!("\"releases_repo\" in {}", path.display()),
-                    flag => flag.to_string(),
-                };
-                write!(formatter, "{origin} is {repo:?}, which is not owner/repo.")
+            Self::InvalidRepoShape { repo } => {
+                write!(formatter, "--repo is {repo:?}, which is not owner/repo.")
             }
+            Self::Git(error) => write!(formatter, "{error}"),
             Self::MissingChangelog { path } => write!(
                 formatter,
                 "no {CHANGELOG_FILE} found at {} — required to publish (CONTRACT.md §7).",
@@ -627,6 +591,7 @@ impl std::error::Error for PublishError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Manifest(error) => Some(error),
+            Self::Git(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             Self::Release(error) => Some(error),
             Self::Gh(error) => Some(error),
@@ -638,6 +603,12 @@ impl std::error::Error for PublishError {
 impl From<ManifestError> for PublishError {
     fn from(error: ManifestError) -> Self {
         Self::Manifest(error)
+    }
+}
+
+impl From<GitError> for PublishError {
+    fn from(error: GitError) -> Self {
+        Self::Git(error)
     }
 }
 

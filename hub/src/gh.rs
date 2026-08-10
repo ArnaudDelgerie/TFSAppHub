@@ -1,9 +1,11 @@
-//! The `gh` seam (`../plan/019-publish-an-app.md` step 3): every
-//! authenticated call `publish` makes, run through GitHub's own CLI on the
-//! *author's* machine — `../decision/003-the-hub-publishes-apps.md`'s
-//! consequence that the hub never holds a forge credential, applied. Four
+//! The `gh` seam (`../plan/019-publish-an-app.md` step 3, revised by step 5):
+//! every authenticated call `publish` makes, run through GitHub's own CLI on
+//! the *author's* machine — `../decision/003-the-hub-publishes-apps.md`'s
+//! consequence that the hub never holds a forge credential, applied. Three
 //! gated calls, each with its own refusal, and the one call that actually
-//! publishes.
+//! publishes. The fourth call step 3 originally had — a tag-existence gate —
+//! is gone: `git.rs`'s gate now proves the commit is on the forge, and
+//! [`Gh::create_release`] puts the tag on it directly with `--target`.
 //!
 //! [`Gh`] holds the program to run — `"gh"` in production, a fake script in
 //! tests — as a parameter, never a `PATH` mutation: the test suite is
@@ -46,7 +48,7 @@ impl Gh {
             .map_err(|_| GhError::NotInstalled)
     }
 
-    /// Gate 6: `gh --version`. A spawn failure at *any* other call below is
+    /// Gate 9: `gh --version`. A spawn failure at *any* other call below is
     /// folded into this same refusal — if `gh` cannot be run at all, "not
     /// installed" is the accurate thing to tell the author, whichever call
     /// happened to be the one that tried it first.
@@ -57,7 +59,7 @@ impl Gh {
         }
     }
 
-    /// Gate 7: `gh auth status`.
+    /// Gate 10: `gh auth status`.
     pub fn ensure_authenticated(&self) -> Result<(), GhError> {
         let output = self.run(&["auth", "status"])?;
         if output.status.success() {
@@ -67,25 +69,7 @@ impl Gh {
         }
     }
 
-    /// Gate 8: `gh api repos/<repo>/git/ref/tags/<tag>` — settled in the
-    /// plan's "the tag must already be pushed": `publish` never lets `gh`
-    /// create the tag itself, since the hub has no git client with which to
-    /// ask whether the working tree it just archived is what that tag would
-    /// point at.
-    pub fn ensure_tag_pushed(&self, repo: &str, tag: &str) -> Result<(), GhError> {
-        let endpoint = format!("repos/{repo}/git/ref/tags/{tag}");
-        let output = self.run(&["api", &endpoint])?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(GhError::TagNotPushed {
-                repo: repo.to_string(),
-                tag: tag.to_string(),
-            })
-        }
-    }
-
-    /// Gate 9: no release already carries `tag`, draft included. Run
+    /// Gate 11: no release already carries `tag`, draft included. Run
     /// authenticated — unlike 018's anonymous resolver, since a draft is
     /// invisible to an anonymous reader and is exactly the collision this
     /// guard exists to catch.
@@ -137,20 +121,26 @@ impl Gh {
     }
 
     /// `gh release create <tag> --repo <repo> --title <tag> --notes-file
-    /// <notes_path> <archive_path> <sums_path>` — one process, fixed argv,
-    /// never `--generate-notes` (the notes are the changelog section,
-    /// verbatim). Returns the release URL `gh` prints on success.
+    /// <notes_path> --target <target_sha> <archive_path> <sums_path>` — one
+    /// process, fixed argv, never `--generate-notes` (the notes are the
+    /// changelog section, verbatim). `--target` is what puts the tag on the
+    /// exact commit `git.rs`'s gate proved is on the forge, rather than on
+    /// whatever the default branch's head happens to be the moment this
+    /// runs (`../plan/019-publish-an-app.md`'s "The archive *is* a pushed
+    /// commit"). Returns the release URL `gh` prints on success.
     ///
     /// `gh` creates the release and *then* uploads assets, so a failed
     /// upload can leave a release with no archive on it. On failure this
     /// re-checks and, if the release now exists without both assets,
     /// deletes it — so a retry meets no version guard of the failed
     /// attempt's own making.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_release(
         &self,
         repo: &str,
         tag: &str,
         notes_path: &Path,
+        target_sha: &str,
         archive_name: &str,
         archive_path: &Path,
         sums_path: &Path,
@@ -165,6 +155,8 @@ impl Gh {
             .arg(tag)
             .arg("--notes-file")
             .arg(notes_path)
+            .arg("--target")
+            .arg(target_sha)
             .arg(archive_path)
             .arg(sums_path)
             .output()
@@ -221,8 +213,6 @@ pub enum GhError {
     NotInstalled,
     /// `gh auth status` failed.
     NotAuthenticated,
-    /// `v<app_version>` does not exist on the repository yet.
-    TagNotPushed { repo: String, tag: String },
     /// A release already carries the tag — draft included.
     ReleaseExists {
         repo: String,
@@ -254,11 +244,6 @@ impl fmt::Display for GhError {
             Self::NotAuthenticated => {
                 write!(formatter, "gh is not authenticated — run `gh auth login`.")
             }
-            Self::TagNotPushed { repo, tag } => write!(
-                formatter,
-                "{tag} does not exist on {repo} — push it first: git tag {tag} && git push \
-                 origin {tag}."
-            ),
             Self::ReleaseExists { repo, tag, draft } => write!(
                 formatter,
                 "release {tag} already exists on {repo}{} — bump app_version, or delete the {} \

@@ -91,51 +91,6 @@ exit 1
 }
 
 #[test]
-fn the_tag_gate_refuses_naming_the_git_commands_to_push_it() {
-    let scripts = tempfile::tempdir().expect("a temp dir");
-    let gh_path = write_fake_gh(
-        scripts.path(),
-        r#"
-case "$1" in
-  api) exit 1 ;;
-esac
-exit 0
-"#,
-    );
-    let gh = Gh::at(gh_path);
-
-    let error = gh.ensure_tag_pushed("owner/repo", "v1.2.0").unwrap_err();
-    match &error {
-        GhError::TagNotPushed { repo, tag } => {
-            assert_eq!(repo, "owner/repo");
-            assert_eq!(tag, "v1.2.0");
-        }
-        other => panic!("expected TagNotPushed, got {other}"),
-    }
-    assert!(error
-        .to_string()
-        .contains("git tag v1.2.0 && git push origin v1.2.0"));
-}
-
-#[test]
-fn the_tag_gate_passes_when_the_tag_ref_resolves() {
-    let scripts = tempfile::tempdir().expect("a temp dir");
-    let gh_path = write_fake_gh(
-        scripts.path(),
-        r#"
-case "$1" in
-  api) exit 0 ;;
-esac
-exit 1
-"#,
-    );
-    let gh = Gh::at(gh_path);
-
-    gh.ensure_tag_pushed("owner/repo", "v1.2.0")
-        .expect("a resolving tag ref to pass the gate");
-}
-
-#[test]
 fn the_version_guard_passes_when_no_release_carries_the_tag() {
     let scripts = tempfile::tempdir().expect("a temp dir");
     let gh_path = write_fake_gh(
@@ -259,6 +214,7 @@ exit 1
             "owner/repo",
             "v1.2.0",
             &notes_path,
+            "deadbeefcafe",
             "demo-1.2.0.tar.gz",
             &archive_path,
             &sums_path,
@@ -268,7 +224,8 @@ exit 1
     assert_eq!(url, "https://github.com/owner/repo/releases/tag/v1.2.0");
 
     let expected = format!(
-        "release create v1.2.0 --repo owner/repo --title v1.2.0 --notes-file {} {} {}\n",
+        "release create v1.2.0 --repo owner/repo --title v1.2.0 --notes-file {} --target \
+         deadbeefcafe {} {}\n",
         notes_path.display(),
         archive_path.display(),
         sums_path.display()
@@ -308,6 +265,7 @@ exit 1
             "owner/repo",
             "v1.2.0",
             &notes_path,
+            "deadbeefcafe",
             "demo-1.2.0.tar.gz",
             &archive_path,
             &sums_path,
@@ -361,6 +319,7 @@ exit 1
             "owner/repo",
             "v1.2.0",
             &notes_path,
+            "deadbeefcafe",
             "demo-1.2.0.tar.gz",
             &archive_path,
             &sums_path,

@@ -12,6 +12,7 @@ mod cli;
 mod desktop;
 mod dev;
 mod gh;
+mod git;
 mod hub_bin;
 mod identity;
 mod install;

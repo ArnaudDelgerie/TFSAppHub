@@ -10,6 +10,7 @@ use super::{
 use crate::{
     archive,
     gh::{Gh, GhError},
+    git::{Git, GitError},
     paths::Paths,
     release, source,
 };
@@ -46,42 +47,121 @@ Fixed the widget.\n\
 \n\
 Initial release.\n";
 
+/// A fake `git` (or `gh`) at `dir/<name>`, logging its own argv (space-joined)
+/// to `dir/argv.log` before dispatching — reused across both seams' tests
+/// here, unlike `git_tests.rs`/`gh_tests.rs`'s own copies, since a
+/// full-pipeline test in this module needs both at once and each fixture
+/// gets its own directory (and so its own log) anyway.
+fn write_fake(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(
+        &path,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/argv.log\"\n{body}\n"),
+    )
+    .expect("a fake script");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("+x");
+    path
+}
+
+fn argv_log(dir: &Path) -> String {
+    fs::read_to_string(dir.join("argv.log")).unwrap_or_default()
+}
+
+/// A `git` that reports a work tree on `main`, clean, tracking
+/// `origin/main` with no divergence, `HEAD` at a fixed sha, and `origin`
+/// resolving to `https://github.com/owner/repo` — every gate 3–6 needs, all
+/// at once, so most tests below that are not themselves about the git gate
+/// can just pass this and move on.
+const GIT_CLEAN_AND_PUSHED: &str = r#"
+case "$3" in
+  rev-parse)
+    case "$4" in
+      --show-toplevel) echo "/repo"; exit 0 ;;
+      HEAD) echo "deadbeefcafe1234"; exit 0 ;;
+    esac
+    ;;
+  status)
+    printf '## main...origin/main\n'
+    exit 0
+    ;;
+  remote)
+    [ "$4" = "get-url" ] && { echo "https://github.com/owner/repo"; exit 0; }
+    ;;
+esac
+exit 1
+"#;
+
+/// A `git` that refuses every call — proves, when a test expects a failure
+/// from an *earlier* gate, that the git gate was never reached at all: a
+/// nonexistent program would surface as `GitError::NotInstalled`, which is
+/// never what these tests expect, so reaching it would fail loudly rather
+/// than by coincidence.
+fn git_never_called() -> Git {
+    Git::at(PathBuf::from("/nonexistent/git"))
+}
+
+/// `gh` that refuses every call — the same proof as [`git_never_called`], for
+/// the `gh` seam.
+fn gh_never_called() -> Gh {
+    Gh::at(PathBuf::from("/nonexistent/gh"))
+}
+
 #[test]
-fn every_gate_passes_and_produces_the_repo_and_the_notes() {
+fn every_gate_passes_and_resolves_the_repo_from_the_upstream_remote() {
     let project = tempfile::tempdir().expect("a temp project dir");
-    write_manifest(
-        project.path(),
-        "1.2.0",
-        r#", "releases_repo": "owner/repo""#,
-    );
+    write_manifest(project.path(), "1.2.0", "");
     write_changelog(project.path(), CHANGELOG);
 
-    let gates = run_local_gates(project.path(), None).expect("every gate to pass");
-    assert_eq!(gates.repo, "owner/repo");
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+
+    let gates = run_local_gates(project.path(), None, &git).expect("every gate to pass");
+    assert_eq!(gates.commit.repo, "owner/repo");
+    assert_eq!(gates.commit.branch, "main");
+    assert_eq!(gates.commit.sha, "deadbeefcafe1234");
     assert_eq!(gates.notes, "Added the frobnicator.\nFixed the widget.");
 }
 
 #[test]
-fn a_repo_flag_overrides_the_manifests_releases_repo() {
+fn a_repo_flag_overrides_the_resolved_remote() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    write_manifest(project.path(), "1.2.0", "");
+    write_changelog(project.path(), CHANGELOG);
+
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+
+    let gates = run_local_gates(project.path(), Some("other-owner/other-repo"), &git)
+        .expect("every gate to pass");
+    assert_eq!(gates.commit.repo, "other-owner/other-repo");
+}
+
+#[test]
+fn a_stale_releases_repo_in_the_manifest_is_ignored() {
+    // The station-era key: still accepted by the manifest parser, read by
+    // nothing. `owner/repo` must come from `origin`, never from this.
     let project = tempfile::tempdir().expect("a temp project dir");
     write_manifest(
         project.path(),
         "1.2.0",
-        r#", "releases_repo": "owner/repo""#,
+        r#", "releases_repo": "stale-owner/stale-repo""#,
     );
     write_changelog(project.path(), CHANGELOG);
 
-    let gates = run_local_gates(project.path(), Some("other-owner/other-repo"))
-        .expect("every gate to pass");
-    assert_eq!(gates.repo, "other-owner/other-repo");
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+
+    let gates = run_local_gates(project.path(), None, &git).expect("every gate to pass");
+    assert_eq!(gates.commit.repo, "owner/repo");
 }
 
 #[test]
-fn a_missing_manifest_is_refused() {
+fn a_missing_manifest_is_refused_before_git_is_ever_called() {
     let project = tempfile::tempdir().expect("a temp project dir");
     fs::create_dir_all(project.path()).expect("a project root");
 
-    let error = run_local_gates(project.path(), Some("owner/repo")).unwrap_err();
+    let error =
+        run_local_gates(project.path(), Some("owner/repo"), &git_never_called()).unwrap_err();
     assert!(matches!(error, PublishError::Manifest(_)), "{error}");
 }
 
@@ -91,7 +171,8 @@ fn a_non_semver_app_version_is_refused_naming_the_value_and_the_field() {
     write_manifest(project.path(), "v1.2", "");
     write_changelog(project.path(), CHANGELOG);
 
-    let error = run_local_gates(project.path(), Some("owner/repo")).unwrap_err();
+    let error =
+        run_local_gates(project.path(), Some("owner/repo"), &git_never_called()).unwrap_err();
     match &error {
         PublishError::UnusableVersion { version, .. } => assert_eq!(version, "v1.2"),
         other => panic!("expected UnusableVersion, got {other}"),
@@ -101,35 +182,7 @@ fn a_non_semver_app_version_is_refused_naming_the_value_and_the_field() {
 }
 
 #[test]
-fn no_repo_from_either_source_is_refused_naming_both_ways() {
-    let project = tempfile::tempdir().expect("a temp project dir");
-    write_manifest(project.path(), "1.2.0", "");
-    write_changelog(project.path(), CHANGELOG);
-
-    let error = run_local_gates(project.path(), None).unwrap_err();
-    assert!(
-        matches!(error, PublishError::NoRepository { .. }),
-        "{error}"
-    );
-    assert!(error.to_string().contains("--repo"), "{error}");
-    assert!(error.to_string().contains("releases_repo"), "{error}");
-}
-
-#[test]
-fn an_empty_releases_repo_is_the_same_as_no_repo() {
-    let project = tempfile::tempdir().expect("a temp project dir");
-    write_manifest(project.path(), "1.2.0", r#", "releases_repo": "   ""#);
-    write_changelog(project.path(), CHANGELOG);
-
-    let error = run_local_gates(project.path(), None).unwrap_err();
-    assert!(
-        matches!(error, PublishError::NoRepository { .. }),
-        "{error}"
-    );
-}
-
-#[test]
-fn a_malformed_repo_shape_is_refused() {
+fn a_malformed_repo_flag_is_refused_before_git_is_ever_called() {
     for bad in ["not-a-repo", "owner/", "/repo", "owner/repo/extra", ""] {
         assert!(!is_owner_repo_shape(bad), "{bad:?} should be rejected");
     }
@@ -139,14 +192,77 @@ fn a_malformed_repo_shape_is_refused() {
     write_manifest(project.path(), "1.2.0", "");
     write_changelog(project.path(), CHANGELOG);
 
-    let error = run_local_gates(project.path(), Some("not-a-repo")).unwrap_err();
+    let error =
+        run_local_gates(project.path(), Some("not-a-repo"), &git_never_called()).unwrap_err();
     match &error {
-        PublishError::InvalidRepoShape { repo, source, .. } => {
-            assert_eq!(repo, "not-a-repo");
-            assert_eq!(*source, "--repo");
-        }
+        PublishError::InvalidRepoShape { repo } => assert_eq!(repo, "not-a-repo"),
         other => panic!("expected InvalidRepoShape, got {other}"),
     }
+}
+
+#[test]
+fn a_dirty_project_directory_refuses_naming_the_paths() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    write_manifest(project.path(), "1.2.0", "");
+    write_changelog(project.path(), CHANGELOG);
+
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(
+        scripts.path(),
+        "git",
+        r#"
+case "$3" in
+  rev-parse)
+    [ "$4" = "--show-toplevel" ] && { echo "/repo"; exit 0; }
+    ;;
+  status)
+    printf '## main...origin/main\n M src/App.php\n'
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+    ));
+
+    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
+    match &error {
+        PublishError::Git(GitError::Dirty { paths }) => {
+            assert_eq!(paths, &["src/App.php"]);
+        }
+        other => panic!("expected Git(Dirty), got {other}"),
+    }
+}
+
+#[test]
+fn no_upstream_refuses_naming_git_push() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    write_manifest(project.path(), "1.2.0", "");
+    write_changelog(project.path(), CHANGELOG);
+
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(
+        scripts.path(),
+        "git",
+        r#"
+case "$3" in
+  rev-parse)
+    [ "$4" = "--show-toplevel" ] && { echo "/repo"; exit 0; }
+    ;;
+  status)
+    printf '## main\n'
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+    ));
+
+    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
+    assert!(
+        matches!(error, PublishError::Git(GitError::NoUpstream { .. })),
+        "{error}"
+    );
+    assert!(error.to_string().contains("git push -u origin main"));
 }
 
 #[test]
@@ -154,7 +270,10 @@ fn a_missing_changelog_file_is_refused() {
     let project = tempfile::tempdir().expect("a temp project dir");
     write_manifest(project.path(), "1.2.0", "");
 
-    let error = run_local_gates(project.path(), Some("owner/repo")).unwrap_err();
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+
+    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
     assert!(
         matches!(error, PublishError::MissingChangelog { .. }),
         "{error}"
@@ -167,7 +286,10 @@ fn a_changelog_with_no_matching_heading_is_refused() {
     write_manifest(project.path(), "1.3.0", "");
     write_changelog(project.path(), CHANGELOG);
 
-    let error = run_local_gates(project.path(), Some("owner/repo")).unwrap_err();
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+
+    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
     match &error {
         PublishError::MissingChangelogEntry { version, .. } => assert_eq!(version, "1.3.0"),
         other => panic!("expected MissingChangelogEntry, got {other}"),
@@ -213,18 +335,38 @@ fn the_extracted_section_stops_at_the_next_heading() {
 #[test]
 fn ipc_on_and_undeclinable_in_a_test_refuses_the_gate() {
     // Tests never run with a terminal on stdin, so `prompt::confirmed(false)`
-    // always refuses here — which is exactly gate 5's point: there is no
+    // always refuses here — which is exactly gate 8's point: there is no
     // `--yes` to make this pass non-interactively.
     let project = tempfile::tempdir().expect("a temp project dir");
     write_manifest(
         project.path(),
         "1.2.0",
-        r#", "releases_repo": "owner/repo", "actions": {"secrets": {"ipc": true, "bridge": false, "keys": ["k"]}}"#,
+        r#", "actions": {"secrets": {"ipc": true, "bridge": false, "keys": ["k"]}}"#,
     );
     write_changelog(project.path(), CHANGELOG);
 
-    let error = run_local_gates(project.path(), None).unwrap_err();
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+
+    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
     assert!(matches!(error, PublishError::IpcNotConfirmed), "{error}");
+}
+
+#[test]
+fn ipc_off_or_bridge_only_never_asks() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    write_manifest(
+        project.path(),
+        "1.2.0",
+        r#", "actions": {"secrets": {"ipc": false, "bridge": true, "keys": ["k"]}}"#,
+    );
+    write_changelog(project.path(), CHANGELOG);
+
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+
+    run_local_gates(project.path(), Some("owner/repo"), &git)
+        .expect("bridge-only must not trip the ipc gate");
 }
 
 fn write_source_files(root: &Path) {
@@ -323,19 +465,6 @@ fn an_escaping_symlink_is_refused_before_anything_is_uploaded() {
     }
 }
 
-#[test]
-fn ipc_off_or_bridge_only_never_asks() {
-    let project = tempfile::tempdir().expect("a temp project dir");
-    write_manifest(
-        project.path(),
-        "1.2.0",
-        r#", "releases_repo": "owner/repo", "actions": {"secrets": {"ipc": false, "bridge": true, "keys": ["k"]}}"#,
-    );
-    write_changelog(project.path(), CHANGELOG);
-
-    run_local_gates(project.path(), None).expect("bridge-only must not trip the ipc gate");
-}
-
 fn temp_paths() -> (tempfile::TempDir, Paths) {
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
@@ -351,31 +480,11 @@ fn publishable_project(root: &Path, app_version: &str) {
     write_source_files(root);
 }
 
-/// A fake `gh` at `dir/gh`, logging its own argv to `dir/argv.log` — see
-/// `gh_tests.rs`'s own copy of this helper for the rationale; duplicated here
-/// rather than shared because `Gh::at` is the only thing this module needs
-/// from `gh.rs`'s test-only surface.
-fn write_fake_gh(dir: &Path, body: &str) -> PathBuf {
-    let path = dir.join("gh");
-    fs::write(
-        &path,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/argv.log\"\n{body}\n"),
-    )
-    .expect("a fake gh script");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("+x");
-    path
-}
-
-fn argv_log(dir: &Path) -> String {
-    fs::read_to_string(dir.join("argv.log")).unwrap_or_default()
-}
-
-/// The fake `gh` for the happy path: installed, authenticated, the tag
-/// resolves, no colliding release, and `release create` succeeds.
+/// The fake `gh` for the happy path: installed, authenticated, no colliding
+/// release, and `release create` succeeds.
 const GH_EVERY_GATE_PASSES: &str = r#"
 case "$1" in
   --version) exit 0 ;;
-  api) exit 0 ;;
 esac
 case "$1 $2" in
   "auth status") exit 0 ;;
@@ -393,11 +502,13 @@ fn publish_runs_the_whole_pipeline_and_leaves_no_scratch_behind() {
     let project = tempfile::tempdir().expect("a temp project dir");
     publishable_project(project.path(), "1.2.0");
 
-    let scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
-    let gh = Gh::at(write_fake_gh(scripts.path(), GH_EVERY_GATE_PASSES));
+    let git_scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(git_scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+    let gh_scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
+    let gh = Gh::at(write_fake(gh_scripts.path(), "gh", GH_EVERY_GATE_PASSES));
     let (_base, paths) = temp_paths();
 
-    let published = publish(&paths, project.path(), Some("owner/repo"), true, &gh)
+    let published = publish(&paths, project.path(), None, true, &git, &gh)
         .expect("the whole pipeline to succeed");
     assert!(published);
 
@@ -405,27 +516,74 @@ fn publish_runs_the_whole_pipeline_and_leaves_no_scratch_behind() {
         !paths.scratch_dir().exists(),
         "scratch must be removed after a successful publish"
     );
-    assert!(
-        argv_log(scripts.path()).contains("release create v1.2.0 --repo owner/repo --title v1.2.0")
-    );
+    assert!(argv_log(gh_scripts.path())
+        .contains("release create v1.2.0 --repo owner/repo --title v1.2.0"));
+    assert!(argv_log(gh_scripts.path()).contains("--target deadbeefcafe1234"));
 }
 
 #[test]
 fn a_local_gate_failure_never_reaches_gh_and_leaves_no_scratch_behind() {
     let project = tempfile::tempdir().expect("a temp project dir");
     write_manifest(project.path(), "1.2.0", "");
-    // No CHANGELOG.md at all — gate 4.
+    // No CHANGELOG.md at all — gate 7, reached only once the git gate (3-6)
+    // has already passed.
     write_source_files(project.path());
 
-    // A program that cannot be run at all: if this gate failure did not stop
-    // the pipeline before gate 6, `ensure_installed` would turn this into a
-    // `GhError::NotInstalled` instead, which the assertion below would catch.
-    let gh = Gh::at(PathBuf::from("/nonexistent/gh"));
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
     let (_base, paths) = temp_paths();
 
-    let error = publish(&paths, project.path(), Some("owner/repo"), true, &gh).unwrap_err();
+    let error = publish(
+        &paths,
+        project.path(),
+        Some("owner/repo"),
+        true,
+        &git,
+        &gh_never_called(),
+    )
+    .unwrap_err();
     assert!(
         matches!(error, PublishError::MissingChangelog { .. }),
+        "{error}"
+    );
+    assert!(!paths.scratch_dir().exists());
+}
+
+#[test]
+fn a_dirty_tree_refuses_before_gh_is_ever_called() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    publishable_project(project.path(), "1.2.0");
+
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(
+        scripts.path(),
+        "git",
+        r#"
+case "$3" in
+  rev-parse)
+    [ "$4" = "--show-toplevel" ] && { echo "/repo"; exit 0; }
+    ;;
+  status)
+    printf '## main...origin/main\n?? untracked.txt\n'
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+    ));
+    let (_base, paths) = temp_paths();
+
+    let error = publish(
+        &paths,
+        project.path(),
+        Some("owner/repo"),
+        true,
+        &git,
+        &gh_never_called(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, PublishError::Git(GitError::Dirty { .. })),
         "{error}"
     );
     assert!(!paths.scratch_dir().exists());
@@ -436,10 +594,19 @@ fn gh_not_installed_refuses_before_the_archive_is_built() {
     let project = tempfile::tempdir().expect("a temp project dir");
     publishable_project(project.path(), "1.2.0");
 
-    let gh = Gh::at(PathBuf::from("/nonexistent/gh"));
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
     let (_base, paths) = temp_paths();
 
-    let error = publish(&paths, project.path(), Some("owner/repo"), true, &gh).unwrap_err();
+    let error = publish(
+        &paths,
+        project.path(),
+        Some("owner/repo"),
+        true,
+        &git,
+        &gh_never_called(),
+    )
+    .unwrap_err();
     match &error {
         PublishError::Gh(GhError::NotInstalled) => {}
         other => panic!("expected Gh(NotInstalled), got {other}"),
@@ -452,9 +619,12 @@ fn gh_not_authenticated_refuses_before_the_archive_is_built() {
     let project = tempfile::tempdir().expect("a temp project dir");
     publishable_project(project.path(), "1.2.0");
 
-    let scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
-    let gh = Gh::at(write_fake_gh(
-        scripts.path(),
+    let git_scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(git_scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+    let gh_scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
+    let gh = Gh::at(write_fake(
+        gh_scripts.path(),
+        "gh",
         r#"
 case "$1" in
   --version) exit 0 ;;
@@ -467,43 +637,13 @@ exit 1
     ));
     let (_base, paths) = temp_paths();
 
-    let error = publish(&paths, project.path(), Some("owner/repo"), true, &gh).unwrap_err();
+    let error = publish(&paths, project.path(), Some("owner/repo"), true, &git, &gh).unwrap_err();
     assert!(
         matches!(error, PublishError::Gh(GhError::NotAuthenticated)),
         "{error}"
     );
     assert!(!paths.scratch_dir().exists());
-    assert!(!argv_log(scripts.path()).contains("release create"));
-}
-
-#[test]
-fn the_tag_gate_refuses_before_the_archive_is_built() {
-    let project = tempfile::tempdir().expect("a temp project dir");
-    publishable_project(project.path(), "1.2.0");
-
-    let scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
-    let gh = Gh::at(write_fake_gh(
-        scripts.path(),
-        r#"
-case "$1" in
-  --version) exit 0 ;;
-  api) exit 1 ;;
-esac
-case "$1 $2" in
-  "auth status") exit 0 ;;
-esac
-exit 1
-"#,
-    ));
-    let (_base, paths) = temp_paths();
-
-    let error = publish(&paths, project.path(), Some("owner/repo"), true, &gh).unwrap_err();
-    assert!(
-        matches!(error, PublishError::Gh(GhError::TagNotPushed { .. })),
-        "{error}"
-    );
-    assert!(!paths.scratch_dir().exists());
-    assert!(!argv_log(scripts.path()).contains("release create"));
+    assert!(!argv_log(gh_scripts.path()).contains("release create"));
 }
 
 #[test]
@@ -511,13 +651,15 @@ fn an_existing_release_refuses_before_the_archive_is_built() {
     let project = tempfile::tempdir().expect("a temp project dir");
     publishable_project(project.path(), "1.2.0");
 
-    let scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
-    let gh = Gh::at(write_fake_gh(
-        scripts.path(),
+    let git_scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(git_scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+    let gh_scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
+    let gh = Gh::at(write_fake(
+        gh_scripts.path(),
+        "gh",
         r#"
 case "$1" in
   --version) exit 0 ;;
-  api) exit 0 ;;
 esac
 case "$1 $2" in
   "auth status") exit 0 ;;
@@ -531,13 +673,13 @@ exit 1
     ));
     let (_base, paths) = temp_paths();
 
-    let error = publish(&paths, project.path(), Some("owner/repo"), true, &gh).unwrap_err();
+    let error = publish(&paths, project.path(), Some("owner/repo"), true, &git, &gh).unwrap_err();
     assert!(
         matches!(error, PublishError::Gh(GhError::ReleaseExists { .. })),
         "{error}"
     );
     assert!(!paths.scratch_dir().exists());
-    assert!(!argv_log(scripts.path()).contains("release create"));
+    assert!(!argv_log(gh_scripts.path()).contains("release create"));
 }
 
 #[test]
@@ -546,15 +688,17 @@ fn an_escaping_symlink_refuses_after_every_gh_gate_and_still_leaves_no_scratch_b
     publishable_project(project.path(), "1.2.0");
     symlink("../../outside", project.path().join("evil")).expect("an escaping symlink");
 
-    let scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
-    let gh = Gh::at(write_fake_gh(scripts.path(), GH_EVERY_GATE_PASSES));
+    let git_scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(git_scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+    let gh_scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
+    let gh = Gh::at(write_fake(gh_scripts.path(), "gh", GH_EVERY_GATE_PASSES));
     let (_base, paths) = temp_paths();
 
-    let error = publish(&paths, project.path(), Some("owner/repo"), true, &gh).unwrap_err();
+    let error = publish(&paths, project.path(), Some("owner/repo"), true, &git, &gh).unwrap_err();
     assert!(
         matches!(error, PublishError::EscapingSymlink { .. }),
         "{error}"
     );
     assert!(!paths.scratch_dir().exists());
-    assert!(!argv_log(scripts.path()).contains("release create"));
+    assert!(!argv_log(gh_scripts.path()).contains("release create"));
 }
