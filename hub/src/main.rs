@@ -124,6 +124,11 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         Command::Open { id } => open::run(&id),
         // Foreground, unlike `open` — see `dev::run`.
         Command::Dev { path } => dev::run(&path),
+        Command::Publish {
+            path,
+            repo,
+            assume_yes,
+        } => publish::run(&path, repo.as_deref(), assume_yes),
         Command::Update {
             id,
             reference,

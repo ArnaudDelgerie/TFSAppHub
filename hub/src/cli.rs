@@ -162,7 +162,7 @@ pub const SURFACE: &[Spec] = &[
         form: "publish <local-path> [--repo owner/repo] [--yes]",
         summary: "Publish a release from a project's working tree, via gh.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "update",

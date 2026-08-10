@@ -10,12 +10,6 @@
 //! threaded and `PATH` is process-global. Every call is a `Command` with
 //! fixed argv, never through a shell.
 
-// Not yet reached from `main.rs` — the gate sequence is wired into
-// `tfsapp-hub publish` in `../plan/019-publish-an-app.md` step 4. This
-// module's own tests are its only caller until then. Remove the allow when
-// that step lands, rather than letting it linger.
-#![allow(dead_code)]
-
 use std::{ffi::OsString, fmt, path::Path, process::Command, process::Output};
 
 use serde::Deserialize;
@@ -35,9 +29,11 @@ impl Gh {
     }
 
     /// A specific program to run instead of `"gh"` — always a test fixture,
-    /// passed as a parameter rather than by mutating `PATH`.
+    /// passed as a parameter rather than by mutating `PATH`. `pub(crate)` so
+    /// `publish_tests.rs`'s own fixtures can build one too, not just this
+    /// module's.
     #[cfg(test)]
-    fn at(program: impl Into<OsString>) -> Self {
+    pub(crate) fn at(program: impl Into<OsString>) -> Self {
         Self {
             program: program.into(),
         }

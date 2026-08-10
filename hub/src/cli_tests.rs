@@ -305,7 +305,6 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
     for line in [
         "--update",
         "--rollback",
-        "publish ../TFSAppTest",
         "export demo /tmp/demo",
         "import demo /tmp/demo.tar.gz",
     ] {
@@ -321,6 +320,7 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         "list",
         "install ../TFSAppTest",
         "open demo",
+        "publish ../TFSAppTest",
         "update demo",
         "rollback demo",
         "remove demo",

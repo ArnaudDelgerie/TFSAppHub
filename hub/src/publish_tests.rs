@@ -1,7 +1,18 @@
-use std::{fs, os::unix::fs::symlink, path::Path};
+use std::{
+    fs,
+    os::unix::fs::{symlink, PermissionsExt},
+    path::{Path, PathBuf},
+};
 
-use super::{build_archive, changelog_section, is_owner_repo_shape, run_local_gates, PublishError};
-use crate::{archive, release, source};
+use super::{
+    build_archive, changelog_section, is_owner_repo_shape, publish, run_local_gates, PublishError,
+};
+use crate::{
+    archive,
+    gh::{Gh, GhError},
+    paths::Paths,
+    release, source,
+};
 
 fn write_manifest(root: &Path, app_version: &str, extra: &str) {
     fs::create_dir_all(root).expect("a project root");
@@ -323,4 +334,227 @@ fn ipc_off_or_bridge_only_never_asks() {
     write_changelog(project.path(), CHANGELOG);
 
     run_local_gates(project.path(), None).expect("bridge-only must not trip the ipc gate");
+}
+
+fn temp_paths() -> (tempfile::TempDir, Paths) {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    (base, paths)
+}
+
+/// A project ready to publish: a valid manifest at `app_version`, a matching
+/// `CHANGELOG.md` section (from the shared `CHANGELOG` fixture, so callers
+/// must pass `"1.2.0"`), and a small source tree.
+fn publishable_project(root: &Path, app_version: &str) {
+    write_manifest(root, app_version, "");
+    write_changelog(root, CHANGELOG);
+    write_source_files(root);
+}
+
+/// A fake `gh` at `dir/gh`, logging its own argv to `dir/argv.log` — see
+/// `gh_tests.rs`'s own copy of this helper for the rationale; duplicated here
+/// rather than shared because `Gh::at` is the only thing this module needs
+/// from `gh.rs`'s test-only surface.
+fn write_fake_gh(dir: &Path, body: &str) -> PathBuf {
+    let path = dir.join("gh");
+    fs::write(
+        &path,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/argv.log\"\n{body}\n"),
+    )
+    .expect("a fake gh script");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("+x");
+    path
+}
+
+fn argv_log(dir: &Path) -> String {
+    fs::read_to_string(dir.join("argv.log")).unwrap_or_default()
+}
+
+/// The fake `gh` for the happy path: installed, authenticated, the tag
+/// resolves, no colliding release, and `release create` succeeds.
+const GH_EVERY_GATE_PASSES: &str = r#"
+case "$1" in
+  --version) exit 0 ;;
+  api) exit 0 ;;
+esac
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "release view") exit 1 ;;
+  "release create")
+    echo "https://github.com/owner/repo/releases/tag/v1.2.0"
+    exit 0
+    ;;
+esac
+exit 1
+"#;
+
+#[test]
+fn publish_runs_the_whole_pipeline_and_leaves_no_scratch_behind() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    publishable_project(project.path(), "1.2.0");
+
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
+    let gh = Gh::at(write_fake_gh(scripts.path(), GH_EVERY_GATE_PASSES));
+    let (_base, paths) = temp_paths();
+
+    let published = publish(&paths, project.path(), Some("owner/repo"), true, &gh)
+        .expect("the whole pipeline to succeed");
+    assert!(published);
+
+    assert!(
+        !paths.scratch_dir().exists(),
+        "scratch must be removed after a successful publish"
+    );
+    assert!(
+        argv_log(scripts.path()).contains("release create v1.2.0 --repo owner/repo --title v1.2.0")
+    );
+}
+
+#[test]
+fn a_local_gate_failure_never_reaches_gh_and_leaves_no_scratch_behind() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    write_manifest(project.path(), "1.2.0", "");
+    // No CHANGELOG.md at all — gate 4.
+    write_source_files(project.path());
+
+    // A program that cannot be run at all: if this gate failure did not stop
+    // the pipeline before gate 6, `ensure_installed` would turn this into a
+    // `GhError::NotInstalled` instead, which the assertion below would catch.
+    let gh = Gh::at(PathBuf::from("/nonexistent/gh"));
+    let (_base, paths) = temp_paths();
+
+    let error = publish(&paths, project.path(), Some("owner/repo"), true, &gh).unwrap_err();
+    assert!(
+        matches!(error, PublishError::MissingChangelog { .. }),
+        "{error}"
+    );
+    assert!(!paths.scratch_dir().exists());
+}
+
+#[test]
+fn gh_not_installed_refuses_before_the_archive_is_built() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    publishable_project(project.path(), "1.2.0");
+
+    let gh = Gh::at(PathBuf::from("/nonexistent/gh"));
+    let (_base, paths) = temp_paths();
+
+    let error = publish(&paths, project.path(), Some("owner/repo"), true, &gh).unwrap_err();
+    match &error {
+        PublishError::Gh(GhError::NotInstalled) => {}
+        other => panic!("expected Gh(NotInstalled), got {other}"),
+    }
+    assert!(!paths.scratch_dir().exists());
+}
+
+#[test]
+fn gh_not_authenticated_refuses_before_the_archive_is_built() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    publishable_project(project.path(), "1.2.0");
+
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
+    let gh = Gh::at(write_fake_gh(
+        scripts.path(),
+        r#"
+case "$1" in
+  --version) exit 0 ;;
+esac
+case "$1 $2" in
+  "auth status") exit 1 ;;
+esac
+exit 1
+"#,
+    ));
+    let (_base, paths) = temp_paths();
+
+    let error = publish(&paths, project.path(), Some("owner/repo"), true, &gh).unwrap_err();
+    assert!(
+        matches!(error, PublishError::Gh(GhError::NotAuthenticated)),
+        "{error}"
+    );
+    assert!(!paths.scratch_dir().exists());
+    assert!(!argv_log(scripts.path()).contains("release create"));
+}
+
+#[test]
+fn the_tag_gate_refuses_before_the_archive_is_built() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    publishable_project(project.path(), "1.2.0");
+
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
+    let gh = Gh::at(write_fake_gh(
+        scripts.path(),
+        r#"
+case "$1" in
+  --version) exit 0 ;;
+  api) exit 1 ;;
+esac
+case "$1 $2" in
+  "auth status") exit 0 ;;
+esac
+exit 1
+"#,
+    ));
+    let (_base, paths) = temp_paths();
+
+    let error = publish(&paths, project.path(), Some("owner/repo"), true, &gh).unwrap_err();
+    assert!(
+        matches!(error, PublishError::Gh(GhError::TagNotPushed { .. })),
+        "{error}"
+    );
+    assert!(!paths.scratch_dir().exists());
+    assert!(!argv_log(scripts.path()).contains("release create"));
+}
+
+#[test]
+fn an_existing_release_refuses_before_the_archive_is_built() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    publishable_project(project.path(), "1.2.0");
+
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
+    let gh = Gh::at(write_fake_gh(
+        scripts.path(),
+        r#"
+case "$1" in
+  --version) exit 0 ;;
+  api) exit 0 ;;
+esac
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "release view")
+    echo '{"isDraft":false,"assets":[]}'
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+    ));
+    let (_base, paths) = temp_paths();
+
+    let error = publish(&paths, project.path(), Some("owner/repo"), true, &gh).unwrap_err();
+    assert!(
+        matches!(error, PublishError::Gh(GhError::ReleaseExists { .. })),
+        "{error}"
+    );
+    assert!(!paths.scratch_dir().exists());
+    assert!(!argv_log(scripts.path()).contains("release create"));
+}
+
+#[test]
+fn an_escaping_symlink_refuses_after_every_gh_gate_and_still_leaves_no_scratch_behind() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    publishable_project(project.path(), "1.2.0");
+    symlink("../../outside", project.path().join("evil")).expect("an escaping symlink");
+
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
+    let gh = Gh::at(write_fake_gh(scripts.path(), GH_EVERY_GATE_PASSES));
+    let (_base, paths) = temp_paths();
+
+    let error = publish(&paths, project.path(), Some("owner/repo"), true, &gh).unwrap_err();
+    assert!(
+        matches!(error, PublishError::EscapingSymlink { .. }),
+        "{error}"
+    );
+    assert!(!paths.scratch_dir().exists());
+    assert!(!argv_log(scripts.path()).contains("release create"));
 }

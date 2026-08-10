@@ -2,17 +2,11 @@
 //! contract (CONTRACT.md's "Publishing a release",
 //! `../decision/003-the-hub-publishes-apps.md`).
 //!
-//! This module is written in the gate order `../plan/019-publish-an-app.md`'s
-//! Overview table lists them. What is here today is gates 1–5, all of it
-//! local and pure over a project directory — no network, no `gh`. The source
-//! archive (step 2) and the `gh` seam (step 3) land in this same module as
-//! the plan proceeds; the command itself is wired in step 4.
-
-// Not yet reached from `main.rs` — `publish` is declared `NotYet` in
-// `cli.rs`'s `SURFACE` until step 4 wires it. This module's own tests are
-// its only caller until then. Remove the allow when that step lands, rather
-// than letting it linger.
-#![allow(dead_code)]
+//! Written in the gate order `../plan/019-publish-an-app.md`'s Overview table
+//! lists them: gates 1–5 are local and pure over a project directory
+//! ([`run_local_gates`]); gates 6–9 are `gh.rs`'s `Gh`; then the archive and
+//! its sums ([`build_archive`]), the announcement, the confirmation, and
+//! `gh release create`. [`run`] is the command `main.rs` reaches.
 
 use std::{
     fmt, fs, io,
@@ -21,7 +15,10 @@ use std::{
 
 use crate::{
     archive,
+    cli::{EXIT_FAILED, EXIT_OK},
+    gh::{Gh, GhError},
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
+    paths::Paths,
     prompt,
     release::{self, ReleaseError},
     source,
@@ -37,6 +34,11 @@ pub const CHANGELOG_FILE: &str = "CHANGELOG.md";
 pub struct LocalGates {
     pub loaded: Loaded,
     pub repo: String,
+    /// `"--repo"` or `"releases_repo"` — which of the two named [`Self::repo`],
+    /// echoed in the announcement so a manifest's stale value is never used
+    /// silently (the plan's "Which repository, and what happens to
+    /// `releases_repo`").
+    pub repo_source: &'static str,
     pub notes: String,
 }
 
@@ -61,13 +63,14 @@ pub fn run_local_gates(
     let manifest_path = project_path.join(MANIFEST_FILE);
 
     validate_version(&loaded.manifest, &manifest_path)?;
-    let repo = resolve_repo(repo, &loaded.manifest, &manifest_path)?;
+    let (repo, repo_source) = resolve_repo(repo, &loaded.manifest, &manifest_path)?;
     let notes = changelog_gate(project_path, &loaded.manifest.app_version)?;
     confirm_ipc_secrets(&loaded.manifest)?;
 
     Ok(LocalGates {
         loaded,
         repo,
+        repo_source,
         notes,
     })
 }
@@ -79,7 +82,9 @@ pub fn run_local_gates(
 pub struct Assets {
     pub archive_path: PathBuf,
     pub archive_name: String,
+    pub archive_size: u64,
     pub sums_path: PathBuf,
+    pub sha256: String,
 }
 
 /// Build `<project_name>-<app_version>.tar.gz` and its `SHA256SUMS.txt` into
@@ -136,10 +141,17 @@ pub fn build_archive(
         path: archive_path.clone(),
         source,
     })?;
-    encoder.finish().map_err(|source| PublishError::Io {
+    let file = encoder.finish().map_err(|source| PublishError::Io {
         path: archive_path.clone(),
         source,
     })?;
+    let archive_size = file
+        .metadata()
+        .map_err(|source| PublishError::Io {
+            path: archive_path.clone(),
+            source,
+        })?
+        .len();
 
     let hash = release::sha256_file(&archive_path)?;
     let sums_path = destination.join(release::SHA256SUMS_ASSET_NAME);
@@ -153,7 +165,9 @@ pub fn build_archive(
     Ok(Assets {
         archive_path,
         archive_name,
+        archive_size,
         sums_path,
+        sha256: hash,
     })
 }
 
@@ -232,6 +246,142 @@ fn append_tree<W: io::Write>(
     Ok(())
 }
 
+/// `tfsapp-hub publish <local-path>` — resolve `Paths`, run the pipeline into
+/// the hub's own scratch directory, and turn the result into an exit code.
+pub fn run(project_path: &str, repo: Option<&str>, assume_yes: bool) -> i32 {
+    let paths = match Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+
+    match publish(
+        &paths,
+        Path::new(project_path),
+        repo,
+        assume_yes,
+        &Gh::new(),
+    ) {
+        Ok(true) => EXIT_OK,
+        // Declining is not a failure of the command, but nothing was
+        // published either — a script reading 0 would conclude it was.
+        Ok(false) => EXIT_FAILED,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            EXIT_FAILED
+        }
+    }
+}
+
+/// The pipeline, in the Overview table's order: gates 1–5
+/// ([`run_local_gates`]), gates 6–9 (`gh`, below), the archive and its sums
+/// built into scratch, the announcement, the confirmation, then
+/// `gh release create`. `false` means the user declined — everything up to
+/// that point already ran, but nothing was uploaded.
+///
+/// Takes `Paths` and a [`Gh`] rather than resolving/constructing them,
+/// matching `update::update` — what lets the whole pipeline run in a test
+/// against a throwaway scratch directory and a fake `gh`.
+pub(crate) fn publish(
+    paths: &Paths,
+    project_path: &Path,
+    repo: Option<&str>,
+    assume_yes: bool,
+    gh: &Gh,
+) -> Result<bool, PublishError> {
+    // Same reasoning as `install::install`'s own wrapper: the archive and its
+    // sums are built into it, and it is removed on the way out regardless of
+    // how this call ends — the hub writes nothing into the project itself
+    // (the plan's "Where it is built, and what is left behind").
+    let scratch = paths.scratch_dir();
+    let result = publish_into(&scratch, project_path, repo, assume_yes, gh);
+    let _ = fs::remove_dir_all(&scratch);
+    result
+}
+
+fn publish_into(
+    scratch: &Path,
+    project_path: &Path,
+    repo: Option<&str>,
+    assume_yes: bool,
+    gh: &Gh,
+) -> Result<bool, PublishError> {
+    let gates = run_local_gates(project_path, repo)?;
+    let manifest = &gates.loaded.manifest;
+    let tag = format!("v{}", manifest.app_version);
+
+    gh.ensure_installed()?;
+    gh.ensure_authenticated()?;
+    gh.ensure_tag_pushed(&gates.repo, &tag)?;
+    gh.ensure_no_existing_release(&gates.repo, &tag)?;
+
+    let assets = build_archive(
+        project_path,
+        &manifest.project_name,
+        &manifest.app_version,
+        scratch,
+    )?;
+    let notes_path = scratch.join("NOTES.md");
+    fs::write(&notes_path, &gates.notes).map_err(|source| PublishError::Io {
+        path: notes_path.clone(),
+        source,
+    })?;
+
+    announce(&gates, &tag, &assets);
+    if !prompt::confirmed(assume_yes) {
+        println!("Aborted — nothing was published.");
+        return Ok(false);
+    }
+
+    let url = gh.create_release(
+        &gates.repo,
+        &tag,
+        &notes_path,
+        &assets.archive_name,
+        &assets.archive_path,
+        &assets.sums_path,
+    )?;
+
+    println!("Published {tag} on {}", gates.repo);
+    println!("  {url}");
+    println!();
+    println!(
+        "Users install it with: tfsapp-hub install github:{}",
+        gates.repo
+    );
+
+    Ok(true)
+}
+
+/// Say what is about to be published, in the terms the user will have to
+/// reason about afterwards — `update::announce`'s counterpart for `publish`.
+/// Names where `gates.repo` came from (never uses it silently — the plan's
+/// "Which repository, and what happens to `releases_repo`"), and closes on
+/// the one sentence that is this command's residual risk: the archive is the
+/// working tree in front of the hub right now, not the tag.
+fn announce(gates: &LocalGates, tag: &str, assets: &Assets) {
+    println!("Repository  {} (from {})", gates.repo, gates.repo_source);
+    println!("Tag         {tag}");
+    println!(
+        "Archive     {} ({} bytes)",
+        assets.archive_name, assets.archive_size
+    );
+    println!("  sha256    {}", assets.sha256);
+    println!("Checksums   {}", release::SHA256SUMS_ASSET_NAME);
+    println!();
+    println!("Notes:");
+    for line in gates.notes.lines() {
+        println!("  {line}");
+    }
+    println!();
+    println!(
+        "This archives the working tree in front of the hub right now — not the tag {tag}. \
+         Publish from a clean checkout of the tag you just pushed."
+    );
+}
+
 /// Gate 2: `app_version` must parse as canonical semver — the value a
 /// published tag and archive name are both built from, and CONTRACT.md §2's
 /// own requirement.
@@ -253,7 +403,7 @@ fn resolve_repo(
     explicit: Option<&str>,
     manifest: &Manifest,
     manifest_path: &Path,
-) -> Result<String, PublishError> {
+) -> Result<(String, &'static str), PublishError> {
     let (repo, source) = match explicit {
         Some(repo) => (repo.to_string(), "--repo"),
         None => match manifest
@@ -279,7 +429,7 @@ fn resolve_repo(
         });
     }
 
-    Ok(repo)
+    Ok((repo, source))
 }
 
 /// Whether `repo` is exactly one non-empty `owner`, a `/`, and one non-empty
@@ -408,6 +558,9 @@ pub enum PublishError {
     /// taxonomy, reported here because it is exactly as much a reason the
     /// archive could not be produced as an `Io` failure is.
     Release(ReleaseError),
+    /// Gates 6–9, or the final `gh release create`, refused — `gh.rs`'s own
+    /// taxonomy.
+    Gh(GhError),
 }
 
 impl fmt::Display for PublishError {
@@ -465,6 +618,7 @@ impl fmt::Display for PublishError {
                 write!(formatter, "{}: {source}", path.display())
             }
             Self::Release(error) => write!(formatter, "{error}"),
+            Self::Gh(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -475,6 +629,7 @@ impl std::error::Error for PublishError {
             Self::Manifest(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             Self::Release(error) => Some(error),
+            Self::Gh(error) => Some(error),
             _ => None,
         }
     }
@@ -489,6 +644,12 @@ impl From<ManifestError> for PublishError {
 impl From<ReleaseError> for PublishError {
     fn from(error: ReleaseError) -> Self {
         Self::Release(error)
+    }
+}
+
+impl From<GhError> for PublishError {
+    fn from(error: GhError) -> Self {
+        Self::Gh(error)
     }
 }
 
