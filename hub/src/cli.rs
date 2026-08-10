@@ -157,10 +157,17 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "update",
-        form: "update <id> [--ref <tag|branch|sha>] [--force]",
+        form: "update <id> [--ref <tag|branch|sha>] [--force] [--yes]",
         summary: "Re-resolve an app's source and update it.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
+    },
+    Spec {
+        name: "rollback",
+        form: "rollback <id> [--yes]",
+        summary: "Undo the last update, restoring the previous version and database.",
+        level: Level::App,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "remove",
@@ -305,6 +312,17 @@ pub enum Command {
         id: String,
         reference: Option<String>,
         force: bool,
+        /// `--yes`: skip the confirmation. `update` runs the app's own PHP —
+        /// `composer install` and its lifecycle commands — exactly as
+        /// `install` does, so it asks first for the same reason and takes the
+        /// same escape for a script.
+        assume_yes: bool,
+    },
+    Rollback {
+        id: String,
+        /// `--yes`: skip the confirmation, same escape as `install` and
+        /// `update` — a rollback also rewrites the database and the tree.
+        assume_yes: bool,
     },
     Remove {
         id: String,
@@ -391,6 +409,7 @@ impl Command {
             Self::Open { .. } => "open",
             Self::Dev { .. } => "dev",
             Self::Update { .. } => "update",
+            Self::Rollback { .. } => "rollback",
             Self::Remove { .. } => "remove",
             Self::Export { .. } => "export",
             Self::Import { .. } => "import",
@@ -501,11 +520,19 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             })
         }
         "update" => {
-            let mut options = options("update", rest, &["--ref"], &["--force"])?;
+            let mut options = options("update", rest, &["--ref"], &["--force", "--yes", "-y"])?;
             Ok(Command::Update {
                 id: options.exactly_one("update", "an app id")?,
                 reference: options.value("--ref"),
                 force: options.flag("--force"),
+                assume_yes: options.assume_yes(),
+            })
+        }
+        "rollback" => {
+            let mut options = options("rollback", rest, &[], &["--yes", "-y"])?;
+            Ok(Command::Rollback {
+                id: options.exactly_one("rollback", "an app id")?,
+                assume_yes: options.assume_yes(),
             })
         }
         "remove" => {

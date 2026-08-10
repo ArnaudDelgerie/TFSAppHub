@@ -7,10 +7,13 @@ use std::{
 };
 
 use super::{
-    acquire_launch_locks, decide_launch, dialog_is_warranted, lifecycle_decision,
-    prepare_dev_launch, probe_run_lock, read_data_version, serving_lock_path, veto_exit,
-    write_data_version, LaunchDecision, LaunchLockError, LifecycleDecisionError, LifecycleError,
-    LifecycleEvent, RunLockHeld,
+    acquire_launch_locks, anchor_state, db_snapshot_path, decide_launch, dialog_is_warranted,
+    discard_db_snapshot, discard_rollback_anchor, lifecycle_decision, prepare_dev_launch,
+    previous_tree_path, probe_run_lock, read_data_version, read_rollback_anchor, rescue_dump_path,
+    restore_db_snapshot, rollback_anchor_path, serving_lock_path, snapshot_db, veto_exit,
+    write_data_version, write_rollback_anchor, Anchor, LaunchDecision, LaunchLockError,
+    LifecycleDecisionError, LifecycleError, LifecycleEvent, RollbackAnchor, RunLockHeld,
+    DB_FILE_NAMES,
 };
 
 fn version(text: &str) -> semver::Version {
@@ -436,4 +439,247 @@ fn a_dialog_when_stderr_is_not_a_terminal() {
     // A `.desktop` launch has no stderr anyone will read — the dialog is the
     // whole answer there.
     assert!(dialog_is_warranted(false));
+}
+
+// --- the rollback anchor's database half: snapshot_db / restore_db_snapshot
+// -----------------------------------------------------------------------
+
+#[test]
+fn a_snapshot_round_trips_with_a_hot_wal_present() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    fs::write(data_subdir.path().join("app.db"), b"main").expect("a db file");
+    fs::write(data_subdir.path().join("app.db-wal"), b"wal").expect("a wal file");
+    // No `-shm` — a snapshot must handle an absent twin, not just a present
+    // one.
+
+    snapshot_db(data_subdir.path()).expect("a snapshot");
+    for name in DB_FILE_NAMES {
+        fs::remove_file(data_subdir.path().join(name)).ok();
+    }
+    restore_db_snapshot(data_subdir.path()).expect("a restore");
+
+    assert_eq!(
+        fs::read(data_subdir.path().join("app.db")).expect("the main file"),
+        b"main"
+    );
+    assert_eq!(
+        fs::read(data_subdir.path().join("app.db-wal")).expect("the wal twin"),
+        b"wal"
+    );
+    assert!(
+        !data_subdir.path().join("app.db-shm").exists(),
+        "a twin absent at snapshot time must not appear on restore"
+    );
+}
+
+#[test]
+fn a_restore_removes_a_wal_that_appeared_after_the_snapshot() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    fs::write(data_subdir.path().join("app.db"), b"main").expect("a db file");
+    // No hot WAL at snapshot time.
+    snapshot_db(data_subdir.path()).expect("a snapshot");
+
+    // A WAL appears afterwards — the live file a failed event created along
+    // the way, or a hot WAL left by an unrelated crash.
+    fs::write(data_subdir.path().join("app.db-wal"), b"stray").expect("a wal file");
+
+    restore_db_snapshot(data_subdir.path()).expect("a restore");
+
+    assert!(
+        !data_subdir.path().join("app.db-wal").exists(),
+        "restoring a main file must not leave a foreign WAL beside it"
+    );
+}
+
+#[test]
+fn discarding_a_db_snapshot_leaves_the_live_database_untouched() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    fs::write(data_subdir.path().join("app.db"), b"live").expect("a db file");
+    snapshot_db(data_subdir.path()).expect("a snapshot");
+
+    discard_db_snapshot(data_subdir.path());
+
+    assert!(!db_snapshot_path(data_subdir.path(), "app.db").exists());
+    assert_eq!(
+        fs::read(data_subdir.path().join("app.db")).expect("the live file"),
+        b"live"
+    );
+}
+
+#[test]
+fn discarding_an_absent_db_snapshot_is_not_an_error() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    discard_db_snapshot(data_subdir.path()); // must not panic
+}
+
+#[test]
+fn the_rescue_dump_path_names_a_rescue_twin_beside_the_live_file() {
+    let data_subdir = Path::new("/tmp/does-not-need-to-exist");
+    assert_eq!(
+        rescue_dump_path(data_subdir, "app.db"),
+        data_subdir.join("app.db.rescue")
+    );
+}
+
+// --- the rollback anchor's tree half: previous_tree_path -------------------
+
+#[test]
+fn the_previous_tree_path_appends_previous_to_the_app_dir() {
+    let app_dir = Path::new("/apps/demo");
+    assert_eq!(
+        previous_tree_path(app_dir),
+        Path::new("/apps/demo.previous")
+    );
+}
+
+// --- the rollback anchor's registry half: rollback.json --------------------
+
+#[test]
+fn a_written_rollback_anchor_reads_back() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let anchor = RollbackAnchor {
+        app_version: "0.5.0".to_string(),
+        source_revision: "sha256:deadbeef".to_string(),
+        created_at: "2026-08-10T00:00:00Z".to_string(),
+    };
+
+    write_rollback_anchor(data_subdir.path(), &anchor).expect("a write");
+
+    assert_eq!(read_rollback_anchor(data_subdir.path()), Some(anchor));
+}
+
+#[test]
+fn a_missing_rollback_anchor_reads_as_none() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    assert_eq!(read_rollback_anchor(data_subdir.path()), None);
+}
+
+#[test]
+fn an_unknown_key_does_not_make_a_rollback_anchor_unreadable() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    fs::write(
+        rollback_anchor_path(data_subdir.path()),
+        r#"{"app_version": "0.5.0", "source_revision": "sha256:deadbeef", "created_at": "2026-08-10T00:00:00Z", "from_a_newer_hub": true}"#,
+    )
+    .expect("a hand-written anchor");
+
+    assert_eq!(
+        read_rollback_anchor(data_subdir.path()),
+        Some(RollbackAnchor {
+            app_version: "0.5.0".to_string(),
+            source_revision: "sha256:deadbeef".to_string(),
+            created_at: "2026-08-10T00:00:00Z".to_string(),
+        })
+    );
+}
+
+#[test]
+fn writing_a_rollback_anchor_leaves_no_temp_file_behind() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    write_rollback_anchor(
+        data_subdir.path(),
+        &RollbackAnchor {
+            app_version: "0.5.0".to_string(),
+            source_revision: "sha256:deadbeef".to_string(),
+            created_at: "2026-08-10T00:00:00Z".to_string(),
+        },
+    )
+    .expect("a write");
+
+    assert!(!data_subdir.path().join("rollback.json.tmp").exists());
+}
+
+#[test]
+fn discarding_the_anchor_record_leaves_it_unreadable() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    write_rollback_anchor(
+        data_subdir.path(),
+        &RollbackAnchor {
+            app_version: "0.5.0".to_string(),
+            source_revision: "sha256:deadbeef".to_string(),
+            created_at: "2026-08-10T00:00:00Z".to_string(),
+        },
+    )
+    .expect("a write");
+
+    discard_rollback_anchor(data_subdir.path());
+
+    assert_eq!(read_rollback_anchor(data_subdir.path()), None);
+}
+
+// --- anchor_state: three halves or Missing ----------------------------------
+
+/// Everything a `Complete` anchor needs, written under `data_subdir` and
+/// `app_dir`'s sibling `.previous` tree.
+fn write_complete_anchor(data_subdir: &Path, app_dir: &Path) {
+    fs::create_dir_all(previous_tree_path(app_dir)).expect("a retained tree");
+    fs::write(data_subdir.join("app.db"), b"pre-update").expect("a live db");
+    snapshot_db(data_subdir).expect("a db snapshot");
+    write_rollback_anchor(
+        data_subdir,
+        &RollbackAnchor {
+            app_version: "0.5.0".to_string(),
+            source_revision: "sha256:deadbeef".to_string(),
+            created_at: "2026-08-10T00:00:00Z".to_string(),
+        },
+    )
+    .expect("an anchor record");
+}
+
+#[test]
+fn all_three_halves_present_reads_as_complete() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let apps_root = tempfile::tempdir().expect("a temp apps root");
+    let app_dir = apps_root.path().join("demo");
+    write_complete_anchor(data_subdir.path(), &app_dir);
+
+    assert_eq!(
+        anchor_state(data_subdir.path(), &app_dir),
+        Anchor::Complete {
+            app_version: "0.5.0".to_string(),
+            source_revision: "sha256:deadbeef".to_string(),
+            created_at: "2026-08-10T00:00:00Z".to_string(),
+        }
+    );
+}
+
+#[test]
+fn a_missing_retained_tree_reads_as_missing() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let apps_root = tempfile::tempdir().expect("a temp apps root");
+    let app_dir = apps_root.path().join("demo");
+    write_complete_anchor(data_subdir.path(), &app_dir);
+    fs::remove_dir_all(previous_tree_path(&app_dir)).expect("dropping the retained tree");
+
+    assert_eq!(anchor_state(data_subdir.path(), &app_dir), Anchor::Missing);
+}
+
+#[test]
+fn a_missing_db_snapshot_reads_as_missing() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let apps_root = tempfile::tempdir().expect("a temp apps root");
+    let app_dir = apps_root.path().join("demo");
+    write_complete_anchor(data_subdir.path(), &app_dir);
+    fs::remove_file(db_snapshot_path(data_subdir.path(), "app.db")).expect("dropping the snapshot");
+
+    assert_eq!(anchor_state(data_subdir.path(), &app_dir), Anchor::Missing);
+}
+
+#[test]
+fn a_missing_rollback_json_reads_as_missing() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let apps_root = tempfile::tempdir().expect("a temp apps root");
+    let app_dir = apps_root.path().join("demo");
+    write_complete_anchor(data_subdir.path(), &app_dir);
+    discard_rollback_anchor(data_subdir.path());
+
+    assert_eq!(anchor_state(data_subdir.path(), &app_dir), Anchor::Missing);
+}
+
+#[test]
+fn nothing_at_all_reads_as_missing() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let app_dir = Path::new("/apps/never-installed");
+
+    assert_eq!(anchor_state(data_subdir.path(), app_dir), Anchor::Missing);
 }

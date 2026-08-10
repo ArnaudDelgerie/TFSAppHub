@@ -129,7 +129,7 @@ fn handle_request(
         // Always 200: the same `check` the IPC command calls never errors, so a
         // caller polling it has one shape to read and no exception to handle.
         (Method::Get, "/update/check") => {
-            let body = serde_json::to_value(crate::update::check())
+            let body = serde_json::to_value(crate::update_check::check())
                 .expect("an UpdateCheckResult always serialises");
             respond(request, 200, &body);
         }

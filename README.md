@@ -44,10 +44,14 @@ with its own data directory and its own cookie store, so two apps open side
 by side stay isolated; `list` and `remove` close the loop, the latter taking
 the entry with it; `run <id> <alias>` runs one of an app's own declared
 `bin/console` commands in the foreground, alongside `run --stop`/
-`run --replace` to release one without a manual `kill`. Not there yet:
-update/rollback, and hub self-update (`make release` publishes an AppImage
-today; nothing yet downloads and swaps one in). Git sources are recognised
-and refused with a
+`run --replace` to release one without a manual `kill`; `update <id>`
+re-resolves an app's own source and replaces the installed version with it,
+snapshotting the database first and reverting code and database together if
+anything fails; `rollback <id>` undoes a successful update afterwards,
+putting the previous source and database back and setting the one being left
+behind aside as a named rescue dump. Not there yet: hub self-update
+(`make release` publishes an AppImage today; nothing yet downloads and swaps
+one in). Git sources are recognised and refused with a
 message saying so, rather than pretended. The design record and the plan
 queue live under the git-ignored `.project/`.
 

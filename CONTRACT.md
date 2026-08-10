@@ -776,26 +776,37 @@ none at all, on a first install — in place, and the next attempt replays the
 *whole* event rather than resuming from the command that failed. There is no
 partial state to reason about.
 
-**Today the hub runs the install event and refuses the update.** Which event a
-moment is gets decided at install time too, against the same data directory a
-launch reads — the one a plain `remove` (without `--purge`) deliberately
-leaves behind. No record means an install, and `install` executes
-`pre-install` then `post-install`, in order, with the full environment and no
-server running, on a terminal where a failure is legible. A record equal to
-the app's own version means neither event, and install runs no lifecycle
-command over it — the ordinary reinstall-after-`remove` path, where Composer
-and the version record are the only things that still run. Per-app update is
-a queued plan;
-until it lands, `pre-update` and `post-update` may be declared but never run,
-and a data directory recording a version *older* than the one being installed
-is refused as the update event, naming the command that will own it once it
-exists — install never runs `pre-update`/`post-update` in its place. A record
+**Both events run, on the moments the host decides.** Which event a moment is
+gets decided against the data directory's own record — the one a plain
+`remove` (without `--purge`) deliberately leaves behind. No record means an
+install, and `tfsapp-hub install` executes `pre-install` then `post-install`,
+in order, with the full environment and no server running, on a terminal
+where a failure is legible. A record equal to the app's own version means
+neither event, and install runs no lifecycle command over it — the ordinary
+reinstall-after-`remove` path, where Composer and the version record are the
+only things that still run. A record *older* than the app being installed is
+the update event, and `install` refuses to run it in `install`'s own moment —
+naming `tfsapp-hub update <id>` as the command that owns it instead. A record
 *newer* than the one being installed is a downgrade, and `install` refuses it
 exactly as a launch does, naming both versions and the directory: running old
 code against data a newer version wrote is how a database gets corrupted
-quietly, whichever host notices it first. When update does land, it owns one
-guarantee this section deliberately does not state on its behalf: an update
-must never leave the app's database between two versions.
+quietly, whichever host notices it first.
+
+`tfsapp-hub update <id>` owns the update event, and with it the one guarantee
+this section states on its own behalf rather than an app author's: **an
+update must never leave the app's database between two versions.** It does
+so by snapshotting the database before `pre-update` runs and reverting the
+snapshot, the code and the registry together the moment any step fails — an
+app either finishes the update it declared, or is left exactly where it
+started, never partway through.
+
+A successful update leaves behind a **rollback anchor** — the outgoing
+source tree and the pre-update database, kept rather than discarded —
+until `tfsapp-hub rollback <id>` consumes it: putting the previous version's
+code and database back together, in one generation, and setting the database
+being left behind aside as a named rescue dump rather than deleting it. A
+rollback is one step back; it leaves nothing behind to roll back a second
+time.
 
 That install-time placement is better than it had to be. A migration and a cache
 warm-up run once, while someone is watching a terminal that can print an error,
@@ -841,10 +852,11 @@ manual `kill`. Four rules govern it.
 **Rule 1 — the app layer must be up to date.** A `run` command refuses unless
 the app's data directory records the version it is actually running — the
 same check a launch makes. A missing record, an older one, or a newer one (a
-downgrade) each refuse, naming the way out: open the app once, update it, or
-resolve the downgrade by hand. `run --stop` is exempt — recovering an
-installation stuck on a stale app layer is one of its own jobs, and stopping
-whatever holds the command's lock never touches this record.
+downgrade) each refuse, naming the way out: open the app once, run
+`tfsapp-hub update <id>`, or resolve the downgrade by hand. `run --stop` is
+exempt — recovering an installation stuck on a stale app layer is one of its
+own jobs, and stopping whatever holds the command's lock never touches this
+record.
 
 **Rule 2 — at most one `run` command per app at a time.** An exclusive lock
 on the app's own data directory, the same directory two different apps never
@@ -982,10 +994,12 @@ answer successfully with `status: "unavailable"` rather than throwing, which is
 what lets an app call this on a timer without wrapping it in exception handling.
 
 **Today the hub always answers `unavailable`,** with the reason above: it
-resolves updates itself, through a command, and has no release feed to point an
-app at. The real answer needs the per-app update plan; until then the honest
-`unavailable` is served over both transports, so an app writes its handling once
-and never learns that anything is missing.
+resolves updates itself, through `tfsapp-hub update <id>`, and has no release
+feed to point an app at. The real answer needs the remote-sources resolver
+(queued, `000-index.md`) so a git source's own newest tag can be compared
+against; until then the honest `unavailable` is served over both transports,
+so an app writes its handling once and never learns that anything is
+missing.
 
 ### The bridge wire contract
 

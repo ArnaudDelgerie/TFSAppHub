@@ -24,11 +24,13 @@ mod platform;
 mod prompt;
 mod registry;
 mod remove;
+mod rollback;
 mod run;
 mod secrets;
 mod sidecar;
 mod source;
 mod update;
+mod update_check;
 mod window;
 mod worker;
 
@@ -118,6 +120,19 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         Command::Open { id } => open::run(&id),
         // Foreground, unlike `open` — see `dev::run`.
         Command::Dev { path } => dev::run(&path),
+        Command::Update {
+            id,
+            reference,
+            force,
+            assume_yes,
+        } => update::run(
+            &id,
+            reference.as_deref(),
+            force,
+            assume_yes,
+            &context.package_info().version.to_string(),
+        ),
+        Command::Rollback { id, assume_yes } => rollback::run(&id, assume_yes),
         Command::Remove {
             id,
             purge,
@@ -378,7 +393,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             secrets::secret_set,
             secrets::secret_delete,
             secrets::secret_list,
-            update::update_check,
+            update_check::update_check,
         ])
         .setup(move |app| {
             // Greyscale rather than subpixel text antialiasing, for every
