@@ -91,8 +91,12 @@ pub fn run(
 /// Takes its `Paths` rather than resolving them, which is what lets the whole
 /// pipeline — copy, Composer, hooks, cleanup — run against a throwaway root in
 /// a test instead of the developer's real `~/.local/share/TFSApp/`.
+///
+/// `pub(crate)` rather than private: `update.rs`'s own tests reuse it to seed
+/// an installed app to update, rather than reimplementing an install fixture
+/// a second time.
 #[allow(clippy::too_many_arguments)]
-fn install(
+pub(crate) fn install(
     paths: &Paths,
     source: &str,
     id: Option<&str>,
@@ -199,8 +203,10 @@ fn install(
 /// Refresh the stable hub copy and (re)write this app's desktop entry.
 ///
 /// Both steps are best-effort: a failure is a warning naming the path and the
-/// cause, never a reason to fail an install that has already succeeded.
-fn write_desktop_entry(paths: &Paths, id: &str, manifest: &Manifest, app_dir: &Path) {
+/// cause, never a reason to fail an install — or an update, which reruns this
+/// unchanged: a re-snapshot can change `product_name` or `icon_path`, and the
+/// entry is stale without it — that has already succeeded.
+pub(crate) fn write_desktop_entry(paths: &Paths, id: &str, manifest: &Manifest, app_dir: &Path) {
     if let Err(error) = hub_bin::ensure_current(paths) {
         eprintln!(
             "tfsapp-hub: warning: could not refresh the stable hub copy at {}: {error}",
@@ -267,38 +273,41 @@ fn announce(
 }
 
 /// Bring the copied tree to a state the app can run from: its dependencies,
-/// then — only when `event` is [`LifecycleEvent::Install`] — its own
-/// install-time lifecycle commands.
+/// then — for [`LifecycleEvent::Install`] or [`LifecycleEvent::Update`] — the
+/// event's own lifecycle commands.
 ///
-/// **Which hooks run here, and why these.** The hub's `install` is the
+/// **Which hooks run here, and why these.** `install`'s own call runs the
 /// contract's install event (CONTRACT.md §6) only when the data directory
 /// says so: `event` was decided by `lifecycle_event_for_install`, above this
-/// function, against the data `remove` (without `--purge`) may have left
-/// behind. An [`LifecycleEvent::Install`] runs `pre-install` then
-/// `post-install`, in that order; [`LifecycleEvent::None`] — an equal
-/// record, the reinstall-after-`remove` path — runs neither, exactly as
-/// CONTRACT.md §6 states it. The event can never resolve to `Update` here:
-/// `lifecycle_event_for_install` already turned that case into a refusal
-/// before `prepare` was ever called, so `pre-update`/`post-update` stay
-/// unreachable from `install`, which is not their event.
+/// function in that module, against the data `remove` (without `--purge`)
+/// may have left behind. `update <id>`'s own call (the per-app update and
+/// rollback plan) is this function's other caller, and always passes
+/// [`LifecycleEvent::Update`] for its `Apply` action — the tree has already
+/// been swapped by the time this runs, so there is nothing left to decide.
+/// [`LifecycleEvent::Install`] runs `pre-install` then `post-install`, in
+/// that order; [`LifecycleEvent::Update`] runs `pre-update` then
+/// `post-update`; [`LifecycleEvent::None`] — an equal record, the
+/// reinstall-after-`remove` path — runs neither, exactly as CONTRACT.md §6
+/// states it.
 ///
-/// The station runs `post-install` after `/healthz` answers `200`, because over
-/// there the install event happens *during a launch* and there is a sidecar up
-/// by then. Here there is not: install is its own moment, with no window and no
-/// server. For the ordinary contents of that hook — a cache warm, an `about` —
-/// it makes no difference; for one that expects to reach its own app over HTTP
-/// it does. CONTRACT.md §6 says so plainly rather than leaving it to be
-/// discovered: a `post-` command may not assume its own app is reachable.
-fn prepare(
+/// The station runs `post-install`/`post-update` after `/healthz` answers
+/// `200`, because over there both events happen *during a launch* and there
+/// is a sidecar up by then. Here there is not: an install or an update is its
+/// own moment, with no window and no server. For the ordinary contents of
+/// that hook — a cache warm, an `about` — it makes no difference; for one
+/// that expects to reach its own app over HTTP it does. CONTRACT.md §6 says
+/// so plainly rather than leaving it to be discovered: a `post-` command may
+/// not assume its own app is reachable.
+pub(crate) fn prepare(
     paths: &Paths,
     toolchain: &Toolchain,
     manifest: &Manifest,
     app_dir: &Path,
     event: LifecycleEvent,
 ) -> Result<(), InstallError> {
-    // `0700` on every install, not only on the first: an app reinstalled after
-    // an older host created it laxly gets tightened here rather than staying
-    // that way forever (`paths::create_app_data_dir`'s own doc).
+    // `0700` on every call, not only on a first install: an app reinstalled
+    // after an older host created it laxly gets tightened here rather than
+    // staying that way forever (`paths::create_app_data_dir`'s own doc).
     let state_root = paths.create_app_data_dir(&manifest.identifier)?;
     let environment = app_env::resolve(
         manifest,
@@ -313,25 +322,33 @@ fn prepare(
     println!("Its data lives in {}", environment.data_dir.display());
 
     // Runs whichever event this is: dependencies are the freshly copied tree's
-    // own, not a lifecycle command, and an app with none to install still
+    // own, not a lifecycle command, and a call with none to install still
     // needs its vendor dir populated.
     toolchain.composer_install(app_dir, &environment.vars)?;
 
-    if event == LifecycleEvent::Install {
-        for command in manifest
+    let commands: Vec<&String> = match event {
+        LifecycleEvent::Install => manifest
             .commands
             .pre_install
             .iter()
             .chain(&manifest.commands.post_install)
-        {
-            toolchain.console(app_dir, &environment.vars, command)?;
-        }
+            .collect(),
+        LifecycleEvent::Update => manifest
+            .commands
+            .pre_update
+            .iter()
+            .chain(&manifest.commands.post_update)
+            .collect(),
+        LifecycleEvent::None => Vec::new(),
+    };
+    for command in commands {
+        toolchain.console(app_dir, &environment.vars, command)?;
     }
 
-    // The install event's success point (CONTRACT.md §6): the data dir records
-    // which version of the app last wrote it, and it is written **only** once
-    // every hook above has succeeded — a failed install leaves the dir undated,
-    // so the next attempt starts the whole event over rather than believing it
+    // The event's success point (CONTRACT.md §6): the data dir records which
+    // version of the app last wrote it, and it is written **only** once every
+    // hook above has succeeded — a failed call leaves the dir undated, so the
+    // next attempt starts the whole event over rather than believing it
     // already ran. Runs whichever event this is, same as `composer_install`
     // above: an equal record is rewritten to the same value, preserving
     // `port_override` exactly as `write_data_version` already does.

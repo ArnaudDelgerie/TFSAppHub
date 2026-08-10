@@ -98,14 +98,16 @@ fn bare_words_route_to_an_app() {
             id: "demo".to_string(),
             reference: None,
             force: false,
+            assume_yes: false,
         }
     );
     assert_eq!(
-        command("update demo --ref main --force"),
+        command("update demo --ref main --force --yes"),
         Command::Update {
             id: "demo".to_string(),
             reference: Some("main".to_string()),
             force: true,
+            assume_yes: true,
         }
     );
     assert_eq!(
@@ -273,7 +275,6 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
     for line in [
         "--update",
         "--rollback",
-        "update demo",
         "export demo /tmp/demo",
         "import demo /tmp/demo.tar.gz",
     ] {
@@ -289,6 +290,7 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         "list",
         "install ../TFSAppTest",
         "open demo",
+        "update demo",
         "remove demo",
         "run demo",
         "run demo console",

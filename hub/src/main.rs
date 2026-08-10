@@ -119,6 +119,18 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         Command::Open { id } => open::run(&id),
         // Foreground, unlike `open` — see `dev::run`.
         Command::Dev { path } => dev::run(&path),
+        Command::Update {
+            id,
+            reference,
+            force,
+            assume_yes,
+        } => update::run(
+            &id,
+            reference.as_deref(),
+            force,
+            assume_yes,
+            &context.package_info().version.to_string(),
+        ),
         Command::Remove {
             id,
             purge,
