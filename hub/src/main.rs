@@ -28,6 +28,7 @@ mod run;
 mod secrets;
 mod sidecar;
 mod source;
+mod update;
 mod update_check;
 mod window;
 mod worker;
