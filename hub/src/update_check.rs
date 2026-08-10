@@ -21,11 +21,12 @@
 //! unpinned and the question is whether its sha moved; a local path is re-read
 //! from its own `tfsapp.config.json`, and `source_revision` answers the very
 //! common case of a developer who changed the tree without bumping the version.
-//! All of it needs the resolver `source.rs` has not grown yet and the applier
-//! `update <id>` will be — the per-app update and rollback plan, and the hub
-//! self-update and lazy revalidation plan after it, neither written yet (see
-//! `000-index.md`) — and "a newer version exists" means nothing until
-//! something can act on it.
+//! All of it needs the resolver `source.rs` has not grown yet. The applier is
+//! written: `tfsapp-hub update <id>` (`update.rs`, the per-app update and
+//! rollback plan). What is still missing is the hub self-update and lazy
+//! revalidation plan (see `000-index.md`), and "a newer version exists" means
+//! nothing until that question is answered about *sources* rather than acted
+//! on by hand.
 //!
 //! CONTRACT.md §7 states this the way it should have been stated all along: the
 //! result says what changed and nothing about how to apply it, because how an
@@ -74,5 +75,5 @@ pub fn update_check() -> UpdateCheckResult {
 }
 
 #[cfg(test)]
-#[path = "update_tests.rs"]
+#[path = "update_check_tests.rs"]
 mod tests;

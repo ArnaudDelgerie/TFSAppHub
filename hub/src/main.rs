@@ -28,7 +28,7 @@ mod run;
 mod secrets;
 mod sidecar;
 mod source;
-mod update;
+mod update_check;
 mod window;
 mod worker;
 
@@ -378,7 +378,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             secrets::secret_set,
             secrets::secret_delete,
             secrets::secret_list,
-            update::update_check,
+            update_check::update_check,
         ])
         .setup(move |app| {
             // Greyscale rather than subpixel text antialiasing, for every
