@@ -93,6 +93,22 @@ fn bare_words_route_to_an_app() {
         }
     );
     assert_eq!(
+        command("publish ../TFSAppTest"),
+        Command::Publish {
+            path: "../TFSAppTest".to_string(),
+            repo: None,
+            assume_yes: false,
+        }
+    );
+    assert_eq!(
+        command("publish ../TFSAppTest --repo owner/repo --yes"),
+        Command::Publish {
+            path: "../TFSAppTest".to_string(),
+            repo: Some("owner/repo".to_string()),
+            assume_yes: true,
+        }
+    );
+    assert_eq!(
         command("update demo"),
         Command::Update {
             id: "demo".to_string(),
@@ -289,6 +305,7 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
     for line in [
         "--update",
         "--rollback",
+        "publish ../TFSAppTest",
         "export demo /tmp/demo",
         "import demo /tmp/demo.tar.gz",
     ] {

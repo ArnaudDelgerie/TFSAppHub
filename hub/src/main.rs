@@ -23,6 +23,7 @@ mod paths;
 mod php;
 mod platform;
 mod prompt;
+mod publish;
 mod registry;
 mod release;
 mod remove;
