@@ -1027,7 +1027,7 @@ applied belongs to the host.
 ```
 
 ```json
-{"status": "unavailable", "reason": "host_resolves_updates_itself"}
+{"status": "unavailable", "reason": "local_source"}
 ```
 
 `update_available` compares semver: a published version older than *or equal to*
@@ -1039,26 +1039,43 @@ now", that is a separate action, not a field in a query's answer.
 
 `reason` is a stable machine-readable token rather than a sentence, so an app can
 hide its "check for updates" button on one and show a network error on another.
+The host publishes the token; the sentence a person reads belongs to the app.
+
+| token | when |
+| --- | --- |
+| `local_source` | installed from a local directory, or a `dev` session — no release feed exists |
+| `no_answer_yet` | a release-installed app whose cache holds nothing usable: the first launch after install, or every refresh attempted so far has failed |
+
+Offline, rate-limited, a malformed release and a repository that 404s all
+collapse into `no_answer_yet` — an app cannot act differently on any of them,
+so they share one token, and the detail goes to the host's own log rather than
+into a vocabulary apps would have to branch on.
 
 **The check is pull, never push.** No automatic, background, periodic or startup
 check, and no notification badge. The app decides when to ask and how to render
 the answer; the host never blocks startup or raises a dialog about a version
-nobody asked about.
+nobody asked about. A host refreshing its cache in the background, on its own
+schedule, is not a push: nothing is delivered to the app or its user unrequested
+— the app still has to ask, and the answer it gets is only ever a reply.
+
+**The check never opens a socket in the app's request path.** Whatever a host
+does to learn the answer, it does before the app asks, not while the app waits
+— so polling this on a timer costs nothing and cannot fail for a network
+reason. A stale answer is served rather than withheld: an update check is never
+urgent, and a host running behind is not a reason to answer less than it knows.
 
 **A check that cannot be made is a result, not a failure.** Both transports
 answer successfully with `status: "unavailable"` rather than throwing, which is
 what lets an app call this on a timer without wrapping it in exception handling.
 
-**Today the hub always answers `unavailable`,** with the reason above: it
-resolves updates itself, through `tfsapp-hub update <id>`. A release-installed
-app does have a feed to compare against now, but a true answer needs a cache
-policy for a check the contract lets an app poll on a timer, a single
-behaviour across how an app was installed (a local install has no feed at
-all), and the handoff that closes the app's window, runs the update and
-reopens it — three things to design together, which is why that answer is its
-own plan (queued, `000-index.md`) rather than a follow-up commit. Until it
-lands, the honest `unavailable` is served over both transports, so an app
-writes its handling once and never learns that anything is missing.
+**The hub answers `ok` for a release-installed app once it has resolved that
+release's feed at least once**, and `unavailable` / `no_answer_yet` until then
+— never by dialling out while the app waits, only from what a background
+refresh already learned. A local install, or a `dev` session, always answers
+`unavailable` / `local_source`: the "latest version" of a directory a developer
+edits by hand is whatever they last typed there, and the question has no other
+meaning. (`host_resolves_updates_itself`, an earlier reason token, is retired;
+it will not reappear.)
 
 ### The bridge wire contract
 
@@ -1207,8 +1224,9 @@ as the rest of this document: what the app sees, never how the hub does it.
 its own data directory, its own cookie store, its own liveness lock, by the
 same identifier-keyed rules an installed app gets; it is simply a different
 identifier. §7's `actions` behave identically over both transports, and
-`actions.update` already answers the same way in both: `unavailable`, since
-the host resolves updates itself regardless of which mode is asking.
+`actions.update` already answers the same way in both: `unavailable` /
+`local_source`, since a dev session has no release feed to compare against
+regardless of which mode is asking.
 
 ### No install, so no install lifecycle
 
