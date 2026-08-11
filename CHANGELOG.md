@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 An app launched from its desktop entry, whose launch then fails — a renamed
 snapshot, a broken dependency, anything `open` refuses — now puts a native
