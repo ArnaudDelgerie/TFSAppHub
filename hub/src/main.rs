@@ -41,6 +41,7 @@ mod source;
 mod update;
 mod update_cache;
 mod update_check;
+mod update_refresh;
 mod window;
 mod worker;
 
@@ -607,4 +608,15 @@ fn serve(
         url,
         product_name: identity.product_name,
     });
+
+    // Last of all, and only after the app is already running: a slow or
+    // offline forge must never delay a launch reaching its window. A no-op
+    // for anything but a release install that declares `actions.update` —
+    // see `update_refresh::spawn`'s own guard.
+    update_refresh::spawn(
+        paths,
+        &spec.update,
+        manifest.actions.update.ipc || manifest.actions.update.bridge,
+        Some(environment.log_dir.join("hub.log")),
+    );
 }
