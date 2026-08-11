@@ -24,7 +24,7 @@
 
 use std::path::PathBuf;
 
-use crate::{identity::Identity, manifest::Manifest};
+use crate::{identity::Identity, manifest::Manifest, update_check};
 
 /// What varies between an installed snapshot and a live project: whether a
 /// hub-local handle exists to re-execute against and to name in a message.
@@ -64,6 +64,11 @@ pub struct LaunchSpec {
     /// where it is produced — see `open::Resolved`'s former doc, which said
     /// the same thing before this module existed.
     pub warnings: Vec<String>,
+    /// What `actions.update`'s answer needs about this launch — see
+    /// [`update_check::Context`]. `open::resolve` builds `Installed` from the
+    /// registry entry it already read; `dev::resolve` builds `Dev`, since a
+    /// live project has no entry to build one from.
+    pub update: update_check::Context,
 }
 
 impl LaunchSpec {

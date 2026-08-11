@@ -47,6 +47,7 @@ use crate::{
     paths::{Paths, PathsError},
     registry::{self, now_timestamp, RegistryError, State},
     revalidate::{self, RevalidateError},
+    update_check,
 };
 
 /// The whole command, parent side. Returns the process's exit code.
@@ -172,6 +173,11 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
         state_root,
         label: id.to_string(),
         warnings: loaded.warnings,
+        update: update_check::Context::Installed {
+            source: entry.source.clone(),
+            app_version: entry.app_version.clone(),
+            cache_path: paths.update_cache_path(),
+        },
     })
 }
 

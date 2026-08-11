@@ -23,6 +23,7 @@ fn spec(source: Source) -> LaunchSpec {
         state_root: PathBuf::from("/data/dev.local.demo"),
         label: "demo".to_string(),
         warnings: vec![],
+        update: update_check::Context::Dev,
     }
 }
 

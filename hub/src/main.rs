@@ -39,7 +39,9 @@ mod secrets;
 mod sidecar;
 mod source;
 mod update;
+mod update_cache;
 mod update_check;
+mod update_refresh;
 mod window;
 mod worker;
 
@@ -552,15 +554,19 @@ fn serve(
 
     // Managed before the sidecar starts, so the IPC commands can never meet a
     // window without a store behind it: `secrets.rs` resolves both from the
-    // calling window and has nothing else to fall back on.
+    // calling window and has nothing else to fall back on. `spec.update` the
+    // same way — `update_check::update_check` reads it from the calling
+    // window, exactly as the secret commands read their own state.
     app.manage(environment.secret_store.clone());
     app.manage(manifest.actions.secrets.clone());
+    app.manage(spec.update.clone());
 
     let (sidecar, url) = match sidecar::start(
         &toolchain,
         &spec.app_dir,
         &environment,
         manifest,
+        &spec.update,
         liveness_lock,
         serving_lock,
         &app,
@@ -602,4 +608,15 @@ fn serve(
         url,
         product_name: identity.product_name,
     });
+
+    // Last of all, and only after the app is already running: a slow or
+    // offline forge must never delay a launch reaching its window. A no-op
+    // for anything but a release install that declares `actions.update` —
+    // see `update_refresh::spawn`'s own guard.
+    update_refresh::spawn(
+        paths,
+        &spec.update,
+        manifest.actions.update.ipc || manifest.actions.update.bridge,
+        Some(environment.log_dir.join("hub.log")),
+    );
 }

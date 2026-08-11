@@ -3,18 +3,46 @@ use std::net::TcpStream;
 
 use super::{start, Bridge, BridgeGroups};
 use crate::secrets::new_fake_keyring_store;
+use crate::update_check::Context;
 
 /// A bridge with both groups on, one declared key, and a store that never
-/// touches D-Bus.
+/// touches D-Bus. Its update context is `Dev` — plain enough for every test
+/// but the ones that care about `/update/check`'s own shape, which build
+/// their own context via [`bridge_with_update_context`].
 fn bridge(groups: BridgeGroups, keys: &[&str]) -> Bridge {
+    bridge_with_update_context(groups, keys, Context::Dev)
+}
+
+fn bridge_with_update_context(
+    groups: BridgeGroups,
+    keys: &[&str],
+    update_context: Context,
+) -> Bridge {
     let store = new_fake_keyring_store();
     crate::secrets::secrets_set(&store, "openai", "sk-stored".to_string());
     start(
         store,
         keys.iter().map(|key| key.to_string()).collect(),
         groups,
+        update_context,
     )
     .expect("a started bridge")
+}
+
+/// A release source pointing at `cache_path`, the shape `/update/check`
+/// tests build their context from.
+fn release_update_context(cache_path: std::path::PathBuf) -> Context {
+    Context::Installed {
+        source: crate::registry::Source {
+            kind: crate::registry::SourceKind::Release,
+            location: "owner/repo".to_string(),
+            reference: Some("v1.0.0".to_string()),
+            reference_kind: Some(crate::registry::ReferenceKind::Tag),
+            index: Some("github".to_string()),
+        },
+        app_version: "1.0.0".to_string(),
+        cache_path,
+    }
 }
 
 const BOTH: BridgeGroups = BridgeGroups {
@@ -189,7 +217,7 @@ fn a_group_that_is_off_answers_not_found_rather_than_forbidden() {
 }
 
 #[test]
-fn the_update_route_answers_the_shape_an_app_already_handles() {
+fn the_update_route_answers_unavailable_for_a_dev_session() {
     let bridge = bridge(BOTH, &[]);
     let token = bridge.token.clone();
 
@@ -201,7 +229,59 @@ fn the_update_route_answers_the_shape_an_app_already_handles() {
     assert_eq!(answer.json()["status"], "unavailable");
     assert_eq!(
         answer.json()["reason"],
-        crate::update_check::HOST_RESOLVES_UPDATES
+        crate::update_check::REASON_LOCAL_SOURCE
+    );
+}
+
+#[test]
+fn the_update_route_answers_no_answer_yet_with_nothing_cached() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = crate::paths::Paths::rooted_at(base.path());
+    let bridge =
+        bridge_with_update_context(BOTH, &[], release_update_context(paths.update_cache_path()));
+    let token = bridge.token.clone();
+
+    let answer = request(&bridge, "GET", "/update/check", Some(&token), "");
+
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.json()["status"], "unavailable");
+    assert_eq!(
+        answer.json()["reason"],
+        crate::update_check::REASON_NO_ANSWER_YET
+    );
+}
+
+#[test]
+fn the_update_route_answers_ok_once_the_cache_holds_a_release() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = crate::paths::Paths::rooted_at(base.path());
+    crate::update_cache::update(&paths, |cache| {
+        cache.insert(
+            "owner/repo".to_string(),
+            crate::update_cache::CachedRelease {
+                checked_at: "2026-08-11T00:00:00Z".to_string(),
+                tag: "v1.2.0".to_string(),
+                release_url: "https://github.com/owner/repo/releases/tag/v1.2.0".to_string(),
+                notes: "release notes".to_string(),
+                unknown: serde_json::Map::new(),
+            },
+        );
+    })
+    .expect("it writes");
+    let bridge =
+        bridge_with_update_context(BOTH, &[], release_update_context(paths.update_cache_path()));
+    let token = bridge.token.clone();
+
+    let answer = request(&bridge, "GET", "/update/check", Some(&token), "");
+
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.json()["status"], "ok");
+    assert_eq!(answer.json()["current"], "1.0.0");
+    assert_eq!(answer.json()["latest"], "1.2.0");
+    assert_eq!(answer.json()["update_available"], true);
+    assert_eq!(
+        answer.json()["release_url"],
+        "https://github.com/owner/repo/releases/tag/v1.2.0"
     );
 }
 

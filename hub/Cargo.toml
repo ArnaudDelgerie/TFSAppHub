@@ -55,8 +55,9 @@ tar = "0.4"
 flate2 = "1"
 # Already a transitive dependency (via tauri's `cookie` crate) — declared
 # directly, with the "formatting" feature, for `export`'s RFC-3339
-# exported_at manifest timestamp.
-time = { version = "0.3", features = ["formatting"] }
+# exported_at manifest timestamp, and "parsing" for `update_refresh.rs`'s own
+# `checked_at` age check.
+time = { version = "0.3", features = ["formatting", "parsing"] }
 # Shared with `core/` — see the root Cargo.toml for what each is for.
 serde.workspace = true
 serde_json.workspace = true

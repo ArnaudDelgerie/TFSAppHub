@@ -56,14 +56,18 @@ pub enum HubUpdateCheck<'a> {
     Unavailable(String),
 }
 
+/// Turn a release tag into a comparable version: strip a leading `v`, then
+/// parse as semver. The one rule for that anywhere in the hub —
+/// `update_check`'s per-app answer (`../plan/021-the-update-check-an-app-can-
+/// read.md`) reuses this rather than growing a second one.
+pub(crate) fn parse_tag_version(tag: &str) -> Result<semver::Version, semver::Error> {
+    semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag))
+}
+
 /// Compare `current` — the running hub's own version — against `release`,
 /// already fetched by the caller. No network, no filesystem.
 pub fn check<'a>(current: &semver::Version, release: &'a GitHubRelease) -> HubUpdateCheck<'a> {
-    let tag = release
-        .tag_name
-        .strip_prefix('v')
-        .unwrap_or(&release.tag_name);
-    let latest = match semver::Version::parse(tag) {
+    let latest = match parse_tag_version(&release.tag_name) {
         Ok(version) => version,
         Err(error) => {
             return HubUpdateCheck::Unavailable(format!(

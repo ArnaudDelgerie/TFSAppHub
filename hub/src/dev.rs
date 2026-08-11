@@ -22,6 +22,7 @@ use crate::{
     identity::Identity,
     launch::{LaunchSpec, Source},
     manifest::{self, ManifestError},
+    update_check,
 };
 
 /// The runtime-identity namespace a dev session's identifier is prefixed
@@ -167,6 +168,7 @@ pub fn resolve(project_path: &str) -> Result<LaunchSpec, DevError> {
         state_root,
         label,
         warnings: loaded.warnings,
+        update: update_check::Context::Dev,
     })
 }
 

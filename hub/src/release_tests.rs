@@ -36,6 +36,7 @@ fn release(tag: &str, assets: Vec<GitHubAsset>) -> GitHubRelease {
         tag_name: tag.to_string(),
         html_url: format!("https://github.com/example/demo/releases/tag/{tag}"),
         assets,
+        body: None,
     }
 }
 
@@ -63,9 +64,33 @@ fn a_good_release_resolves_its_tag_and_assets() {
     handle.join().expect("the stub thread finishes");
 
     assert_eq!(release.tag_name, "v1.2.0");
+    // No "body" key at all in this response — defaults to `None` rather than
+    // failing to deserialise.
+    assert_eq!(release.body, None);
     let assets = resolve_assets(&release).expect("both assets present");
     assert_eq!(assets.archive_name, "demo-1.2.0.tar.gz");
     assert_eq!(assets.checksums_url, "https://example.test/SHA256SUMS.txt");
+}
+
+#[test]
+fn a_release_s_body_is_read_when_present_and_none_when_explicitly_null() {
+    let (base_url, handle) = stub_once(
+        200,
+        "application/json",
+        r#"{"tag_name": "v1.0.0", "html_url": "https://x", "assets": [], "body": "Fixes stuff."}"#,
+    );
+    let release = fetch_latest_release_at(&base_url, "example/demo").expect("a good release");
+    handle.join().expect("the stub thread finishes");
+    assert_eq!(release.body, Some("Fixes stuff.".to_string()));
+
+    let (base_url, handle) = stub_once(
+        200,
+        "application/json",
+        r#"{"tag_name": "v1.0.0", "html_url": "https://x", "assets": [], "body": null}"#,
+    );
+    let release = fetch_latest_release_at(&base_url, "example/demo").expect("a good release");
+    handle.join().expect("the stub thread finishes");
+    assert_eq!(release.body, None);
 }
 
 #[test]
