@@ -30,12 +30,12 @@ set -euo pipefail
 #
 # The releases repo is a constant, not resolved or prompted for: the hub is
 # one project with one release stream, not N apps each choosing their own.
-# Override it from the environment for a fork or a private mirror.
-# **Hand-off, recorded here so it is not rediscovered**: hub self-update
-# needs this same value in Rust, and that plan must move it to one shared
-# source of truth rather than copy it a second time.
-RELEASES_REPO="${RELEASES_REPO:-ArnaudDelgerie/TFSAppHub-releases}"
-
+# Override it from the environment for a fork or a private mirror. The value
+# itself lives in build/releases-repo, one shared source of truth read here
+# and by hub/build.rs (TFSAPP_RELEASES_REPO, for hub self-update in
+# release.rs) — resolved relative to this script's own directory so it works
+# from anywhere it's invoked from.
+#
 # Requires: gh, authenticated (`gh auth login`). Public releases repo only:
 # the eventual anonymous in-app update check carries no token, so a private
 # repo is out of scope.
@@ -48,6 +48,15 @@ die() { echo "release: $*" >&2; exit 1; }
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CARGO_TOML="$ROOT_DIR/hub/Cargo.toml"
+
+if [[ -z "${RELEASES_REPO:-}" ]]; then
+  RELEASES_REPO_FILE="$ROOT_DIR/build/releases-repo"
+  [[ -f "$RELEASES_REPO_FILE" ]] \
+    || die "no build/releases-repo file at $RELEASES_REPO_FILE"
+  RELEASES_REPO="$(grep -vE '^[[:space:]]*(#|$)' "$RELEASES_REPO_FILE" | head -n1)"
+  [[ -n "$RELEASES_REPO" ]] \
+    || die "build/releases-repo ($RELEASES_REPO_FILE) has no value line"
+fi
 
 # --- Preconditions ----------------------------------------------------------
 command -v gh >/dev/null 2>&1 \

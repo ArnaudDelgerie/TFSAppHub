@@ -45,6 +45,17 @@ const GITHUB_USER_AGENT: &str = "TFSAppHub-release-resolver";
 /// `release_tests.rs`, extended one layer up.
 pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
 
+/// The hub's own releases repo — the value `build/releases-repo` publishes,
+/// baked in by `hub/build.rs` as `TFSAPP_RELEASES_REPO` so `release.sh`
+/// (publishing) and this constant (the hub's own `--update`, `../plan/020-
+/// hub-self-update-and-revalidation.md`) read one shared source of truth
+/// rather than two copies of the same string.
+///
+/// `#[allow(dead_code)]`: step 1 only introduces the constant; `hub_update.rs`
+/// (step 2) is its first real reader.
+#[allow(dead_code)]
+pub const RELEASES_REPO: &str = env!("TFSAPP_RELEASES_REPO");
+
 /// Timeouts for a `releases/latest` or `releases/tags/<tag>` call — small
 /// JSON, so a hung network must fail fast rather than wedge an `install`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -123,12 +134,28 @@ fn fetch_release(url: &str) -> Result<GitHubRelease, ReleaseError> {
 }
 
 /// The two assets a release must carry, located without knowing the app's
-/// `project_name` yet (see the module header).
+/// `project_name` yet (see the module header) — [`resolve_assets`]'s source
+/// archive, or [`resolve_appimage_assets`]'s hub binary; the field names stay
+/// generic across both callers rather than forking the struct in two.
 #[derive(Debug)]
 pub struct ResolvedAssets<'a> {
     pub archive_name: &'a str,
     pub archive_url: &'a str,
     pub checksums_url: &'a str,
+}
+
+/// `release`'s `SHA256SUMS.txt` asset, or the [`ReleaseError::MissingAsset`]
+/// naming it — shared by [`resolve_assets`] and [`resolve_appimage_assets`]
+/// so the lookup exists in exactly one place.
+fn find_checksums(release: &GitHubRelease) -> Result<&GitHubAsset, ReleaseError> {
+    release
+        .assets
+        .iter()
+        .find(|asset| asset.name == SHA256SUMS_ASSET_NAME)
+        .ok_or_else(|| ReleaseError::MissingAsset {
+            tag: release.tag_name.clone(),
+            missing: SHA256SUMS_ASSET_NAME,
+        })
 }
 
 /// Find `release`'s source archive and its `SHA256SUMS.txt`, or say which one
@@ -154,18 +181,53 @@ pub fn resolve_assets(release: &GitHubRelease) -> Result<ResolvedAssets<'_>, Rel
             })
         }
     };
-    let checksums = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == SHA256SUMS_ASSET_NAME)
-        .ok_or_else(|| ReleaseError::MissingAsset {
-            tag: release.tag_name.clone(),
-            missing: SHA256SUMS_ASSET_NAME,
-        })?;
+    let checksums = find_checksums(release)?;
 
     Ok(ResolvedAssets {
         archive_name: &archive.name,
         archive_url: &archive.browser_download_url,
+        checksums_url: &checksums.browser_download_url,
+    })
+}
+
+/// Find `release`'s hub `.AppImage` and its `SHA256SUMS.txt` — the hub
+/// self-update's own view of [`resolve_assets`], matching a `.AppImage`
+/// asset where that one matches `.tar.gz`, same exactly-one rule (an
+/// ambiguous release is refused, not guessed) and the same
+/// [`ReleaseError::MissingAsset`] vocabulary.
+///
+/// `#[allow(dead_code)]`: `hub_update::check` (step 2) is its first caller
+/// outside tests; `hub_update::run` (step 4) is what makes it reachable from
+/// `main`.
+#[allow(dead_code)]
+pub fn resolve_appimage_assets(
+    release: &GitHubRelease,
+) -> Result<ResolvedAssets<'_>, ReleaseError> {
+    let appimages: Vec<&GitHubAsset> = release
+        .assets
+        .iter()
+        .filter(|asset| asset.name.ends_with(".AppImage"))
+        .collect();
+    let appimage = match appimages.as_slice() {
+        [one] => *one,
+        [] => {
+            return Err(ReleaseError::MissingAsset {
+                tag: release.tag_name.clone(),
+                missing: "a TFSAppHub_<version>_<arch>.AppImage asset",
+            })
+        }
+        _ => {
+            return Err(ReleaseError::MissingAsset {
+                tag: release.tag_name.clone(),
+                missing: "exactly one .AppImage asset — this release carries more than one",
+            })
+        }
+    };
+    let checksums = find_checksums(release)?;
+
+    Ok(ResolvedAssets {
+        archive_name: &appimage.name,
+        archive_url: &appimage.browser_download_url,
         checksums_url: &checksums.browser_download_url,
     })
 }

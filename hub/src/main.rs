@@ -14,6 +14,8 @@ mod dev;
 mod gh;
 mod git;
 mod hub_bin;
+mod hub_rollback;
+mod hub_update;
 mod identity;
 mod install;
 mod launch;
@@ -26,9 +28,11 @@ mod php;
 mod platform;
 mod prompt;
 mod publish;
+mod reconcile;
 mod registry;
 mod release;
 mod remove;
+mod revalidate;
 mod rollback;
 mod run;
 mod secrets;
@@ -40,7 +44,8 @@ mod window;
 mod worker;
 
 use cli::{
-    Command, OpenChildSource, RunInvocation, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE,
+    Command, Level, OpenChildSource, RunInvocation, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED,
+    EXIT_USAGE,
 };
 use identity::Identity;
 
@@ -87,6 +92,25 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         return EXIT_UNIMPLEMENTED;
     }
 
+    // Reconciliation (plan 020, step 5): a hub self-update can move PHP out
+    // from under an already-installed app, and this is where that gets
+    // noticed — once, on the first `Level::App` command that runs after it,
+    // against the very registry that command is about to read anyway. Read
+    // from `SURFACE` rather than listed here by name, same as the
+    // unimplemented check above. A `Paths` failure here is swallowed rather
+    // than reported: the command below either does not need the registry at
+    // all, or is about to resolve `Paths` itself and will report the same
+    // failure in its own words.
+    if cli::spec(command.name()).is_some_and(|spec| spec.level == Level::App) {
+        if let Ok(paths) = paths::Paths::resolve() {
+            if let Err(error) =
+                reconcile::reconcile(&paths, &context.package_info().version.to_string())
+            {
+                eprintln!("tfsapp-hub: warning: could not reconcile the registry: {error}");
+            }
+        }
+    }
+
     match command {
         Command::Help => {
             print!("{}", cli::help_text());
@@ -101,6 +125,13 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             println!("{} {}", package_info.name, package_info.version);
             EXIT_OK
         }
+        // Same package info `--version` prints, passed by reference: `check`
+        // (`hub_update.rs`) compares it against the release tag directly,
+        // with no string round trip.
+        Command::HubUpdate { assume_yes } => {
+            hub_update::run(&context.package_info().version, assume_yes)
+        }
+        Command::HubRollback { assume_yes } => hub_rollback::run(assume_yes),
         Command::Install {
             source,
             id,

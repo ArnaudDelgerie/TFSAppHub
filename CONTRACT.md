@@ -820,6 +820,12 @@ recorded version *newer* than the app being run is a downgrade: it has no
 lifecycle event, and it is refused rather than guessed at — running old code
 against data a newer version wrote is how a database gets corrupted quietly.
 
+*(A host replacing itself is neither of these — the app's `app_version` has
+not moved, so no event fires, ever. What a host may still do on its own
+behalf, without an event, is re-resolve `composer.lock` against a PHP that
+has changed underneath the app; that is a platform concern of §3's, not a
+lifecycle one, and `ARCHITECTURE.md`'s to explain.)*
+
 **The record is never written speculatively.** It is updated only after the
 event's last command has succeeded, so a failure leaves the previous record — or
 none at all, on a first install — in place, and the next attempt replays the

@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+No user-facing change — this release exists to validate `tfsapp-hub --update`
+and `--rollback` end to end against a real release (plan 020, step 8).
+
+## 0.2.0
 
 An app launched from its desktop entry, whose launch then fails — a renamed
 snapshot, a broken dependency, anything `open` refuses — now puts a native

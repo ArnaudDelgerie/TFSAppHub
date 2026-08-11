@@ -49,11 +49,14 @@ re-resolves an app's own source and replaces the installed version with it,
 snapshotting the database first and reverting code and database together if
 anything fails; `rollback <id>` undoes a successful update afterwards,
 putting the previous source and database back and setting the one being left
-behind aside as a named rescue dump. Not there yet: hub self-update
-(`make release` publishes an AppImage today; nothing yet downloads and swaps
-one in). Git sources are recognised and refused with a
-message saying so, rather than pretended. The design record and the plan
-queue live under the git-ignored `.project/`.
+behind aside as a named rescue dump; `--update` replaces the hub itself with
+its own latest release, verified against the release's checksums, and
+revalidates any installed app whose PHP moved under it the next time it is
+used; `--rollback` undoes that — the previous hub binary and the registry it
+recorded, both back exactly as they were, offline, in under a second. Git
+sources are recognised and refused with a message saying so, rather than
+pretended. The design record and the plan queue live under the git-ignored
+`.project/`.
 
 ## Build
 

@@ -357,6 +357,20 @@ fn lock(paths: &Paths) -> Result<fs::File, RegistryError> {
 
 /// Temp file, `fsync`, rename — the caller must already hold the lock.
 fn write_locked(paths: &Paths, registry: &Registry) -> Result<(), RegistryError> {
+    let mut json =
+        serde_json::to_vec_pretty(registry).map_err(|error| RegistryError::Unserialisable {
+            detail: error.to_string(),
+        })?;
+    json.push(b'\n');
+    write_bytes_locked(paths, &json)
+}
+
+/// The write half both [`write_locked`] and [`restore_from`] share: temp
+/// file, `fsync`, rename, directory `fsync` — the caller must already hold
+/// the lock. Factored out because a rollback restore writes bytes read
+/// verbatim from an anchor snapshot rather than a freshly serialised
+/// [`Registry`], and the two must land on disk the same careful way.
+fn write_bytes_locked(paths: &Paths, bytes: &[u8]) -> Result<(), RegistryError> {
     let hub_root = paths.hub_root();
     let target = paths.registry_path();
     // A fixed temp name is safe because the lock is held: only one writer is
@@ -364,19 +378,13 @@ fn write_locked(paths: &Paths, registry: &Registry) -> Result<(), RegistryError>
     // writer is simply truncated by the next one.
     let temp = target.with_extension("json.tmp");
 
-    let mut json =
-        serde_json::to_vec_pretty(registry).map_err(|error| RegistryError::Unserialisable {
-            detail: error.to_string(),
-        })?;
-    json.push(b'\n');
-
     let io_error = |path: &std::path::Path| {
         let path = path.to_path_buf();
         move |source| RegistryError::Io { path, source }
     };
 
     let mut file = fs::File::create(&temp).map_err(io_error(&temp))?;
-    file.write_all(&json).map_err(io_error(&temp))?;
+    file.write_all(bytes).map_err(io_error(&temp))?;
     // Before the rename, not after: a rename that lands ahead of the content
     // is exactly the crash window this ordering closes.
     file.sync_all().map_err(io_error(&temp))?;
@@ -391,6 +399,46 @@ fn write_locked(paths: &Paths, registry: &Registry) -> Result<(), RegistryError>
         .map_err(io_error(&hub_root))?;
 
     Ok(())
+}
+
+/// Write the current registry to `destination`, under the exclusive lock —
+/// the rollback anchor's registry half (`hub_update.rs`, `../plan/020-hub-
+/// self-update-and-revalidation.md`'s Overview, step 7). Reads through
+/// [`load`] rather than `fs::copy`-ing `registry.json` directly, so a
+/// never-written registry (nothing installed yet) snapshots as the same
+/// empty [`Registry::default`] a fresh read would answer with, instead of a
+/// missing-file error.
+///
+/// `hub_update::run` (this plan's step 4) is its caller.
+pub fn snapshot_to(paths: &Paths, destination: &std::path::Path) -> Result<(), RegistryError> {
+    let _lock = lock(paths)?;
+    let registry = load(paths)?;
+
+    let mut json =
+        serde_json::to_vec_pretty(&registry).map_err(|error| RegistryError::Unserialisable {
+            detail: error.to_string(),
+        })?;
+    json.push(b'\n');
+
+    fs::write(destination, json).map_err(|source| RegistryError::Io {
+        path: destination.to_path_buf(),
+        source,
+    })
+}
+
+/// Restore `registry.json` from `source`, under the exclusive lock — the
+/// rollback anchor's registry half restored (`hub_rollback.rs`, this plan's
+/// step 7), the exact inverse of [`snapshot_to`]. Copies `source`'s bytes
+/// verbatim rather than reading them through a [`Registry`] and
+/// re-serialising: the restored file ends up byte-identical to the snapshot,
+/// not merely equivalent under it.
+pub fn restore_from(paths: &Paths, source: &std::path::Path) -> Result<(), RegistryError> {
+    let bytes = fs::read(source).map_err(|read_error| RegistryError::Io {
+        path: source.to_path_buf(),
+        source: read_error,
+    })?;
+    let _lock = lock(paths)?;
+    write_bytes_locked(paths, &bytes)
 }
 
 /// RFC 3339 in UTC, for `installed_at` / `updated_at`.
