@@ -9,14 +9,25 @@
 //! hub has no manifest to read its own next version from the way an app
 //! does; the tag is the only place it lives.
 //!
-//! The swap mechanics, the anchor and `run` itself are steps 3–4 of the same
-//! plan and land in this file as they are written.
+//! Step 3 adds the swap mechanics' pure half, in isolation from the network
+//! and from the actual swap: the `$APPIMAGE` guard, and the rollback
+//! anchor's readiness. `run` itself (step 4) and `--rollback`
+//! (`hub_rollback.rs`, step 7) are what call into these.
 
-// `check` has no real caller until `run` (step 4) exists to fetch a release
-// and hand it here. Remove the allow once that caller lands.
+// `check`, `resolve_appimage_target` and `anchor_state` have no real caller
+// until `run` (step 4) and `hub_rollback.rs` (step 7) exist to call them.
+// Remove the allow once those callers land.
 #![allow(dead_code)]
 
-use crate::release::{self, GitHubRelease};
+use std::{
+    fmt, fs,
+    path::{Path, PathBuf},
+};
+
+use crate::{
+    hub_bin,
+    release::{self, GitHubRelease},
+};
 
 /// [`check`]'s outcome — pure over an already-fetched release, so it needs no
 /// network of its own; `run` (step 4) is what calls
@@ -73,6 +84,73 @@ pub fn check<'a>(current: &semver::Version, release: &'a GitHubRelease) -> HubUp
             checksums_url: assets.checksums_url,
         },
         Err(error) => HubUpdateCheck::Unavailable(error.to_string()),
+    }
+}
+
+/// `$APPIMAGE`'s value, refused when unset or empty — the Overview's order,
+/// step 1: "`$APPIMAGE` is set — otherwise refuse, nothing contacted." Pure
+/// over an already-read environment variable rather than reading it itself,
+/// so the unset/empty/set cases are each one line to test. `None` means this
+/// is not a packaged hub — a `cargo run`, a plain binary — and there is no
+/// image on disk for `--update` to replace.
+pub(crate) fn resolve_appimage_target(appimage_env: Option<&str>) -> Option<PathBuf> {
+    match appimage_env {
+        Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
+        _ => None,
+    }
+}
+
+/// Whether `a` and `b` are the same file — `$APPIMAGE` against the stable
+/// copy (the Overview's "Two files, not one": when they coincide there is
+/// one swap, not two). Reuses `hub_bin::same_file`'s canonicalize comparison
+/// rather than a second one.
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
+    hub_bin::same_file(a, b)
+}
+
+/// Which half of the rollback anchor is missing — [`anchor_state`]'s
+/// refusal, named so the message can say which one rather than a bare "no
+/// anchor": half-present is exactly as unusable as absent, but it is a
+/// different thing to have gone wrong (an interrupted `--update`, never a
+/// network problem).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissingAnchorHalf {
+    Binary,
+    Registry,
+    Both,
+}
+
+impl fmt::Display for MissingAnchorHalf {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::Binary => "the previous hub binary",
+            Self::Registry => "its registry snapshot",
+            Self::Both => "the previous hub binary and its registry snapshot",
+        };
+        write!(formatter, "{text}")
+    }
+}
+
+/// Whether the rollback anchor left by a previous `--update` is usable:
+/// `binary_path` present and non-empty, `registry_snapshot_path` present
+/// beside it. No version comparison against the running hub — correction 3
+/// of the plan's Overview: the anchor is deleted by the `--rollback` that
+/// consumes it, so its mere presence already answers "is there something to
+/// roll back to".
+pub(crate) fn anchor_state(
+    binary_path: &Path,
+    registry_snapshot_path: &Path,
+) -> Result<(), MissingAnchorHalf> {
+    let binary_present = fs::metadata(binary_path)
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false);
+    let registry_present = registry_snapshot_path.is_file();
+
+    match (binary_present, registry_present) {
+        (true, true) => Ok(()),
+        (false, true) => Err(MissingAnchorHalf::Binary),
+        (true, false) => Err(MissingAnchorHalf::Registry),
+        (false, false) => Err(MissingAnchorHalf::Both),
     }
 }
 

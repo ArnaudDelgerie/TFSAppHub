@@ -1,4 +1,6 @@
-use super::{check, HubUpdateCheck};
+use std::fs;
+
+use super::{anchor_state, check, resolve_appimage_target, HubUpdateCheck, MissingAnchorHalf};
 use crate::release::fetch_latest_release_at;
 
 /// Start a `tiny_http` server that answers exactly one request with a JSON
@@ -153,4 +155,85 @@ fn a_tag_that_is_not_a_version_is_unavailable() {
         HubUpdateCheck::Unavailable(reason) => assert!(reason.contains("not-a-version")),
         other => panic!("expected Unavailable, got {other:?}"),
     }
+}
+
+#[test]
+fn resolve_appimage_target_is_none_when_unset() {
+    assert_eq!(resolve_appimage_target(None), None);
+}
+
+#[test]
+fn resolve_appimage_target_is_none_when_empty() {
+    assert_eq!(resolve_appimage_target(Some("")), None);
+}
+
+#[test]
+fn resolve_appimage_target_is_the_path_when_set() {
+    assert_eq!(
+        resolve_appimage_target(Some("/home/user/Downloads/tfsapp-hub.AppImage")),
+        Some("/home/user/Downloads/tfsapp-hub.AppImage".into())
+    );
+}
+
+#[test]
+fn anchor_state_is_ready_when_both_halves_are_present() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let binary = dir.path().join("tfsapp-hub.previous");
+    let registry = dir.path().join("registry.json.previous");
+    fs::write(&binary, b"hub v1").expect("the previous binary");
+    fs::write(&registry, b"{}").expect("the registry snapshot");
+
+    assert_eq!(anchor_state(&binary, &registry), Ok(()));
+}
+
+#[test]
+fn anchor_state_names_both_halves_missing_when_neither_exists() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let binary = dir.path().join("tfsapp-hub.previous");
+    let registry = dir.path().join("registry.json.previous");
+
+    assert_eq!(
+        anchor_state(&binary, &registry),
+        Err(MissingAnchorHalf::Both)
+    );
+}
+
+#[test]
+fn anchor_state_names_the_binary_missing_when_only_the_registry_snapshot_exists() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let binary = dir.path().join("tfsapp-hub.previous");
+    let registry = dir.path().join("registry.json.previous");
+    fs::write(&registry, b"{}").expect("the registry snapshot");
+
+    assert_eq!(
+        anchor_state(&binary, &registry),
+        Err(MissingAnchorHalf::Binary)
+    );
+}
+
+#[test]
+fn anchor_state_names_the_registry_missing_when_only_the_binary_exists() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let binary = dir.path().join("tfsapp-hub.previous");
+    let registry = dir.path().join("registry.json.previous");
+    fs::write(&binary, b"hub v1").expect("the previous binary");
+
+    assert_eq!(
+        anchor_state(&binary, &registry),
+        Err(MissingAnchorHalf::Registry)
+    );
+}
+
+#[test]
+fn anchor_state_treats_an_empty_binary_as_missing() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let binary = dir.path().join("tfsapp-hub.previous");
+    let registry = dir.path().join("registry.json.previous");
+    fs::write(&binary, b"").expect("an empty previous binary");
+    fs::write(&registry, b"{}").expect("the registry snapshot");
+
+    assert_eq!(
+        anchor_state(&binary, &registry),
+        Err(MissingAnchorHalf::Binary)
+    );
 }

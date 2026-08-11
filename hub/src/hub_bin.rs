@@ -66,6 +66,36 @@ pub fn ensure_current(paths: &Paths) -> Result<Outcome, HubBinError> {
     ensure_current_at(&source, &paths.hub_executable_path())
 }
 
+/// `<hub root>/bin/tfsapp-hub.previous` — the rollback anchor's binary half:
+/// the outgoing stable copy renamed aside before a verified download
+/// replaces it (`../plan/020-hub-self-update-and-revalidation.md`'s
+/// Overview, step 8), the hub's own equivalent of `lifecycle::
+/// previous_tree_path` for an app. One generation, like that one: a second
+/// `--update` before a `--rollback` overwrites it rather than keeping two.
+///
+/// `#[allow(dead_code)]`: this plan's steps 4 and 7 (`hub_update::run`,
+/// `hub_rollback.rs`) are its first real callers outside tests.
+#[allow(dead_code)]
+pub fn anchor_path(paths: &Paths) -> PathBuf {
+    let mut previous = paths.hub_executable_path().into_os_string();
+    previous.push(".previous");
+    PathBuf::from(previous)
+}
+
+/// `<hub root>/bin/registry.json.previous` — the rollback anchor's registry
+/// half, snapshotted beside the binary (Overview step 7) under the registry
+/// lock, so `--rollback` can restore the app states a hub update mutated
+/// along with the binary that mutated them (correction 2).
+///
+/// `#[allow(dead_code)]`: this plan's steps 4 and 7 (`hub_update::run`,
+/// `hub_rollback.rs`) are its first real callers outside tests.
+#[allow(dead_code)]
+pub fn anchor_registry_path(paths: &Paths) -> PathBuf {
+    paths
+        .hub_executable_path()
+        .with_file_name("registry.json.previous")
+}
+
 /// The image to copy: `$APPIMAGE` if the process was started as one,
 /// `current_exe()` otherwise — see the module header.
 ///
@@ -83,24 +113,40 @@ fn resolve_running_image(
     }
 }
 
+/// Whether `a` and `b` name the same file on disk, compared by canonical path
+/// rather than by content or by string equality — a symlink or a relative
+/// path must not fool it. [`ensure_current_at`]'s own "are we already the
+/// target" check, `pub(crate)` so hub self-update (`hub_update.rs`) reuses it
+/// for the same question about `$APPIMAGE` against the stable copy (the
+/// plan's "Two files, not one") rather than a second canonicalize-and-compare.
+///
+/// Either side missing (not canonicalizable) answers `false` rather than
+/// erroring: "not found" is never "same file".
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// The pure half of [`ensure_current`]: given the image actually running and
 /// the path a stable copy belongs at, make the second a current copy of the
 /// first.
-fn ensure_current_at(source: &Path, target: &Path) -> Result<Outcome, HubBinError> {
+///
+/// `pub(crate)`: hub self-update (`hub_update.rs`, this plan's step 4) calls
+/// it directly to install a verified download at the stable path — the same
+/// atomic copy-then-rename an ordinary install already trusts, rather than a
+/// second implementation of it.
+pub(crate) fn ensure_current_at(source: &Path, target: &Path) -> Result<Outcome, HubBinError> {
     let io_error = |path: &Path| {
         let path = path.to_path_buf();
         move |source| HubBinError::Io { path, source }
     };
 
-    // Compared by canonical path rather than by content: the ordinary case of
-    // installing a second app from the stable copy must not try to overwrite
-    // the file it is executing.
-    if let (Ok(source_canon), Ok(target_canon)) =
-        (fs::canonicalize(source), fs::canonicalize(target))
-    {
-        if source_canon == target_canon {
-            return Ok(Outcome::WeAreIt);
-        }
+    // The ordinary case of installing a second app from the stable copy must
+    // not try to overwrite the file it is executing.
+    if same_file(source, target) {
+        return Ok(Outcome::WeAreIt);
     }
 
     let source_meta = fs::metadata(source).map_err(io_error(source))?;
