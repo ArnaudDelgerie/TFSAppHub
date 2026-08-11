@@ -393,6 +393,33 @@ fn write_locked(paths: &Paths, registry: &Registry) -> Result<(), RegistryError>
     Ok(())
 }
 
+/// Write the current registry to `destination`, under the exclusive lock —
+/// the rollback anchor's registry half (`hub_update.rs`, `../plan/020-hub-
+/// self-update-and-revalidation.md`'s Overview, step 7). Reads through
+/// [`load`] rather than `fs::copy`-ing `registry.json` directly, so a
+/// never-written registry (nothing installed yet) snapshots as the same
+/// empty [`Registry::default`] a fresh read would answer with, instead of a
+/// missing-file error.
+///
+/// `#[allow(dead_code)]`: `hub_update::run` (this plan's step 4) is its first
+/// real caller.
+#[allow(dead_code)]
+pub fn snapshot_to(paths: &Paths, destination: &std::path::Path) -> Result<(), RegistryError> {
+    let _lock = lock(paths)?;
+    let registry = load(paths)?;
+
+    let mut json =
+        serde_json::to_vec_pretty(&registry).map_err(|error| RegistryError::Unserialisable {
+            detail: error.to_string(),
+        })?;
+    json.push(b'\n');
+
+    fs::write(destination, json).map_err(|source| RegistryError::Io {
+        path: destination.to_path_buf(),
+        source,
+    })
+}
+
 /// RFC 3339 in UTC, for `installed_at` / `updated_at`.
 ///
 /// UTC rather than local time, and RFC 3339 rather than anything friendlier:

@@ -303,7 +303,6 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
     // The distinction the whole "not implemented yet" outcome exists for: a
     // wrong error here sends a user hunting for a typo that is not there.
     for line in [
-        "--update",
         "--rollback",
         "export demo /tmp/demo",
         "import demo /tmp/demo.tar.gz",
@@ -317,6 +316,7 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
     for line in [
         "--version",
         "--help",
+        "--update",
         "list",
         "install ../TFSAppTest",
         "open demo",

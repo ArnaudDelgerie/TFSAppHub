@@ -102,6 +102,12 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             println!("{} {}", package_info.name, package_info.version);
             EXIT_OK
         }
+        // Same package info `--version` prints, passed by reference: `check`
+        // (`hub_update.rs`) compares it against the release tag directly,
+        // with no string round trip.
+        Command::HubUpdate { assume_yes } => {
+            hub_update::run(&context.package_info().version, assume_yes)
+        }
         Command::Install {
             source,
             id,
