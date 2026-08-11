@@ -46,6 +46,7 @@ use crate::{
     manifest::{self, ManifestError},
     paths::{Paths, PathsError},
     registry::{self, now_timestamp, RegistryError, State},
+    revalidate::{self, RevalidateError},
 };
 
 /// The whole command, parent side. Returns the process's exit code.
@@ -92,31 +93,29 @@ pub fn run(id: &str) -> i32 {
 /// installer states, read from the other end.
 ///
 /// Every refusal below names the app and the way out, because the audience is
-/// someone at a terminal who typed one word and got nothing. The one state that
-/// is *not* a refusal is `needs-revalidation`: the app's dependencies were
-/// resolved against a PHP that has since moved, which is a reason to revalidate
-/// (the hub self-update and lazy revalidation plan, not yet written — see
-/// `000-index.md`) and not a reason to keep the user out of their own data.
+/// someone at a terminal who typed one word and got nothing. The one state
+/// that is *not* an immediate refusal is `needs-revalidation`: the app's
+/// dependencies were resolved against a PHP that has since moved, which
+/// `revalidate::revalidate` resolves right here — a fresh `composer install`
+/// against the existing `composer.lock`, before the launch proceeds — rather
+/// than a reason to keep the user out of their own data. `Broken`, already
+/// recorded from an earlier attempt, is refused without retrying: nothing has
+/// changed since it failed, and retrying it on every `open` would only repeat
+/// the same minutes of work for the same answer.
 pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
     let installed = registry::load(paths)?;
     let entry = installed
         .get(id)
         .ok_or_else(|| OpenError::NotInstalled { id: id.to_string() })?;
 
-    match entry.state {
-        State::Broken => {
-            return Err(OpenError::Broken {
-                id: id.to_string(),
-                platform: entry.platform.to_string(),
-            })
-        }
-        State::NeedsRevalidation => eprintln!(
-            "tfsapp-hub: warning: {id} was installed against PHP {} and the hub now runs \
-             something else. Continuing anyway; its dependencies have not been re-resolved.",
-            entry.platform
-        ),
-        State::Ready => {}
+    if entry.state == State::Broken {
+        return Err(OpenError::Broken {
+            id: id.to_string(),
+            platform: entry.platform.to_string(),
+        });
     }
+    let needs_revalidation = entry.state == State::NeedsRevalidation;
+    let last_known_platform = entry.platform.to_string();
 
     let app_dir = paths.app_dir(id)?;
     if !app_dir.is_dir() {
@@ -141,6 +140,25 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
             registered: entry.identifier.clone(),
             declared: manifest.identifier.clone(),
         });
+    }
+
+    // Announced before it starts, not after: a `composer install` is minutes
+    // of work, and silence for that long reads as a hang rather than as
+    // progress.
+    if needs_revalidation {
+        println!(
+            "Revalidating {id} — it was installed against PHP {last_known_platform} and \
+             this hub now runs something else. Re-resolving its dependencies…"
+        );
+        match revalidate::revalidate(paths, id, &app_dir, &manifest)? {
+            revalidate::Outcome::Ready => println!("{id} is ready."),
+            revalidate::Outcome::Broken => {
+                return Err(OpenError::Broken {
+                    id: id.to_string(),
+                    platform: last_known_platform,
+                })
+            }
+        }
     }
 
     let state_root = paths.app_data_dir(&manifest.identifier)?;
@@ -299,6 +317,7 @@ pub enum OpenError {
     Registry(RegistryError),
     Manifest(ManifestError),
     Paths(PathsError),
+    Revalidate(RevalidateError),
     NotInstalled {
         id: String,
     },
@@ -328,6 +347,7 @@ impl fmt::Display for OpenError {
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Manifest(error) => write!(formatter, "{error}"),
             Self::Paths(error) => write!(formatter, "{error}"),
+            Self::Revalidate(error) => write!(formatter, "{error}"),
             Self::NotInstalled { id } => write!(
                 formatter,
                 "no app is installed under {id}. `tfsapp-hub list` shows what is, \
@@ -373,6 +393,7 @@ impl std::error::Error for OpenError {
             Self::Registry(error) => Some(error),
             Self::Manifest(error) => Some(error),
             Self::Paths(error) => Some(error),
+            Self::Revalidate(error) => Some(error),
             Self::NoExecutable(source) => Some(source),
             Self::Unstartable { source, .. } => Some(source),
             _ => None,
@@ -395,6 +416,12 @@ impl From<ManifestError> for OpenError {
 impl From<PathsError> for OpenError {
     fn from(error: PathsError) -> Self {
         Self::Paths(error)
+    }
+}
+
+impl From<RevalidateError> for OpenError {
+    fn from(error: RevalidateError) -> Self {
+        Self::Revalidate(error)
     }
 }
 

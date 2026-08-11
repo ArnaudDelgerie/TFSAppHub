@@ -31,6 +31,7 @@ mod reconcile;
 mod registry;
 mod release;
 mod remove;
+mod revalidate;
 mod rollback;
 mod run;
 mod secrets;
