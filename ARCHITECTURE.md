@@ -241,9 +241,9 @@ ordinary case, not an edge case — one may be open from it while a second
 install refreshes it for a newer hub — and a rename swaps the whole inode
 atomically, so a process already running the old copy keeps running the
 generation it started with instead of meeting a half-written 170 MB binary or
-an `ETXTBSY`. It is also what hub self-update (queued, not yet built) will
-replace this same file with, which is the other reason it lives under the
-hub's own root rather than beside a per-app path.
+an `ETXTBSY`. It is also what `--update` (`hub_update.rs`) replaces this same
+file with, which is the other reason it lives under the hub's own root
+rather than beside a per-app path.
 
 ## Updating
 
@@ -693,6 +693,56 @@ experiences as a *hub* update is the worst possible moment for a surprise.
 **It is not a security check and not a version pin.** It authenticates nothing
 and blocks no launch on its own. An app whose fingerprint differs is
 revalidated, never refused.
+
+### Self-update, reconciliation and rollback
+
+`--update` (`hub_update.rs`) cannot compare fingerprints itself: after it
+swaps the binary, the process still answering is the *old* one, running the
+*old* FrankenPHP — only a later invocation, of the *new* binary, can ask that
+question honestly. Reconciliation (`reconcile.rs`) is therefore deferred and
+keyed on state already recorded: `registry.json` carries the `hub_version` of
+whichever hub last wrote it, and every `Level::App` command (the same table
+the CLI grammar's own dispatch reads) compares that string against its own
+version before doing anything else. Equal — the overwhelmingly common case —
+costs one string comparison and nothing more. Different, it probes PHP once,
+marks every app whose fingerprint moved `needs-revalidation`, leaves an
+already-`broken` one alone, and re-stamps. This survives a hub replaced by
+any means other than `--update` too — a hand download, a distribution
+package, a `--rollback` — where a hook on `--update`'s own success would
+silently miss every one of them.
+
+Revalidation itself (`revalidate.rs`) is what a marked app's next `open` runs
+into — described above. None of §6's lifecycle commands run alongside it: the
+app's own version has not moved, so no event fires.
+
+Two files must end up holding the new binary, not one: the stable copy under
+`<hub root>/bin/tfsapp-hub`, which every generated `.desktop` entry's `Exec=`
+names, and `$APPIMAGE`, wherever the user's own download happens to sit. The
+stable copy is swapped first — every launcher on the machine silently
+running the old hub, with nothing on screen to say so, is the worse of the
+two possible partial failures, so it is the one `--update` protects against
+finishing last.
+
+The rollback anchor is the stable copy **renamed aside**
+(`bin/tfsapp-hub.previous`), not a re-download: the hub already keeps a full
+copy of what is running on the hub root's own filesystem, so renaming it
+before the verified download replaces it is atomic, zero-copy and needs no
+network of its own. A `registry.json.previous` snapshot is taken beside it,
+under the registry lock, *before* the binary swap — a snapshot taken after
+could already describe a state the new hub had begun to change. One
+generation, like the per-app anchor `update <id>` leaves: a second
+`--update` before a `--rollback` overwrites it rather than keeping two.
+
+`--rollback` (`hub_rollback.rs`) touches no network at all. Its precondition
+— both anchor halves present — is checked before anything else, including the
+confirmation prompt, so a half-written anchor from an interrupted `--update`
+reads as "nothing to roll back to" rather than a network problem. On
+success it restores the binary, the registry (byte-identical to the
+snapshot, not merely re-serialised from it) and `$APPIMAGE` — skipped
+when that already names the stable copy, and noted rather than failed when
+the user's own download no longer exists — then deletes the anchor: it is
+consumed by the rollback that uses it, so a second `--rollback` finds
+nothing rather than re-downloading an already-restored version.
 
 ## The CLI grammar
 
