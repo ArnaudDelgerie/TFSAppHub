@@ -14,6 +14,7 @@ mod dev;
 mod gh;
 mod git;
 mod hub_bin;
+mod hub_update;
 mod identity;
 mod install;
 mod launch;
