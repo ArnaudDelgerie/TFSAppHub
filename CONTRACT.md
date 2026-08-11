@@ -152,6 +152,13 @@ All four are reachable by hand — a forge's web UI needs nothing more than
 path/to/project` automates exactly this sequence and is the convenience, never
 the requirement.
 
+The convenience needs two things a hand-built release does not: `gh` **and**
+`git`, both installed and authenticated on the **author's own machine** — the
+one command where the hub runs `git`, and only there (decision 003, "the hub
+publishes apps"). The project must be committed and pushed; `publish` proves
+it rather than trusting an asserted tag, and the release lands on whichever
+repository that pushed commit's own remote names.
+
 ---
 
 ## 2. `tfsapp.config.json`
@@ -250,7 +257,10 @@ compared makes that decision unanswerable.
 
 The hub **refuses at the transitions**: installing or updating an app whose
 `app_version` is not canonical semver fails, naming the file, the value, and
-what the value is for. It does **not** re-check when opening an app that is
+what the value is for. `tfsapp-hub publish` enforces the same rule on the
+author's own machine, before anything is built or uploaded — the station's
+`build/scripts/release.sh` used to be where this was checked; `publish` is
+where it is checked now. It does **not** re-check when opening an app that is
 already installed — an app that passed the gate on its way in should not become
 unopenable later, and re-refusing it would make the hub reject something it
 itself accepted. A dev session never installs, so neither check ever runs
@@ -332,6 +342,13 @@ to replace. A manifest that could redirect its own future updates would let
 one good release permanently steer every machine that ever installed it. Only
 what the hub itself wrote may steer a fetch; an app asks about its own updates
 through §7, and how an update is *applied* belongs to the host.
+
+`tfsapp-hub publish` reads nothing more out of it than `update` does: the
+repository a release lands on comes from `--repo` or from the project's own
+git remote, never from the manifest, so a stale `releases_repo` — naming a
+downloads repository this route retired — cannot steer a publish either. The
+key is accepted and read by nothing, on every path alike; an author who finds
+one in an old manifest can take it as inert, not as a setting to update.
 
 ---
 

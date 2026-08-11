@@ -155,6 +155,15 @@ pub const SURFACE: &[Spec] = &[
         level: Level::App,
         availability: Availability::Implemented,
     },
+    // The path argument takes `install`/`dev`'s exemption to the grammar rule
+    // for the same reason: the subject is a source, not an installed app.
+    Spec {
+        name: "publish",
+        form: "publish <local-path> [--repo owner/repo] [--yes]",
+        summary: "Publish a release from a project's working tree, via gh.",
+        level: Level::App,
+        availability: Availability::Implemented,
+    },
     Spec {
         name: "update",
         form: "update <id> [--ref <tag>] [--force] [--yes]",
@@ -308,6 +317,16 @@ pub enum Command {
     Dev {
         path: String,
     },
+    Publish {
+        path: String,
+        /// `--repo owner/repo`: wins over the manifest's `releases_repo` when
+        /// given.
+        repo: Option<String>,
+        /// `--yes`: skips the confirmation before `gh release create` runs.
+        /// The `actions.secrets.ipc` gate (CONTRACT.md §7) is a separate
+        /// question with no `--yes` escape of its own.
+        assume_yes: bool,
+    },
     Update {
         id: String,
         reference: Option<String>,
@@ -408,6 +427,7 @@ impl Command {
             Self::List => "list",
             Self::Open { .. } => "open",
             Self::Dev { .. } => "dev",
+            Self::Publish { .. } => "publish",
             Self::Update { .. } => "update",
             Self::Rollback { .. } => "rollback",
             Self::Remove { .. } => "remove",
@@ -517,6 +537,14 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             let mut options = options("dev", rest, &[], &[])?;
             Ok(Command::Dev {
                 path: options.exactly_one("dev", "a project path")?,
+            })
+        }
+        "publish" => {
+            let mut options = options("publish", rest, &["--repo"], &["--yes", "-y"])?;
+            Ok(Command::Publish {
+                path: options.exactly_one("publish", "a project path")?,
+                repo: options.value("--repo"),
+                assume_yes: options.assume_yes(),
             })
         }
         "update" => {

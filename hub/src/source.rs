@@ -49,7 +49,14 @@ use crate::{
 /// build, and hashing it would report "changed since install" for a build that
 /// touched no source at all. Top-level only, so a legitimately named `src/var/`
 /// still counts.
-const EXCLUDED_FROM_HASH: &[&str] = &[".git", "vendor", "var", "node_modules", "tfsapp_build"];
+///
+/// `pub(crate)` so `publish.rs`'s archive builder walks under the exact same
+/// predicate `tree_hash` does, rather than a second list that could drift from
+/// it — the property `../plan/019-publish-an-app.md` step 2 exists for is
+/// `tree_hash` of a published archive, once extracted, equalling `tree_hash`
+/// of the tree it was built from.
+pub(crate) const EXCLUDED_FROM_HASH: &[&str] =
+    &[".git", "vendor", "var", "node_modules", "tfsapp_build"];
 
 /// Where a source stands now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,15 +145,39 @@ pub fn classify(spec: &str) -> Origin {
     Origin::LocalPath(PathBuf::from(spec))
 }
 
-/// `https://github.com/<owner>/<repo>` (an optional trailing slash tolerated,
-/// nothing else after it) turned into `<owner>/<repo>` — the same repo string
-/// `github:<owner>/<repo>` names. `None` for anything shaped differently,
-/// including a `github.com` URL carrying more path segments than that: this
-/// function only recognises the one shape a browser's address bar produces
-/// for a repository's own page, not every possible GitHub URL.
-fn github_https_repo(spec: &str) -> Option<String> {
+/// `https://github.com/<owner>/<repo>` (an optional trailing slash and an
+/// optional `.git` suffix both tolerated, nothing else after it) turned into
+/// `<owner>/<repo>` — the same repo string `github:<owner>/<repo>` names.
+/// `None` for anything shaped differently, including a `github.com` URL
+/// carrying more path segments than that: this function only recognises the
+/// one shape a browser's address bar produces for a repository's own page
+/// (plus the `.git`-suffixed form `git remote get-url` can print for an
+/// https remote), not every possible GitHub URL.
+///
+/// `pub(crate)` so `git.rs`'s upstream-remote gate
+/// (`../plan/019-publish-an-app.md` step 5) parses `git remote get-url`'s
+/// output with the exact same rule this module already applies to a
+/// user-typed spec, rather than a second one that could drift from it.
+pub(crate) fn github_https_repo(spec: &str) -> Option<String> {
     let rest = spec.strip_prefix("https://github.com/")?;
     let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut segments = rest.split('/');
+    let owner = segments.next().filter(|segment| !segment.is_empty())?;
+    let repo = segments.next().filter(|segment| !segment.is_empty())?;
+    match segments.next() {
+        None => Some(format!("{owner}/{repo}")),
+        Some(_) => None,
+    }
+}
+
+/// `git@github.com:<owner>/<repo>.git` (the scp-like spelling `git remote
+/// get-url` prints for an SSH remote — an optional `.git` suffix tolerated,
+/// same as the https form) turned into `<owner>/<repo>` — `git.rs`'s other
+/// half of the same reuse [`github_https_repo`] documents.
+pub(crate) fn github_ssh_repo(spec: &str) -> Option<String> {
+    let rest = spec.strip_prefix("git@github.com:")?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
     let mut segments = rest.split('/');
     let owner = segments.next().filter(|segment| !segment.is_empty())?;
     let repo = segments.next().filter(|segment| !segment.is_empty())?;

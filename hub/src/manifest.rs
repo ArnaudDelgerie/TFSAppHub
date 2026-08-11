@@ -148,6 +148,13 @@ pub struct Manifest {
     /// silent `false` — see this module's header.
     #[serde(default)]
     pub async_worker: bool,
+    /// The forge repository `publish` targets when `--repo` is not given
+    /// (CONTRACT.md §2's "Keys this contract does not define"). Read in
+    /// exactly one place, `publish.rs`, on the author's own machine — never
+    /// on the install or update path, which never steer a fetch from a value
+    /// recorded inside the source being replaced.
+    #[serde(default)]
+    pub releases_repo: Option<String>,
 }
 
 /// The four launch-time lifecycle command lists (CONTRACT.md §2/§6):
