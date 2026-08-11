@@ -11,7 +11,31 @@ use std::{fs, path::Path};
 fn main() {
     ensure_resource_stub(Path::new("resources/frankenphp"));
     ensure_resource_stub(Path::new("resources/composer.phar"));
+    emit_releases_repo(Path::new("../build/releases-repo"));
     tauri_build::build()
+}
+
+/// Bake `build/releases-repo`'s value into `TFSAPP_RELEASES_REPO`
+/// (`release.rs`'s `RELEASES_REPO`), one shared source of truth with
+/// `build/scripts/release.sh` rather than a second copy of the same string.
+/// Missing or empty is a build failure with the path in the message — not a
+/// silent empty repo that would only surface as `--update` 404ing at
+/// runtime.
+fn emit_releases_repo(relative: &Path) {
+    println!("cargo::rerun-if-changed={}", relative.display());
+    let contents = fs::read_to_string(relative)
+        .unwrap_or_else(|error| panic!("{}: {error}", relative.display()));
+    let repo = contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: no value line (comments and blanks only)",
+                relative.display()
+            )
+        });
+    println!("cargo::rustc-env=TFSAPP_RELEASES_REPO={repo}");
 }
 
 fn ensure_resource_stub(relative: &Path) {

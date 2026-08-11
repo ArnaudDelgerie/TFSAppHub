@@ -2,7 +2,7 @@ use std::{collections::HashMap, fs, path::Path};
 
 use super::{
     download_to, fetch_latest_release_at, fetch_text, parse_sha256sums, resolve_assets,
-    sha256_file, verify, GitHubAsset, GitHubRelease, ReleaseError, VerifyOutcome,
+    sha256_file, verify, GitHubAsset, GitHubRelease, ReleaseError, VerifyOutcome, RELEASES_REPO,
 };
 
 /// Start a `tiny_http` server that answers exactly one request with `status`
@@ -233,5 +233,17 @@ fn verify_reports_a_missing_entry_rather_than_passing_by_absence() {
     assert_eq!(
         verify(&expected, "demo.tar.gz", "deadbeef"),
         VerifyOutcome::MissingEntry
+    );
+}
+
+#[test]
+fn releases_repo_is_non_empty_and_parses_as_owner_slash_repo() {
+    let mut parts = RELEASES_REPO.split('/');
+    let owner = parts.next().filter(|part| !part.is_empty());
+    let repo = parts.next().filter(|part| !part.is_empty());
+
+    assert!(
+        owner.is_some() && repo.is_some() && parts.next().is_none(),
+        "RELEASES_REPO ({RELEASES_REPO:?}) must parse as exactly one owner/repo pair"
     );
 }

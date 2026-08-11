@@ -1,0 +1,5 @@
+# The hub's own releases repo. Read by build/scripts/release.sh (publishing)
+# and by hub/build.rs, which bakes it into the binary as TFSAPP_RELEASES_REPO
+# for release.rs's hub self-update check — one file, not two copies of the
+# same value.
+ArnaudDelgerie/TFSAppHub-releases
