@@ -16,11 +16,6 @@
 //! anchor is what makes the change reversible (`--rollback`,
 //! `hub_rollback.rs`, this plan's step 7).
 
-// `anchor_state` and `MissingAnchorHalf` have no real caller until
-// `hub_rollback.rs` (step 7) exists to call them. Remove the allow once that
-// caller lands.
-#![allow(dead_code)]
-
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},

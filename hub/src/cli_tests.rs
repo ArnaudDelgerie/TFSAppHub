@@ -302,11 +302,7 @@ fn an_unknown_word_is_refused_without_a_form_to_point_at() {
 fn unimplemented_commands_are_recognised_rather_than_rejected() {
     // The distinction the whole "not implemented yet" outcome exists for: a
     // wrong error here sends a user hunting for a typo that is not there.
-    for line in [
-        "--rollback",
-        "export demo /tmp/demo",
-        "import demo /tmp/demo.tar.gz",
-    ] {
+    for line in ["export demo /tmp/demo", "import demo /tmp/demo.tar.gz"] {
         assert!(
             !command(line).is_implemented(),
             "{line:?} is not implemented yet, and parsing must still recognise it"
@@ -317,6 +313,7 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         "--version",
         "--help",
         "--update",
+        "--rollback",
         "list",
         "install ../TFSAppTest",
         "open demo",

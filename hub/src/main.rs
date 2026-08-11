@@ -14,6 +14,7 @@ mod dev;
 mod gh;
 mod git;
 mod hub_bin;
+mod hub_rollback;
 mod hub_update;
 mod identity;
 mod install;
@@ -130,6 +131,7 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         Command::HubUpdate { assume_yes } => {
             hub_update::run(&context.package_info().version, assume_yes)
         }
+        Command::HubRollback { assume_yes } => hub_rollback::run(assume_yes),
         Command::Install {
             source,
             id,

@@ -72,10 +72,6 @@ pub fn ensure_current(paths: &Paths) -> Result<Outcome, HubBinError> {
 /// Overview, step 8), the hub's own equivalent of `lifecycle::
 /// previous_tree_path` for an app. One generation, like that one: a second
 /// `--update` before a `--rollback` overwrites it rather than keeping two.
-///
-/// `#[allow(dead_code)]`: this plan's steps 4 and 7 (`hub_update::run`,
-/// `hub_rollback.rs`) are its first real callers outside tests.
-#[allow(dead_code)]
 pub fn anchor_path(paths: &Paths) -> PathBuf {
     let mut previous = paths.hub_executable_path().into_os_string();
     previous.push(".previous");
@@ -86,10 +82,6 @@ pub fn anchor_path(paths: &Paths) -> PathBuf {
 /// half, snapshotted beside the binary (Overview step 7) under the registry
 /// lock, so `--rollback` can restore the app states a hub update mutated
 /// along with the binary that mutated them (correction 2).
-///
-/// `#[allow(dead_code)]`: this plan's steps 4 and 7 (`hub_update::run`,
-/// `hub_rollback.rs`) are its first real callers outside tests.
-#[allow(dead_code)]
 pub fn anchor_registry_path(paths: &Paths) -> PathBuf {
     paths
         .hub_executable_path()

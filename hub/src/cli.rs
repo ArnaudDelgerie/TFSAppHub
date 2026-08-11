@@ -120,7 +120,7 @@ pub const SURFACE: &[Spec] = &[
         form: "--rollback [--yes]",
         summary: "Undo the last hub update.",
         level: Level::Hub,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "install",
