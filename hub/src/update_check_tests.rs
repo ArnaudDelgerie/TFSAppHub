@@ -1,5 +1,7 @@
-use super::{answer, check, UpdateCheckResult, REASON_LOCAL_SOURCE, REASON_NO_ANSWER_YET};
-use crate::{registry::Source, update_cache::CachedRelease};
+use super::{
+    answer, answer_now, Context, UpdateCheckResult, REASON_LOCAL_SOURCE, REASON_NO_ANSWER_YET,
+};
+use crate::{paths::Paths, registry::Source, update_cache::CachedRelease};
 
 fn local_source() -> Source {
     Source {
@@ -143,15 +145,61 @@ fn the_ok_shape_carries_exactly_the_five_fields() {
 }
 
 #[test]
-fn the_pre_context_shim_answers_no_answer_yet() {
-    // `check()` (and the tauri command wrapping it) still exist only because
-    // step 4 has not yet threaded real launch context through either
-    // transport; until then, "nothing cached" is the honest answer for every
-    // app.
+fn a_dev_context_is_always_unavailable_local_source() {
+    // No registry entry exists for a `dev` session, so there is nothing to
+    // look up — `Context::Dev` answers the same way a local-path source does,
+    // just without a `Source` to consult in the first place.
+    let result = answer_now(&Context::Dev);
     assert_eq!(
-        check(),
+        result,
+        UpdateCheckResult::Unavailable {
+            reason: REASON_LOCAL_SOURCE.to_string()
+        }
+    );
+}
+
+#[test]
+fn an_installed_context_with_nothing_cached_is_no_answer_yet() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let context = Context::Installed {
+        source: release_source(),
+        app_version: "1.0.0".to_string(),
+        cache_path: paths.update_cache_path(),
+    };
+
+    let result = answer_now(&context);
+    assert_eq!(
+        result,
         UpdateCheckResult::Unavailable {
             reason: REASON_NO_ANSWER_YET.to_string()
+        }
+    );
+}
+
+#[test]
+fn an_installed_context_reads_the_cache_fresh_off_disk() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    crate::update_cache::update(&paths, |cache| {
+        cache.insert("owner/repo".to_string(), cached("v1.2.0"));
+    })
+    .expect("it writes");
+    let context = Context::Installed {
+        source: release_source(),
+        app_version: "1.1.0".to_string(),
+        cache_path: paths.update_cache_path(),
+    };
+
+    let result = answer_now(&context);
+    assert_eq!(
+        result,
+        UpdateCheckResult::Ok {
+            current: "1.1.0".to_string(),
+            latest: "1.2.0".to_string(),
+            update_available: true,
+            release_url: "https://github.com/owner/repo/releases/tag/v1.2.0".to_string(),
+            notes: "release notes".to_string(),
         }
     );
 }

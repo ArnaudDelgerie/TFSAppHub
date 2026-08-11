@@ -553,15 +553,19 @@ fn serve(
 
     // Managed before the sidecar starts, so the IPC commands can never meet a
     // window without a store behind it: `secrets.rs` resolves both from the
-    // calling window and has nothing else to fall back on.
+    // calling window and has nothing else to fall back on. `spec.update` the
+    // same way — `update_check::update_check` reads it from the calling
+    // window, exactly as the secret commands read their own state.
     app.manage(environment.secret_store.clone());
     app.manage(manifest.actions.secrets.clone());
+    app.manage(spec.update.clone());
 
     let (sidecar, url) = match sidecar::start(
         &toolchain,
         &spec.app_dir,
         &environment,
         manifest,
+        &spec.update,
         liveness_lock,
         serving_lock,
         &app,

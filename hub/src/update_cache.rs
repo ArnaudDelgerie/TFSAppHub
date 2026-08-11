@@ -27,16 +27,17 @@
 //! No network anywhere in this module — it only ever reads and writes what
 //! `release.rs` already fetched.
 
-// `update_check.rs` (step 3) and the background refresh (step 5) are this
-// module's first real callers; until they land, its own tests are the only
-// ones. Remove the allow once they do.
+// `update_check::answer_now` (step 4) is this module's first real caller, of
+// `load`/`load_from`. `update` and `UpdateCacheError` are still only
+// exercised by this module's own tests — the background refresh (step 5) is
+// their real caller. Remove the allow once that lands too.
 #![allow(dead_code)]
 
 use std::{
     collections::BTreeMap,
     fmt, fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -68,7 +69,15 @@ pub struct CachedRelease {
 /// Read the cache. A missing *or* unparseable file is empty — see the module
 /// header for why that differs from `registry::load`.
 pub fn load(paths: &Paths) -> UpdateCache {
-    let contents = match fs::read_to_string(paths.update_cache_path()) {
+    load_from(&paths.update_cache_path())
+}
+
+/// [`load`], from a bare path rather than a [`Paths`] — what
+/// `update_check::answer_now` calls, since a launch's `Context` already
+/// resolved the cache path once and has no reason to rebuild a whole `Paths`
+/// from it on every request.
+pub fn load_from(path: &Path) -> UpdateCache {
+    let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(_) => return UpdateCache::default(),
     };

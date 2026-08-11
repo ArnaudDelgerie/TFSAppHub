@@ -57,11 +57,15 @@ pub struct BridgeGroups {
 /// keyring prompt, say — can never block a concurrent call.
 ///
 /// `keys` is the app's declared `actions.secrets.keys`, snapshotted here: like
-/// the store, it does not change for the life of a launch.
+/// the store, it does not change for the life of a launch. `update_context` is
+/// the same `Context` `main::serve` manages for the IPC side — see
+/// `update_check.rs` — cloned once per request so `/update/check` re-reads the
+/// cache fresh, never the socket.
 pub fn start(
     store: SecretStore,
     keys: Vec<String>,
     groups: BridgeGroups,
+    update_context: crate::update_check::Context,
 ) -> Result<Bridge, Box<dyn std::error::Error>> {
     let server = tiny_http::Server::http("127.0.0.1:0")
         .map_err(|error| format!("Cannot start the actions bridge: {error}"))?;
@@ -77,7 +81,10 @@ pub fn start(
             let store = store.clone();
             let token = accept_token.clone();
             let keys = keys.clone();
-            thread::spawn(move || handle_request(request, &store, &token, &keys, groups));
+            let update_context = update_context.clone();
+            thread::spawn(move || {
+                handle_request(request, &store, &token, &keys, groups, &update_context)
+            });
         }
     });
 
@@ -101,6 +108,7 @@ fn handle_request(
     token: &str,
     keys: &[String],
     groups: BridgeGroups,
+    update_context: &crate::update_check::Context,
 ) {
     if !is_authorized(&request, token) {
         respond(request, 401, &json!({"error": "unauthorized"}));
@@ -126,10 +134,10 @@ fn handle_request(
     match (method, url.as_str()) {
         (Method::Get, "/healthz") => respond(request, 200, &json!({"status": "ok"})),
 
-        // Always 200: the same `check` the IPC command calls never errors, so a
+        // Always 200: the same answer the IPC command reads never errors, so a
         // caller polling it has one shape to read and no exception to handle.
         (Method::Get, "/update/check") => {
-            let body = serde_json::to_value(crate::update_check::check())
+            let body = serde_json::to_value(crate::update_check::answer_now(update_context))
                 .expect("an UpdateCheckResult always serialises");
             respond(request, 200, &body);
         }

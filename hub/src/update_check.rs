@@ -9,16 +9,19 @@
 //! a version, answers `no_answer_yet`; otherwise `ok`, comparing the cached
 //! tag against the installed version. This module has no opinion on *how*
 //! the cache gets populated — that is the background refresh's job
-//! (`../plan/021-the-update-check-an-app-can-read.md`'s step 5) — or on how
-//! either transport reaches it, which is step 4's.
+//! (`../plan/021-the-update-check-an-app-can-read.md`'s step 5).
+//!
+//! [`Context`] and [`answer_now`] are step 4's: the one piece of state each
+//! launch resolves once — from the registry entry `open::resolve` already
+//! read, or `Dev` outright for a session with no registry entry at all — and
+//! hands to both transports (`main::serve`'s `app.manage`, `sidecar::start`'s
+//! bridge context). Neither transport opens a socket to answer a poll; both
+//! just re-read whatever [`update_cache`] holds at the moment they are asked.
 
-// `answer` has no caller yet outside its own tests — `check()`/`update_check()`
-// below are what `main.rs` and `bridge.rs` still call, until step 4 rewires
-// both to build real context and call `answer` directly. Remove the allow
-// when that lands.
-#![allow(dead_code)]
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 
 use crate::{hub_update, registry, update_cache};
 
@@ -95,20 +98,57 @@ fn unavailable(reason: &str) -> UpdateCheckResult {
     }
 }
 
-/// The pre-context entry points both transports still call directly (`main.rs`'s
-/// `invoke_handler`, `bridge.rs`'s `/update/check` route). Neither has anything
-/// to answer [`answer`] with yet — no launch context is threaded through
-/// either side before this plan's step 4 — so both simply report the one
-/// honest thing true of every app today: nothing is cached, because nothing
-/// populates the cache before step 5 either. Step 4 removes this pair and
-/// calls [`answer`] with the real thing.
-pub fn check() -> UpdateCheckResult {
-    unavailable(REASON_NO_ANSWER_YET)
+/// What `actions.update`'s answer needs about one launch, resolved once —
+/// `open::resolve` already reads the registry entry this is built from, and
+/// `main::serve` hands a clone to `sidecar::start` for the bridge alongside
+/// managing one for IPC.
+///
+/// `Dev` covers a `dev` session (`launch::Source::Live`), which has no
+/// registry entry at all — [`REASON_LOCAL_SOURCE`] is the whole answer there,
+/// with nothing to look up. An app *installed* from a local directory is a
+/// different case, `Installed` with a [`registry::SourceKind::LocalPath`]
+/// source: it does have an entry, and [`answer`] is what turns that into the
+/// same reason.
+#[derive(Debug, Clone)]
+pub enum Context {
+    Installed {
+        source: registry::Source,
+        app_version: String,
+        cache_path: PathBuf,
+    },
+    Dev,
 }
 
+/// The real answer for one launch, as either transport's route handler calls
+/// it. The cache is re-read from disk on every call — no socket opens here,
+/// whatever `cache_path` holds is exactly what the background refresh last
+/// wrote — which is what makes this, unlike [`answer`], not a pure function.
+pub fn answer_now(context: &Context) -> UpdateCheckResult {
+    match context {
+        Context::Dev => unavailable(REASON_LOCAL_SOURCE),
+        Context::Installed {
+            source,
+            app_version,
+            cache_path,
+        } => {
+            let cache = update_cache::load_from(cache_path);
+            answer(source, app_version, cache.get(&source.location))
+        }
+    }
+}
+
+/// The IPC side: `window`'s app handle carries the `Context` `main::serve`
+/// managed for this launch. Not-yet-managed only happens for a webview call
+/// that somehow lands before that `app.manage` runs — impossible on the
+/// ordinary path, since the window is only navigated to the backend after —
+/// so it is answered the same as "nothing resolved yet" rather than treated
+/// as a distinct error.
 #[tauri::command]
-pub fn update_check() -> UpdateCheckResult {
-    check()
+pub fn update_check(window: tauri::Window) -> UpdateCheckResult {
+    match window.app_handle().try_state::<Context>() {
+        Some(context) => answer_now(&context),
+        None => unavailable(REASON_NO_ANSWER_YET),
+    }
 }
 
 #[cfg(test)]

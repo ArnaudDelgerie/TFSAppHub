@@ -158,11 +158,13 @@ pub fn write_caddyfile(data_dir: &Path) -> std::io::Result<PathBuf> {
 /// already holds; both are stored, never acquired here, so there is exactly
 /// one place in the codebase — `lifecycle::acquire_launch_locks` — that
 /// decides what this process claims.
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     toolchain: &Toolchain,
     app_dir: &Path,
     environment: &AppEnvironment,
     manifest: &crate::manifest::Manifest,
+    update_context: &crate::update_check::Context,
     lock: Option<fs::File>,
     serving: Option<fs::File>,
     app: &tauri::AppHandle,
@@ -204,6 +206,7 @@ pub fn start(
                 secrets: actions.secrets.bridge,
                 update: actions.update.bridge,
             },
+            update_context.clone(),
         )
         .map_err(|error| format!("Cannot start the actions bridge: {error}"))?;
         envs.push((
