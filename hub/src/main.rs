@@ -39,6 +39,7 @@ mod secrets;
 mod sidecar;
 mod source;
 mod update;
+mod update_cache;
 mod update_check;
 mod window;
 mod worker;

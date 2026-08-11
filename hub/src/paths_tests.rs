@@ -23,6 +23,14 @@ fn the_hub_root_sits_under_the_shared_vendor_folder() {
         paths.registry_lock_path(),
         base.path().join("TFSApp/hub/registry.lock")
     );
+    assert_eq!(
+        paths.update_cache_path(),
+        base.path().join("TFSApp/hub/update_cache.json")
+    );
+    assert_eq!(
+        paths.update_cache_lock_path(),
+        base.path().join("TFSApp/hub/update_cache.lock")
+    );
 }
 
 #[test]

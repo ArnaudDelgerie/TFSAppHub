@@ -88,6 +88,19 @@ pub const SCRATCH_DIR: &str = "scratch";
 /// which would drop an flock taken on it.
 pub const REGISTRY_LOCK_FILE: &str = "registry.lock";
 
+/// The update-check feed cache's file name, under the hub root — beside the
+/// registry, not under any app's `data/cache` (`app_env` empties that
+/// directory on every launch, and `update.rs` empties it again), since this
+/// file is exactly what has to survive a launch (`../plan/021-the-update-
+/// check-an-app-can-read.md`).
+pub const UPDATE_CACHE_FILE: &str = "update_cache.json";
+
+/// The update cache's lock file, kept beside it for the same reason
+/// [`REGISTRY_LOCK_FILE`] is kept beside the registry: an atomic write
+/// replaces the target inode, which would drop an flock taken on the file
+/// itself.
+pub const UPDATE_CACHE_LOCK_FILE: &str = "update_cache.lock";
+
 /// Every path the hub resolves, hanging off one base — the OS data dir.
 ///
 /// The base is a field rather than a call so the whole module is testable
@@ -198,6 +211,18 @@ impl Paths {
     /// `<OS data dir>/TFSApp/hub/registry.lock`.
     pub fn registry_lock_path(&self) -> PathBuf {
         self.hub_root().join(REGISTRY_LOCK_FILE)
+    }
+
+    /// `<OS data dir>/TFSApp/hub/update_cache.json` — every repository's
+    /// resolved release feed, one entry per `owner/repo`, shared by every app
+    /// installed from that repository.
+    pub fn update_cache_path(&self) -> PathBuf {
+        self.hub_root().join(UPDATE_CACHE_FILE)
+    }
+
+    /// `<OS data dir>/TFSApp/hub/update_cache.lock`.
+    pub fn update_cache_lock_path(&self) -> PathBuf {
+        self.hub_root().join(UPDATE_CACHE_LOCK_FILE)
     }
 
     /// `<OS data dir>/TFSApp/hub/scratch/<pid>/` — this process's own
