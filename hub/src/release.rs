@@ -79,6 +79,11 @@ pub struct GitHubRelease {
     pub html_url: String,
     #[serde(default)]
     pub assets: Vec<GitHubAsset>,
+    /// The release's own notes — GitHub sends `null` for a release with none,
+    /// and omits the key from nothing this resolver has seen, but `default`
+    /// covers that too. `update_check.rs`'s `notes` is this, or empty.
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]

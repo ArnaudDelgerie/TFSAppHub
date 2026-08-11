@@ -201,7 +201,7 @@ fn the_update_route_answers_the_shape_an_app_already_handles() {
     assert_eq!(answer.json()["status"], "unavailable");
     assert_eq!(
         answer.json()["reason"],
-        crate::update_check::HOST_RESOLVES_UPDATES
+        crate::update_check::REASON_NO_ANSWER_YET
     );
 }
 
