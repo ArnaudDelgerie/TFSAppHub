@@ -661,9 +661,95 @@ fn an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order() {
     // …and the hooks ran, in the contract's order, against the app's own data
     // dir rather than anywhere the hub happened to be standing.
     let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
+    // The hub's own `cache:warmup` (plan 024) runs last, through the same
+    // toolchain and this same fixture console — after the declared hooks,
+    // never instead of or ahead of them.
     assert_eq!(
         fs::read_to_string(log).expect("a hook trace"),
-        "doctrine:migrations:migrate\nabout\n"
+        "doctrine:migrations:migrate\nabout\ncache:warmup --env=prod --no-debug\n"
+    );
+}
+
+#[test]
+fn an_install_writes_a_cache_stamp_matching_the_current_platform() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    runnable_app_tree(source.path(), "{}");
+
+    let id = super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("it installs");
+    assert_eq!(id.as_deref(), Some("demo"));
+
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    let stamp: crate::lifecycle::CacheStamp = serde_json::from_str(
+        &fs::read_to_string(data_subdir.join("cache.json")).expect("a written cache stamp"),
+    )
+    .expect("a parseable stamp");
+
+    assert_eq!(stamp.app_version, "0.6.0");
+    assert_eq!(
+        stamp.snapshot_path,
+        tfsapp_core::sidecar::path_to_string(&app_dir)
+    );
+    assert_eq!(
+        stamp.platform,
+        crate::platform::hub_platform().expect("a probe of the same interpreter")
+    );
+}
+
+#[test]
+fn a_failed_warm_up_does_not_fail_the_install_and_leaves_no_stamp() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    manifest_at(source.path(), "0.6.0");
+    fs::write(source.path().join("composer.json"), "{\"require\": {}}").expect("a composer.json");
+    fs::create_dir_all(source.path().join("bin")).expect("a bin dir");
+    // Fails on cache:warmup alone — composer install and any declared hook
+    // still succeed, so a failure here is isolated to the warm-up itself.
+    fs::write(
+        source.path().join("bin/console"),
+        r#"<?php
+        $arguments = array_slice($argv, 1);
+        exit(($arguments[0] ?? '') === 'cache:warmup' ? 1 : 0);
+        "#,
+    )
+    .expect("a console that fails only on cache:warmup");
+    fs::create_dir_all(source.path().join("public")).expect("a public dir");
+    fs::write(source.path().join("public/index.php"), "<?php").expect("a front controller");
+
+    let id = super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("a failed warm-up must not fail the install");
+    assert_eq!(id.as_deref(), Some("demo"));
+
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    assert!(
+        !data_subdir.join("cache.json").exists(),
+        "a failed warm-up must leave no stamp — CONTRACT.md §6's \"never written speculatively\""
     );
 }
 
@@ -785,12 +871,17 @@ fn a_record_of_the_same_version_installs_and_runs_no_lifecycle_command() {
     let app_dir = paths.app_dir("demo").expect("an app dir");
     // Composer still ran: dependencies are not a lifecycle command.
     assert!(app_dir.join("vendor/autoload.php").is_file());
-    // …but neither hook did, unlike a first install of the same manifest
-    // (`an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order`).
+    // …but neither declared hook did, unlike a first install of the same
+    // manifest (`an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order`).
+    // The hub's own `cache:warmup` (plan 024) is not a *lifecycle* command —
+    // it runs regardless of `event` — so it is the one line this trace does
+    // carry.
     let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
-    assert!(
-        !log.exists(),
-        "an equal record must run no lifecycle command"
+    assert_eq!(
+        fs::read_to_string(log).expect("a hook trace"),
+        "cache:warmup --env=prod --no-debug\n",
+        "an equal record must run no *declared* lifecycle command, but the hub's own warm-up \
+         still runs"
     );
 }
 

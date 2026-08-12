@@ -113,7 +113,7 @@ fn a_satisfiable_lock_ends_ready_with_the_new_platform_stamped() {
 
     let outcome =
         revalidate(&paths, "demo", source.path(), &manifest).expect("composer resolves cleanly");
-    assert!(matches!(outcome, Outcome::Ready), "{outcome:?}");
+    assert!(matches!(outcome, Outcome::Ready(_)), "{outcome:?}");
 
     let after = registry::load(&paths).expect("it reads");
     let entry = after.get("demo").expect("still there");
@@ -151,6 +151,63 @@ fn an_unsatisfiable_requirement_ends_broken_and_keeps_the_last_known_platform() 
 }
 
 #[test]
+fn a_platform_change_mismatches_the_stale_cache_stamp_on_the_fingerprint_alone() {
+    // Plan 024 step 5, invalidation path 3: a hub self-update moves PHP, marks
+    // the entry `NeedsRevalidation`, and the next `open` calls `revalidate`
+    // — which never touches `cache.json` itself (unlike `update`'s revert or
+    // `install::prepare`'s own warm-up). The stale stamp a prior install left,
+    // naming the *old* platform, must mismatch against the stamp the next
+    // launch would build from the freshly probed one — on the platform
+    // dimension alone, with `app_version`/`snapshot_path` untouched.
+    if !resources_present() {
+        return;
+    }
+    let (base, paths) = temp_paths();
+    let source = tempfile::tempdir().expect("a temp source");
+    app_tree(source.path(), "");
+    let manifest = manifest(source.path());
+
+    registry::update(&paths, |registry| registry.upsert(seeded_entry())).expect("a seeded entry");
+
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    let stale_stamp = crate::lifecycle::CacheStamp {
+        app_version: manifest.app_version.clone(),
+        snapshot_path: tfsapp_core::sidecar::path_to_string(source.path()),
+        platform: implausible_platform(),
+    };
+    crate::lifecycle::write_cache_stamp(&data_subdir, &stale_stamp).expect("a seeded stamp");
+
+    let outcome =
+        revalidate(&paths, "demo", source.path(), &manifest).expect("composer resolves cleanly");
+    let Outcome::Ready(fresh_platform) = outcome else {
+        panic!("expected Ready, got {outcome:?}");
+    };
+    assert_ne!(
+        fresh_platform,
+        implausible_platform(),
+        "the real probe can never answer the seeded, implausible platform"
+    );
+
+    let expected = crate::lifecycle::CacheStamp {
+        app_version: manifest.app_version.clone(),
+        snapshot_path: tfsapp_core::sidecar::path_to_string(source.path()),
+        platform: fresh_platform,
+    };
+    let cache_dir = base.path().join("TFSApp/dev.local.demo/cache");
+
+    match crate::lifecycle::read_cache_stamp(&data_subdir, &cache_dir, &expected) {
+        crate::lifecycle::CacheStatus::Mismatch { reason } => {
+            assert!(
+                reason.contains("the platform changed"),
+                "the mismatch must be on the platform dimension alone: {reason}"
+            );
+        }
+        other => panic!("expected a mismatch on the stale stamp's platform, got {other:?}"),
+    }
+}
+
+#[test]
 fn an_entry_removed_out_from_under_a_revalidation_is_not_an_error() {
     if !resources_present() {
         return;
@@ -164,7 +221,7 @@ fn an_entry_removed_out_from_under_a_revalidation_is_not_an_error() {
 
     let outcome = revalidate(&paths, "demo", source.path(), &manifest)
         .expect("a missing entry is not an error here");
-    assert!(matches!(outcome, Outcome::Ready), "{outcome:?}");
+    assert!(matches!(outcome, Outcome::Ready(_)), "{outcome:?}");
 
     let after = registry::load(&paths).expect("it reads");
     assert!(after.get("demo").is_none());

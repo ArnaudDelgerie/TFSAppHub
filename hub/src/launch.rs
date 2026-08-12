@@ -69,6 +69,13 @@ pub struct LaunchSpec {
     /// registry entry it already read; `dev::resolve` builds `Dev`, since a
     /// live project has no entry to build one from.
     pub update: update_check::Context,
+    /// The cache stamp (plan 024) this launch would write if it rebuilt right
+    /// now — `Some` from `open::resolve`, built from the registry entry's own
+    /// `Platform` rather than a fresh probe (re-read after a revalidation, so
+    /// a platform change is never compared against its own stale value).
+    /// `None` from `dev::resolve`: a dev session has no registry entry and
+    /// `Mode::Dev` never wipes, so nothing would ever read it.
+    pub expected_cache: Option<crate::lifecycle::CacheStamp>,
 }
 
 impl LaunchSpec {

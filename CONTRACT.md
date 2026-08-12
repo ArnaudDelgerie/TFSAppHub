@@ -411,11 +411,15 @@ both exist before any of the app's own code runs, and warming them is what the
 install lifecycle is for (§6). Anything that must survive a launch goes to the
 database, or to the app's data directory (§5).
 
-*(The hub empties them on every launch of an installed app today; a dev session
-does not, so its container survives a relaunch instead of paying for a full
-rebuild on every reload (§9). That difference is a choice about safety and
-cost, not a property of this clause, and it is `ARCHITECTURE.md`'s to
-explain.)*
+*(The hub warms both once, at install and at update, and reuses them across an
+installed app's launches as long as a stamp it keeps under `data/` — the app's
+version, the snapshot path, and the PHP fingerprint the container was compiled
+against — still matches; it empties them at a launch only when one of those
+three has moved, which an update, a rollback or a hub self-update can each
+cause. A dev session never wipes at all, so its container survives a relaunch
+instead of paying for a full rebuild on every reload (§9). That difference is
+a choice about safety and cost, not a property of this clause, and it is
+`ARCHITECTURE.md`'s to explain.)*
 
 ### The database is SQLite, and that is a constraint on the app
 

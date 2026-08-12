@@ -33,8 +33,11 @@ use crate::{
 /// What came of re-resolving `id`'s dependencies.
 #[derive(Debug)]
 pub enum Outcome {
-    /// Composer resolved cleanly against the running hub's PHP.
-    Ready,
+    /// Composer resolved cleanly against the running hub's PHP — carrying the
+    /// `Platform` just probed, so a caller building plan 024's cache stamp
+    /// never has to re-probe (or worse, reach for the registry entry's own
+    /// in-memory copy, which this same call is what makes stale).
+    Ready(registry::Platform),
     /// It did not. Composer's own explanation already reached the terminal by
     /// the time this is returned — [`php::Toolchain::composer_install`] runs
     /// with inherited stdio, the same as an `install`'s or an `update`'s — so
@@ -76,17 +79,17 @@ pub fn revalidate(
     )?;
 
     let outcome = match toolchain.composer_install(app_dir, &environment.vars) {
-        Ok(()) => Outcome::Ready,
+        Ok(()) => Outcome::Ready(platform.clone()),
         Err(_) => Outcome::Broken,
     };
 
     registry::update(paths, |registry| {
         if let Some(entry) = registry.get_mut(id) {
             entry.state = match outcome {
-                Outcome::Ready => State::Ready,
+                Outcome::Ready(_) => State::Ready,
                 Outcome::Broken => State::Broken,
             };
-            if let Outcome::Ready = outcome {
+            if let Outcome::Ready(ref platform) = outcome {
                 entry.platform = platform.clone();
             }
             entry.updated_at = registry::now_timestamp();

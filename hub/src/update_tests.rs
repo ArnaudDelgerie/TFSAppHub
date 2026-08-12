@@ -385,9 +385,12 @@ fn an_update_runs_pre_update_then_post_update_and_no_install_hooks() {
     update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
 
     let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
+    // The hub's own `cache:warmup` (plan 024) closes out each event — the
+    // install's, then the update's — through this same fixture console.
     assert_eq!(
         fs::read_to_string(log).expect("a hook trace"),
-        "about\ndoctrine:migrations:migrate\ncache:clear\nabout\n",
+        "about\ndoctrine:migrations:migrate\ncache:warmup --env=prod --no-debug\n\
+         cache:clear\nabout\ncache:warmup --env=prod --no-debug\n",
         "the install's own hooks must not repeat, and the update's must run in order"
     );
 
@@ -456,6 +459,61 @@ fn a_failing_pre_update_leaves_the_tree_the_database_and_the_registry_entry_unch
 }
 
 #[test]
+fn an_update_leaves_a_cache_stamp_the_next_launch_will_match() {
+    // Plan 024 step 5, invalidation path 1: an update to a new `app_version`
+    // must leave a stamp naming that new version — the one `open::resolve`
+    // will build as `expected` on the very next launch.
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+
+    runnable_app_tree(source.path(), "0.6.0", "{}");
+    crate::install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the first install");
+
+    runnable_app_tree(source.path(), "0.7.0", "{}");
+    update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
+
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join("data");
+    let cache_dir = data_dir.join("cache");
+    // A real launch always finds `cache/` repopulated by its own warm-up —
+    // this fixture's console never actually writes one, so it is faked here
+    // to isolate what this test cares about: whether the stamp's *fields*
+    // would let a launch reuse it, not whether this fixture writes a cache.
+    fs::create_dir_all(&cache_dir).expect("a cache dir");
+    fs::write(cache_dir.join("marker"), b"warm").expect("a cache entry");
+
+    let entry = registry::load(&paths)
+        .expect("a readable registry")
+        .get("demo")
+        .cloned()
+        .expect("the entry survives");
+    let expected = crate::lifecycle::CacheStamp {
+        app_version: entry.app_version.clone(),
+        snapshot_path: tfsapp_core::sidecar::path_to_string(&app_dir),
+        platform: entry.platform.clone(),
+    };
+
+    assert_eq!(
+        crate::lifecycle::read_cache_stamp(&data_subdir, &cache_dir, &expected),
+        crate::lifecycle::CacheStatus::Matches,
+        "an update's own warm-up must leave a stamp the very next launch reuses"
+    );
+}
+
+#[test]
 fn force_on_an_equal_source_resyncs_without_running_any_hook() {
     if !resources_present() {
         return;
@@ -492,9 +550,14 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
     update(&paths, "demo", None, true, true, "0.1.0").expect("--force resyncs");
 
     let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
-    assert!(
-        !log.exists(),
-        "a resync must run no lifecycle command at all"
+    // The initial install ran no declared hook (no `pre-install`/`post-install`
+    // in this manifest) but still ran the hub's own `cache:warmup` (plan 024);
+    // a resync goes through `resync_only`, never `install::prepare`, so it
+    // must add nothing further to this trace.
+    assert_eq!(
+        fs::read_to_string(log).expect("a hook trace"),
+        "cache:warmup --env=prod --no-debug\n",
+        "a resync must run no lifecycle command, and must not warm the cache a second time"
     );
     assert!(
         !previous_tree_path(&paths.app_dir("demo").expect("an app dir")).exists(),

@@ -40,9 +40,12 @@
 
 use std::{fmt, io, path::PathBuf, process::Command};
 
+use tfsapp_core::sidecar::path_to_string;
+
 use crate::{
     cli::{EXIT_FAILED, EXIT_OK, OPEN_CHILD_SUBCOMMAND},
     launch::{LaunchSpec, Source},
+    lifecycle::CacheStamp,
     manifest::{self, ManifestError},
     paths::{Paths, PathsError},
     registry::{self, now_timestamp, RegistryError, State},
@@ -117,6 +120,12 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
     }
     let needs_revalidation = entry.state == State::NeedsRevalidation;
     let last_known_platform = entry.platform.to_string();
+    // The `Platform` plan 024's cache stamp compares against — the entry's own
+    // in-memory copy, unless revalidation below actually runs and advances it.
+    // Read from the registry rather than re-probed: `revalidate::Outcome::Ready`
+    // carries the very probe it just took, precisely so this never compares a
+    // platform change against its own stale value.
+    let mut cache_platform = entry.platform.clone();
 
     let app_dir = paths.app_dir(id)?;
     if !app_dir.is_dir() {
@@ -152,7 +161,10 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
              this hub now runs something else. Re-resolving its dependencies…"
         );
         match revalidate::revalidate(paths, id, &app_dir, &manifest)? {
-            revalidate::Outcome::Ready => println!("{id} is ready."),
+            revalidate::Outcome::Ready(platform) => {
+                println!("{id} is ready.");
+                cache_platform = platform;
+            }
             revalidate::Outcome::Broken => {
                 return Err(OpenError::Broken {
                     id: id.to_string(),
@@ -164,6 +176,15 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
 
     let state_root = paths.app_data_dir(&manifest.identifier)?;
     let identity = manifest.identity(&app_dir);
+    // The stamp this launch would write if it rebuilt right now (plan 024) —
+    // `app_env::resolve`'s `Mode::Launch` compares the recorded one against
+    // this rather than deciding on its own, which has neither a `Platform`
+    // nor any notion of the installed snapshot's identity beyond `app_dir`.
+    let expected_cache = CacheStamp {
+        app_version: manifest.app_version.clone(),
+        snapshot_path: path_to_string(&app_dir),
+        platform: cache_platform,
+    };
 
     Ok(LaunchSpec {
         source: Source::Installed { id: id.to_string() },
@@ -178,6 +199,7 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
             app_version: entry.app_version.clone(),
             cache_path: paths.update_cache_path(),
         },
+        expected_cache: Some(expected_cache),
     })
 }
 

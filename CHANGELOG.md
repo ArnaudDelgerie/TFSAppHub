@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+Opening an installed app is now measurably faster the second time, and every
+time after that: `cache/`/`build/` used to be emptied on every single launch,
+so each `open` compiled the Symfony container from scratch — now `install`
+and `update` warm it themselves, right after their own lifecycle commands,
+and a launch reuses what they built as long as nothing has moved under it.
+Measured on the reference app, that is the difference between roughly 3s and
+roughly 1.1s per launch. `cache/`/`build/` are still emptied — `hub.log`
+names why — whenever the app's version, its installed path, or the hub's own
+PHP fingerprint no longer matches what the cache was built against: after an
+`update`, after a `rollback` (whose next launch rebuilds at the un-warmed
+cost, and every launch after it until the next `install` or `update`), and
+after a hub self-update that moves PHP under an app pending revalidation.
+Nothing an app declares changes, and `CONTRACT.md` §3's guarantee that
+`APP_CACHE_DIR`/`APP_BUILD_DIR` may be emptied at any launch is unchanged —
+only how often the hub actually chooses to.
+
 ## 0.3.0
 
 No user-facing change — this release exists to validate `tfsapp-hub --update`

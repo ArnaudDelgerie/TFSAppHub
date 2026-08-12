@@ -272,3 +272,70 @@ fn a_successful_update_can_be_rolled_back_end_to_end() {
     assert!(!lifecycle::db_snapshot_path(&data_subdir, "app.db").exists());
     assert!(!lifecycle::rollback_anchor_path(&data_subdir).exists());
 }
+
+#[test]
+fn a_rollback_leaves_a_stale_cache_stamp_that_mismatches_the_restored_version() {
+    // Plan 024 step 5, invalidation path 2: unlike `update`'s own revert
+    // (which discards `cache.json` outright on failure), a *successful*
+    // rollback never touches it — the stamp `install::prepare`'s warm-up
+    // wrote for the version the update moved *to* is left stale next to a
+    // tree just restored to the version it moved *from*. Its `app_version`
+    // alone must be enough for the next launch to catch the mismatch and
+    // rebuild, with no code in `rollback.rs` needing to clear it.
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+
+    runnable_app_tree(source.path(), "0.6.0", "{}");
+    crate::install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the first install");
+
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    // `update`'s own `snapshot_db` only copies files that exist — the
+    // rollback anchor's database half needs one to snapshot, same as the
+    // round-trip test above.
+    fs::write(data_subdir.join("app.db"), b"pre-update-bytes").expect("a seeded database");
+
+    runnable_app_tree(source.path(), "0.7.0", "{}");
+    crate::update::update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
+
+    assert!(rollback(&paths, "demo", true).expect("it rolls back"));
+
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    let cache_dir = base.path().join("TFSApp/dev.local.demo/cache");
+    let entry = registry::load(&paths)
+        .expect("a readable registry")
+        .get("demo")
+        .cloned()
+        .expect("the entry survives");
+    assert_eq!(
+        entry.app_version, "0.6.0",
+        "the restored version, which `expected` below must be built from"
+    );
+
+    let expected = lifecycle::CacheStamp {
+        app_version: entry.app_version.clone(),
+        snapshot_path: tfsapp_core::sidecar::path_to_string(&app_dir),
+        platform: entry.platform.clone(),
+    };
+
+    match lifecycle::read_cache_stamp(&data_subdir, &cache_dir, &expected) {
+        lifecycle::CacheStatus::Mismatch { reason } => {
+            assert!(
+                reason.contains("0.7.0") && reason.contains("0.6.0"),
+                "the mismatch must name both versions: {reason}"
+            );
+        }
+        other => panic!("expected a mismatch on the stale stamp's app_version, got {other:?}"),
+    }
+}

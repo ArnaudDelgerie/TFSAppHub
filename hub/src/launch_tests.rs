@@ -24,6 +24,7 @@ fn spec(source: Source) -> LaunchSpec {
         label: "demo".to_string(),
         warnings: vec![],
         update: update_check::Context::Dev,
+        expected_cache: None,
     }
 }
 

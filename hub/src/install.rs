@@ -30,6 +30,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use tfsapp_core::sidecar::path_to_string;
+
 use crate::{
     app_env::{self, EnvError},
     cli::{EXIT_FAILED, EXIT_OK},
@@ -219,7 +221,7 @@ pub(crate) fn install_into(
     // Everything from here runs the app's own PHP, so everything from here can
     // fail in ways the hub does not control. One place to undo the copy, rather
     // than an `if` after each step.
-    if let Err(error) = prepare(paths, &toolchain, manifest, &app_dir, event) {
+    if let Err(error) = prepare(paths, &toolchain, manifest, &app_dir, event, &platform) {
         let _ = fs::remove_dir_all(&app_dir);
         return Err(error);
     }
@@ -374,6 +376,7 @@ pub(crate) fn prepare(
     manifest: &Manifest,
     app_dir: &Path,
     event: LifecycleEvent,
+    platform: &registry::Platform,
 ) -> Result<(), InstallError> {
     // `0700` on every call, not only on a first install: an app reinstalled
     // after an older host created it laxly gets tightened here rather than
@@ -428,7 +431,68 @@ pub(crate) fn prepare(
     // whichever host wrote it.
     lifecycle::write_data_version(&environment.data_subdir, &manifest.app_version)?;
 
+    warm_cache(toolchain, app_dir, manifest, &environment, platform);
+
     Ok(())
+}
+
+/// Warm `cache/`/`build/` right after this event's own commands, and record
+/// the stamp plan 024's launch-time comparison reads (`app_env::resolve`'s
+/// `Mode::Launch`).
+///
+/// **The hub runs this itself, not the app.** An app that forgot to declare a
+/// warm-up must not be the one that pays for it at every subsequent launch —
+/// `cache/` is the hub's directory to keep warm, not the app's to remember,
+/// which is also why this ignores whatever the manifest's dead `pre-build`
+/// key says (CONTRACT.md §2's dead-end refusal already covers that key).
+///
+/// Its output is logged, never inherited: unlike `pre-install`/`post-install`,
+/// this is not a command the app declared, so a failure here must read like
+/// one more line in `commands.log`, not a hang on an install that looks
+/// otherwise ordinary.
+///
+/// **A failed warm-up does not fail the install/update.** The obvious-looking
+/// reading is the wrong one: the cache is *derived*, so the correct response
+/// to a failed rebuild is to leave no stamp and let the next launch rebuild
+/// it, not to refuse an otherwise-successful install over a directory
+/// CONTRACT.md promises nothing about. The stamp itself is written only once
+/// the warm-up has actually succeeded — CONTRACT.md §6's "never written
+/// speculatively" rule, applied to this record.
+fn warm_cache(
+    toolchain: &Toolchain,
+    app_dir: &Path,
+    manifest: &Manifest,
+    environment: &app_env::AppEnvironment,
+    platform: &registry::Platform,
+) {
+    let outcome = toolchain.console_logged(
+        app_dir,
+        &environment.vars,
+        "cache:warmup --env=prod --no-debug",
+        &environment.log_dir.join("commands.log"),
+        "cache-warmup",
+    );
+    match outcome {
+        Ok(()) => {
+            let stamp = lifecycle::CacheStamp {
+                app_version: manifest.app_version.clone(),
+                snapshot_path: path_to_string(app_dir),
+                platform: platform.clone(),
+            };
+            if let Err(error) = lifecycle::write_cache_stamp(&environment.data_subdir, &stamp) {
+                println!(
+                    "tfsapp-hub: warning: cache warmed but its stamp could not be recorded \
+                     ({error}); the next launch will rebuild it."
+                );
+            }
+        }
+        Err(error) => {
+            println!(
+                "tfsapp-hub: warning: cache warm-up failed ({error}); the next launch will \
+                 rebuild it."
+            );
+        }
+    }
 }
 
 /// Paths, relative to the project root, the snapshot never copies.
