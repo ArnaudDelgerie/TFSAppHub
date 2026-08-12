@@ -169,6 +169,10 @@ pub fn resolve(project_path: &str) -> Result<LaunchSpec, DevError> {
         label,
         warnings: loaded.warnings,
         update: update_check::Context::Dev,
+        // A dev session has no registry entry to build a stamp from, and
+        // `Mode::Dev` never wipes `cache/`/`build/` — nothing would ever read
+        // this.
+        expected_cache: None,
     })
 }
 

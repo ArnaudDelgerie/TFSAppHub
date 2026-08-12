@@ -169,12 +169,6 @@ pub fn write_data_version(data_subdir: &Path, version: &str) -> Result<(), Lifec
 /// were last compiled against. Beside `config.json`, following the same
 /// temp-file-plus-`rename` write and the same "absent is not an error" read
 /// shape as [`read_data_version`]/[`write_data_version`].
-///
-/// `#[allow(dead_code)]` on this and the rest of the cache-stamp group below:
-/// plan 024 steps 3 and 4 wire `resolve` and `install`/`update` to these —
-/// until then, this file's own tests are the only caller. Same situation as
-/// `registry.rs`'s own `#![allow(dead_code)]`; removed once that wiring lands.
-#[allow(dead_code)]
 pub fn cache_stamp_path(data_subdir: &Path) -> PathBuf {
     data_subdir.join("cache.json")
 }
@@ -186,8 +180,7 @@ pub fn cache_stamp_path(data_subdir: &Path) -> PathBuf {
 /// the `Platform` fingerprint (`registry.rs`) the PHP that compiled it ran
 /// under. A rollback restoring an older tree changes the first, a hub
 /// self-update moving PHP changes the third; nothing else does.
-#[allow(dead_code)]
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CacheStamp {
     pub app_version: String,
     pub snapshot_path: String,
@@ -197,7 +190,6 @@ pub struct CacheStamp {
 /// [`read_cache_stamp`]'s answer: never a bare bool, so the caller can log
 /// *why* it is about to rebuild rather than rebuilding silently — a launch
 /// that silently rebuilds is the failure mode plan 024 exists to remove.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheStatus {
     /// The stamp matches `expected` and `cache/` actually holds something —
@@ -218,7 +210,6 @@ pub enum CacheStatus {
 /// exist reads the same as an empty one — both mean "nothing to reuse" — so
 /// callers get one answer instead of having to fold two `Result`/`bool`s
 /// themselves.
-#[allow(dead_code)]
 fn cache_dir_has_entries(cache_dir: &Path) -> bool {
     fs::read_dir(cache_dir)
         .map(|mut entries| entries.next().is_some())
@@ -233,7 +224,6 @@ fn cache_dir_has_entries(cache_dir: &Path) -> bool {
 /// gets to explain its own mismatch first): a stamp is a claim about what was
 /// built, not a promise that it is still on disk, and this function must
 /// never tell a caller to reuse a container that is not there.
-#[allow(dead_code)]
 pub fn read_cache_stamp(
     data_subdir: &Path,
     cache_dir: &Path,
@@ -296,6 +286,10 @@ pub fn read_cache_stamp(
 /// [`write_data_version`]. Callers own CONTRACT.md §6's "never written
 /// speculatively" rule — this only ever runs after the warm-up it describes
 /// has actually succeeded.
+///
+/// `#[allow(dead_code)]`: plan 024 step 4 wires `install`/`update` to this —
+/// until then, this file's own tests are the only caller. Same situation as
+/// `registry.rs`'s own `#![allow(dead_code)]`; removed once that wiring lands.
 #[allow(dead_code)]
 pub fn write_cache_stamp(data_subdir: &Path, stamp: &CacheStamp) -> Result<(), LifecycleError> {
     let path = cache_stamp_path(data_subdir);

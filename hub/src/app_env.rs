@@ -32,7 +32,10 @@ use std::{
 
 use tfsapp_core::sidecar::path_to_string;
 
-use crate::manifest::Manifest;
+use crate::{
+    lifecycle::{read_cache_stamp, CacheStamp, CacheStatus},
+    manifest::Manifest,
+};
 
 /// Which moment is assembling this environment, and — since plan 009 — which
 /// of §3's dev-clause variables to use.
@@ -41,14 +44,19 @@ use crate::manifest::Manifest;
 /// must not be able to tell an install's `bin/console` from a launch's, and
 /// CONTRACT.md's dev section (plan 009 step 5) is the closed list of what a
 /// dev session is allowed to see differently from a launch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     /// An `install` or `update`: warm what the app's own commands are about to
     /// build, and throw nothing away.
     Install,
-    /// An installed app's launch: wipe `cache/` and `build/`, and rotate the
-    /// logs before anything opens them.
-    Launch,
+    /// An installed app's launch: reuse `cache/`/`build/` when the cache stamp
+    /// (plan 024) matches, wipe and rebuild when it does not, and rotate the
+    /// logs before anything opens them. The stamp this launch would write if
+    /// it rebuilt right now — the caller's, since `resolve` has neither a
+    /// `Platform` nor any notion of the installed snapshot's identity beyond
+    /// `app_dir` — travels with the variant rather than as a side parameter,
+    /// so a `Launch` can never reach the wipe decision without one.
+    Launch(CacheStamp),
     /// A `dev <path>` launch (plan 009): `APP_ENV=dev`, `APP_DEBUG=1`, a fixed
     /// throwaway `APP_SECRET`, and — like `Launch` — a log rotation. Never
     /// wipes `cache/`/`build/`: Symfony's dev container invalidates itself on
@@ -119,16 +127,27 @@ pub struct AppEnvironment {
 /// dev session's `var/` needs no such tightening at all. This function only
 /// ever creates what hangs *under* `state_root`: its five subdirectories.
 ///
-/// **The launch-time cache wipe is the station's workaround, kept deliberately.**
-/// Over there `cache/` and `build/` are emptied on every launch because a random
-/// `/tmp/.mount_*` AppImage path bakes itself into the compiled Symfony
-/// container, and reusing it across an upgrade is how a stale container survives.
-/// The hub does not have that cause: it runs installed apps from a stable real
-/// path (see `paths.rs`). So a persistent warm cache is *possible* here — which
-/// is not the same as proven, and claiming it needs its own measurement. Until
-/// then the hub pays the same cost the station pays for an installed launch,
-/// because the failure mode of getting this wrong is a user running last
-/// version's compiled container against this version's code.
+/// **The launch-time cache wipe used to be unconditional; now it is a
+/// comparison (plan 024).** The station empties `cache/` and `build/` on every
+/// launch because a random `/tmp/.mount_*` AppImage path bakes itself into the
+/// compiled Symfony container, and reusing it across an upgrade is how a stale
+/// container survives. The hub does not have that cause: it runs installed
+/// apps from a stable real path (see `paths.rs`), which is what makes a
+/// persistent warm cache possible here at all — plan 024 step 1 measured the
+/// wipe at roughly 1.7s of every launch, cost enough to be worth spending the
+/// stamp on.
+///
+/// Three things can invalidate a compiled container, and only three: the
+/// app's own `app_version`, the snapshot path it was compiled from, and the
+/// `Platform` the PHP that compiled it ran under (`lifecycle::CacheStamp`). A
+/// `Mode::Launch` carries the stamp it would write if it rebuilt right now —
+/// see the variant's own doc comment for why `resolve` cannot derive that
+/// itself — and wipes only when [`crate::lifecycle::read_cache_stamp`] finds a
+/// reason to: a mismatched dimension, no stamp at all, or a `cache/` that
+/// turned out empty despite one. Every wipe logs why, to stdout — which is
+/// `hub.log` by the time this runs (`open::prepare_hub_log` redirects it
+/// before the child that reaches here is ever spawned) — so a launch that
+/// rebuilds is diagnosable rather than merely slow.
 ///
 /// An install is not a launch: wiping there would throw away the very cache the
 /// install's own `cache:warmup` just built. Neither is dev, but for a different
@@ -148,13 +167,21 @@ pub fn resolve(
     let build_dir = data_dir.join("build");
     let log_dir = data_dir.join("log");
     let sessions_dir = data_dir.join("sessions");
-    if mode == Mode::Launch {
-        // Best-effort: a directory that cannot be removed is recreated below and
-        // the launch carries on, rather than refusing to open the app over a
-        // cache it could not clear. Dev never reaches this branch — see the
-        // doc comment above.
-        let _ = fs::remove_dir_all(&cache_dir);
-        let _ = fs::remove_dir_all(&build_dir);
+    if let Mode::Launch(expected) = &mode {
+        let wipe_reason = match read_cache_stamp(&data_subdir, &cache_dir, expected) {
+            CacheStatus::Matches => None,
+            CacheStatus::Absent => Some("no cache stamp recorded yet".to_string()),
+            CacheStatus::Mismatch { reason } => Some(reason),
+        };
+        if let Some(reason) = wipe_reason {
+            println!("cache/build not reused, rebuilding: {reason}");
+            // Best-effort: a directory that cannot be removed is recreated below
+            // and the launch carries on, rather than refusing to open the app
+            // over a cache it could not clear. Dev never reaches this branch —
+            // see the doc comment above.
+            let _ = fs::remove_dir_all(&cache_dir);
+            let _ = fs::remove_dir_all(&build_dir);
+        }
     }
     for directory in [
         &data_subdir,
@@ -168,7 +195,7 @@ pub fn resolve(
             source,
         })?;
     }
-    if matches!(mode, Mode::Launch | Mode::Dev) {
+    if matches!(&mode, Mode::Launch(_) | Mode::Dev) {
         // Once per launch — installed or dev — and here rather than anywhere
         // later: this is the one point both `commands.log`'s first write and
         // `sidecar.log`'s fd open are still ahead of, which is what a
@@ -213,9 +240,9 @@ pub fn resolve(
     // a fixed, throwaway constant, neither generated, persisted nor read from
     // the keyring — see [`DEV_APP_SECRET`]. Everything else about the store
     // (`actions.secrets`, `TFS_KEYRING_AVAILABLE` below) stays real.
-    let app_secret = match mode {
+    let app_secret = match &mode {
         Mode::Dev => DEV_APP_SECRET.to_string(),
-        Mode::Install | Mode::Launch | Mode::Run => {
+        Mode::Install | Mode::Launch(_) | Mode::Run => {
             crate::secrets::resolve_app_secret(&secret_store, &data_subdir)
                 .map_err(|error| EnvError::Secret(error.to_string()))?
         }
@@ -226,9 +253,9 @@ pub fn resolve(
     let mercure_secret = tfsapp_core::app_secret::random_secret_hex()
         .map_err(|error| EnvError::Secret(error.to_string()))?;
 
-    let (app_env, app_debug) = match mode {
+    let (app_env, app_debug) = match &mode {
         Mode::Dev => ("dev", "1"),
-        Mode::Install | Mode::Launch | Mode::Run => ("prod", "0"),
+        Mode::Install | Mode::Launch(_) | Mode::Run => ("prod", "0"),
     };
 
     let vars = vec![

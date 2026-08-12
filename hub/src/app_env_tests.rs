@@ -5,7 +5,22 @@ use std::{
 };
 
 use super::{resolve, Mode};
-use crate::{manifest, paths::Paths};
+use crate::{lifecycle::CacheStamp, manifest, paths::Paths, registry::Platform};
+
+/// A stamp for tests that only need `Mode::Launch` to resolve at all, not to
+/// care whether it matches — this file's cache-reuse behaviour itself is
+/// `lifecycle_tests.rs`'s job (`read_cache_stamp`) and `app_env_tests.rs`'s own
+/// wipe-decision tests, not every other test that merely needs a `Launch`.
+fn any_cache_stamp() -> CacheStamp {
+    CacheStamp {
+        app_version: "0.6.0".to_string(),
+        snapshot_path: "/apps/demo".to_string(),
+        platform: Platform {
+            php_version: "8.5".to_string(),
+            extensions_hash: "deadbeef".to_string(),
+        },
+    }
+}
 
 /// One `identifier` per test, named after the test.
 ///
@@ -349,6 +364,94 @@ fn a_dev_launch_never_wipes_cache_or_build() {
     );
 }
 
+// --- the cache stamp decides the launch-time wipe (plan 024) ---------------
+
+#[test]
+fn a_matching_cache_stamp_keeps_cache_and_build() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("matching-stamp-keeps-cache");
+    let installed_state_root = state_root(&paths, &identifier);
+    std::fs::create_dir_all(installed_state_root.join("cache")).expect("a pre-existing cache dir");
+    std::fs::write(installed_state_root.join("cache/marker"), "warm").expect("a marker file");
+    std::fs::create_dir_all(installed_state_root.join("data")).expect("a data dir");
+
+    let stamp = any_cache_stamp();
+    crate::lifecycle::write_cache_stamp(&installed_state_root.join("data"), &stamp)
+        .expect("a written stamp");
+
+    resolve(
+        &manifest_for(&identifier, ""),
+        Path::new(&stamp.snapshot_path),
+        &identifier,
+        &installed_state_root,
+        Mode::Launch(stamp.clone()),
+    )
+    .expect("the launch environment resolves");
+
+    assert!(
+        installed_state_root.join("cache/marker").is_file(),
+        "a matching stamp must keep the warm cache rather than wipe it"
+    );
+}
+
+#[test]
+fn a_mismatched_cache_stamp_wipes_cache_and_build() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("mismatched-stamp-wipes-cache");
+    let installed_state_root = state_root(&paths, &identifier);
+    std::fs::create_dir_all(installed_state_root.join("cache")).expect("a pre-existing cache dir");
+    std::fs::write(installed_state_root.join("cache/marker"), "warm").expect("a marker file");
+    std::fs::create_dir_all(installed_state_root.join("data")).expect("a data dir");
+
+    let recorded = any_cache_stamp();
+    crate::lifecycle::write_cache_stamp(&installed_state_root.join("data"), &recorded)
+        .expect("a written stamp");
+    let mut expected = recorded.clone();
+    expected.app_version = "0.7.0".to_string();
+
+    resolve(
+        &manifest_for(&identifier, ""),
+        Path::new(&recorded.snapshot_path),
+        &identifier,
+        &installed_state_root,
+        Mode::Launch(expected),
+    )
+    .expect("the launch environment resolves");
+
+    assert!(
+        !installed_state_root.join("cache/marker").exists(),
+        "a mismatched app_version must wipe the stale cache rather than reuse it"
+    );
+}
+
+#[test]
+fn no_cache_stamp_at_all_wipes_cache_and_build() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("absent-stamp-wipes-cache");
+    let installed_state_root = state_root(&paths, &identifier);
+    std::fs::create_dir_all(installed_state_root.join("cache")).expect("a pre-existing cache dir");
+    std::fs::write(installed_state_root.join("cache/marker"), "warm").expect("a marker file");
+    // No `data/cache.json` written at all — every app installed before plan 024,
+    // or a first launch that raced a still-running install/update.
+
+    resolve(
+        &manifest_for(&identifier, ""),
+        Path::new("/apps/demo"),
+        &identifier,
+        &installed_state_root,
+        Mode::Launch(any_cache_stamp()),
+    )
+    .expect("the launch environment resolves");
+
+    assert!(
+        !installed_state_root.join("cache/marker").exists(),
+        "no stamp at all must wipe rather than trust an unrecorded cache"
+    );
+}
+
 #[test]
 fn the_dev_secrets_store_service_carries_the_prefix() {
     let project = tempfile::tempdir().expect("a temp project dir");
@@ -390,7 +493,7 @@ fn dev_and_installed_inject_the_same_set_of_variable_names() {
         Path::new("/apps/demo"),
         &identifier,
         &installed_state_root,
-        Mode::Launch,
+        Mode::Launch(any_cache_stamp()),
     )
     .expect("the installed environment resolves");
 

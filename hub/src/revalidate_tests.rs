@@ -113,7 +113,7 @@ fn a_satisfiable_lock_ends_ready_with_the_new_platform_stamped() {
 
     let outcome =
         revalidate(&paths, "demo", source.path(), &manifest).expect("composer resolves cleanly");
-    assert!(matches!(outcome, Outcome::Ready), "{outcome:?}");
+    assert!(matches!(outcome, Outcome::Ready(_)), "{outcome:?}");
 
     let after = registry::load(&paths).expect("it reads");
     let entry = after.get("demo").expect("still there");
@@ -164,7 +164,7 @@ fn an_entry_removed_out_from_under_a_revalidation_is_not_an_error() {
 
     let outcome = revalidate(&paths, "demo", source.path(), &manifest)
         .expect("a missing entry is not an error here");
-    assert!(matches!(outcome, Outcome::Ready), "{outcome:?}");
+    assert!(matches!(outcome, Outcome::Ready(_)), "{outcome:?}");
 
     let after = registry::load(&paths).expect("it reads");
     assert!(after.get("demo").is_none());

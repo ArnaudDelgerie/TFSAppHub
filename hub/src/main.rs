@@ -534,8 +534,13 @@ fn serve(
         );
     }
 
-    let env_mode = match spec.source {
-        launch::Source::Installed { .. } => app_env::Mode::Launch,
+    let env_mode = match &spec.source {
+        launch::Source::Installed { .. } => {
+            app_env::Mode::Launch(spec.expected_cache.clone().expect(
+                "an installed launch's spec always carries its expected cache stamp — \
+                 open::resolve is its only constructor",
+            ))
+        }
         launch::Source::Live => app_env::Mode::Dev,
     };
     let environment = match app_env::resolve(
