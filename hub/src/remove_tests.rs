@@ -54,7 +54,10 @@ fn a_plain_remove_keeps_the_data_and_a_purge_names_every_zone() {
     installed_snapshot(&paths, "demo");
 
     let kept = plan(&paths, "demo", IDENTIFIER, false).expect("a plan");
-    assert_eq!(kept.app_dir, paths.app_dir("demo").expect("an app dir"));
+    assert_eq!(
+        kept.app_dir,
+        Some(paths.app_dir("demo").expect("an app dir"))
+    );
     assert!(
         kept.keyring_accounts.is_empty(),
         "a plain remove never touches the keyring"
@@ -160,6 +163,52 @@ fn a_purge_takes_the_data_with_it() {
 
     assert!(!data_dir.exists(), "the data dir goes with --purge");
     assert!(!webkit_dir.exists(), "so does WebKit's own");
+}
+
+#[test]
+fn a_live_window_refuses_a_purge() {
+    let (_base, paths) = temp_paths();
+    installed_snapshot(&paths, "demo");
+    registry::save_entry(&paths, "demo");
+    let data_dir = paths.app_data_dir(IDENTIFIER).expect("a data dir");
+    fs::create_dir_all(&data_dir).expect("a data dir");
+    let pid_file = data_dir.join("sidecar.pid");
+    // Held in this test's own process, the same fake `install_tests.rs` and
+    // `portability_tests.rs` use for their own busy-guard tests: `flock` is
+    // per open file description, so a second, fresh open of the same path
+    // still sees it held.
+    let _holder = tfsapp_core::process::try_lock_file(&tfsapp_core::process::lock_path(&pid_file))
+        .expect("no I/O error")
+        .expect("the lock is free to take");
+
+    let error = remove(&paths, "demo", true, true).expect_err("a live window owns this data dir");
+
+    assert!(matches!(error, RemoveError::StillRunning { .. }), "{error}");
+    assert!(error.to_string().contains("demo"), "{error}");
+}
+
+#[test]
+fn an_active_run_command_now_refuses_a_purge() {
+    // The gap this step closes: `remove --purge` used to probe only
+    // `sidecar.pid` and ignore `run.lock`, so an active `run` command did not
+    // stop a purge from deleting the data underneath it.
+    let (_base, paths) = temp_paths();
+    installed_snapshot(&paths, "demo");
+    registry::save_entry(&paths, "demo");
+    let data_dir = paths.app_data_dir(IDENTIFIER).expect("a data dir");
+    fs::create_dir_all(&data_dir).expect("a data dir");
+    let run_lock_path = data_dir.join("run.lock");
+    let _holder = tfsapp_core::process::try_lock_file(&run_lock_path)
+        .expect("no I/O error")
+        .expect("the lock is free to take");
+    fs::write(&run_lock_path, "migrate\n1234").expect("a run.lock record");
+
+    let error =
+        remove(&paths, "demo", true, true).expect_err("an active run command owns this data dir");
+
+    let message = error.to_string();
+    assert!(message.contains("migrate"), "{message}");
+    assert!(message.contains("run --stop demo"), "{message}");
 }
 
 #[test]

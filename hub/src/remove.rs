@@ -96,51 +96,101 @@ fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool
         .ok_or_else(|| RemoveError::NotInstalled { id: id.to_string() })?;
     let identifier = entry.identifier.clone();
 
-    let plan = plan(paths, id, &identifier, purge)?;
+    let removal_plan = plan(paths, id, &identifier, purge)?;
 
-    // Only for `--purge`, and only because that is the form that deletes data:
-    // a live sidecar has an open SQLite file under it. A read-only probe, so a
+    // Only for `--purge`, and only because that is the form that deletes
+    // data: a live window has an open SQLite file under it, and an active
+    // `run` command is reading or writing the same directory. Shared with
+    // `export`/`import` (plan 022) and, from plan 023 step 3, `purge
+    // <identifier>` — one definition of "who holds this data directory",
+    // never a second probe with its own idea of it. A read-only probe, so a
     // refusal never has the side effect of reaping anything.
     if purge {
-        let pid_file = plan.data_dir.join("sidecar.pid");
-        if tfsapp_core::process::is_owner_live(&pid_file).unwrap_or(false) {
-            return Err(RemoveError::StillRunning { identifier });
+        match busy_holder(&removal_plan.data_dir) {
+            Ok(None) => {}
+            Ok(Some(holder)) => {
+                return Err(RemoveError::StillRunning {
+                    id: id.to_string(),
+                    holder,
+                })
+            }
+            Err(source) => {
+                return Err(RemoveError::Io {
+                    path: removal_plan.data_dir.clone(),
+                    source,
+                })
+            }
         }
     }
 
-    announce(&plan, purge);
+    announce(&removal_plan, purge);
     if !prompt::confirmed(assume_yes) {
         println!("Aborted — nothing was removed.");
         return Ok(false);
     }
 
-    // The entry goes first, under the registry's own lock. An app whose files
-    // are gone but which `list` still shows is the worse of the two orders:
-    // every command afterwards points at a tree that is not there, and the id
-    // cannot be reused.
-    registry::update(paths, |registry| registry.remove(id))?;
-    println!("  registry entry: removed");
+    execute(paths, &removal_plan, purge)?;
+    Ok(true)
+}
 
-    report("installed app", remove_directory(&plan.app_dir));
-    // `apps/<id>.previous` — the rollback anchor's tree half, if `id` ever
-    // had one — goes with it. Silent and best-effort: it is bookkeeping the
-    // anchor owns, not a zone this command's own announcement promises, and
-    // an already-absent one is exactly the common case.
-    crate::update::discard_tree(&plan.app_dir);
-    // Code-side, not data — the entry points at a snapshot that is being
-    // deleted — so plain `remove` takes it exactly as it takes `apps/<id>/`;
-    // `--purge` adds nothing here. The stable hub copy the entry's `Exec=`
-    // points at is left alone: it is the hub's own file, and another
-    // installed app's launcher points at it.
+/// Whether something already holds `data_dir` — a live window, or an active
+/// `run` command. Mirrors `portability::busy_holder`'s own guard:
+/// [`lifecycle::data_dir_holder`] has no opinion about a missing directory
+/// (probing `run.lock` inside one would just fail to open it), and a data
+/// directory that has never been written to is not busy.
+fn busy_holder(data_dir: &Path) -> io::Result<Option<lifecycle::DataDirHolder>> {
+    if !data_dir.is_dir() {
+        return Ok(None);
+    }
+    lifecycle::data_dir_holder(data_dir)
+}
+
+/// Delete every zone `plan` carries: the registry entry and the code-side
+/// zones only for an installed subject (`plan.id`/`plan.app_dir` are
+/// `Some`), the identifier-keyed zones always, and the keyring accounts only
+/// when `purge` is true. The shared execution path behind both of this
+/// module's entry points — `remove <id> [--purge]` today, and (plan 023 step
+/// 3) `purge <identifier>`'s orphan subject.
+fn execute(paths: &Paths, plan: &RemovalPlan, purge: bool) -> Result<(), RemoveError> {
+    if let Some(id) = &plan.id {
+        // The entry goes first, under the registry's own lock. An app whose
+        // files are gone but which `list` still shows is the worse of the two
+        // orders: every command afterwards points at a tree that is not
+        // there, and the id cannot be reused.
+        registry::update(paths, |registry| registry.remove(id))?;
+        println!("  registry entry: removed");
+    }
+
+    if let Some(app_dir) = &plan.app_dir {
+        report("installed app", remove_directory(app_dir));
+        // `apps/<id>.previous` — the rollback anchor's tree half, if `id`
+        // ever had one — goes with it. Silent and best-effort: it is
+        // bookkeeping the anchor owns, not a zone this command's own
+        // announcement promises, and an already-absent one is exactly the
+        // common case.
+        crate::update::discard_tree(app_dir);
+    }
+
+    // Code-side, not data, for an installed subject: the entry points at a
+    // snapshot that is being deleted, so plain `remove` takes it exactly as
+    // it takes `apps/<id>/`. The orphan subject has no `id` left to verify
+    // the marker against, so it takes any entry the identifier's own
+    // filename carries a marker at all (`desktop::remove_any`). The stable
+    // hub copy the entry's `Exec=` points at is left alone either way: it is
+    // the hub's own file, and another installed app's launcher points at it.
     report(
         "desktop entry",
-        desktop::remove(&plan.id, &plan.identifier, paths).map(desktop_removal_status),
+        match &plan.id {
+            Some(id) => desktop::remove(id, &plan.identifier, paths).map(desktop_removal_status),
+            None => desktop::remove_any(&plan.identifier, paths).map(desktop_removal_status),
+        },
     );
+
     if purge {
         report("data dir", remove_directory(&plan.data_dir));
         report("WebKit data dir", remove_directory(&plan.webkit_data_dir));
         for account in &plan.keyring_accounts {
-            let removed = delete_keyring_account(&identifier, account);
+            let removed = delete_keyring_account(&plan.identifier, account);
             println!(
                 "  keyring[{account}]: {}",
                 match removed {
@@ -151,7 +201,7 @@ fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool
         }
     }
 
-    Ok(true)
+    Ok(())
 }
 
 /// `tfsapp-hub purge [<identifier>] [--yes]` — resolve `Paths` and either list
@@ -342,12 +392,19 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-/// Everything a given `remove` would touch — computed before anything is, so it
-/// can be printed in full and confirmed as one decision.
+/// Everything a given removal would touch — computed before anything is, so
+/// it can be printed in full and confirmed as one decision.
+///
+/// `id` and `app_dir` are the code-side zones: real for the installed
+/// subject `remove <id> [--purge]` builds today (via [`plan`]), `None` for
+/// the orphan subject `purge <identifier>` (plan 023 step 3) builds instead —
+/// there is no hub-local `id` left once an app has been removed, so there is
+/// nothing code-side to plan for. The rest is keyed on `identifier` alone,
+/// and every subject carries it.
 struct RemovalPlan {
-    id: String,
+    id: Option<String>,
     identifier: String,
-    app_dir: PathBuf,
+    app_dir: Option<PathBuf>,
     /// The `.desktop` entry `install` may have written — code-side, taken by
     /// plain `remove` exactly as `app_dir` is, whether or not this app
     /// actually has one or the hub wrote it. [`desktop::remove`] is what
@@ -385,8 +442,8 @@ fn plan(
     }
 
     Ok(RemovalPlan {
-        id: id.to_string(),
-        app_dir,
+        id: Some(id.to_string()),
+        app_dir: Some(app_dir),
         desktop_entry: paths.desktop_entry_path(identifier)?,
         data_dir: paths.app_data_dir(identifier)?,
         webkit_data_dir: paths.webkit_data_dir(identifier)?,
@@ -397,9 +454,17 @@ fn plan(
 
 /// Print what is about to happen, and — just as important — what is not.
 fn announce(plan: &RemovalPlan, purge: bool) {
-    println!("Remove {} ({}):", plan.id, plan.identifier);
-    println!("  - {}", plan.app_dir.display());
-    println!("  - its registry entry");
+    match &plan.id {
+        Some(id) => println!("Remove {} ({}):", id, plan.identifier),
+        // Reached from plan 023 step 3 onward, once `purge <identifier>`
+        // builds an orphan plan — never today, since [`plan`] always fills
+        // `id` in.
+        None => println!("Purge {}:", plan.identifier),
+    }
+    if let Some(app_dir) = &plan.app_dir {
+        println!("  - {}", app_dir.display());
+        println!("  - its registry entry");
+    }
     println!("  - {} (if the hub wrote it)", plan.desktop_entry.display());
 
     match purge {
@@ -480,8 +545,11 @@ pub enum RemoveError {
     NotInstalled {
         id: String,
     },
+    /// A live window or an active `run` command holds the data directory —
+    /// `--purge` refuses rather than delete a database out from under it.
     StillRunning {
-        identifier: String,
+        id: String,
+        holder: lifecycle::DataDirHolder,
     },
     /// Reading `TFSApp/` to enumerate orphaned data — [`orphaned_data`]'s own
     /// I/O failure, distinct from a `Paths` resolution failure.
@@ -500,11 +568,23 @@ impl fmt::Display for RemoveError {
                 formatter,
                 "no app is installed as {id} — `tfsapp-hub list` shows the ones that are."
             ),
-            Self::StillRunning { identifier } => write!(
-                formatter,
-                "{identifier} is running — close it first. Purging would delete the \
-                 database it has open."
-            ),
+            Self::StillRunning { id, holder } => match holder {
+                lifecycle::DataDirHolder::Window => write!(
+                    formatter,
+                    "{id} has a window open right now — purging would delete the database it \
+                     has open. Close {id} first."
+                ),
+                lifecycle::DataDirHolder::RunCommand { alias: Some(alias) } => write!(
+                    formatter,
+                    "{id}'s \"{alias}\" run command is still active — purging would delete the \
+                     database it has open. Stop it first with `tfsapp-hub run --stop {id}`."
+                ),
+                lifecycle::DataDirHolder::RunCommand { alias: None } => write!(
+                    formatter,
+                    "a run command is still active for {id} — purging would delete the \
+                     database it has open. Stop it first with `tfsapp-hub run --stop {id}`."
+                ),
+            },
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
         }
     }
