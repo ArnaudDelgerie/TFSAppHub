@@ -237,6 +237,26 @@ pub fn splash_style(
 /// by [`classify_navigation`] once wired there (step 4).
 pub const SPLASH_SCHEME: &str = "tfsapp-splash";
 
+/// The CSP on every response [`register_splash_scheme`] serves.
+///
+/// CONTRACT.md §4 documents the sidecar's own default (`default-src 'self'`,
+/// scoped to that origin's own assets) — this is not that policy loosened to
+/// a new origin, it is stricter, because the case is narrower: `splash_path`
+/// is documented as one self-contained file, inline CSS/JS only, no external
+/// assets (CONTRACT.md line 196), and it runs before the sidecar exists, so
+/// it has no API or session to call. `default-src 'none'` starts from
+/// nothing; `style-src`/`script-src 'unsafe-inline'` admit exactly the inline
+/// CSS/JS the format allows (same containment argument as §4's own
+/// `'unsafe-inline'` — it cannot reach the network or read another origin
+/// with everything else at `'none'`); `img-src data:` admits inlined images,
+/// the only kind a single self-contained file can carry. `base-uri`,
+/// `form-action` and `frame-ancestors` are pinned to `'none'`/refused rather
+/// than left to `default-src`'s fallback, so a page that tries to reach past
+/// its own markup fails visibly instead of silently doing nothing.
+const SPLASH_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; \
+     script-src 'unsafe-inline'; img-src data:; base-uri 'none'; \
+     form-action 'none'; frame-ancestors 'none'";
+
 /// Resolve `request_path` (a URI scheme request's raw, `/`-prefixed path)
 /// against `canonical_root`, refusing anything that would land outside it once
 /// symlinks and `..` segments are resolved — `canonical_root.join` never sees
@@ -268,6 +288,12 @@ fn resolve_within(canonical_root: &Path, request_path: &str) -> Option<PathBuf> 
 /// `#[allow(dead_code)]`: not called until `main::open_window` wires it into
 /// the splash window's creation (plan 025 step 2) — this step only proves the
 /// scheme safe in isolation.
+///
+/// Every response — success or 404 alike — carries [`SPLASH_CSP`]. There is
+/// no HTTP request here for an app-set header to override (CONTRACT.md §4's
+/// override rule is specific to the sidecar's own responses), and no author
+/// gets a chance to set one either, so the host's policy is the only one a
+/// splash page ever gets.
 #[allow(dead_code)]
 pub fn register_splash_scheme<R: tauri::Runtime>(
     builder: tauri::Builder<R>,
@@ -282,12 +308,14 @@ pub fn register_splash_scheme<R: tauri::Runtime>(
             .map(|bytes| {
                 Response::builder()
                     .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                    .header(header::CONTENT_SECURITY_POLICY, SPLASH_CSP)
                     .body(bytes)
                     .expect("a valid response")
             })
             .unwrap_or_else(|| {
                 Response::builder()
                     .status(StatusCode::NOT_FOUND)
+                    .header(header::CONTENT_SECURITY_POLICY, SPLASH_CSP)
                     .body(Vec::new())
                     .expect("a valid empty response")
             })
