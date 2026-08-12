@@ -2,7 +2,10 @@ use std::collections::BTreeSet;
 
 use tauri::Url;
 
-use super::{classify_navigation, next_window_label_among, splash_style, NavigationTarget};
+use super::{
+    classify_navigation, next_window_label_among, resolve_splash_source, resolve_within,
+    splash_style, NavigationTarget, SplashSource,
+};
 
 fn url(text: &str) -> Url {
     Url::parse(text).expect("a parseable URL")
@@ -84,6 +87,30 @@ fn every_other_scheme_is_refused_outright() {
 }
 
 #[test]
+fn the_splash_scheme_is_internal_before_the_app_origin_is_known() {
+    // The splash page itself may need to reach its own snapshot root (an
+    // `img`/`link` request) before hand-over — the one legitimate use of the
+    // scheme from inside a webview.
+    assert_eq!(
+        classify_navigation(None, &url("tfsapp-splash://localhost/splash.html")),
+        NavigationTarget::Internal
+    );
+}
+
+#[test]
+fn the_splash_scheme_is_blocked_once_the_app_origin_is_published() {
+    let origin = url("http://127.0.0.1:8123");
+
+    // Once hand-over has happened, the running app has no legitimate reason
+    // to reach the splash snapshot a second time — the scheme falls through
+    // to the same refusal as any other non-http(s) target.
+    assert_eq!(
+        classify_navigation(Some(&origin), &url("tfsapp-splash://localhost/splash.html")),
+        NavigationTarget::Blocked
+    );
+}
+
+#[test]
 fn an_unknown_origin_never_makes_a_target_internal() {
     // While the splash has not learned the backend URL, an http target is not
     // the app's — treating it as internal would let the pre-backend window be
@@ -91,6 +118,115 @@ fn an_unknown_origin_never_makes_a_target_internal() {
     assert_eq!(
         classify_navigation(None, &url("http://127.0.0.1:8123/")),
         NavigationTarget::ExternalWeb
+    );
+}
+
+// --- the splash scheme's path confinement ---------------------------------
+//
+// `resolve_within` is the whole safety argument for plan 025's scheme: one
+// process, one root, and nothing a request can do reaches outside it.
+
+#[test]
+fn a_file_actually_inside_the_root_resolves() {
+    let dir = tempfile::tempdir().expect("a temp snapshot root");
+    let root = dir.path().canonicalize().expect("a canonical root");
+    std::fs::write(root.join("splash.html"), b"<h1>hi</h1>").expect("write the splash file");
+
+    assert_eq!(
+        resolve_within(&root, "/splash.html"),
+        Some(root.join("splash.html"))
+    );
+}
+
+#[test]
+fn a_dot_dot_segment_cannot_escape_the_root() {
+    let dir = tempfile::tempdir().expect("a temp parent dir");
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).expect("create the root");
+    let root = root.canonicalize().expect("a canonical root");
+    std::fs::write(dir.path().join("secret.txt"), b"nope").expect("write the sibling file");
+
+    assert_eq!(resolve_within(&root, "/../secret.txt"), None);
+}
+
+#[test]
+fn a_symlink_pointing_outside_the_root_is_refused() {
+    let dir = tempfile::tempdir().expect("a temp parent dir");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).expect("create the outside dir");
+    std::fs::write(outside.join("secret.txt"), b"nope").expect("write the outside file");
+
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).expect("create the root");
+    std::os::unix::fs::symlink(&outside, root.join("link")).expect("symlink out of the root");
+    let root = root.canonicalize().expect("a canonical root");
+
+    assert_eq!(resolve_within(&root, "/link/secret.txt"), None);
+}
+
+#[test]
+fn a_missing_file_resolves_to_nothing() {
+    let dir = tempfile::tempdir().expect("a temp snapshot root");
+    let root = dir.path().canonicalize().expect("a canonical root");
+
+    assert_eq!(resolve_within(&root, "/missing.html"), None);
+}
+
+#[test]
+fn a_request_for_exactly_the_root_stays_confined() {
+    let dir = tempfile::tempdir().expect("a temp snapshot root");
+    let root = dir.path().canonicalize().expect("a canonical root");
+
+    // Not a useful response on its own (the handler's `fs::read` on a
+    // directory fails and falls back to a refusal) — this only proves the
+    // confinement check itself treats the boundary as inside, not outside.
+    assert_eq!(resolve_within(&root, "/"), Some(root.clone()));
+    assert_eq!(resolve_within(&root, ""), Some(root));
+}
+
+// --- resolving splash_path against the snapshot root ----------------------
+
+#[test]
+fn no_splash_path_declared_is_the_fallback() {
+    let dir = tempfile::tempdir().expect("a temp snapshot root");
+
+    assert_eq!(
+        resolve_splash_source(dir.path(), None),
+        SplashSource::Fallback
+    );
+}
+
+#[test]
+fn a_declared_splash_path_that_exists_resolves_to_the_scheme() {
+    let dir = tempfile::tempdir().expect("a temp snapshot root");
+    std::fs::write(dir.path().join("splash.html"), b"<h1>hi</h1>").expect("write the splash");
+
+    assert_eq!(
+        resolve_splash_source(dir.path(), Some("splash.html")),
+        SplashSource::App(url("tfsapp-splash://localhost/splash.html"))
+    );
+}
+
+#[test]
+fn a_declared_splash_path_pointing_at_a_missing_file_is_the_fallback() {
+    let dir = tempfile::tempdir().expect("a temp snapshot root");
+
+    assert_eq!(
+        resolve_splash_source(dir.path(), Some("missing.html")),
+        SplashSource::Fallback
+    );
+}
+
+#[test]
+fn a_declared_splash_path_escaping_the_root_is_the_fallback() {
+    let dir = tempfile::tempdir().expect("a temp parent dir");
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).expect("create the root");
+    std::fs::write(dir.path().join("secret.txt"), b"nope").expect("write the sibling file");
+
+    assert_eq!(
+        resolve_splash_source(&root, Some("../secret.txt")),
+        SplashSource::Fallback
     );
 }
 

@@ -193,7 +193,7 @@ anything downstream is keyed on it.
 | --- | --- | --- |
 | `app_port` | integer or null | Pins the app's loopback port instead of taking a fresh free one each launch. Absent (the default) is dynamic, and dynamic is the right answer unless something outside the app must know the port in advance. |
 | `icon_path` | string | Project-root-relative path to one square source PNG (1024×1024 RGBA recommended, ≥512 wanted) used as the app's launcher, switcher and window icon. Absent keeps a placeholder. |
-| `splash_path` | string | Project-root-relative path to one self-contained HTML file (inline CSS and JS only, no external assets) shown while the app cold-starts. **Not honoured today** — see §8. |
+| `splash_path` | string | Project-root-relative path to one self-contained HTML file (inline CSS and JS only, no external assets) shown while the app cold-starts, served read-only over a scheme scoped to the app's own snapshot. Missing or unreadable falls back to the host's own cold-start page — see §8. |
 | `splash_bg` / `splash_text` | string, `#rgb` or `#rrggbb` | Recolour the cold-start page's background and text without authoring one. Either or both; an unset one keeps the default. |
 | `commands` | object | Lifecycle commands the hub runs around an install or an update — §6. |
 | `run` | object | Named `bin/console` aliases a user can run directly. |
@@ -1204,15 +1204,40 @@ leave `app_port` out and take a dynamic one.
 
 ### The cold-start page
 
-`splash_path` is **not honoured today.** The file sits inside the installed
-snapshot, outside `public/`, and it is wanted *before* the app's own server
-exists — so it is reachable neither over HTTP nor from the window's own origin.
-Rather than fail, the host shows its own cold-start page in the app's declared
+`splash_path`'s file sits inside the installed snapshot, outside `public/`,
+and it is wanted *before* the app's own server exists — so it is reachable
+neither over HTTP nor from the window's own origin at launch time. The host
+closes that gap with a read-only custom URI scheme, registered once per
+process and scoped to that process's own resolved snapshot root: every
+request path is canonicalised and confirmed inside the root before anything
+is opened, so one app's scheme can never reach another's tree. When
+`splash_path` is declared and the resolved file exists and is readable, the
+splash window loads it over that scheme; when it is absent, missing or
+unreadable, the host shows its own cold-start page in the app's declared
 `splash_bg` / `splash_text` colours, with its `product_name`, and warns at
-launch that it did so.
+launch that it fell back and why.
 
-So `splash_bg` and `splash_text` work; `splash_path` is parsed, reported and
-ignored. Closing that gap is a queued plan, not a change of contract.
+The scheme's own responses carry a `Content-Security-Policy` distinct from
+§4's default — `default-src 'none'` with `style-src`/`script-src
+'unsafe-inline'` and `img-src data:` admitting exactly what a self-contained
+splash file is documented to use, and `base-uri`/`form-action`/
+`frame-ancestors` pinned to `'none'`. A page reaching past its own inline
+markup fails visibly rather than silently reaching further into the snapshot
+or the network.
+
+The scheme's reach is bounded by navigation policy, not by unregistering it:
+Tauri has no runtime unregistration, and one hub process serves one app for
+its whole life, so the handler staying registered is not itself a new
+isolation risk. §4's navigation policy treats the scheme as internal only
+while the app's own origin is not yet known — the splash window, before
+hand-over — and once the backend origin is published, a navigation to the
+scheme is refused like any other non-`http(s)` target. The running app gains
+no standing second way to read its own splash snapshot after hand-over.
+
+So `splash_bg`, `splash_text` and `splash_path` all work; the two colour
+fields recolour the host's own fallback page specifically — an app that
+supplies its own `splash_path` page styles it itself, inline, since that page
+replaces the fallback rather than layering on top of it.
 
 ### Off-window work, and secret storage
 
