@@ -87,6 +87,30 @@ fn every_other_scheme_is_refused_outright() {
 }
 
 #[test]
+fn the_splash_scheme_is_internal_before_the_app_origin_is_known() {
+    // The splash page itself may need to reach its own snapshot root (an
+    // `img`/`link` request) before hand-over — the one legitimate use of the
+    // scheme from inside a webview.
+    assert_eq!(
+        classify_navigation(None, &url("tfsapp-splash://localhost/splash.html")),
+        NavigationTarget::Internal
+    );
+}
+
+#[test]
+fn the_splash_scheme_is_blocked_once_the_app_origin_is_published() {
+    let origin = url("http://127.0.0.1:8123");
+
+    // Once hand-over has happened, the running app has no legitimate reason
+    // to reach the splash snapshot a second time — the scheme falls through
+    // to the same refusal as any other non-http(s) target.
+    assert_eq!(
+        classify_navigation(Some(&origin), &url("tfsapp-splash://localhost/splash.html")),
+        NavigationTarget::Blocked
+    );
+}
+
+#[test]
 fn an_unknown_origin_never_makes_a_target_internal() {
     // While the splash has not learned the backend URL, an http target is not
     // the app's — treating it as internal would let the pre-backend window be

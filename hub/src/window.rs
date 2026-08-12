@@ -90,8 +90,22 @@ fn same_origin(a: &Url, b: &Url) -> bool {
 /// `Internal`: before the origin is known the only navigation that can
 /// legitimately happen is to the bundled assets, which the first branch already
 /// covers regardless.
+///
+/// [`SPLASH_SCHEME`] is `Internal` only while `app_origin` is still `None` —
+/// the splash page itself may need to load its own `img`/`link` requests
+/// against its snapshot root before hand-over. Once `publish_app_origin` has
+/// filled the slot, the same target falls through to the final `match` like
+/// any other non-`http(s)` scheme and is `Blocked`: the running app has no
+/// legitimate reason to reach its own splash snapshot a second time, and
+/// giving the scheme a standing exemption after hand-over would be a second,
+/// permanent way to read that root instead of the one the splash window uses
+/// once. (Settled in this plan's overview, "The scheme's reach is bounded by
+/// navigation policy, not by unregistering it.")
 pub fn classify_navigation(app_origin: Option<&Url>, target: &Url) -> NavigationTarget {
     if is_bundled_asset_origin(target) {
+        return NavigationTarget::Internal;
+    }
+    if app_origin.is_none() && target.scheme() == SPLASH_SCHEME {
         return NavigationTarget::Internal;
     }
     if let Some(origin) = app_origin {
