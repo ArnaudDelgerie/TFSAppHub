@@ -73,5 +73,15 @@ dbus-run-session -- bash -c '
     waited=$((waited + 1))
   done
 
-  cargo test "$@"
+  # A generous ceiling: the suite itself runs in ~5s once compiled, but a
+  # cold invocation compiles the whole workspace first, which alone can take
+  # several minutes. 10 minutes leaves headroom for that while still making
+  # sure a wedged run (audit 004/P3) fails loud instead of hanging a session
+  # forever.
+  status=0
+  timeout 10m cargo test "$@" || status=$?
+  if [ "$status" -eq 124 ]; then
+    echo "run-tests.sh: cargo test did not finish within the 10 minute ceiling -- most likely the Secret Service wedge described in audit 004/P3 (a keyring crate call with no timeout of its own, blocked on a locked Secret Service). Check for a stray gnome-keyring-daemon on this session bus." >&2
+  fi
+  exit "$status"
 ' -- "$@"
