@@ -397,7 +397,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
     let app_origin = window::new_app_origin_slot();
     let relaunch_origin = app_origin.clone();
 
-    tauri::Builder::default()
+    window::register_splash_scheme(tauri::Builder::default(), &spec.app_dir)
         // Registered before every other plugin, per the plugin's own guidance,
         // and after the identity mutation above — which is what makes its key
         // this app's identifier rather than the hub's. Two different apps of
@@ -455,6 +455,8 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             // sidecar the thread below is about to spawn.
             lifecycle::install_shutdown_on_signal(app.handle());
 
+            let splash_source =
+                window::resolve_splash_source(&spec.app_dir, spec.manifest.splash_path.as_deref());
             let splash = window::create_splash_window(
                 app,
                 &identity.product_name,
@@ -464,6 +466,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
                     spec.manifest.splash_text.as_deref(),
                 ),
                 &app_origin,
+                &splash_source,
             )?;
             if let Some(path) = &identity.icon_path {
                 if let Some(icon) = identity::load_icon(path) {
@@ -524,13 +527,15 @@ fn serve(
     };
 
     let manifest = &spec.manifest;
-    if manifest.splash_path.is_some() {
+    let splash_source =
+        window::resolve_splash_source(&spec.app_dir, manifest.splash_path.as_deref());
+    if manifest.splash_path.is_some() && splash_source == window::SplashSource::Fallback {
         // Said, not swallowed: an app author who declared a splash page has to
         // learn it is not the one on screen. See `window::splash_style`.
         eprintln!(
-            "tfsapp-hub: warning: this app declares \"splash_path\", which the hub cannot \
-             serve — it has no per-app build step to bundle the page with. Showing the hub's \
-             own splash in its colours instead."
+            "tfsapp-hub: warning: this app declares \"splash_path\", but the hub could not \
+             show it — the file is missing, unreadable, or escapes the installed snapshot. \
+             Showing the hub's own splash in its colours instead."
         );
     }
 

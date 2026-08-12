@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use tauri::Url;
 
 use super::{
-    classify_navigation, next_window_label_among, resolve_within, splash_style, NavigationTarget,
+    classify_navigation, next_window_label_among, resolve_splash_source, resolve_within,
+    splash_style, NavigationTarget, SplashSource,
 };
 
 fn url(text: &str) -> Url {
@@ -157,6 +158,52 @@ fn a_request_for_exactly_the_root_stays_confined() {
     // confinement check itself treats the boundary as inside, not outside.
     assert_eq!(resolve_within(&root, "/"), Some(root.clone()));
     assert_eq!(resolve_within(&root, ""), Some(root));
+}
+
+// --- resolving splash_path against the snapshot root ----------------------
+
+#[test]
+fn no_splash_path_declared_is_the_fallback() {
+    let dir = tempfile::tempdir().expect("a temp snapshot root");
+
+    assert_eq!(
+        resolve_splash_source(dir.path(), None),
+        SplashSource::Fallback
+    );
+}
+
+#[test]
+fn a_declared_splash_path_that_exists_resolves_to_the_scheme() {
+    let dir = tempfile::tempdir().expect("a temp snapshot root");
+    std::fs::write(dir.path().join("splash.html"), b"<h1>hi</h1>").expect("write the splash");
+
+    assert_eq!(
+        resolve_splash_source(dir.path(), Some("splash.html")),
+        SplashSource::App(url("tfsapp-splash://localhost/splash.html"))
+    );
+}
+
+#[test]
+fn a_declared_splash_path_pointing_at_a_missing_file_is_the_fallback() {
+    let dir = tempfile::tempdir().expect("a temp snapshot root");
+
+    assert_eq!(
+        resolve_splash_source(dir.path(), Some("missing.html")),
+        SplashSource::Fallback
+    );
+}
+
+#[test]
+fn a_declared_splash_path_escaping_the_root_is_the_fallback() {
+    let dir = tempfile::tempdir().expect("a temp parent dir");
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).expect("create the root");
+    std::fs::write(dir.path().join("secret.txt"), b"nope").expect("write the sibling file");
+
+    assert_eq!(
+        resolve_splash_source(&root, Some("../secret.txt")),
+        SplashSource::Fallback
+    );
 }
 
 // --- window labels -------------------------------------------------------

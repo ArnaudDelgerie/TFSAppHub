@@ -294,32 +294,100 @@ pub fn register_splash_scheme<R: tauri::Runtime>(
     })
 }
 
-/// The cold-start window: the hub's bundled page, on the webview's own origin.
+/// Where the splash window should point: the app's own `splash_path`, or the
+/// hub's bundled fallback when there is none to honour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplashSource {
+    /// `splash_path` was declared, resolves inside the snapshot root, and was
+    /// confirmed openable — this is the URL to navigate to, over
+    /// [`SPLASH_SCHEME`].
+    App(Url),
+    /// No `splash_path` declared, or one that could not be honoured (missing,
+    /// unreadable, or outside the snapshot root). [`create_splash_window`]
+    /// reads this the same way either way; telling the two apart for the
+    /// warning is [`resolve_splash_source`]'s caller's job (`main::serve`),
+    /// since only it also has `manifest.splash_path` to compare against.
+    Fallback,
+}
+
+impl SplashSource {
+    fn webview_url(&self) -> WebviewUrl {
+        match self {
+            SplashSource::App(url) => WebviewUrl::External(url.clone()),
+            SplashSource::Fallback => WebviewUrl::App("index.html".into()),
+        }
+    }
+}
+
+/// Decide [`SplashSource`] for `splash_path` against `snapshot_root` — the
+/// same root [`register_splash_scheme`] is confined to, so a page this
+/// resolves to is always one the running scheme can actually serve.
 ///
-/// `WebviewUrl::App` rather than the backend URL, because there is no backend
-/// yet — pointing a window at a port nothing is listening on is how a launch
-/// shows a connection error instead of a spinner. The launch navigates this same
-/// window once `/healthz` answers, which is also why it carries the app window's
-/// title and sizing already: nothing should visibly jump at the hand-over.
+/// Reuses [`resolve_within`] for the confinement check, on the *undecoded*
+/// `splash_path` string itself (prefixed with `/` to match a scheme request's
+/// shape) — one path, checked once here and re-resolved once more per request
+/// by the scheme's own handler, always in agreement because both go through
+/// the same function. `splash_path` reaching this function unencoded is why
+/// the scheme never percent-decodes a request path either (see
+/// `resolve_within`): a name with characters that would need it is already
+/// outside what CONTRACT.md documents `splash_path` as (one self-contained
+/// file, ordinary path).
+///
+/// Openability is confirmed with `File::open` rather than reading the whole
+/// file — existence and permission are what matter here, not content; the
+/// scheme's handler reads the real bytes when the webview actually requests
+/// it.
+pub fn resolve_splash_source(snapshot_root: &Path, splash_path: Option<&str>) -> SplashSource {
+    let Some(splash_path) = splash_path else {
+        return SplashSource::Fallback;
+    };
+    let Ok(canonical_root) = std::fs::canonicalize(snapshot_root) else {
+        return SplashSource::Fallback;
+    };
+    let request_path = format!("/{splash_path}");
+    let Some(resolved) = resolve_within(&canonical_root, &request_path) else {
+        return SplashSource::Fallback;
+    };
+    if std::fs::File::open(&resolved).is_err() {
+        return SplashSource::Fallback;
+    }
+    match Url::parse(&format!("{SPLASH_SCHEME}://localhost{request_path}")) {
+        Ok(url) => SplashSource::App(url),
+        Err(_) => SplashSource::Fallback,
+    }
+}
+
+/// The cold-start window: the app's own `splash_path` when [`SplashSource`]
+/// resolved one, the hub's bundled page on the webview's own origin
+/// otherwise.
+///
+/// `WebviewUrl::App` rather than the backend URL for the fallback, because
+/// there is no backend yet — pointing a window at a port nothing is
+/// listening on is how a launch shows a connection error instead of a
+/// spinner. The launch navigates this same window once `/healthz` answers,
+/// which is also why it carries the app window's title and sizing already:
+/// nothing should visibly jump at the hand-over.
+///
+/// `fallback_script` — [`splash_style`]'s output — is only attached on the
+/// fallback path: it dresses the hub's own page in the app's colours and
+/// name, which means nothing to a page the app authored itself.
 pub fn create_splash_window<R: tauri::Runtime>(
     app: &impl tauri::Manager<R>,
     title: &str,
-    initialization_script: &str,
+    fallback_script: &str,
     app_origin: &AppOriginSlot,
+    splash_source: &SplashSource,
 ) -> tauri::Result<tauri::WebviewWindow<R>> {
-    with_window_policy(
-        WebviewWindowBuilder::new(
-            app,
-            next_window_label(app),
-            WebviewUrl::App("index.html".into()),
-        )
-        .initialization_script(initialization_script),
-        app_origin.clone(),
-    )
-    .title(title)
-    .inner_size(1100.0, 760.0)
-    .min_inner_size(800.0, 560.0)
-    .build()
+    let mut builder =
+        WebviewWindowBuilder::new(app, next_window_label(app), splash_source.webview_url());
+    if *splash_source == SplashSource::Fallback {
+        builder = builder.initialization_script(fallback_script);
+    }
+    with_window_policy(builder, app_origin.clone())
+        .title(title)
+        .inner_size(1100.0, 760.0)
+        .min_inner_size(800.0, 560.0)
+        .build()
 }
 
 /// A further window on an already-running backend — what a second `open` of the
