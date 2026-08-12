@@ -252,6 +252,16 @@ impl Registry {
         self.apps.iter_mut().find(|entry| entry.id == id)
     }
 
+    /// The entry registered under `identifier`, if any — the question
+    /// `install::check_identifier_free` and `purge <identifier>` (plan 023)
+    /// both have to ask the same way, since a collision here is what tells
+    /// either of them the identifier is not an orphan's to touch.
+    pub fn by_identifier(&self, identifier: &str) -> Option<&RegistryEntry> {
+        self.apps
+            .iter()
+            .find(|entry| entry.identifier == identifier)
+    }
+
     /// Add `entry`, or replace the one already carrying its `id` in place —
     /// keeping the list in install order rather than moving an updated app to
     /// the end.

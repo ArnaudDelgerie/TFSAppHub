@@ -539,11 +539,7 @@ pub fn check_id_free(registry: &Registry, paths: &Paths, id: &str) -> Result<(),
 /// explains the data directory better than any version mismatch the
 /// lifecycle gate below would find, so it is reported first.
 pub fn check_identifier_free(registry: &Registry, identifier: &str) -> Result<(), InstallError> {
-    if let Some(entry) = registry
-        .apps
-        .iter()
-        .find(|entry| entry.identifier == identifier)
-    {
+    if let Some(entry) = registry.by_identifier(identifier) {
         return Err(InstallError::IdentifierTaken {
             identifier: identifier.to_string(),
             id: entry.id.clone(),

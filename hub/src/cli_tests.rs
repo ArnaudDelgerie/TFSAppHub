@@ -157,6 +157,27 @@ fn bare_words_route_to_an_app() {
         }
     );
     assert_eq!(
+        command("purge"),
+        Command::Purge {
+            identifier: None,
+            assume_yes: false,
+        }
+    );
+    assert_eq!(
+        command("purge com.example.demo"),
+        Command::Purge {
+            identifier: Some("com.example.demo".to_string()),
+            assume_yes: false,
+        }
+    );
+    assert_eq!(
+        command("purge com.example.demo --yes"),
+        Command::Purge {
+            identifier: Some("com.example.demo".to_string()),
+            assume_yes: true,
+        }
+    );
+    assert_eq!(
         command("export demo /tmp/demo"),
         Command::Export {
             id: "demo".to_string(),
@@ -273,6 +294,7 @@ fn a_malformed_invocation_names_the_right_form() {
         ("install", "install <source>"),
         ("install ../app --as", "install <source>"),
         ("list --all", "list"),
+        ("purge one two", "purge [<identifier>] [--yes]"),
         ("export demo", "export <id> <path>"),
         ("import demo /tmp/x.tar.gz --purge", "import <id> <path>"),
         ("update demo --ref", "update <id>"),
@@ -327,6 +349,7 @@ fn every_declared_command_is_implemented() {
         "update demo",
         "rollback demo",
         "remove demo",
+        "purge",
         "export demo /tmp/demo",
         "import demo /tmp/demo.tar.gz",
         "run demo",

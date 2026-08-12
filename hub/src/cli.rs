@@ -192,6 +192,19 @@ pub const SURFACE: &[Spec] = &[
         level: Level::App,
         availability: Availability::Implemented,
     },
+    // The identifier argument takes `install`'s, `dev`'s and `publish`'s
+    // exemption to the grammar rule: the subject here is an `identifier`, not
+    // a hub-local `id` — there is no `id` left to name once an app has been
+    // removed. What has to stay unmissable is the spelling that separates the
+    // two: `remove <id> --purge` takes an `id`, `purge <identifier>` takes an
+    // `identifier`.
+    Spec {
+        name: "purge",
+        form: "purge [<identifier>] [--yes]",
+        summary: "Delete a removed app's leftover data, by its identifier.",
+        level: Level::App,
+        availability: Availability::Implemented,
+    },
     Spec {
         name: "export",
         form: "export <id> <path>",
@@ -355,6 +368,13 @@ pub enum Command {
         purge: bool,
         assume_yes: bool,
     },
+    /// `purge [<identifier>] [--yes]` — `None` lists what is purgeable,
+    /// `Some` purges it. See the grammar exemption recorded beside this
+    /// form's own [`Spec`].
+    Purge {
+        identifier: Option<String>,
+        assume_yes: bool,
+    },
     Export {
         id: String,
         path: String,
@@ -439,6 +459,7 @@ impl Command {
             Self::Update { .. } => "update",
             Self::Rollback { .. } => "rollback",
             Self::Remove { .. } => "remove",
+            Self::Purge { .. } => "purge",
             Self::Export { .. } => "export",
             Self::Import { .. } => "import",
             Self::Run(_) => "run",
@@ -576,6 +597,13 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             Ok(Command::Remove {
                 id: options.exactly_one("remove", "an app id")?,
                 purge: options.flag("--purge"),
+                assume_yes: options.assume_yes(),
+            })
+        }
+        "purge" => {
+            let mut options = options("purge", rest, &[], &["--yes", "-y"])?;
+            Ok(Command::Purge {
+                identifier: options.at_most_one("purge", "an identifier")?,
                 assume_yes: options.assume_yes(),
             })
         }
@@ -774,6 +802,23 @@ impl Options {
             found => Err(usage_error(
                 name,
                 format!("{name} takes {expected}, got {found} words"),
+            )),
+        }
+    }
+
+    /// Zero or one positional — `purge`'s own shape, where a second bare word
+    /// is a usage error rather than silently ignored.
+    fn at_most_one(
+        &mut self,
+        name: &'static str,
+        expected: &str,
+    ) -> Result<Option<String>, UsageError> {
+        match self.positionals.len() {
+            0 => Ok(None),
+            1 => Ok(Some(self.positionals.remove(0))),
+            found => Err(usage_error(
+                name,
+                format!("{name} takes at most {expected}, got {found} words"),
             )),
         }
     }

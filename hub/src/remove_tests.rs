@@ -1,6 +1,9 @@
 use std::fs;
 
-use super::{plan, remove, RemoveError, APP_SECRET_ACCOUNT, PROBE_ACCOUNT};
+use super::{
+    orphaned_data, plan, remove, render_orphans, OrphanedData, RemoveError, APP_SECRET_ACCOUNT,
+    PROBE_ACCOUNT,
+};
 use crate::{
     identity::Identity,
     paths::Paths,
@@ -211,6 +214,145 @@ fn a_remove_leaves_an_unmarked_entry_untouched() {
         entry.is_file(),
         "an entry this hub did not write must survive removal"
     );
+}
+
+#[test]
+fn an_orphan_is_listed_and_an_installed_app_is_not() {
+    let (_base, paths) = temp_paths();
+    fs::create_dir_all(
+        paths
+            .app_data_dir("com.example.orphan")
+            .expect("a data dir")
+            .join("data"),
+    )
+    .expect("an orphan data dir");
+    fs::create_dir_all(
+        paths
+            .app_data_dir(IDENTIFIER)
+            .expect("a data dir")
+            .join("data"),
+    )
+    .expect("an installed app's data dir");
+    registry::save_entry(&paths, "demo");
+
+    let loaded = crate::registry::load(&paths).expect("a readable registry");
+    let orphans = orphaned_data(&paths, &loaded).expect("an enumeration");
+
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0].identifier, "com.example.orphan");
+}
+
+#[test]
+fn hub_dir_is_never_a_candidate() {
+    let (_base, paths) = temp_paths();
+    fs::create_dir_all(paths.hub_root()).expect("the hub root");
+
+    let orphans =
+        orphaned_data(&paths, &crate::registry::Registry::default()).expect("an enumeration");
+
+    assert!(orphans.is_empty(), "{orphans:?}");
+}
+
+#[test]
+fn a_symlink_and_a_plain_file_are_both_skipped() {
+    let (base, paths) = temp_paths();
+    fs::create_dir_all(paths.vendor_dir()).expect("the vendor dir");
+    std::os::unix::fs::symlink(base.path(), paths.vendor_dir().join("com.example.link"))
+        .expect("a symlink");
+    fs::write(
+        paths.vendor_dir().join("com.example.file"),
+        b"not a directory",
+    )
+    .expect("a plain file");
+
+    let orphans =
+        orphaned_data(&paths, &crate::registry::Registry::default()).expect("an enumeration");
+
+    assert!(orphans.is_empty(), "{orphans:?}");
+}
+
+#[test]
+fn a_missing_config_json_lists_as_no_version_recorded() {
+    let (_base, paths) = temp_paths();
+    fs::create_dir_all(
+        paths
+            .app_data_dir("com.example.orphan")
+            .expect("a data dir"),
+    )
+    .expect("an orphan data dir with no data/ subdir at all");
+
+    let orphans =
+        orphaned_data(&paths, &crate::registry::Registry::default()).expect("an enumeration");
+
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0].app_version, None);
+    assert!(render_orphans(&orphans).contains("no version recorded"));
+}
+
+#[test]
+fn an_empty_vendor_dir_lists_nothing() {
+    let (_base, paths) = temp_paths();
+
+    let orphans =
+        orphaned_data(&paths, &crate::registry::Registry::default()).expect("an enumeration");
+
+    assert!(orphans.is_empty());
+    assert_eq!(render_orphans(&orphans), "nothing to purge\n");
+}
+
+#[test]
+fn size_is_the_sum_of_file_lengths() {
+    let (_base, paths) = temp_paths();
+    let dir = paths
+        .app_data_dir("com.example.orphan")
+        .expect("a data dir");
+    fs::create_dir_all(dir.join("data")).expect("an orphan data dir");
+    fs::write(dir.join("data/app.db"), vec![0u8; 42]).expect("a database file");
+
+    let orphans =
+        orphaned_data(&paths, &crate::registry::Registry::default()).expect("an enumeration");
+
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0].size_bytes, 42);
+}
+
+#[test]
+fn a_webkit_sibling_is_detected() {
+    let (_base, paths) = temp_paths();
+    fs::create_dir_all(
+        paths
+            .app_data_dir("com.example.orphan")
+            .expect("a data dir"),
+    )
+    .expect("an orphan data dir");
+    fs::create_dir_all(
+        paths
+            .webkit_data_dir("com.example.orphan")
+            .expect("a webkit dir"),
+    )
+    .expect("a webkit data dir");
+
+    let orphans =
+        orphaned_data(&paths, &crate::registry::Registry::default()).expect("an enumeration");
+
+    assert_eq!(orphans.len(), 1);
+    assert!(orphans[0].has_webkit_data);
+}
+
+#[test]
+fn render_orphans_shows_the_recorded_version_and_the_webkit_sibling() {
+    let orphans = vec![OrphanedData {
+        identifier: "com.example.orphan".to_string(),
+        app_version: Some("1.2.0".to_string()),
+        size_bytes: 2048,
+        has_webkit_data: true,
+    }];
+
+    let text = render_orphans(&orphans);
+
+    assert!(text.contains("com.example.orphan"), "{text}");
+    assert!(text.contains("1.2.0"), "{text}");
+    assert!(text.contains("with WebKit data"), "{text}");
 }
 
 /// Registry fixtures, kept out of the tests above so they read as what they are

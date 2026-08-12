@@ -40,17 +40,17 @@
 //! `build/scripts/run-tests.sh` does for the suite.
 
 use std::{
-    fmt, fs,
+    fmt, fs, io,
     path::{Path, PathBuf},
 };
 
 use crate::{
-    cli::{EXIT_FAILED, EXIT_OK},
+    cli::{EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED},
     desktop::{self, RemovalOutcome},
-    manifest,
-    paths::{Paths, PathsError},
+    lifecycle, manifest,
+    paths::{self, Paths, PathsError},
     prompt,
-    registry::{self, RegistryError},
+    registry::{self, Registry, RegistryError},
 };
 
 /// The two accounts a purge owns whatever the manifest says: the one holding
@@ -152,6 +152,194 @@ fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool
     }
 
     Ok(true)
+}
+
+/// `tfsapp-hub purge [<identifier>] [--yes]` — resolve `Paths` and either list
+/// what is purgeable (`identifier` is `None`) or purge one.
+///
+/// The two forms share one grammar line (`cli::SURFACE`'s `purge` row) because
+/// they share one subject, an `identifier` with no registry entry — but only
+/// the listing form is wired up here. `purge <identifier>` itself lands in
+/// this plan's step 3; until then the grammar already accepts it and this says
+/// so, the same "recognised but not implemented yet" vocabulary `dispatch`
+/// uses at the whole-command level.
+pub fn purge(identifier: Option<&str>, _assume_yes: bool) -> i32 {
+    let paths = match Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+
+    match identifier {
+        None => match list_orphaned_data(&paths) {
+            Ok(text) => {
+                print!("{text}");
+                EXIT_OK
+            }
+            Err(error) => {
+                eprintln!("tfsapp-hub: {error}");
+                EXIT_FAILED
+            }
+        },
+        Some(_) => {
+            eprintln!("tfsapp-hub: purge <identifier> is recognised but not implemented yet.");
+            EXIT_UNIMPLEMENTED
+        }
+    }
+}
+
+/// Load the registry and render bare `purge`'s whole output.
+fn list_orphaned_data(paths: &Paths) -> Result<String, RemoveError> {
+    let registry = registry::load(paths)?;
+    let orphans = orphaned_data(paths, &registry)?;
+    Ok(render_orphans(&orphans))
+}
+
+/// One identifier under `TFSApp/` that has data but no registered app — what
+/// bare `purge` lists, and what `purge <identifier>` (step 3) refuses unless
+/// it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanedData {
+    pub identifier: String,
+    /// [`lifecycle::read_data_version`]'s own answer for this identifier's
+    /// `data/` subdir. `None` covers both "no record" and "unreadable
+    /// record" — a broken one must not hide the directory it belongs to.
+    pub app_version: Option<String>,
+    /// The sum of file lengths over a recursive walk — an order of magnitude
+    /// to decide with, not accounting. Deliberately not `st_blocks`; do not
+    /// "fix" it into one.
+    pub size_bytes: u64,
+    pub has_webkit_data: bool,
+}
+
+/// Every identifier under `TFSApp/` with data but no installed app.
+///
+/// Candidates are read from `TFSApp/` only, never from the OS data dir
+/// directly — the existence of `TFSApp/<identifier>/` is what *proves* an
+/// identifier is ours (see the plan's Overview). `paths::HUB_DIR` is excluded
+/// by name, a symlink or a plain file is skipped rather than refused (only a
+/// real directory counts as a candidate), and anything the registry still
+/// claims is left out.
+pub fn orphaned_data(paths: &Paths, registry: &Registry) -> Result<Vec<OrphanedData>, RemoveError> {
+    let vendor_dir = paths.vendor_dir();
+    let entries = match fs::read_dir(&vendor_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(RemoveError::Io {
+                path: vendor_dir,
+                source,
+            })
+        }
+    };
+
+    let mut orphans = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| RemoveError::Io {
+            path: vendor_dir.clone(),
+            source,
+        })?;
+        let name = entry.file_name();
+        let Some(identifier) = name.to_str() else {
+            continue;
+        };
+        if identifier == paths::HUB_DIR {
+            continue;
+        }
+
+        // `symlink_metadata`, never `metadata`: a symlink must be proven or
+        // skipped here, not followed — the same rule the purge itself follows
+        // for this same directory.
+        let Ok(metadata) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        if registry.by_identifier(identifier).is_some() {
+            continue;
+        }
+
+        let data_subdir = entry.path().join("data");
+        let app_version = lifecycle::read_data_version(&data_subdir).unwrap_or(None);
+        let size_bytes = directory_size(&entry.path());
+        let has_webkit_data = paths
+            .webkit_data_dir(identifier)
+            .map(|dir| dir.is_dir())
+            .unwrap_or(false);
+
+        orphans.push(OrphanedData {
+            identifier: identifier.to_string(),
+            app_version,
+            size_bytes,
+            has_webkit_data,
+        });
+    }
+
+    // Deterministic, for a predictable listing and a predictable test.
+    orphans.sort_by(|a, b| a.identifier.cmp(&b.identifier));
+    Ok(orphans)
+}
+
+/// The sum of file lengths under `path`, recursively. Best-effort: a subtree
+/// this process cannot read contributes nothing rather than failing the whole
+/// listing — the size is an estimate, never the reason a purge is refused.
+fn directory_size(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(metadata) if metadata.is_dir() => directory_size(&entry.path()),
+            Ok(metadata) => metadata.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// Bare `purge`'s whole output — pure, so the "nothing to purge" line and the
+/// column layout are testable without a filesystem, matching `list::render`.
+fn render_orphans(orphans: &[OrphanedData]) -> String {
+    if orphans.is_empty() {
+        return "nothing to purge\n".to_string();
+    }
+
+    let mut text = String::new();
+    for orphan in orphans {
+        let version = orphan
+            .app_version
+            .as_deref()
+            .unwrap_or("no version recorded");
+        let webkit = match orphan.has_webkit_data {
+            true => "with WebKit data",
+            false => "no WebKit data",
+        };
+        text.push_str(&format!(
+            "{}  {version}  {}  {webkit}\n",
+            orphan.identifier,
+            human_size(orphan.size_bytes),
+        ));
+    }
+    text
+}
+
+/// `size_bytes` as something a human can eyeball — a plausible order of
+/// magnitude, not an exact figure (see [`OrphanedData::size_bytes`]).
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    match unit {
+        0 => format!("{bytes} B"),
+        _ => format!("{size:.1} {}", UNITS[unit]),
+    }
 }
 
 /// Everything a given `remove` would touch — computed before anything is, so it
@@ -289,8 +477,18 @@ fn delete_keyring_account(identifier: &str, account: &str) -> bool {
 pub enum RemoveError {
     Paths(PathsError),
     Registry(RegistryError),
-    NotInstalled { id: String },
-    StillRunning { identifier: String },
+    NotInstalled {
+        id: String,
+    },
+    StillRunning {
+        identifier: String,
+    },
+    /// Reading `TFSApp/` to enumerate orphaned data — [`orphaned_data`]'s own
+    /// I/O failure, distinct from a `Paths` resolution failure.
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for RemoveError {
@@ -307,6 +505,7 @@ impl fmt::Display for RemoveError {
                 "{identifier} is running — close it first. Purging would delete the \
                  database it has open."
             ),
+            Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
         }
     }
 }
@@ -316,6 +515,7 @@ impl std::error::Error for RemoveError {
         match self {
             Self::Paths(error) => Some(error),
             Self::Registry(error) => Some(error),
+            Self::Io { source, .. } => Some(source),
             _ => None,
         }
     }
