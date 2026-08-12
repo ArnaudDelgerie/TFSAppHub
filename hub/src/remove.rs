@@ -44,6 +44,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     cli::{EXIT_FAILED, EXIT_OK},
     desktop::{self, RemovalOutcome},
@@ -61,7 +63,7 @@ use crate::{
 /// Imported from the module that writes them, now that plan 007 has brought it
 /// over — 006 spelled them out here because there was nothing yet to import
 /// from, and a duplicated account name is a purge that silently misses.
-use crate::secrets::{APP_SECRET_ACCOUNT, PROBE_ACCOUNT};
+use crate::secrets::{self, APP_SECRET_ACCOUNT, PROBE_ACCOUNT};
 
 /// The whole command. Returns the process's exit code.
 pub fn run(id: &str, purge: bool, assume_yes: bool) -> i32 {
@@ -96,7 +98,7 @@ fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool
         .ok_or_else(|| RemoveError::NotInstalled { id: id.to_string() })?;
     let identifier = entry.identifier.clone();
 
-    let removal_plan = plan(paths, id, &identifier, purge)?;
+    let removal_plan = plan(paths, id, &identifier)?;
 
     // Only for `--purge`, and only because that is the form that deletes
     // data: a live window has an open SQLite file under it, and an active
@@ -200,6 +202,14 @@ fn execute(paths: &Paths, plan: &RemovalPlan, purge: bool) -> Result<(), RemoveE
                 }
             );
         }
+    } else {
+        // Only reached by a retaining `remove` (plan_orphan's own subject
+        // always executes with `purge` true) — the note the data directory
+        // it keeps needs for a later `purge <identifier>` to reach the
+        // accounts this manifest declared. Best-effort and silent: a failed
+        // note costs that later purge some completeness, never this
+        // removal.
+        let _ = write_keyring_note(&plan.data_dir, &plan.keyring_accounts);
     }
 
     Ok(())
@@ -509,28 +519,31 @@ struct RemovalPlan {
     /// it, which is exactly why it is easy to leave behind.
     webkit_data_dir: PathBuf,
     /// `app-secret`, the availability probe, then whatever the app declared
-    /// under `actions.secrets.keys`. Empty unless purging.
+    /// under `actions.secrets.keys`. Computed for both forms now (plan 023
+    /// step 4): the installed subject reads it from its live manifest via
+    /// [`plan`] whether or not `purge` is set, since a plain `remove` needs
+    /// the full set to write into the note it leaves behind; the orphan
+    /// subject reads it from that note via [`plan_orphan`], or falls back to
+    /// the two hub accounts when there is none.
     keyring_accounts: Vec<String>,
+    /// Whether `keyring_accounts` is a set this hub can vouch for in full —
+    /// the installed subject's live manifest, or the orphan subject's found
+    /// note — rather than the two-account fallback with nothing behind it.
+    /// `announce`'s "declared secrets may remain" caveat is gated on this,
+    /// not on `id`, so a purge with a note stops naming a limit that no
+    /// longer applies to it.
+    keyring_note_found: bool,
 }
 
-fn plan(
-    paths: &Paths,
-    id: &str,
-    identifier: &str,
-    purge: bool,
-) -> Result<RemovalPlan, RemoveError> {
+fn plan(paths: &Paths, id: &str, identifier: &str) -> Result<RemovalPlan, RemoveError> {
     let app_dir = paths.app_dir(id)?;
 
-    let mut keyring_accounts = Vec::new();
-    if purge {
-        keyring_accounts.push(APP_SECRET_ACCOUNT.to_string());
-        keyring_accounts.push(PROBE_ACCOUNT.to_string());
-        // Read from the snapshot about to be deleted, and best-effort: an
-        // unreadable manifest costs the declared keys, not the removal. The two
-        // above are the hub's own and need no manifest to know about.
-        if let Ok(loaded) = manifest::load(&app_dir) {
-            keyring_accounts.extend(loaded.manifest.actions.secrets.keys);
-        }
+    let mut keyring_accounts = vec![APP_SECRET_ACCOUNT.to_string(), PROBE_ACCOUNT.to_string()];
+    // Read from the snapshot, and best-effort: an unreadable manifest costs
+    // the declared keys, not the removal. The two above are the hub's own
+    // and need no manifest to know about.
+    if let Ok(loaded) = manifest::load(&app_dir) {
+        keyring_accounts.extend(loaded.manifest.actions.secrets.keys);
     }
 
     Ok(RemovalPlan {
@@ -541,24 +554,91 @@ fn plan(
         webkit_data_dir: paths.webkit_data_dir(identifier)?,
         identifier: identifier.to_string(),
         keyring_accounts,
+        keyring_note_found: true,
     })
 }
 
 /// The orphan subject `purge <identifier>` builds once its refusals have
-/// passed: no `id`, no `app_dir`, and the keyring zone limited to the two
-/// hub-owned accounts — there is no installed app left, and so no manifest
-/// left to read declared `actions.secrets` keys from (plan 023 step 4 gives
-/// this a way out via the note a retaining `remove` leaves behind).
+/// passed: no `id`, no `app_dir`, and the keyring zone read from the note a
+/// retaining `remove` may have left behind (plan 023 step 4), unioned with
+/// [`secrets::RESERVED_SECRET_KEYS`] and deduplicated. No note (an older
+/// hub's leftover, or a packaged station app's data, which never writes one)
+/// falls back to the two hub-owned accounts alone.
 fn plan_orphan(paths: &Paths, identifier: &str) -> Result<RemovalPlan, RemoveError> {
+    let data_dir = paths.app_data_dir(identifier)?;
+    let note = read_keyring_note(&data_dir);
+    let keyring_note_found = note.is_some();
+
+    let mut keyring_accounts = note.unwrap_or_default();
+    for &reserved in secrets::RESERVED_SECRET_KEYS {
+        if !keyring_accounts.iter().any(|account| account == reserved) {
+            keyring_accounts.push(reserved.to_string());
+        }
+    }
+
     Ok(RemovalPlan {
         id: None,
         app_dir: None,
         desktop_entry: paths.desktop_entry_path(identifier)?,
-        data_dir: paths.app_data_dir(identifier)?,
         webkit_data_dir: paths.webkit_data_dir(identifier)?,
         identifier: identifier.to_string(),
-        keyring_accounts: vec![APP_SECRET_ACCOUNT.to_string(), PROBE_ACCOUNT.to_string()],
+        data_dir,
+        keyring_accounts,
+        keyring_note_found,
     })
+}
+
+/// `<data_dir>/data/keyring.json` — the note a retaining `remove` leaves
+/// behind for a later `purge <identifier>`: the OS keyring accounts a
+/// manifest declared, read while `plan` still has the snapshot that declares
+/// them — by the time a purge runs, that snapshot is gone (the plan's
+/// keyring design decision).
+///
+/// Not `data/config.json`, which is CONTRACT.md §6's contract surface shared
+/// with the station: this note exists purely so *this* hub can `purge` what
+/// *this* hub's `remove` retained. It lands inside `data/`, so `export`'s
+/// curated set (`lifecycle::DB_FILE_NAMES`, nothing else) leaves it out by
+/// construction.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+struct KeyringNote {
+    accounts: Vec<String>,
+    /// Keys a newer hub wrote and this one does not know — same rule as
+    /// `registry::Registry::unknown`.
+    #[serde(flatten)]
+    unknown: serde_json::Map<String, serde_json::Value>,
+}
+
+fn keyring_note_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("data").join("keyring.json")
+}
+
+/// Write `accounts` into `data_dir`'s note, atomically — same same-directory
+/// temp-file-plus-`rename` move as `lifecycle::write_data_version`. Every
+/// caller treats a failure here as non-fatal (see [`execute`]'s own comment).
+fn write_keyring_note(data_dir: &Path, accounts: &[String]) -> io::Result<()> {
+    let note = KeyringNote {
+        accounts: accounts.to_vec(),
+        unknown: serde_json::Map::new(),
+    };
+    let json = serde_json::to_string_pretty(&note).map_err(io::Error::other)?;
+
+    let path = keyring_note_path(data_dir);
+    let temporary = data_dir.join("data").join("keyring.json.tmp");
+    fs::write(&temporary, json)?;
+    fs::rename(&temporary, &path)?;
+    Ok(())
+}
+
+/// Read `data_dir`'s note back, if there is one to read. `None` covers both
+/// "no note" (an older hub's leftover, or a packaged station app's data
+/// directory, neither of which ever writes one) and "a note that does not
+/// parse" — [`plan_orphan`]'s honest fallback either way, never a reason to
+/// refuse the purge itself.
+fn read_keyring_note(data_dir: &Path) -> Option<Vec<String>> {
+    let contents = fs::read_to_string(keyring_note_path(data_dir)).ok()?;
+    serde_json::from_str::<KeyringNote>(&contents)
+        .ok()
+        .map(|note| note.accounts)
 }
 
 /// Print what is about to happen, and — just as important — what is not.
@@ -591,15 +671,17 @@ fn announce(plan: &RemovalPlan, purge: bool) {
                  is recoverable, and reinstalling gives you an empty app."
             );
             // The orphan subject has no installed app left to read declared
-            // `actions.secrets` keys from — only the two hub-owned accounts
-            // above are known. Plan 023 step 4 gives this a way out via a note
-            // a retaining `remove` leaves behind; until then, say the limit
-            // out loud rather than silently under-purging.
-            if plan.id.is_none() {
+            // `actions.secrets` keys from — a note a retaining `remove` left
+            // behind (plan 023 step 4) is the only way it can know the full
+            // set. No note found means only the two hub-owned accounts above
+            // are known; say the limit out loud rather than silently
+            // under-purging.
+            if plan.id.is_none() && !plan.keyring_note_found {
                 println!(
-                    "This identifier has no installed app to read its declared secret keys \
-                     from, so only the two accounts above are removed — anything the app \
-                     itself declared under actions.secrets may remain."
+                    "This identifier's data carries no note of declared secret keys (an older \
+                     hub's leftover, or a packaged station app's data) — only the two accounts \
+                     above are removed; anything the app itself declared under actions.secrets \
+                     may remain."
                 );
             }
         }

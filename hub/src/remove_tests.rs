@@ -1,8 +1,9 @@
 use std::fs;
 
 use super::{
-    orphaned_data, plan, plan_orphan, purge_identifier, remove, render_orphans, OrphanedData,
-    RemoveError, APP_SECRET_ACCOUNT, PROBE_ACCOUNT,
+    keyring_note_path, orphaned_data, plan, plan_orphan, purge_identifier, read_keyring_note,
+    remove, render_orphans, write_keyring_note, KeyringNote, OrphanedData, RemoveError,
+    APP_SECRET_ACCOUNT, PROBE_ACCOUNT,
 };
 use crate::{
     identity::Identity,
@@ -53,29 +54,28 @@ fn installed_snapshot(paths: &Paths, id: &str) {
 }
 
 #[test]
-fn a_plain_remove_keeps_the_data_and_a_purge_names_every_zone() {
-    // The whole reason the two forms exist: someone reinstalling a broken app
-    // must not lose their database to a command that only had to replace a tree.
+fn a_plan_carries_every_zone_and_the_full_declared_keyring_set() {
+    // `plan` computes the same thing for both forms now (plan 023 step 4): a
+    // plain `remove` needs the full declared set as much as `--purge` does,
+    // to write it into the note it leaves behind.
     let (base, paths) = temp_paths();
     installed_snapshot(&paths, "demo");
 
-    let kept = plan(&paths, "demo", IDENTIFIER, false).expect("a plan");
+    let planned = plan(&paths, "demo", IDENTIFIER).expect("a plan");
+
     assert_eq!(
-        kept.app_dir,
+        planned.app_dir,
         Some(paths.app_dir("demo").expect("an app dir"))
     );
-    assert!(
-        kept.keyring_accounts.is_empty(),
-        "a plain remove never touches the keyring"
+    assert_eq!(
+        planned.data_dir,
+        base.path().join("TFSApp").join(IDENTIFIER)
     );
-
-    let purged = plan(&paths, "demo", IDENTIFIER, true).expect("a plan");
-    assert_eq!(purged.data_dir, base.path().join("TFSApp").join(IDENTIFIER));
     // A sibling of TFSApp/, not a child — WebKit derives it from the GTK app id
     // and has never heard of this project's vendor folder.
-    assert_eq!(purged.webkit_data_dir, base.path().join(IDENTIFIER));
+    assert_eq!(planned.webkit_data_dir, base.path().join(IDENTIFIER));
     assert_eq!(
-        purged.keyring_accounts,
+        planned.keyring_accounts,
         vec![
             APP_SECRET_ACCOUNT.to_string(),
             PROBE_ACCOUNT.to_string(),
@@ -92,10 +92,10 @@ fn an_unreadable_manifest_costs_the_declared_keys_and_nothing_else() {
     // need no manifest to be known.
     let (_base, paths) = temp_paths();
 
-    let purged = plan(&paths, "demo", IDENTIFIER, true).expect("a plan");
+    let planned = plan(&paths, "demo", IDENTIFIER).expect("a plan");
 
     assert_eq!(
-        purged.keyring_accounts,
+        planned.keyring_accounts,
         vec![APP_SECRET_ACCOUNT.to_string(), PROBE_ACCOUNT.to_string()]
     );
 }
@@ -486,6 +486,10 @@ fn an_orphan_plan_carries_no_id_and_the_two_hub_accounts() {
         orphan.keyring_accounts,
         vec![APP_SECRET_ACCOUNT.to_string(), PROBE_ACCOUNT.to_string()]
     );
+    assert!(
+        !orphan.keyring_note_found,
+        "no note was left behind, so the caveat must still apply"
+    );
     assert_eq!(
         orphan.data_dir,
         paths.app_data_dir(ORPHAN_IDENTIFIER).expect("a data dir")
@@ -527,6 +531,74 @@ fn an_orphan_purge_takes_the_data_and_the_webkit_dir_with_it() {
 
     assert!(!data_dir.exists(), "the data dir goes with the purge");
     assert!(!webkit_dir.exists(), "so does WebKit's own");
+}
+
+#[test]
+fn the_keyring_note_round_trips_with_an_unknown_key_surviving() {
+    let contents = r#"{"accounts":["openai"],"written_by_a_newer_hub":"kept"}"#;
+
+    let note: KeyringNote = serde_json::from_str(contents).expect("valid json");
+    assert_eq!(note.accounts, vec!["openai".to_string()]);
+
+    let rendered = serde_json::to_string(&note).expect("a serializable note");
+    assert!(rendered.contains("written_by_a_newer_hub"), "{rendered}");
+}
+
+#[test]
+fn a_retaining_remove_writes_the_manifests_declared_keys_into_a_note() {
+    let (_base, paths) = temp_paths();
+    installed_snapshot(&paths, "demo");
+    let data_dir = paths.app_data_dir(IDENTIFIER).expect("a data dir");
+    fs::create_dir_all(data_dir.join("data")).expect("an app data dir");
+    registry::save_entry(&paths, "demo");
+
+    assert!(remove(&paths, "demo", false, true).expect("it removes"));
+
+    let note = read_keyring_note(&data_dir).expect("a note was written");
+    assert_eq!(
+        note,
+        vec![
+            APP_SECRET_ACCOUNT.to_string(),
+            PROBE_ACCOUNT.to_string(),
+            "openai".to_string(),
+            "anthropic".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_purge_writes_no_keyring_note() {
+    // The directory the note would live in is itself going away — writing
+    // one would only be deleted along with it.
+    let (_base, paths) = temp_paths();
+    installed_snapshot(&paths, "demo");
+    let data_dir = paths.app_data_dir(IDENTIFIER).expect("a data dir");
+    fs::create_dir_all(data_dir.join("data")).expect("an app data dir");
+    registry::save_entry(&paths, "demo");
+
+    assert!(remove(&paths, "demo", true, true).expect("it purges"));
+
+    assert!(!keyring_note_path(&data_dir).exists());
+}
+
+#[test]
+fn a_purge_with_a_note_deletes_the_declared_accounts() {
+    let (_base, paths) = temp_paths();
+    let data_dir = paths.app_data_dir(ORPHAN_IDENTIFIER).expect("a data dir");
+    fs::create_dir_all(data_dir.join("data")).expect("an orphan data dir");
+    write_keyring_note(&data_dir, &["openai".to_string()]).expect("a note is written");
+
+    let entry = keyring::Entry::new(ORPHAN_IDENTIFIER, "openai").expect("a keyring entry");
+    entry
+        .set_password("secret")
+        .expect("a real keyring account");
+
+    assert!(purge_identifier(&paths, ORPHAN_IDENTIFIER, true).expect("it purges"));
+
+    assert!(
+        entry.get_password().is_err(),
+        "the account this note declared must be gone"
+    );
 }
 
 /// Registry fixtures, kept out of the tests above so they read as what they are
