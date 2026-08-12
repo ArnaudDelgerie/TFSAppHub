@@ -1,8 +1,8 @@
 use std::fs;
 
 use super::{
-    orphaned_data, plan, remove, render_orphans, OrphanedData, RemoveError, APP_SECRET_ACCOUNT,
-    PROBE_ACCOUNT,
+    orphaned_data, plan, plan_orphan, purge_identifier, remove, render_orphans, OrphanedData,
+    RemoveError, APP_SECRET_ACCOUNT, PROBE_ACCOUNT,
 };
 use crate::{
     identity::Identity,
@@ -20,6 +20,12 @@ use crate::{
 /// purge here could remove an `app-secret` another test had just written, in
 /// another thread, and make it read back a different secret.
 const IDENTIFIER: &str = "dev.local.demo-remove";
+
+/// The orphan-side tests' own identifier, distinct from [`IDENTIFIER`] for
+/// the same reason that one is distinct from every other module's: the ones
+/// below that reach [`purge_identifier`]'s execution path delete real
+/// keyring accounts, under a service name nothing else in the suite touches.
+const ORPHAN_IDENTIFIER: &str = "dev.local.demo-orphan-remove";
 
 fn temp_paths() -> (tempfile::TempDir, Paths) {
     let base = tempfile::tempdir().expect("a temp data dir");
@@ -402,6 +408,125 @@ fn render_orphans_shows_the_recorded_version_and_the_webkit_sibling() {
     assert!(text.contains("com.example.orphan"), "{text}");
     assert!(text.contains("1.2.0"), "{text}");
     assert!(text.contains("with WebKit data"), "{text}");
+}
+
+#[test]
+fn purging_an_installed_identifier_names_remove_purge() {
+    let (_base, paths) = temp_paths();
+    registry::save_entry(&paths, "demo");
+
+    let error =
+        purge_identifier(&paths, IDENTIFIER, true).expect_err("an installed identifier refuses");
+
+    assert!(
+        matches!(error, RemoveError::AlreadyInstalled { .. }),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("demo"), "{message}");
+    assert!(message.contains("remove demo --purge"), "{message}");
+}
+
+#[test]
+fn purging_an_identifier_with_no_data_points_at_bare_purge() {
+    let (_base, paths) = temp_paths();
+
+    let error = purge_identifier(&paths, "com.example.nothing", true)
+        .expect_err("nothing exists under TFSApp/ for this identifier");
+
+    assert!(matches!(error, RemoveError::NoOrphanData { .. }), "{error}");
+    assert!(error.to_string().contains("tfsapp-hub purge"), "{error}");
+}
+
+#[test]
+fn a_symlinked_data_dir_refuses_the_purge_and_deletes_nothing() {
+    let (base, paths) = temp_paths();
+    let target = base.path().join("elsewhere");
+    fs::create_dir_all(&target).expect("a link target");
+    fs::create_dir_all(paths.vendor_dir()).expect("the vendor dir");
+    let data_dir = paths.app_data_dir(ORPHAN_IDENTIFIER).expect("a data dir");
+    std::os::unix::fs::symlink(&target, &data_dir).expect("a symlink data dir");
+
+    let error = purge_identifier(&paths, ORPHAN_IDENTIFIER, true)
+        .expect_err("a symlink is refused, not followed");
+
+    assert!(matches!(error, RemoveError::SymlinkData { .. }), "{error}");
+    assert!(
+        target.is_dir(),
+        "the link's target must survive a refused purge"
+    );
+}
+
+#[test]
+fn a_live_window_refuses_an_orphan_purge() {
+    let (_base, paths) = temp_paths();
+    let data_dir = paths.app_data_dir(ORPHAN_IDENTIFIER).expect("a data dir");
+    fs::create_dir_all(&data_dir).expect("a data dir");
+    let pid_file = data_dir.join("sidecar.pid");
+    let _holder = tfsapp_core::process::try_lock_file(&tfsapp_core::process::lock_path(&pid_file))
+        .expect("no I/O error")
+        .expect("the lock is free to take");
+
+    let error = purge_identifier(&paths, ORPHAN_IDENTIFIER, true)
+        .expect_err("a live window owns this data dir");
+
+    assert!(matches!(error, RemoveError::StillRunning { .. }), "{error}");
+    assert!(error.to_string().contains(ORPHAN_IDENTIFIER), "{error}");
+}
+
+#[test]
+fn an_orphan_plan_carries_no_id_and_the_two_hub_accounts() {
+    let (_base, paths) = temp_paths();
+
+    let orphan = plan_orphan(&paths, ORPHAN_IDENTIFIER).expect("a plan");
+
+    assert_eq!(orphan.id, None);
+    assert_eq!(orphan.app_dir, None);
+    assert_eq!(
+        orphan.keyring_accounts,
+        vec![APP_SECRET_ACCOUNT.to_string(), PROBE_ACCOUNT.to_string()]
+    );
+    assert_eq!(
+        orphan.data_dir,
+        paths.app_data_dir(ORPHAN_IDENTIFIER).expect("a data dir")
+    );
+}
+
+#[test]
+fn declining_a_purge_confirmation_touches_nothing() {
+    // stdin is not a terminal under the test harness, and assume_yes is
+    // false: `prompt::confirmed` refuses non-interactively, which is exactly
+    // the decline path this exercises.
+    let (_base, paths) = temp_paths();
+    let data_dir = paths.app_data_dir(ORPHAN_IDENTIFIER).expect("a data dir");
+    fs::create_dir_all(data_dir.join("data")).expect("an orphan data dir");
+    fs::write(data_dir.join("data/app.db"), b"existing").expect("a database");
+
+    let proceeded = purge_identifier(&paths, ORPHAN_IDENTIFIER, false)
+        .expect("a non-interactive decline is Ok(false), not an error");
+
+    assert!(!proceeded);
+    assert!(
+        data_dir.join("data/app.db").is_file(),
+        "declining must touch nothing"
+    );
+}
+
+#[test]
+fn an_orphan_purge_takes_the_data_and_the_webkit_dir_with_it() {
+    let (_base, paths) = temp_paths();
+    let data_dir = paths.app_data_dir(ORPHAN_IDENTIFIER).expect("a data dir");
+    let webkit_dir = paths
+        .webkit_data_dir(ORPHAN_IDENTIFIER)
+        .expect("a webkit dir");
+    fs::create_dir_all(data_dir.join("data")).expect("an orphan data dir");
+    fs::write(data_dir.join("data/app.db"), b"not really a database").expect("a database");
+    fs::create_dir_all(&webkit_dir).expect("a webkit data dir");
+
+    assert!(purge_identifier(&paths, ORPHAN_IDENTIFIER, true).expect("it purges"));
+
+    assert!(!data_dir.exists(), "the data dir goes with the purge");
+    assert!(!webkit_dir.exists(), "so does WebKit's own");
 }
 
 /// Registry fixtures, kept out of the tests above so they read as what they are

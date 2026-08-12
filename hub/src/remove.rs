@@ -45,7 +45,7 @@ use std::{
 };
 
 use crate::{
-    cli::{EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED},
+    cli::{EXIT_FAILED, EXIT_OK},
     desktop::{self, RemovalOutcome},
     lifecycle, manifest,
     paths::{self, Paths, PathsError},
@@ -110,7 +110,8 @@ fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool
             Ok(None) => {}
             Ok(Some(holder)) => {
                 return Err(RemoveError::StillRunning {
-                    id: id.to_string(),
+                    id: Some(id.to_string()),
+                    identifier: identifier.clone(),
                     holder,
                 })
             }
@@ -207,13 +208,9 @@ fn execute(paths: &Paths, plan: &RemovalPlan, purge: bool) -> Result<(), RemoveE
 /// `tfsapp-hub purge [<identifier>] [--yes]` — resolve `Paths` and either list
 /// what is purgeable (`identifier` is `None`) or purge one.
 ///
-/// The two forms share one grammar line (`cli::SURFACE`'s `purge` row) because
-/// they share one subject, an `identifier` with no registry entry — but only
-/// the listing form is wired up here. `purge <identifier>` itself lands in
-/// this plan's step 3; until then the grammar already accepts it and this says
-/// so, the same "recognised but not implemented yet" vocabulary `dispatch`
-/// uses at the whole-command level.
-pub fn purge(identifier: Option<&str>, _assume_yes: bool) -> i32 {
+/// The two forms share one grammar line (`cli::SURFACE`'s `purge` row)
+/// because they share one subject, an `identifier` with no registry entry.
+pub fn purge(identifier: Option<&str>, assume_yes: bool) -> i32 {
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
         Err(error) => {
@@ -233,10 +230,16 @@ pub fn purge(identifier: Option<&str>, _assume_yes: bool) -> i32 {
                 EXIT_FAILED
             }
         },
-        Some(_) => {
-            eprintln!("tfsapp-hub: purge <identifier> is recognised but not implemented yet.");
-            EXIT_UNIMPLEMENTED
-        }
+        Some(identifier) => match purge_identifier(&paths, identifier, assume_yes) {
+            Ok(true) => EXIT_OK,
+            // Same reasoning as `remove`'s own decline: a script reading 0
+            // must not conclude the data is gone.
+            Ok(false) => EXIT_FAILED,
+            Err(error) => {
+                eprintln!("tfsapp-hub: {error}");
+                EXIT_FAILED
+            }
+        },
     }
 }
 
@@ -245,6 +248,95 @@ fn list_orphaned_data(paths: &Paths) -> Result<String, RemoveError> {
     let registry = registry::load(paths)?;
     let orphans = orphaned_data(paths, &registry)?;
     Ok(render_orphans(&orphans))
+}
+
+/// `purge <identifier>` itself: the refusals in the fixed order the plan's
+/// Overview lays out, then the same announce/confirm/execute shape
+/// `remove --purge` uses — [`execute`] is the one execution path both entry
+/// points share.
+///
+/// `false` when the user declined, matching [`remove`]'s own contract.
+fn purge_identifier(
+    paths: &Paths,
+    identifier: &str,
+    assume_yes: bool,
+) -> Result<bool, RemoveError> {
+    // Refusal 1: a registry entry still claims this identifier. Purging
+    // under a live install would delete data `remove <id> --purge` is the
+    // one command meant to reach.
+    let registry = registry::load(paths)?;
+    if let Some(entry) = registry.by_identifier(identifier) {
+        return Err(RemoveError::AlreadyInstalled {
+            id: entry.id.clone(),
+            identifier: identifier.to_string(),
+        });
+    }
+
+    // Refusals 2 and 3 both read `TFSApp/<identifier>/` once, with
+    // `symlink_metadata` — never `metadata` — so a symlink is proven rather
+    // than followed. Nothing there at all (refusal 2) and a symlink in its
+    // place (refusal 3) are the two ways this path is not a real data
+    // directory this command may act on; anything else not a directory (a
+    // plain file, say) falls into the same "nothing to purge" refusal as a
+    // missing path, exactly as the enumeration behind bare `purge` skips it.
+    let data_dir = paths.app_data_dir(identifier)?;
+    match fs::symlink_metadata(&data_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(RemoveError::NoOrphanData {
+                identifier: identifier.to_string(),
+            });
+        }
+        Err(source) => {
+            return Err(RemoveError::Io {
+                path: data_dir,
+                source,
+            });
+        }
+        Ok(metadata) if metadata.is_symlink() => {
+            return Err(RemoveError::SymlinkData {
+                target: fs::read_link(&data_dir).ok(),
+                identifier: identifier.to_string(),
+                path: data_dir,
+            });
+        }
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(RemoveError::NoOrphanData {
+                identifier: identifier.to_string(),
+            });
+        }
+    }
+
+    // Refusal 4: the same shared guard `remove --purge` now goes through
+    // too (step 2) — a live window or an active `run` command holds this
+    // data directory.
+    match busy_holder(&data_dir) {
+        Ok(None) => {}
+        Ok(Some(holder)) => {
+            return Err(RemoveError::StillRunning {
+                id: None,
+                identifier: identifier.to_string(),
+                holder,
+            })
+        }
+        Err(source) => {
+            return Err(RemoveError::Io {
+                path: data_dir,
+                source,
+            })
+        }
+    }
+
+    let removal_plan = plan_orphan(paths, identifier)?;
+
+    announce(&removal_plan, true);
+    if !prompt::confirmed(assume_yes) {
+        println!("Aborted — nothing was purged.");
+        return Ok(false);
+    }
+
+    execute(paths, &removal_plan, true)?;
+    Ok(true)
 }
 
 /// One identifier under `TFSApp/` that has data but no registered app — what
@@ -452,6 +544,23 @@ fn plan(
     })
 }
 
+/// The orphan subject `purge <identifier>` builds once its refusals have
+/// passed: no `id`, no `app_dir`, and the keyring zone limited to the two
+/// hub-owned accounts — there is no installed app left, and so no manifest
+/// left to read declared `actions.secrets` keys from (plan 023 step 4 gives
+/// this a way out via the note a retaining `remove` leaves behind).
+fn plan_orphan(paths: &Paths, identifier: &str) -> Result<RemovalPlan, RemoveError> {
+    Ok(RemovalPlan {
+        id: None,
+        app_dir: None,
+        desktop_entry: paths.desktop_entry_path(identifier)?,
+        data_dir: paths.app_data_dir(identifier)?,
+        webkit_data_dir: paths.webkit_data_dir(identifier)?,
+        identifier: identifier.to_string(),
+        keyring_accounts: vec![APP_SECRET_ACCOUNT.to_string(), PROBE_ACCOUNT.to_string()],
+    })
+}
+
 /// Print what is about to happen, and — just as important — what is not.
 fn announce(plan: &RemovalPlan, purge: bool) {
     match &plan.id {
@@ -481,6 +590,18 @@ fn announce(plan: &RemovalPlan, purge: bool) {
                 "This deletes the app's database, sessions and secrets. Nothing here \
                  is recoverable, and reinstalling gives you an empty app."
             );
+            // The orphan subject has no installed app left to read declared
+            // `actions.secrets` keys from — only the two hub-owned accounts
+            // above are known. Plan 023 step 4 gives this a way out via a note
+            // a retaining `remove` leaves behind; until then, say the limit
+            // out loud rather than silently under-purging.
+            if plan.id.is_none() {
+                println!(
+                    "This identifier has no installed app to read its declared secret keys \
+                     from, so only the two accounts above are removed — anything the app \
+                     itself declared under actions.secrets may remain."
+                );
+            }
         }
         // Said out loud rather than left to be inferred: someone removing an
         // app to reinstall it needs to know their data is waiting, and someone
@@ -546,10 +667,33 @@ pub enum RemoveError {
         id: String,
     },
     /// A live window or an active `run` command holds the data directory —
-    /// `--purge` refuses rather than delete a database out from under it.
+    /// refused rather than deleting a database out from under it. `id` is
+    /// `None` for an orphan subject (`purge <identifier>`), which has no
+    /// hub-local id to suggest a `run --stop` command with.
     StillRunning {
-        id: String,
+        id: Option<String>,
+        identifier: String,
         holder: lifecycle::DataDirHolder,
+    },
+    /// `purge <identifier>` named an identifier a registry entry still
+    /// claims — `remove <id> --purge` is the way to delete an installed
+    /// app's data, never this command.
+    AlreadyInstalled {
+        id: String,
+        identifier: String,
+    },
+    /// `purge <identifier>` found nothing under `TFSApp/<identifier>/` — the
+    /// guard that also stops a typo from ever reaching the WebKit sibling
+    /// (see the plan's Overview).
+    NoOrphanData {
+        identifier: String,
+    },
+    /// `TFSApp/<identifier>/` is a symlink — refused rather than followed
+    /// (see the plan's Overview design decision).
+    SymlinkData {
+        identifier: String,
+        path: PathBuf,
+        target: Option<PathBuf>,
     },
     /// Reading `TFSApp/` to enumerate orphaned data — [`orphaned_data`]'s own
     /// I/O failure, distinct from a `Paths` resolution failure.
@@ -568,23 +712,60 @@ impl fmt::Display for RemoveError {
                 formatter,
                 "no app is installed as {id} — `tfsapp-hub list` shows the ones that are."
             ),
-            Self::StillRunning { id, holder } => match holder {
-                lifecycle::DataDirHolder::Window => write!(
+            Self::StillRunning {
+                id,
+                identifier,
+                holder,
+            } => {
+                let name = id.as_deref().unwrap_or(identifier);
+                let stop = match id {
+                    Some(id) => format!(" Stop it first with `tfsapp-hub run --stop {id}`."),
+                    None => " Stop it first.".to_string(),
+                };
+                match holder {
+                    lifecycle::DataDirHolder::Window => write!(
+                        formatter,
+                        "{name} has a window open right now — purging would delete the \
+                         database it has open. Close {name} first."
+                    ),
+                    lifecycle::DataDirHolder::RunCommand { alias: Some(alias) } => write!(
+                        formatter,
+                        "{name}'s \"{alias}\" run command is still active — purging would \
+                         delete the database it has open.{stop}"
+                    ),
+                    lifecycle::DataDirHolder::RunCommand { alias: None } => write!(
+                        formatter,
+                        "a run command is still active for {name} — purging would delete the \
+                         database it has open.{stop}"
+                    ),
+                }
+            }
+            Self::AlreadyInstalled { id, identifier } => write!(
+                formatter,
+                "{identifier} is installed as {id} — purge only reaches data an installed \
+                 app has no claim on. Use `tfsapp-hub remove {id} --purge` instead."
+            ),
+            Self::NoOrphanData { identifier } => write!(
+                formatter,
+                "{identifier}: nothing found under TFSApp/ — `tfsapp-hub purge` lists every \
+                 identifier that has data to purge."
+            ),
+            Self::SymlinkData {
+                identifier,
+                path,
+                target,
+            } => {
+                let target = match target {
+                    Some(target) => format!(" (to {})", target.display()),
+                    None => String::new(),
+                };
+                write!(
                     formatter,
-                    "{id} has a window open right now — purging would delete the database it \
-                     has open. Close {id} first."
-                ),
-                lifecycle::DataDirHolder::RunCommand { alias: Some(alias) } => write!(
-                    formatter,
-                    "{id}'s \"{alias}\" run command is still active — purging would delete the \
-                     database it has open. Stop it first with `tfsapp-hub run --stop {id}`."
-                ),
-                lifecycle::DataDirHolder::RunCommand { alias: None } => write!(
-                    formatter,
-                    "a run command is still active for {id} — purging would delete the \
-                     database it has open. Stop it first with `tfsapp-hub run --stop {id}`."
-                ),
-            },
+                    "{identifier}'s data directory ({}) is a symlink{target} — refusing to \
+                     purge through a link. Delete it by hand if you mean to clear it.",
+                    path.display()
+                )
+            }
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
         }
     }
