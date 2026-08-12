@@ -177,6 +177,7 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             &context.package_info().version.to_string(),
         ),
         Command::Rollback { id, assume_yes } => rollback::run(&id, assume_yes),
+        Command::Export { id, path } => portability::export(&id, &path),
         Command::Remove {
             id,
             purge,

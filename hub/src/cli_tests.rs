@@ -302,12 +302,11 @@ fn an_unknown_word_is_refused_without_a_form_to_point_at() {
 fn unimplemented_commands_are_recognised_rather_than_rejected() {
     // The distinction the whole "not implemented yet" outcome exists for: a
     // wrong error here sends a user hunting for a typo that is not there.
-    for line in ["export demo /tmp/demo", "import demo /tmp/demo.tar.gz"] {
-        assert!(
-            !command(line).is_implemented(),
-            "{line:?} is not implemented yet, and parsing must still recognise it"
-        );
-    }
+    let line = "import demo /tmp/demo.tar.gz";
+    assert!(
+        !command(line).is_implemented(),
+        "{line:?} is not implemented yet, and parsing must still recognise it"
+    );
 
     for line in [
         "--version",
@@ -321,6 +320,7 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         "update demo",
         "rollback demo",
         "remove demo",
+        "export demo /tmp/demo",
         "run demo",
         "run demo console",
         "run --stop demo",

@@ -190,7 +190,7 @@ pub const SURFACE: &[Spec] = &[
         form: "export <id> <path>",
         summary: "Write an app's data to <path>.tar.gz.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "import",

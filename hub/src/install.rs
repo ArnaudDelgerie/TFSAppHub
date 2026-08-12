@@ -553,33 +553,23 @@ pub fn check_identifier_free(registry: &Registry, identifier: &str) -> Result<()
     Ok(())
 }
 
-/// Who [`check_data_dir_available`] found already using the data directory.
-#[derive(Debug)]
-pub enum DataDirHolder {
-    /// A live app window holds the sidecar liveness lock (CONTRACT.md §6).
-    Window,
-    /// An active `run` command holds `run.lock` (rule 3). `alias` is
-    /// whatever [`lifecycle::probe_run_lock`] could read from the record —
-    /// `None` in the narrow window between `run`'s own lock acquisition and
-    /// its first write.
-    RunCommand { alias: Option<String> },
-}
-
 /// Refuse an install into a data directory something is already using —
 /// `install` is the data directory's third writer, and observes the same two
-/// locks `open`'s launch guard and `run`'s own rule 3 already read
-/// ([`lifecycle::probe_run_lock`], reused rather than reimplemented, and
-/// [`tfsapp_core::process::is_owner_live`], the same read-only probe
-/// `remove --purge` makes at `remove.rs`). This is the gap plain `remove`
-/// leaves open: it does not check whether the app is running, so a live
-/// window or an active `run` command can survive a `remove` and be exactly
-/// what a following `install` would otherwise run Composer and lifecycle
-/// commands against.
+/// locks `open`'s launch guard and `run`'s own rule 3 already read. This is
+/// the gap plain `remove` leaves open: it does not check whether the app is
+/// running, so a live window or an active `run` command can survive a
+/// `remove` and be exactly what a following `install` would otherwise run
+/// Composer and lifecycle commands against.
 ///
 /// A stale `sidecar.pid` whose owning process is gone must **not** refuse:
 /// [`tfsapp_core::process::is_owner_live`] already answers that correctly (a
 /// dead process holds no lock), so a crashed instance never locks an app out
 /// of being reinstalled.
+///
+/// A thin wrapper around [`lifecycle::data_dir_holder`], which `export`/
+/// `import` (plan 022) also call: this function's own job is only turning
+/// "something holds it" into `install`'s own [`InstallError::DataDirInUse`]
+/// and message, never a second copy of the probing itself.
 pub fn check_data_dir_available(id: &str, data_dir: &Path) -> Result<(), InstallError> {
     // The ordinary case, by far: a brand new `identifier` has no data
     // directory at all yet. Neither probe below may create one — both open
@@ -590,21 +580,12 @@ pub fn check_data_dir_available(id: &str, data_dir: &Path) -> Result<(), Install
         return Ok(());
     }
 
-    let pid_file = data_dir.join("sidecar.pid");
-    if tfsapp_core::process::is_owner_live(&pid_file).unwrap_or(false) {
-        return Err(InstallError::DataDirInUse {
+    match lifecycle::data_dir_holder(data_dir) {
+        Ok(None) => Ok(()),
+        Ok(Some(holder)) => Err(InstallError::DataDirInUse {
             id: id.to_string(),
             data_dir: data_dir.to_path_buf(),
-            holder: DataDirHolder::Window,
-        });
-    }
-
-    match lifecycle::probe_run_lock(data_dir) {
-        Ok(lifecycle::RunLockHeld::Free) => Ok(()),
-        Ok(lifecycle::RunLockHeld::Held { alias }) => Err(InstallError::DataDirInUse {
-            id: id.to_string(),
-            data_dir: data_dir.to_path_buf(),
-            holder: DataDirHolder::RunCommand { alias },
+            holder,
         }),
         Err(source) => Err(InstallError::Io {
             path: data_dir.join("run.lock"),
@@ -857,7 +838,7 @@ pub enum InstallError {
     DataDirInUse {
         id: String,
         data_dir: PathBuf,
-        holder: DataDirHolder,
+        holder: lifecycle::DataDirHolder,
     },
     /// The data directory records a version *newer* than the source being
     /// installed — a downgrade, refused rather than guessed at (CONTRACT.md
@@ -947,20 +928,20 @@ impl fmt::Display for InstallError {
                 data_dir,
                 holder,
             } => match holder {
-                DataDirHolder::Window => write!(
+                lifecycle::DataDirHolder::Window => write!(
                     formatter,
                     "{} is in use — {id} has a window open right now. Installing over it would \
                      run Composer and the app's own commands against the database that window \
                      has open; close {id} first.",
                     data_dir.display()
                 ),
-                DataDirHolder::RunCommand { alias: Some(alias) } => write!(
+                lifecycle::DataDirHolder::RunCommand { alias: Some(alias) } => write!(
                     formatter,
                     "{} is in use — {id}'s \"{alias}\" run command is still active. Stop it \
                      first with `tfsapp-hub run --stop {id}`.",
                     data_dir.display()
                 ),
-                DataDirHolder::RunCommand { alias: None } => write!(
+                lifecycle::DataDirHolder::RunCommand { alias: None } => write!(
                     formatter,
                     "{} is in use — a run command is still active for {id}. Stop it first with \
                      `tfsapp-hub run --stop {id}`.",
