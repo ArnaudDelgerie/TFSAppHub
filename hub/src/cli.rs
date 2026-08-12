@@ -67,9 +67,16 @@ pub enum Level {
 }
 
 /// Whether the hub can honour a form today.
+///
+/// `NotYet` has no `SURFACE` entry using it right now — `export`/`import`
+/// were the last (plan 022) — but the grammar rule it serves stays: a form
+/// gets declared here, and parseable, before the command behind it exists
+/// (plan 005's own habit, `export`/`import` included). The next command
+/// declared ahead of its implementation reaches for it again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Availability {
     Implemented,
+    #[allow(dead_code)]
     NotYet,
 }
 
@@ -190,14 +197,14 @@ pub const SURFACE: &[Spec] = &[
         form: "export <id> <path>",
         summary: "Write an app's data to <path>.tar.gz.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "import",
-        form: "import <id> <path> [--force]",
+        form: "import <id> <path> [--force] [--yes]",
         summary: "Seed an app's data from a .tar.gz written by export.",
         level: Level::App,
-        availability: Availability::NotYet,
+        availability: Availability::Implemented,
     },
     Spec {
         name: "run",
@@ -356,6 +363,7 @@ pub enum Command {
         id: String,
         path: String,
         force: bool,
+        assume_yes: bool,
     },
     Run(RunInvocation),
     /// Hidden, temporary — see [`PLATFORM_SUBCOMMAND`].
@@ -577,12 +585,13 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             Ok(Command::Export { id, path })
         }
         "import" => {
-            let mut options = options("import", rest, &[], &["--force"])?;
+            let mut options = options("import", rest, &[], &["--force", "--yes", "-y"])?;
             let (id, path) = options.exactly_two("import", "an app id and a path")?;
             Ok(Command::Import {
                 id,
                 path,
                 force: options.flag("--force"),
+                assume_yes: options.assume_yes(),
             })
         }
         "run" => parse_run(rest),

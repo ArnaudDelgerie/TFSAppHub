@@ -26,6 +26,7 @@ mod open;
 mod paths;
 mod php;
 mod platform;
+mod portability;
 mod prompt;
 mod publish;
 mod reconcile;
@@ -176,6 +177,13 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             &context.package_info().version.to_string(),
         ),
         Command::Rollback { id, assume_yes } => rollback::run(&id, assume_yes),
+        Command::Export { id, path } => portability::export(&id, &path),
+        Command::Import {
+            id,
+            path,
+            force,
+            assume_yes,
+        } => portability::import(&id, &path, force, assume_yes),
         Command::Remove {
             id,
             purge,
@@ -214,17 +222,6 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
                 context,
             );
             EXIT_OK
-        }
-        // Unreachable while the table above and this match agree, which is
-        // exactly what makes it worth keeping: a command marked implemented
-        // with no route here is a bug in one of the two, and it should say so
-        // rather than fall through to something plausible.
-        other => {
-            eprintln!(
-                "tfsapp-hub: {} is marked implemented but has no route — this is a bug.",
-                other.name()
-            );
-            EXIT_FAILED
         }
     }
 }

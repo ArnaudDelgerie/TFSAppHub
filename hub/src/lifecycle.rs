@@ -719,6 +719,46 @@ pub(crate) fn probe_run_lock(data_dir: &Path) -> std::io::Result<RunLockHeld> {
     Ok(RunLockHeld::Held { alias })
 }
 
+/// Who is already using a data directory — a live app window, or an active
+/// `run` command. Returned by [`data_dir_holder`]; `None` there means free.
+///
+/// Shared, not install-specific despite the name it carries over from plan
+/// 016: `export`/`import` (plan 022) are further writers into a data
+/// directory and refuse the same two ways something is already using it, so
+/// there is one definition of "who holds this data directory" rather than a
+/// second one that could drift from the first.
+#[derive(Debug)]
+pub enum DataDirHolder {
+    /// A live app window holds the sidecar liveness lock (CONTRACT.md §6).
+    Window,
+    /// An active `run` command holds `run.lock` (rule 3). `alias` is
+    /// whatever [`probe_run_lock`] could read from the record — `None` in
+    /// the narrow window between `run`'s own lock acquisition and its first
+    /// write.
+    RunCommand { alias: Option<String> },
+}
+
+/// Probe whether something already holds `data_dir` — a live window, then an
+/// active `run` command, in that order — returning who, if anyone.
+///
+/// The window check comes first because it is the more common case and the
+/// cheaper probe; both are read-only and retain nothing, exactly like
+/// [`probe_run_lock`] itself. `data_dir` not existing is out of scope here —
+/// each caller already knows what "nothing to check yet" means for its own
+/// command (an install has nothing to refuse; an export has nothing to
+/// read), so that is decided before this is ever called.
+pub fn data_dir_holder(data_dir: &Path) -> io::Result<Option<DataDirHolder>> {
+    let pid_file = data_dir.join("sidecar.pid");
+    if tfsapp_core::process::is_owner_live(&pid_file).unwrap_or(false) {
+        return Ok(Some(DataDirHolder::Window));
+    }
+
+    match probe_run_lock(data_dir)? {
+        RunLockHeld::Free => Ok(None),
+        RunLockHeld::Held { alias } => Ok(Some(DataDirHolder::RunCommand { alias })),
+    }
+}
+
 /// Rule 3's launch-side refusal (plan 013, CONTRACT.md §6): refuse to open a
 /// window while a `run` command holds `run.lock` for this app, naming the
 /// active alias when [`probe_run_lock`] found one and pointing at the way to

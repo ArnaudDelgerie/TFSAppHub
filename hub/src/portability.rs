@@ -1,0 +1,756 @@
+//! `export <id> <path>` / `import <id> <path> [--force] [--yes]` — moving one
+//! installed app's data between machines (`../.project/plan/022-export-and-
+//! import.md`).
+//!
+//! This module holds what needs no I/O and is worth getting right in
+//! isolation before the two commands built on it: [`Manifest`], the archive's
+//! only metadata, and [`import_decision`], the whole of what `import` refuses
+//! and why. The commands themselves — the busy guard, the tar/gzip writing
+//! and reading, the confirmation, the rescue dump, the anchor discard, the
+//! forward migration of an archive older than what is installed — are
+//! [`export`] and [`import`], added once the primitives below have their own
+//! tests.
+//!
+//! **What travels, and what does not.** The archive holds exactly
+//! `manifest.json` at its root and `data/` plus [`lifecycle::DB_FILE_NAMES`],
+//! whichever of those three exist — never re-listed here, read from
+//! `lifecycle` directly so there is one spelling of "the database" across the
+//! update/rollback anchor and this pair. Everything else in a data directory
+//! (`cache/`, `build/`, `log/`, `sessions/`, `secrets.json`, `config.json`,
+//! the live locks, the rollback anchor) is excluded, each for its own reason
+//! — see the plan's Overview, not restated here.
+
+use std::{
+    fmt, fs,
+    io::{self, Read},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    archive::{self, ArchiveError},
+    cli::{EXIT_FAILED, EXIT_OK},
+    install::{self, InstallError},
+    lifecycle::{self, LifecycleEvent},
+    manifest::{self, ManifestError},
+    paths::{Paths, PathsError},
+    php::{self, PhpError},
+    prompt,
+    registry::{self, RegistryError},
+    update,
+};
+
+/// `manifest.json`, at the archive's root — the only metadata `export`
+/// writes and `import` reads back.
+///
+/// `unknown` carries a manifest a later hub wrote through untouched, the same
+/// "warn on an unknown key, never refuse" rule `registry.rs`'s own `unknown`
+/// fields follow: a manifest this hub cannot fully read is still a manifest
+/// it can compare `identifier` and `app_version` from.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Manifest {
+    /// The exporting registry entry's own `identifier` — what `import`
+    /// checks against the installation it is seeding, never against the
+    /// hub's own identity.
+    pub identifier: String,
+    /// The exporting registry entry's own `app_version` — what `import`
+    /// refuses to write into a data directory a newer app already occupies.
+    pub app_version: String,
+    /// RFC 3339, UTC — [`crate::registry::now_timestamp`]'s own convention,
+    /// reused rather than reformatted a second way.
+    pub exported_at: String,
+    #[serde(flatten)]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The manifest's filename at the archive's root.
+pub const MANIFEST_FILE: &str = "manifest.json";
+
+/// The archive's internal directory holding the curated database files —
+/// [`lifecycle::DB_FILE_NAMES`] joined under it, never a separate list.
+pub const DATA_DIR: &str = "data";
+
+/// Why `import <id> <path>` refuses, in the fixed order [`import_decision`]
+/// checks them.
+///
+/// Identifier first, then version, then the populated dir: the two
+/// unconditional refusals are checked before the one `--force` can unlock,
+/// so a foreign archive is never reported as "pass --force" and a future
+/// archive is never reported as merely "the data dir is populated".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportRefusal {
+    /// The archive's `identifier` is not the installation's own. Not a
+    /// decision to override — `--force` does not reach this.
+    IdentifierMismatch { archive: String, installed: String },
+    /// The archive's `app_version` is newer than the installed app's.
+    /// `--force` does not reach this either: writing a future version into
+    /// `data/config.json` would leave the next launch on
+    /// [`lifecycle::LifecycleDecisionError::Downgrade`], which has no
+    /// recovery path.
+    ArchiveNewer { archive: String, installed: String },
+    /// The data directory already holds a database. The one refusal
+    /// `--force` unlocks.
+    DataDirPopulated,
+}
+
+/// The whole of what `import` refuses, and why — pure, no I/O: every input is
+/// already resolved by the caller (the manifest read from the archive, the
+/// installed identity and version from the registry entry, whether the data
+/// directory is populated from [`data_dir_populated`]).
+///
+/// `manifest.app_version` is expected to already parse as semver — `export`
+/// only ever writes a registry entry's own `app_version`, which `install`
+/// refused to accept in any other shape (CONTRACT.md §2) — so the caller
+/// reads and validates `manifest.json` before this is ever reached, exactly
+/// as `install::lifecycle_event_for_install` trusts the installed side's own
+/// already-validated version.
+pub fn import_decision(
+    manifest: &Manifest,
+    installed_identifier: &str,
+    installed_version: &semver::Version,
+    data_dir_populated: bool,
+    force: bool,
+) -> Result<(), ImportRefusal> {
+    if manifest.identifier != installed_identifier {
+        return Err(ImportRefusal::IdentifierMismatch {
+            archive: manifest.identifier.clone(),
+            installed: installed_identifier.to_string(),
+        });
+    }
+
+    let archive_version = semver::Version::parse(&manifest.app_version)
+        .expect("the caller already validated manifest.app_version before calling import_decision");
+    if archive_version > *installed_version {
+        return Err(ImportRefusal::ArchiveNewer {
+            archive: archive_version.to_string(),
+            installed: installed_version.to_string(),
+        });
+    }
+
+    if data_dir_populated && !force {
+        return Err(ImportRefusal::DataDirPopulated);
+    }
+
+    Ok(())
+}
+
+impl std::fmt::Display for ImportRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IdentifierMismatch { archive, installed } => write!(
+                formatter,
+                "this archive was exported from {archive}, but this installation is \
+                 {installed} — importing it would seed the wrong app's data."
+            ),
+            Self::ArchiveNewer { archive, installed } => write!(
+                formatter,
+                "this archive is from version {archive}, but the installed app is only \
+                 {installed} — importing it would write data a newer app understands into an \
+                 older one. Update the app first."
+            ),
+            Self::DataDirPopulated => write!(
+                formatter,
+                "this installation already has a database. Pass --force to replace it — the \
+                 current one is rescue-dumped first, never destroyed outright."
+            ),
+        }
+    }
+}
+
+/// Whether `data_subdir` already holds a database — the one criterion
+/// [`import_decision`] and `import` itself act on.
+///
+/// `app.db` existing, specifically: not "the directory exists" (`install`
+/// creates it empty before anything else runs) and not "`config.json`
+/// exists" (same), so a reinstall-then-import sequence is never spuriously
+/// refused.
+pub fn data_dir_populated(data_subdir: &Path) -> bool {
+    data_subdir.join("app.db").is_file()
+}
+
+/// `tfsapp-hub export <id> <path>` — resolve `Paths`, run the pipeline, and
+/// turn the result into an exit code.
+pub fn export(id: &str, path: &str) -> i32 {
+    let paths = match Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+
+    match run_export(&paths, id, Path::new(path)) {
+        Ok(()) => EXIT_OK,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            EXIT_FAILED
+        }
+    }
+}
+
+/// The pipeline: resolve the registry entry, refuse a busy data dir, build
+/// the manifest, write the curated `.tar.gz` atomically, and report what was
+/// written.
+///
+/// Takes its `Paths` rather than resolving them, matching every other
+/// command's pipeline — what lets it run against a throwaway root in a test.
+fn run_export(paths: &Paths, id: &str, target: &Path) -> Result<(), PortabilityError> {
+    let installed = registry::load(paths)?;
+    let entry = installed
+        .get(id)
+        .ok_or_else(|| PortabilityError::NotInstalled { id: id.to_string() })?;
+
+    if target.exists() {
+        return Err(PortabilityError::TargetExists {
+            path: target.to_path_buf(),
+        });
+    }
+
+    let data_dir = paths.app_data_dir(&entry.identifier)?;
+    let holder = busy_holder(&data_dir).map_err(|source| PortabilityError::Io {
+        path: data_dir.join("run.lock"),
+        source,
+    })?;
+    if let Some(holder) = holder {
+        return Err(PortabilityError::Busy {
+            id: id.to_string(),
+            holder,
+            action: Action::Export,
+        });
+    }
+    let data_subdir = data_dir.join("data");
+
+    let manifest = Manifest {
+        identifier: entry.identifier.clone(),
+        app_version: entry.app_version.clone(),
+        exported_at: registry::now_timestamp(),
+        unknown: serde_json::Map::new(),
+    };
+
+    let written = write_archive(target, &manifest, &data_subdir)?;
+
+    println!(
+        "Exported {id} ({}) to {}.",
+        manifest.app_version,
+        target.display()
+    );
+    if written.is_empty() {
+        println!("  no database yet — this installation has never been opened.");
+    } else {
+        for name in &written {
+            println!("  {DATA_DIR}/{name}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether something already holds `data_dir` — a live window, or an active
+/// `run` command — shared by `export` and `import` (plan 022) so both refuse
+/// the same two ways rather than probing a second time each in their own
+/// words.
+///
+/// A data directory that does not exist yet is not busy: nothing has ever
+/// written to it, so there is nothing to guard against, exactly as
+/// `install::check_data_dir_available` treats it.
+fn busy_holder(data_dir: &Path) -> io::Result<Option<lifecycle::DataDirHolder>> {
+    if !data_dir.is_dir() {
+        return Ok(None);
+    }
+    lifecycle::data_dir_holder(data_dir)
+}
+
+/// Write `manifest` and whichever of [`lifecycle::DB_FILE_NAMES`] exist under
+/// `data_subdir` into a fresh `.tar.gz`, to a temp path beside `target` and
+/// `rename`d into place — so a failure midway leaves `target` itself
+/// untouched, never a half-written archive at the name the caller asked for.
+///
+/// Returns the DB file names actually written, in [`lifecycle::DB_FILE_NAMES`]'s
+/// order — empty when the installation has no database yet.
+fn write_archive(
+    target: &Path,
+    manifest: &Manifest,
+    data_subdir: &Path,
+) -> Result<Vec<&'static str>, PortabilityError> {
+    let temporary = target.with_extension("tmp");
+    let io_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| PortabilityError::Io { path, source }
+    };
+
+    let file = fs::File::create(&temporary).map_err(io_error(&temporary))?;
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        file,
+        flate2::Compression::default(),
+    ));
+
+    let manifest_json = serde_json::to_vec_pretty(manifest)
+        .expect("a Manifest holds nothing that can fail to serialise");
+    append_bytes(&mut builder, MANIFEST_FILE, &manifest_json).map_err(io_error(&temporary))?;
+
+    let mut written = Vec::new();
+    for name in lifecycle::DB_FILE_NAMES {
+        let source_path = data_subdir.join(name);
+        if !source_path.is_file() {
+            continue;
+        }
+        let bytes = fs::read(&source_path).map_err(io_error(&source_path))?;
+        let archive_path = format!("{DATA_DIR}/{name}");
+        append_bytes(&mut builder, &archive_path, &bytes).map_err(io_error(&temporary))?;
+        written.push(name);
+    }
+
+    let encoder = builder.into_inner().map_err(io_error(&temporary))?;
+    encoder.finish().map_err(io_error(&temporary))?;
+
+    fs::rename(&temporary, target).map_err(io_error(target))?;
+
+    Ok(written)
+}
+
+/// Append one in-memory file to `builder` at `archive_path`, with an ordinary
+/// `0644` mode and this process's own start-adjacent mtime — nothing here
+/// reads back a timestamp so any fixed, valid one does.
+fn append_bytes<W: io::Write>(
+    builder: &mut tar::Builder<W>,
+    archive_path: &str,
+    data: &[u8],
+) -> io::Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(data.len() as u64);
+    header.set_mode(0o644);
+    let mtime = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    header.set_mtime(mtime);
+    header.set_cksum();
+    builder.append_data(&mut header, archive_path, data)
+}
+
+/// `tfsapp-hub import <id> <path> [--force] [--yes]` — resolve `Paths`, run
+/// the pipeline, and turn the result into an exit code.
+pub fn import(id: &str, path: &str, force: bool, assume_yes: bool) -> i32 {
+    let paths = match Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+
+    match run_import(&paths, id, Path::new(path), force, assume_yes) {
+        Ok(true) => EXIT_OK,
+        // Declining is not a failure of the command, but nothing changed
+        // either — a script reading 0 would conclude it did.
+        Ok(false) => EXIT_FAILED,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            EXIT_FAILED
+        }
+    }
+}
+
+/// The pipeline (the plan's step 3): resolve the entry, read the manifest out
+/// of the archive before anything else, refuse a busy data dir, run
+/// [`import_decision`], confirm when overwriting, then — past the point of no
+/// return — rescue-dump, discard the anchor, extract, migrate forward when
+/// the archive is older than what is installed, and record the version.
+/// `false` means the user declined.
+///
+/// Takes its `Paths` rather than resolving them, matching every other
+/// command's pipeline — what lets it run against a throwaway root in a test.
+fn run_import(
+    paths: &Paths,
+    id: &str,
+    archive_path: &Path,
+    force: bool,
+    assume_yes: bool,
+) -> Result<bool, PortabilityError> {
+    let installed = registry::load(paths)?;
+    let entry = installed
+        .get(id)
+        .ok_or_else(|| PortabilityError::NotInstalled { id: id.to_string() })?
+        .clone();
+
+    // Before anything else touches the data dir: a malformed or non-archive
+    // `<path>` is a clean refusal here rather than a half-run pipeline.
+    let manifest = read_manifest(archive_path)?;
+    let archive_version = semver::Version::parse(&manifest.app_version).map_err(|error| {
+        PortabilityError::MalformedManifest {
+            path: archive_path.to_path_buf(),
+            detail: format!("app_version {:?}: {error}", manifest.app_version),
+        }
+    })?;
+
+    let data_dir = paths.app_data_dir(&entry.identifier)?;
+    let holder = busy_holder(&data_dir).map_err(|source| PortabilityError::Io {
+        path: data_dir.join("run.lock"),
+        source,
+    })?;
+    if let Some(holder) = holder {
+        return Err(PortabilityError::Busy {
+            id: id.to_string(),
+            holder,
+            action: Action::Import,
+        });
+    }
+    let data_subdir = data_dir.join("data");
+
+    let installed_version = semver::Version::parse(&entry.app_version)
+        .expect("the registry only ever holds a canonical semver app_version");
+    let populated = data_dir_populated(&data_subdir);
+    import_decision(
+        &manifest,
+        &entry.identifier,
+        &installed_version,
+        populated,
+        force,
+    )
+    .map_err(PortabilityError::Refused)?;
+
+    if populated {
+        announce_overwrite(
+            id,
+            &data_subdir,
+            &entry.app_version,
+            &archive_version.to_string(),
+        );
+        if !prompt::confirmed(assume_yes) {
+            println!("Aborted — nothing was changed.");
+            return Ok(false);
+        }
+    }
+
+    // The point of no return: everything above only reads. What follows
+    // rescue-dumps what it is about to overwrite, discards the anchor
+    // (an import proceeding has already made it incoherent — see the
+    // Overview), and then writes.
+    let rescue_path = rescue_dump(&data_subdir)?;
+    lifecycle::discard_rollback_anchor(&data_subdir);
+    lifecycle::discard_db_snapshot(&data_subdir);
+    update::discard_tree(&paths.app_dir(id)?);
+
+    archive::extract_prefix(archive_path, DATA_DIR, &data_subdir)
+        .map_err(PortabilityError::Archive)?;
+
+    // `lifecycle::check_version` — the guard every `open` runs — reads only
+    // `data/config.json`; it has no way to tell "an update never finished"
+    // from "an older archive was just imported", and refuses either way. Left
+    // at the archive's own version, an older archive would make the app
+    // permanently unopenable: `open` refuses citing `update <id>`, and
+    // `update` itself cannot rescue it, because its own decision compares the
+    // registry to the freshly resolved *source*, never to the data directory
+    // (`update::update_decision`'s own doc) — so an unchanged source reads as
+    // "nothing to update" regardless of what the data directory says. Running
+    // the installed manifest's `pre-update`/`post-update` right here — the
+    // same event `update`'s own `Apply` runs — is what keeps "restore an
+    // older backup onto an already-updated installation", the ordinary
+    // cross-machine case (the plan's Overview), from landing on data nothing
+    // can ever open again.
+    let migrated_forward = if archive_version < installed_version {
+        let app_dir = paths.app_dir(id)?;
+        let installed_manifest = manifest::load(&app_dir)?.manifest;
+        let toolchain = php::toolchain(paths)?;
+        install::prepare(
+            paths,
+            &toolchain,
+            &installed_manifest,
+            &app_dir,
+            LifecycleEvent::Update,
+        )?;
+        true
+    } else {
+        // Equal versions only — `import_decision` already refused anything
+        // newer. `install::prepare` writes the version record itself when it
+        // runs above; this is the branch where nothing else does.
+        lifecycle::write_data_version(&data_subdir, &manifest.app_version)?;
+        false
+    };
+
+    if let Some(rescue_path) = rescue_path {
+        println!(
+            "The database being replaced was saved to {}.",
+            rescue_path.display()
+        );
+    }
+    if migrated_forward {
+        println!(
+            "Imported into {id} at {} and migrated forward to {} — the archive was older than \
+             the installed app, so pre-update then post-update ran on it.",
+            manifest.app_version, entry.app_version
+        );
+    } else {
+        println!("Imported into {id} at {}.", manifest.app_version);
+    }
+    println!(
+        "  this machine keeps its own APP_SECRET: any session or remember-me token in the \
+         imported database is invalid here, anything the source encrypted with its own \
+         APP_SECRET is unreadable, and actions.secrets values must be re-provisioned"
+    );
+
+    Ok(true)
+}
+
+/// Read and parse `manifest.json` out of the archive at `archive_path`,
+/// without extracting anything else — `import`'s first read, so a malformed
+/// or non-`.tar.gz` file is refused before the data directory is touched at
+/// all.
+fn read_manifest(archive_path: &Path) -> Result<Manifest, PortabilityError> {
+    let io_error = |source: io::Error| PortabilityError::Io {
+        path: archive_path.to_path_buf(),
+        source,
+    };
+
+    let file = fs::File::open(archive_path).map_err(io_error)?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let entries = archive.entries().map_err(io_error)?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(io_error)?;
+        let path = entry.path().map_err(io_error)?.into_owned();
+        if path != Path::new(MANIFEST_FILE) {
+            continue;
+        }
+
+        let mut contents = String::new();
+        entry.read_to_string(&mut contents).map_err(io_error)?;
+        return serde_json::from_str(&contents).map_err(|error| {
+            PortabilityError::MalformedManifest {
+                path: archive_path.to_path_buf(),
+                detail: error.to_string(),
+            }
+        });
+    }
+
+    Err(PortabilityError::NoManifest {
+        path: archive_path.to_path_buf(),
+    })
+}
+
+/// Say what overwriting is about to cost, in the terms the user will have to
+/// reason about afterwards — `rollback.rs`'s own `announce` for this
+/// command's shape of "and if I got this wrong?".
+fn announce_overwrite(
+    id: &str,
+    data_subdir: &Path,
+    installed_version: &str,
+    archive_version: &str,
+) {
+    println!(
+        "Import into {id}: {installed_version} data -> replaced by the archive's {archive_version}"
+    );
+    println!(
+        "  its current database will be replaced — the database being replaced will be saved \
+         to {}",
+        lifecycle::rescue_dump_path(data_subdir, "app.db").display()
+    );
+    println!(
+        "  its rollback anchor, if any, will be discarded — a rollback after this import would \
+         have nothing coherent left to restore"
+    );
+}
+
+/// Copy the *current* database aside, before it is overwritten by the
+/// archive's — a manual-recovery artefact, never auto-restored. Returns
+/// `app.db`'s own rescue path, the one named on screen; `None` when there was
+/// nothing to save (an app that never got as far as creating a database).
+///
+/// `rollback.rs`'s own `rescue_dump`, duplicated rather than shared: both are
+/// small, module-private pipeline steps over the same
+/// [`lifecycle::rescue_dump_path`], and the two commands' error types differ.
+fn rescue_dump(data_subdir: &Path) -> Result<Option<PathBuf>, PortabilityError> {
+    let mut app_db_rescue = None;
+    for name in lifecycle::DB_FILE_NAMES {
+        let source = data_subdir.join(name);
+        if !source.is_file() {
+            continue;
+        }
+        let rescue = lifecycle::rescue_dump_path(data_subdir, name);
+        fs::copy(&source, &rescue).map_err(|error| PortabilityError::Io {
+            path: rescue.clone(),
+            source: error,
+        })?;
+        if name == "app.db" {
+            app_db_rescue = Some(rescue);
+        }
+    }
+    Ok(app_db_rescue)
+}
+
+/// Which command [`PortabilityError::Busy`] was refusing — its message names
+/// the risk in the command's own terms rather than a shared, blander one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Action {
+    Export,
+    Import,
+}
+
+/// Everything that can stop `export` or `import`, in one type so both
+/// commands have one place to print from — `rollback.rs`'s own
+/// `RollbackError` is the template.
+#[derive(Debug)]
+pub enum PortabilityError {
+    Paths(PathsError),
+    Registry(RegistryError),
+    Archive(ArchiveError),
+    Lifecycle(lifecycle::LifecycleError),
+    /// Reloading the installed manifest, or running its `pre-update`/
+    /// `post-update` commands, to migrate an older archive forward.
+    Install(InstallError),
+    Manifest(ManifestError),
+    Php(PhpError),
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    /// No app is registered under this id at all.
+    NotInstalled {
+        id: String,
+    },
+    /// `export`'s target already exists.
+    TargetExists {
+        path: PathBuf,
+    },
+    /// A live window or an active `run` command holds the data directory.
+    Busy {
+        id: String,
+        holder: lifecycle::DataDirHolder,
+        action: Action,
+    },
+    /// The archive at `path` has no `manifest.json` at its root.
+    NoManifest {
+        path: PathBuf,
+    },
+    /// `manifest.json` exists but is not readable as a [`Manifest`], or its
+    /// `app_version` does not parse as semver.
+    MalformedManifest {
+        path: PathBuf,
+        detail: String,
+    },
+    /// [`import_decision`] refused.
+    Refused(ImportRefusal),
+}
+
+impl fmt::Display for PortabilityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Paths(error) => write!(formatter, "{error}"),
+            Self::Registry(error) => write!(formatter, "{error}"),
+            Self::Archive(error) => write!(formatter, "{error}"),
+            Self::Lifecycle(error) => write!(formatter, "{error}"),
+            Self::Install(error) => write!(formatter, "{error}"),
+            Self::Manifest(error) => write!(formatter, "{error}"),
+            Self::Php(error) => write!(formatter, "{error}"),
+            Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
+            Self::NotInstalled { id } => write!(
+                formatter,
+                "no app is installed as {id} — `tfsapp-hub list` shows the ones that are."
+            ),
+            Self::TargetExists { path } => write!(
+                formatter,
+                "{} already exists — pick another path, or remove it first. export never \
+                 overwrites a file it did not just write.",
+                path.display()
+            ),
+            Self::Busy { id, holder, action } => {
+                let (verb, risk) = match action {
+                    Action::Export => ("exporting", "copy its database mid-write"),
+                    Action::Import => (
+                        "importing",
+                        "corrupt the database it writes into, or leave it reading a file that \
+                         changed out from under it",
+                    ),
+                };
+                match holder {
+                    lifecycle::DataDirHolder::Window => write!(
+                        formatter,
+                        "{id} has a window open right now — {verb} while it's open could \
+                         {risk}. Close {id} first."
+                    ),
+                    lifecycle::DataDirHolder::RunCommand { alias: Some(alias) } => write!(
+                        formatter,
+                        "{id}'s \"{alias}\" run command is still active — {verb} while it's \
+                         running could {risk}. Stop it first with `tfsapp-hub run --stop {id}`."
+                    ),
+                    lifecycle::DataDirHolder::RunCommand { alias: None } => write!(
+                        formatter,
+                        "a run command is still active for {id} — {verb} while it's running \
+                         could {risk}. Stop it first with `tfsapp-hub run --stop {id}`."
+                    ),
+                }
+            }
+            Self::NoManifest { path } => write!(
+                formatter,
+                "{}: no manifest.json at its root — this does not look like an archive \
+                 `export` wrote.",
+                path.display()
+            ),
+            Self::MalformedManifest { path, detail } => write!(
+                formatter,
+                "{}: its manifest.json is unreadable ({detail}) — this does not look like an \
+                 archive `export` wrote.",
+                path.display()
+            ),
+            Self::Refused(refusal) => write!(formatter, "{refusal}"),
+        }
+    }
+}
+
+impl std::error::Error for PortabilityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Paths(error) => Some(error),
+            Self::Registry(error) => Some(error),
+            Self::Archive(error) => Some(error),
+            Self::Lifecycle(error) => Some(error),
+            Self::Install(error) => Some(error),
+            Self::Manifest(error) => Some(error),
+            Self::Php(error) => Some(error),
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<PathsError> for PortabilityError {
+    fn from(error: PathsError) -> Self {
+        Self::Paths(error)
+    }
+}
+
+impl From<RegistryError> for PortabilityError {
+    fn from(error: RegistryError) -> Self {
+        Self::Registry(error)
+    }
+}
+
+impl From<lifecycle::LifecycleError> for PortabilityError {
+    fn from(error: lifecycle::LifecycleError) -> Self {
+        Self::Lifecycle(error)
+    }
+}
+
+impl From<InstallError> for PortabilityError {
+    fn from(error: InstallError) -> Self {
+        Self::Install(error)
+    }
+}
+
+impl From<ManifestError> for PortabilityError {
+    fn from(error: ManifestError) -> Self {
+        Self::Manifest(error)
+    }
+}
+
+impl From<PhpError> for PortabilityError {
+    fn from(error: PhpError) -> Self {
+        Self::Php(error)
+    }
+}
+
+#[cfg(test)]
+#[path = "portability_tests.rs"]
+mod tests;
