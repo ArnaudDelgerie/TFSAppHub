@@ -362,6 +362,28 @@ before it extracts, announced in the overwrite list ahead of the
 confirmation — losing the ability to roll back is the honest price of
 replacing the data underneath it.
 
+**An archive older than the installed app is migrated forward, right inside
+import.** This is the plan's own ordinary case — restore a backup onto an
+installation whose source has since moved on — and it very nearly shipped
+without it: `lifecycle::check_version`, the guard every `open` runs, reads
+only `data/config.json` and cannot tell "an update never finished" from "an
+older archive just landed here" — it refuses either way, naming
+`update <id>` as the way out. `update <id>` cannot actually rescue it, though:
+its own decision compares the registry's `app_version` to the freshly
+re-resolved *source*, never to the data directory
+(`update::update_decision`'s own doc), so an unchanged source reads as
+"nothing to update" regardless of what `data/config.json` says. Left
+unhandled, importing the ordinary case would have left the app permanently
+unopenable — caught only by running the end-to-end validation for real rather
+than trusting the design read. The fix reuses `install::prepare` under
+`LifecycleEvent::Update` — the exact event `update`'s own `Apply` runs —
+against the *installed* manifest (reloaded from `apps/<id>`, never the
+archive's own), right after extraction: `pre-update` then `post-update` run
+over the freshly imported database, and the version record lands on what is
+actually installed, not on the archive's older one. An archive at the
+installed version skips this — nothing to migrate — and one newer is already
+refused before either path is reached.
+
 **Extraction reuses `archive.rs`'s safety checks under a different shape.**
 `archive::extract` requires exactly one top-level directory, which does not
 fit an archive holding `manifest.json` and `data/` side by side, so

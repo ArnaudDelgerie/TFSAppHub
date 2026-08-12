@@ -6,7 +6,8 @@
 //! isolation before the two commands built on it: [`Manifest`], the archive's
 //! only metadata, and [`import_decision`], the whole of what `import` refuses
 //! and why. The commands themselves — the busy guard, the tar/gzip writing
-//! and reading, the confirmation, the rescue dump, the anchor discard — are
+//! and reading, the confirmation, the rescue dump, the anchor discard, the
+//! forward migration of an archive older than what is installed — are
 //! [`export`] and [`import`], added once the primitives below have their own
 //! tests.
 //!
@@ -31,8 +32,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     archive::{self, ArchiveError},
     cli::{EXIT_FAILED, EXIT_OK},
-    lifecycle,
+    install::{self, InstallError},
+    lifecycle::{self, LifecycleEvent},
+    manifest::{self, ManifestError},
     paths::{Paths, PathsError},
+    php::{self, PhpError},
     prompt,
     registry::{self, RegistryError},
     update,
@@ -352,7 +356,8 @@ pub fn import(id: &str, path: &str, force: bool, assume_yes: bool) -> i32 {
 /// The pipeline (the plan's step 3): resolve the entry, read the manifest out
 /// of the archive before anything else, refuse a busy data dir, run
 /// [`import_decision`], confirm when overwriting, then — past the point of no
-/// return — rescue-dump, discard the anchor, extract, and record the version.
+/// return — rescue-dump, discard the anchor, extract, migrate forward when
+/// the archive is older than what is installed, and record the version.
 /// `false` means the user declined.
 ///
 /// Takes its `Paths` rather than resolving them, matching every other
@@ -431,7 +436,39 @@ fn run_import(
     archive::extract_prefix(archive_path, DATA_DIR, &data_subdir)
         .map_err(PortabilityError::Archive)?;
 
-    lifecycle::write_data_version(&data_subdir, &manifest.app_version)?;
+    // `lifecycle::check_version` — the guard every `open` runs — reads only
+    // `data/config.json`; it has no way to tell "an update never finished"
+    // from "an older archive was just imported", and refuses either way. Left
+    // at the archive's own version, an older archive would make the app
+    // permanently unopenable: `open` refuses citing `update <id>`, and
+    // `update` itself cannot rescue it, because its own decision compares the
+    // registry to the freshly resolved *source*, never to the data directory
+    // (`update::update_decision`'s own doc) — so an unchanged source reads as
+    // "nothing to update" regardless of what the data directory says. Running
+    // the installed manifest's `pre-update`/`post-update` right here — the
+    // same event `update`'s own `Apply` runs — is what keeps "restore an
+    // older backup onto an already-updated installation", the ordinary
+    // cross-machine case (the plan's Overview), from landing on data nothing
+    // can ever open again.
+    let migrated_forward = if archive_version < installed_version {
+        let app_dir = paths.app_dir(id)?;
+        let installed_manifest = manifest::load(&app_dir)?.manifest;
+        let toolchain = php::toolchain(paths)?;
+        install::prepare(
+            paths,
+            &toolchain,
+            &installed_manifest,
+            &app_dir,
+            LifecycleEvent::Update,
+        )?;
+        true
+    } else {
+        // Equal versions only — `import_decision` already refused anything
+        // newer. `install::prepare` writes the version record itself when it
+        // runs above; this is the branch where nothing else does.
+        lifecycle::write_data_version(&data_subdir, &manifest.app_version)?;
+        false
+    };
 
     if let Some(rescue_path) = rescue_path {
         println!(
@@ -439,11 +476,15 @@ fn run_import(
             rescue_path.display()
         );
     }
-    println!("Imported into {id} at {}.", manifest.app_version);
-    println!(
-        "  the next launch will open on this data directly, or migrate it forward if this \
-         archive is older than {id}'s installed version"
-    );
+    if migrated_forward {
+        println!(
+            "Imported into {id} at {} and migrated forward to {} — the archive was older than \
+             the installed app, so pre-update then post-update ran on it.",
+            manifest.app_version, entry.app_version
+        );
+    } else {
+        println!("Imported into {id} at {}.", manifest.app_version);
+    }
     println!(
         "  this machine keeps its own APP_SECRET: any session or remember-me token in the \
          imported database is invalid here, anything the source encrypted with its own \
@@ -556,6 +597,11 @@ pub enum PortabilityError {
     Registry(RegistryError),
     Archive(ArchiveError),
     Lifecycle(lifecycle::LifecycleError),
+    /// Reloading the installed manifest, or running its `pre-update`/
+    /// `post-update` commands, to migrate an older archive forward.
+    Install(InstallError),
+    Manifest(ManifestError),
+    Php(PhpError),
     Io {
         path: PathBuf,
         source: io::Error,
@@ -595,6 +641,9 @@ impl fmt::Display for PortabilityError {
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Archive(error) => write!(formatter, "{error}"),
             Self::Lifecycle(error) => write!(formatter, "{error}"),
+            Self::Install(error) => write!(formatter, "{error}"),
+            Self::Manifest(error) => write!(formatter, "{error}"),
+            Self::Php(error) => write!(formatter, "{error}"),
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::NotInstalled { id } => write!(
                 formatter,
@@ -657,6 +706,9 @@ impl std::error::Error for PortabilityError {
             Self::Registry(error) => Some(error),
             Self::Archive(error) => Some(error),
             Self::Lifecycle(error) => Some(error),
+            Self::Install(error) => Some(error),
+            Self::Manifest(error) => Some(error),
+            Self::Php(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -678,6 +730,24 @@ impl From<RegistryError> for PortabilityError {
 impl From<lifecycle::LifecycleError> for PortabilityError {
     fn from(error: lifecycle::LifecycleError) -> Self {
         Self::Lifecycle(error)
+    }
+}
+
+impl From<InstallError> for PortabilityError {
+    fn from(error: InstallError) -> Self {
+        Self::Install(error)
+    }
+}
+
+impl From<ManifestError> for PortabilityError {
+    fn from(error: ManifestError) -> Self {
+        Self::Manifest(error)
+    }
+}
+
+impl From<PhpError> for PortabilityError {
+    fn from(error: PhpError) -> Self {
+        Self::Php(error)
     }
 }
 

@@ -5,7 +5,7 @@ use super::{
     Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE,
 };
 use crate::{
-    lifecycle,
+    install, lifecycle,
     paths::Paths,
     registry::{self, Platform, RegistryEntry, Source, SourceKind, State},
 };
@@ -732,4 +732,134 @@ fn an_archive_with_a_traversal_entry_is_refused_by_archives_own_checks() {
     let error = run_import(&paths, "demo", &archive, false, true)
         .expect_err("a traversal entry is refused by archive's own checks");
     assert!(matches!(error, PortabilityError::Archive(_)), "{error}");
+}
+
+// --- import migrates an older archive forward --------------------------
+
+/// A fixture app whose `bin/console` records what it was asked to do —
+/// `install_tests.rs`'s/`update_tests.rs`'s own `runnable_app_tree`,
+/// self-contained per this file's own convention (`seeded_entry`'s doc)
+/// rather than imported from another module's `_tests.rs`.
+fn runnable_app_tree(root: &Path, app_version: &str, commands: &str) {
+    fs::create_dir_all(root).expect("a project root");
+    fs::write(
+        root.join("tfsapp.config.json"),
+        format!(
+            r#"{{
+              "product_name": "Demo App",
+              "identifier": "dev.local.demo",
+              "project_name": "demo",
+              "app_version": "{app_version}",
+              "commands": {commands}
+            }}"#
+        ),
+    )
+    .expect("a manifest");
+    fs::write(root.join("composer.json"), "{}").expect("a composer.json");
+
+    fs::create_dir_all(root.join("bin")).expect("a bin dir");
+    fs::write(
+        root.join("bin/console"),
+        r#"<?php
+        $arguments = array_slice($argv, 1);
+        file_put_contents(
+            getenv('APP_LOG_DIR') . '/hooks.log',
+            implode(' ', $arguments) . "\n",
+            FILE_APPEND
+        );
+        exit(in_array('boom', $arguments, true) ? 1 : 0);
+        "#,
+    )
+    .expect("a console");
+
+    fs::create_dir_all(root.join("public")).expect("a public dir");
+    fs::write(root.join("public/index.php"), "<?php").expect("a front controller");
+}
+
+/// The bundled interpreter and Composer, or a reason to skip — copied from
+/// `install_tests.rs`/`update_tests.rs` rather than shared, exactly as their
+/// own doc comments already explain: `make check` has to stay green on a
+/// fresh clone where `make resources` has never run.
+fn resources_present() -> bool {
+    let missing: Vec<_> = [
+        crate::platform::bundled_frankenphp(),
+        crate::php::bundled_composer(),
+    ]
+    .into_iter()
+    .filter(|candidates| !candidates.iter().any(|path| path.is_file()))
+    .collect();
+
+    for candidates in &missing {
+        eprintln!(
+            "skipped: none of {candidates:?} are there — run `make resources` to cover this one"
+        );
+    }
+    missing.is_empty()
+}
+
+#[test]
+fn an_archive_older_than_the_installed_app_is_migrated_forward_on_import() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+
+    // `pre-update`/`post-update` are properties of the manifest, not of an
+    // event in progress — declared once, and only ever run under
+    // `LifecycleEvent::Update`, whichever command decides that is the event.
+    // A plain install runs neither; import's own migrate-forward step is
+    // what reaches them here.
+    runnable_app_tree(
+        source.path(),
+        "1.3.0",
+        r#"{"pre-update": ["cache:clear"], "post-update": ["about"]}"#,
+    );
+    install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the install succeeds")
+    .expect("the user did not decline");
+
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.0")),
+            (&format!("{DATA_DIR}/app.db"), b"older-backup"),
+        ],
+    );
+
+    let proceeded = run_import(&paths, "demo", &archive, true, true)
+        .expect("an older archive over a populated dir, forced");
+    assert!(proceeded);
+
+    let config: tfsapp_core::ports::DataConfig = serde_json::from_str(
+        &fs::read_to_string(data_subdir.join("config.json")).expect("config.json"),
+    )
+    .expect("a parseable config.json");
+    assert_eq!(
+        config.version, "1.3.0",
+        "the record must land on the installed version, not the archive's older one"
+    );
+
+    let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
+    assert_eq!(
+        fs::read_to_string(log).expect("a hook trace"),
+        "cache:clear\nabout\n",
+        "the installed manifest's pre-update then post-update must run over the imported data"
+    );
+
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("the imported database"),
+        b"older-backup",
+        "the imported bytes are what the hooks ran against, not a fixture database"
+    );
 }
