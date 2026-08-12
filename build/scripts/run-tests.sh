@@ -40,13 +40,38 @@ export XDG_RUNTIME_DIR
 # The workspace root, so `cargo test` covers both `core/` and `hub/`.
 cd "$ROOT_DIR"
 
-# gnome-keyring-daemon registers org.freedesktop.secrets on the private bus
-# dbus-run-session hands it — that is all the `keyring` crate needs to find it,
-# no exported control-socket vars required. `dbus-run-session` tears the whole
-# private bus (and everything D-Bus-activated on it, including this daemon)
-# down when the inner command exits, so nothing outlives this script.
+# gnome-keyring-daemon runs in the *foreground*, as a background child of the
+# inner shell below rather than detached via `--daemonize` — its lifetime is
+# therefore exactly this shell's, torn down by the trap on any exit (success,
+# failure, or a future timeout), never left to a detached process that
+# `dbus-run-session`'s own bus teardown might or might not reach. Before
+# `cargo test` starts, the shell polls the private bus until
+# `org.freedesktop.secrets` has an owner: D-Bus only *activates* a name's
+# configured service when the name has no owner yet, so once this daemon
+# holds it first, the tests can never trigger activation into a locked,
+# unprompted daemon of their own (audit 004/P3 — the indefinite hang this
+# guards against).
+# The single quotes below are the point: this whole block is one script
+# string handed to the inner `bash -c`, expanded by that shell, not this one.
+# shellcheck disable=SC2016
 dbus-run-session -- bash -c '
   set -euo pipefail
-  gnome-keyring-daemon --daemonize --unlock --components=secrets <<< ""
+
+  gnome-keyring-daemon --foreground --unlock --components=secrets <<< "" &
+  daemon_pid=$!
+  trap "kill $daemon_pid 2>/dev/null" EXIT
+
+  waited=0
+  until dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+      /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+      string:org.freedesktop.secrets 2>/dev/null | grep -q "boolean true"; do
+    if [ "$waited" -ge 100 ]; then
+      echo "run-tests.sh: gnome-keyring-daemon (pid $daemon_pid) never took org.freedesktop.secrets on the private bus after 10s — see audit 004/P3." >&2
+      exit 1
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+
   cargo test "$@"
 ' -- "$@"
