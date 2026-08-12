@@ -30,6 +30,14 @@ XDG_RUNTIME_DIR="$(mktemp -d)"
 chmod 700 "$XDG_RUNTIME_DIR"
 
 cleanup() {
+  # gvfsd-fuse mounts a FUSE filesystem at $XDG_RUNTIME_DIR/gvfs on demand;
+  # its own teardown races this trap when the private bus goes away, so
+  # `rm -rf` can hit it while still mounted ("Device or resource busy" — the
+  # gvfs failure diagnosed in audit 004/P3, there attributed to the
+  # XDG_DATA_HOME dir rather than this one). Force-unmount it first,
+  # quietly and best-effort: it is often already gone by the time we get
+  # here, and it is never ours to leave mounted either way.
+  fusermount3 -uz "$XDG_RUNTIME_DIR/gvfs" 2>/dev/null || true
   rm -rf "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
 }
 trap cleanup EXIT
