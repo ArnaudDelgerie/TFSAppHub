@@ -1,10 +1,11 @@
 use std::{fs, path::Path};
 
 use super::{
-    data_dir_populated, import_decision, run_export, ImportRefusal, Manifest, PortabilityError,
-    MANIFEST_FILE,
+    append_bytes, data_dir_populated, import_decision, run_export, run_import, ImportRefusal,
+    Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE,
 };
 use crate::{
+    lifecycle,
     paths::Paths,
     registry::{self, Platform, RegistryEntry, Source, SourceKind, State},
 };
@@ -366,4 +367,369 @@ fn a_crashed_instance_does_not_block_export() {
     let target = base.path().join("backup.tar.gz");
 
     run_export(&paths, "demo", &target).expect("a crashed instance must not block export");
+}
+
+// --- run_import ----------------------------------------------------------
+
+fn manifest_json(identifier: &str, app_version: &str) -> Vec<u8> {
+    serde_json::to_vec(&manifest(identifier, app_version)).expect("a serialisable manifest")
+}
+
+fn write_test_archive(path: &Path, entries: &[(&str, &[u8])]) {
+    let file = fs::File::create(path).expect("create archive file");
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        file,
+        flate2::Compression::fast(),
+    ));
+    for (name, data) in entries {
+        append_bytes(&mut builder, name, data).expect("append entry");
+    }
+    let encoder = builder.into_inner().expect("finish tar layer");
+    encoder.finish().expect("finish gzip layer");
+}
+
+/// Append an entry whose path bypasses `Header::set_path`'s own "relative, no
+/// `..`" validation — `archive_tests.rs`'s own fixture trick, duplicated here
+/// rather than shared: the only way to build an archive this crate's
+/// *builder* would refuse to write honestly, needed to prove `import`
+/// refuses one written by some other tool entirely.
+fn append_raw_path(
+    builder: &mut tar::Builder<flate2::write::GzEncoder<fs::File>>,
+    raw_path: &str,
+    content: &[u8],
+) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(content.len() as u64);
+    header.set_mode(0o644);
+    {
+        let name = &mut header.as_old_mut().name;
+        for byte in name.iter_mut() {
+            *byte = 0;
+        }
+        let bytes = raw_path.as_bytes();
+        assert!(
+            bytes.len() <= name.len(),
+            "fixture path too long for a raw header"
+        );
+        name[..bytes.len()].copy_from_slice(bytes);
+    }
+    header.set_cksum();
+    builder.append(&header, content).expect("append raw entry");
+}
+
+#[test]
+fn importing_an_unregistered_id_refuses() {
+    let (base, paths) = temp_paths();
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[(MANIFEST_FILE, &manifest_json("dev.local.demo", "1.0.0"))],
+    );
+
+    let error =
+        run_import(&paths, "demo", &archive, false, true).expect_err("nothing is installed");
+    assert!(
+        matches!(error, PortabilityError::NotInstalled { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn importing_a_non_archive_file_is_a_clean_refusal() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let not_an_archive = base.path().join("notes.txt");
+    fs::write(&not_an_archive, b"hello, this is not a tar.gz").expect("a plain text file");
+
+    let error =
+        run_import(&paths, "demo", &not_an_archive, false, true).expect_err("not a tar.gz at all");
+    assert!(
+        matches!(
+            error,
+            PortabilityError::Io { .. } | PortabilityError::NoManifest { .. }
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_archive_missing_manifest_json_is_refused() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let archive = base.path().join("no-manifest.tar.gz");
+    write_test_archive(&archive, &[(&format!("{DATA_DIR}/app.db"), b"sqlite")]);
+
+    let error =
+        run_import(&paths, "demo", &archive, false, true).expect_err("no manifest.json at all");
+    assert!(
+        matches!(error, PortabilityError::NoManifest { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn importing_refuses_a_foreign_identifier() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[(MANIFEST_FILE, &manifest_json("dev.local.other", "1.2.3"))],
+    );
+
+    let error = run_import(&paths, "demo", &archive, true, true)
+        .expect_err("a foreign archive is always refused, even with force");
+    assert!(
+        matches!(
+            error,
+            PortabilityError::Refused(ImportRefusal::IdentifierMismatch { .. })
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn importing_refuses_an_archive_newer_than_the_installed_app_even_with_force() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[(MANIFEST_FILE, &manifest_json("dev.local.demo", "9.9.9"))],
+    );
+
+    let error = run_import(&paths, "demo", &archive, true, true)
+        .expect_err("a future archive is never adopted, even with force");
+    assert!(
+        matches!(
+            error,
+            PortabilityError::Refused(ImportRefusal::ArchiveNewer { .. })
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn importing_over_a_populated_dir_without_force_touches_nothing() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    fs::write(data_subdir.join("app.db"), b"existing").expect("an existing database");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{DATA_DIR}/app.db"), b"incoming"),
+        ],
+    );
+
+    let error = run_import(&paths, "demo", &archive, false, true)
+        .expect_err("a populated data dir needs --force");
+    assert!(
+        matches!(
+            error,
+            PortabilityError::Refused(ImportRefusal::DataDirPopulated)
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("untouched"),
+        b"existing"
+    );
+}
+
+#[test]
+fn declining_the_overwrite_confirmation_touches_nothing() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    fs::write(data_subdir.join("app.db"), b"existing").expect("an existing database");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{DATA_DIR}/app.db"), b"incoming"),
+        ],
+    );
+
+    // stdin is not a terminal under the test harness, and assume_yes is
+    // false: `prompt::confirmed` refuses non-interactively, which is exactly
+    // the decline path this exercises.
+    let proceeded = run_import(&paths, "demo", &archive, true, false)
+        .expect("a non-interactive decline is Ok(false), not an error");
+
+    assert!(!proceeded);
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("untouched"),
+        b"existing"
+    );
+}
+
+#[test]
+fn a_forced_import_rescue_dumps_the_replaced_database_and_discards_the_anchor() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    fs::write(data_subdir.join("app.db"), b"existing").expect("an existing database");
+    lifecycle::write_rollback_anchor(
+        &data_subdir,
+        &lifecycle::RollbackAnchor {
+            app_version: "1.1.0".to_string(),
+            source_revision: "sha256:previous".to_string(),
+            created_at: registry::now_timestamp(),
+        },
+    )
+    .expect("a seeded anchor");
+    fs::write(
+        lifecycle::db_snapshot_path(&data_subdir, "app.db"),
+        b"pre-update-snapshot",
+    )
+    .expect("a seeded db snapshot");
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    fs::create_dir_all(lifecycle::previous_tree_path(&app_dir)).expect("a retained tree");
+
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{DATA_DIR}/app.db"), b"incoming"),
+        ],
+    );
+
+    let proceeded = run_import(&paths, "demo", &archive, true, true)
+        .expect("force unlocks a populated data dir");
+    assert!(proceeded);
+
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("the new database"),
+        b"incoming"
+    );
+    assert_eq!(
+        fs::read(lifecycle::rescue_dump_path(&data_subdir, "app.db"))
+            .expect("the replaced database, rescue-dumped"),
+        b"existing"
+    );
+    assert!(
+        lifecycle::read_rollback_anchor(&data_subdir).is_none(),
+        "the anchor's rollback.json half must be gone"
+    );
+    assert!(
+        !lifecycle::db_snapshot_path(&data_subdir, "app.db").is_file(),
+        "the anchor's database-snapshot half must be gone"
+    );
+    assert!(
+        !lifecycle::previous_tree_path(&app_dir).is_dir(),
+        "the anchor's retained-tree half must be gone"
+    );
+}
+
+#[test]
+fn a_successful_import_writes_the_manifests_version_and_preserves_an_existing_port_override() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    fs::write(
+        data_subdir.join("config.json"),
+        r#"{"version":"0.0.0","port_override":4242}"#,
+    )
+    .expect("a config.json with a port override, from before this app ever had a database");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{DATA_DIR}/app.db"), b"seeded"),
+        ],
+    );
+
+    run_import(&paths, "demo", &archive, false, true).expect("an empty data dir needs no force");
+
+    let config: tfsapp_core::ports::DataConfig = serde_json::from_str(
+        &fs::read_to_string(data_subdir.join("config.json")).expect("config.json"),
+    )
+    .expect("a parseable config.json");
+    assert_eq!(config.version, "1.2.3");
+    assert_eq!(config.port_override, Some(4242));
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("the seeded database"),
+        b"seeded"
+    );
+}
+
+#[test]
+fn a_live_window_refuses_the_import() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    fs::create_dir_all(&data_dir).expect("a data dir");
+    let pid_file = data_dir.join("sidecar.pid");
+    let _holder = tfsapp_core::process::try_lock_file(&tfsapp_core::process::lock_path(&pid_file))
+        .expect("no I/O error")
+        .expect("the lock is free to take");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[(MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3"))],
+    );
+
+    let error = run_import(&paths, "demo", &archive, false, true)
+        .expect_err("a live window owns this data dir");
+    assert!(matches!(error, PortabilityError::Busy { .. }), "{error}");
+}
+
+#[test]
+fn an_active_run_command_refuses_the_import_naming_the_alias() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    fs::create_dir_all(&data_dir).expect("a data dir");
+    let run_lock_path = data_dir.join("run.lock");
+    let _holder = tfsapp_core::process::try_lock_file(&run_lock_path)
+        .expect("no I/O error")
+        .expect("the lock is free to take");
+    fs::write(&run_lock_path, "migrate\n1234").expect("a run.lock record");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[(MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3"))],
+    );
+
+    let error = run_import(&paths, "demo", &archive, false, true)
+        .expect_err("an active run command owns this data dir");
+    let message = error.to_string();
+    assert!(message.contains("migrate"), "{message}");
+    assert!(message.contains("run --stop demo"), "{message}");
+}
+
+#[test]
+fn an_archive_with_a_traversal_entry_is_refused_by_archives_own_checks() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let archive = base.path().join("malicious.tar.gz");
+    let file = fs::File::create(&archive).expect("create archive file");
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        file,
+        flate2::Compression::fast(),
+    ));
+    append_bytes(
+        &mut builder,
+        MANIFEST_FILE,
+        &manifest_json("dev.local.demo", "1.2.3"),
+    )
+    .expect("manifest entry");
+    append_raw_path(&mut builder, "data/../../evil", b"pwned");
+    let encoder = builder.into_inner().expect("finish tar layer");
+    encoder.finish().expect("finish gzip layer");
+
+    let error = run_import(&paths, "demo", &archive, false, true)
+        .expect_err("a traversal entry is refused by archive's own checks");
+    assert!(matches!(error, PortabilityError::Archive(_)), "{error}");
 }

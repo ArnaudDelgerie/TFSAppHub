@@ -104,6 +104,71 @@ pub fn extract(archive_path: &Path, destination: &Path) -> Result<PathBuf, Archi
     }
 }
 
+/// Extract every entry under `prefix` from the `.tar.gz` at `archive_path`
+/// into `destination`, with `prefix` stripped — the same per-entry safety
+/// checks [`extract`] applies (`check_safe_path`, `check_safe_link`), but
+/// with none of its "exactly one top-level directory" requirement.
+///
+/// `import` (plan 022) is the caller this exists for: the archive `export`
+/// writes holds `manifest.json` and `data/` side by side at its root, which
+/// [`extract`] would reject outright as either no top-level directory (if
+/// `manifest.json` sorts first) or two of them. An entry outside `prefix` —
+/// `manifest.json` above all, which `import` reads separately before this
+/// ever runs — is silently skipped, not an error: this function's job is
+/// "seed `destination` from the entries that belong there", not "validate
+/// the whole archive".
+///
+/// `destination` is created if missing. An entry naming `prefix` itself
+/// (the directory entry some tar writers emit for it) is skipped rather
+/// than written, since it strips to an empty relative path.
+pub fn extract_prefix(
+    archive_path: &Path,
+    prefix: &str,
+    destination: &Path,
+) -> Result<(), ArchiveError> {
+    fs::create_dir_all(destination).map_err(ArchiveError::Io)?;
+
+    let file = fs::File::open(archive_path).map_err(ArchiveError::Io)?;
+    let mut archive = Archive::new(GzDecoder::new(file));
+
+    for entry in archive.entries().map_err(ArchiveError::Io)? {
+        let mut entry = entry.map_err(ArchiveError::Io)?;
+
+        // Same bookkeeping-not-content exemption `extract` grants — see its
+        // own comment on why `git archive`-style pax headers reach here at
+        // all.
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_pax_global_extensions() || entry_type.is_pax_local_extensions() {
+            continue;
+        }
+
+        let path = entry.path().map_err(ArchiveError::Io)?.into_owned();
+        check_safe_path(&path)?;
+
+        let Ok(relative) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            // Checked against `relative`, not `path`: what matters is
+            // whether the link escapes `destination` once written there,
+            // and `path` still carries `prefix`'s own extra depth.
+            check_safe_link(&mut entry, relative, entry_type)?;
+        }
+
+        let out_path = destination.join(relative);
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).map_err(ArchiveError::Io)?;
+        }
+        entry.unpack(&out_path).map_err(ArchiveError::Io)?;
+    }
+
+    Ok(())
+}
+
 /// Reject an absolute path or one carrying a `..` component, and return its
 /// first (top-level) component on success — every entry's path is checked
 /// this way before anything about it is trusted further.

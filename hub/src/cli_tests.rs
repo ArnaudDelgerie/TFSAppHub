@@ -169,6 +169,16 @@ fn bare_words_route_to_an_app() {
             id: "demo".to_string(),
             path: "/tmp/demo.tar.gz".to_string(),
             force: true,
+            assume_yes: false,
+        }
+    );
+    assert_eq!(
+        command("import demo /tmp/demo.tar.gz --force -y"),
+        Command::Import {
+            id: "demo".to_string(),
+            path: "/tmp/demo.tar.gz".to_string(),
+            force: true,
+            assume_yes: true,
         }
     );
 }
@@ -299,15 +309,12 @@ fn an_unknown_word_is_refused_without_a_form_to_point_at() {
 }
 
 #[test]
-fn unimplemented_commands_are_recognised_rather_than_rejected() {
-    // The distinction the whole "not implemented yet" outcome exists for: a
-    // wrong error here sends a user hunting for a typo that is not there.
-    let line = "import demo /tmp/demo.tar.gz";
-    assert!(
-        !command(line).is_implemented(),
-        "{line:?} is not implemented yet, and parsing must still recognise it"
-    );
-
+fn every_declared_command_is_implemented() {
+    // `export`/`import` were the last two `Availability::NotYet` entries
+    // (plan 022) — nothing in `SURFACE` answers `EXIT_UNIMPLEMENTED` any
+    // more. Kept as one test naming every command rather than reading
+    // `SURFACE` itself, so a future regression to `NotYet` fails here rather
+    // than silently changing what this test covers.
     for line in [
         "--version",
         "--help",
@@ -321,6 +328,7 @@ fn unimplemented_commands_are_recognised_rather_than_rejected() {
         "rollback demo",
         "remove demo",
         "export demo /tmp/demo",
+        "import demo /tmp/demo.tar.gz",
         "run demo",
         "run demo console",
         "run --stop demo",

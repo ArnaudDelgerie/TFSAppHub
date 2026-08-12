@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf};
 use flate2::{write::GzEncoder, Compression};
 use tar::{Builder, EntryType, Header};
 
-use super::{extract, ArchiveError};
+use super::{extract, extract_prefix, ArchiveError};
 
 fn write_archive(
     dir: &std::path::Path,
@@ -247,4 +247,91 @@ fn an_archive_with_two_top_level_directories_is_refused() {
         matches!(error, ArchiveError::MultipleTopLevelDirectories { .. }),
         "{error}"
     );
+}
+
+// --- extract_prefix (plan 022, `import`'s own extractor) -------------------
+
+#[test]
+fn extract_prefix_writes_only_entries_under_the_prefix_stripped() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let archive = write_archive(temp.path(), "export.tar.gz", |builder| {
+        append_file(builder, "manifest.json", b"{}");
+        append_file(builder, "data/app.db", b"sqlite");
+        append_file(builder, "data/app.db-wal", b"wal");
+    });
+
+    let destination = temp.path().join("out");
+    extract_prefix(&archive, "data", &destination).expect("a clean extraction");
+
+    assert_eq!(
+        fs::read_to_string(destination.join("app.db")).expect("app.db on disk"),
+        "sqlite"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("app.db-wal")).expect("app.db-wal on disk"),
+        "wal"
+    );
+    // `manifest.json` sits outside the prefix — never written at all, not
+    // even under some other name.
+    assert!(!destination.join("manifest.json").exists());
+    assert!(!temp.path().join("out/manifest.json").exists());
+}
+
+#[test]
+fn extract_prefix_skips_a_directory_entry_naming_the_prefix_itself() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let archive = write_archive(temp.path(), "with-dir-entry.tar.gz", |builder| {
+        append_dir(builder, "data/");
+        append_file(builder, "data/app.db", b"sqlite");
+    });
+
+    let destination = temp.path().join("out");
+    extract_prefix(&archive, "data", &destination).expect("the bare prefix entry is skipped");
+
+    assert_eq!(
+        fs::read_to_string(destination.join("app.db")).expect("app.db on disk"),
+        "sqlite"
+    );
+}
+
+#[test]
+fn extract_prefix_refuses_a_parent_dir_entry_even_outside_the_prefix() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let archive = write_archive(temp.path(), "traversal.tar.gz", |builder| {
+        append_raw_path(builder, "../evil", b"pwned");
+        append_file(builder, "data/app.db", b"sqlite");
+    });
+
+    let error = extract_prefix(&archive, "data", &temp.path().join("out"))
+        .expect_err("a traversal entry, even one that would fall outside the prefix");
+    assert!(matches!(error, ArchiveError::UnsafePath { .. }), "{error}");
+}
+
+#[test]
+fn extract_prefix_refuses_a_symlink_under_the_prefix_that_escapes_the_destination() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let archive = write_archive(temp.path(), "symlink.tar.gz", |builder| {
+        append_symlink(builder, "data/evil", "/etc/passwd");
+    });
+
+    let error = extract_prefix(&archive, "data", &temp.path().join("out"))
+        .expect_err("an escaping symlink");
+    assert!(matches!(error, ArchiveError::UnsafeLink { .. }), "{error}");
+}
+
+#[test]
+fn extract_prefix_accepts_a_symlink_under_the_prefix_that_stays_inside_it() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let archive = write_archive(temp.path(), "internal-symlink.tar.gz", |builder| {
+        append_file(builder, "data/app.db", b"sqlite");
+        append_symlink(builder, "data/alias.db", "app.db");
+    });
+
+    let destination = temp.path().join("out");
+    extract_prefix(&archive, "data", &destination).expect("a benign internal symlink");
+
+    let link = destination.join("alias.db");
+    assert!(fs::symlink_metadata(&link)
+        .expect("the symlink was written")
+        .is_symlink());
 }
