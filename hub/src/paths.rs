@@ -149,9 +149,9 @@ impl Paths {
     ///
     /// Stable and real is not incidental: it is what removes the cause of the
     /// station's wipe-cache-per-launch, where a random `/tmp/.mount_*` FUSE
-    /// path baked itself into the compiled Symfony container. Claiming a warm
-    /// cache needs its own measurement and its own plan; this function only
-    /// makes it possible.
+    /// path baked itself into the compiled Symfony container. This function
+    /// only makes a warm cache possible; plan 024 (`app_env::resolve`'s
+    /// `Mode::Launch`, and the stamp in `lifecycle.rs`) is what claims it.
     pub fn app_dir(&self, id: &str) -> Result<PathBuf, PathsError> {
         Ok(self.apps_root().join(safe_segment("app id", id)?))
     }

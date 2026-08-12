@@ -163,7 +163,12 @@ open. In order:
 10. Write the version record into the data directory — **only** once every
     step above has succeeded, and every event, including an equal record
     rewriting itself.
-11. Refresh the stable copy of the hub itself, and write the app's `.desktop`
+11. Run `bin/console cache:warmup` through the same toolchain the lifecycle
+    commands just ran with, and, only if it succeeds, write the cache stamp
+    (plan 024 — "Opening an app", below, has the full mechanism). A failure
+    here is a warning, not an install failure: the cache is a derived
+    artefact, and the next launch rebuilds it the slow way instead.
+12. Refresh the stable copy of the hub itself, and write the app's `.desktop`
     entry — best-effort, and skipped together by `--no-desktop-entry`.
 
 Step 10 is the one worth defending. The record is what decides whether a later
@@ -272,15 +277,19 @@ versions.
 4. `Apply`, in order: snapshot `app.db` (+ `-wal`/`-shm`), retain the
    outgoing tree at `apps/<id>.previous` (a rename, never a copy — the cost
    of holding an anchor is one generation of the tree, not a copy pass over
-   it), copy the new tree in, empty the app's own cache/build directories,
-   run `install::prepare` under the update event (`pre-update` then
-   `post-update`), then — only once every step above has succeeded — write
-   the rollback anchor's third half from the *outgoing* registry entry,
-   stamp the registry with the new one, and rewrite the desktop entry.
+   it), copy the new tree in, empty the app's own cache/build directories
+   (they are about to boot a container compiled from code that is no longer
+   there), run `install::prepare` under the update event (`pre-update` then
+   `post-update`, then the same `cache:warmup`-and-stamp `install` itself
+   runs — plan 024), then — only once every step above has succeeded —
+   write the rollback anchor's third half from the *outgoing* registry
+   entry, stamp the registry with the new one, and rewrite the desktop
+   entry.
 5. Any failure from the tree swap onward reverts the whole attempt: the
    database snapshot is restored, the copied-in tree is removed, the
-   outgoing tree is renamed back — and the registry is never touched, so the
-   next `open` does not know an update was attempted at all.
+   outgoing tree is renamed back, the cache stamp `prepare`'s own warm-up
+   may already have written is discarded — and the registry is never
+   touched, so the next `open` does not know an update was attempted at all.
 
 **The rollback anchor is three halves, or none.** `rollback <id>` refuses
 unless all three are present, naming whichever is missing:
@@ -582,6 +591,76 @@ registered.
 Step 3's order is load-bearing too: `messenger:setup-transports` runs before
 anything is spawned, so an app that declares a worker without the Doctrine
 Messenger bridge fails with no sidecar to tear down.
+
+### The cache stamp, and why a launch only sometimes rebuilds (plan 024)
+
+`APP_CACHE_DIR`/`APP_BUILD_DIR` hold the compiled Symfony container —
+`CONTRACT.md` §3 lets the host empty them at any launch, and for a while the
+hub always did: the station wiped both on every launch because a random
+`/tmp/.mount_*` FUSE path baked itself into the compiled container, so reusing
+one across an upgrade meant running last version's container against this
+version's code, and the hub inherited that workaround deliberately without
+inheriting its cause — installed apps run from a stable real path
+(`<OS data>/TFSApp/hub/apps/<id>/`), never a fresh mount per launch. Doing
+that unconditionally on every `open` meant every single launch of an
+installed app compiled the container from scratch,
+in a process with no terminal attached, while the user watched the cold-start
+splash — the dominant cost of a launch by far, confirmed by the measurement
+in `.project/plan/024-a-persistent-warm-symfony-cache.md`.
+
+The replacement moves the build to the moment that has a terminal and makes
+the invalidation explicit. `install` and `update` each run `bin/console
+cache:warmup` themselves, through the app's own toolchain, right after the
+lifecycle event's commands succeed — the hub runs it, not the app, because an
+app that forgets to declare a warm-up must not be the one paying for it at
+every launch, and `cache/`/`build/` are the hub's own directories to manage.
+Only once that warm-up succeeds does the hub write a stamp to
+`data/cache.json`, beside `data/config.json`: the app's `app_version`, the
+absolute path of the snapshot the container was compiled from, and the
+`Platform` fingerprint (below) the PHP that compiled it ran under — the same
+shape and the same "never written speculatively" rule as the version record.
+
+At `open`, `Mode::Launch` compares that stamp against what the launch is
+actually about to run, and empties `cache/`/`build/` only when one of the
+three no longer matches, logging which one to `hub.log` before it does:
+
+- **`app_version`** moves on every `update`, and moves *back* on a
+  `rollback` — which restores the tree but, deliberately, does not rewrite
+  the stamp `update`'s own warm-up left behind (out of scope for this plan:
+  "warming at rollback" makes the first launch after one *correct*, by
+  wiping; making it *fast* too is a separate, smaller question). So the
+  first launch after a rollback rebuilds, at the un-warmed cost, and every
+  launch after it keeps rebuilding the same way until the next `install` or
+  `update` re-stamps it.
+- **the snapshot path** only moves if an installed app's tree were relocated
+  outside the hub's own commands — not something anything here does, but
+  cheap to check since the stamp already carries it.
+- **the `Platform` fingerprint** moves when a hub self-update changes the
+  bundled PHP or its extensions. `open::resolve` never trusts the registry
+  entry's own `platform` field blindly for this: when `needs-revalidation`
+  sends it through `revalidate::revalidate` first, it builds the stamp to
+  compare against from the freshly re-probed `Platform` that call returns,
+  not the (possibly stale, in-memory) one it started with — otherwise a
+  revalidation that itself detected the drift would immediately paper back
+  over it. `revalidate.rs` itself never touches `cache.json`: the mismatch
+  is caught here, naturally, the same way a rollback's is.
+- **a hand-emptied `cache/`** overrides an otherwise-matching stamp: the
+  stamp is a claim about what was built, not a promise that it is still on
+  disk, and a launch must never reuse a container that is not there.
+
+`Mode::Install`, `Mode::Dev` and `Mode::Run` are untouched by any of this —
+`Mode::Install` always starts from an empty cache by construction, and dev's
+own container invalidates itself on file change (`Mode::Dev` never wipes,
+matching the CONTRACT.md §3 parenthetical).
+
+**Why the layout does not move.** Putting `cache/`/`build/` inside the
+snapshot (`apps/<id>/`) was considered and rejected: it would make
+update/rollback invalidation structural and free — a new tree simply has no
+old cache to find — but it drags the cache out of the `0700` directory
+`paths::create_app_data_dir` enforces, and tightening `apps/<id>/` to match
+is a permissions change plan 024 was not worth spending. The five
+directories (`cache/`, `build/`, `log/`, `sessions/`, `data/`) stay exactly
+where §3 already puts them; only *when* two of them are emptied changed.
 
 ### Where each process's output goes, and who reads a failure
 
