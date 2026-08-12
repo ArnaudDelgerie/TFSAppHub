@@ -764,6 +764,34 @@ format and is not on the roadmap. Read per-`identifier` storage as tidiness, not
 as secrecy, and do not store in it something whose disclosure to another
 application on the same machine would be a breach.
 
+### An installation moves between machines — the database is what travels
+
+`tfsapp-hub export <id> <path>` and `tfsapp-hub import <id> <path>` carry one
+installed app's data to another machine, or to a fresh install on the same
+one. The guarantee is narrow and worth stating in exactly those terms: **the
+database travels, and nothing else in the data directory does.**
+
+`cache/`, `build/`, `log/`, `sessions/` do not travel — each is either
+machine-specific or gets regenerated on the destination's next launch anyway.
+Neither does `secrets.json`, the plaintext keyring fallback: it holds
+`APP_SECRET` and every `actions.secrets` value in the clear, and shipping it
+in a file people copy around would turn a convenience into a disclosure. An
+app must not treat anything outside its own database as portable state — a
+value stashed in `cache/` or read back from a file it wrote beside the
+database is not carried by an export, whatever survives a reinstall on the
+same machine.
+
+Two consequences an app author should know rather than discover. **The
+destination's `APP_SECRET` is never part of the transfer** — it keeps
+whatever secret the destination already had, or resolves one fresh exactly as
+any first use does (see above). Every session and remember-me token in the
+imported database stops validating there, the same one-time reset a backend
+flip already causes, and the app should treat a login prompt right after an
+import as expected rather than a bug to chase. **`actions.secrets` values do
+not travel either** — they live in the OS keyring under the destination's own
+identifier (§7), untouched by an import, and must be re-provisioned there by
+whatever provisioned them the first time.
+
 ---
 
 ## 6. Lifecycle
