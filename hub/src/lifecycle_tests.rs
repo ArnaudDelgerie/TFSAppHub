@@ -7,14 +7,16 @@ use std::{
 };
 
 use super::{
-    acquire_launch_locks, anchor_state, db_snapshot_path, decide_launch, dialog_is_warranted,
-    discard_db_snapshot, discard_rollback_anchor, lifecycle_decision, prepare_dev_launch,
-    previous_tree_path, probe_run_lock, read_data_version, read_rollback_anchor, rescue_dump_path,
-    restore_db_snapshot, rollback_anchor_path, serving_lock_path, snapshot_db, veto_exit,
-    write_data_version, write_rollback_anchor, Anchor, LaunchDecision, LaunchLockError,
+    acquire_launch_locks, anchor_state, cache_stamp_path, db_snapshot_path, decide_launch,
+    dialog_is_warranted, discard_db_snapshot, discard_rollback_anchor, lifecycle_decision,
+    prepare_dev_launch, previous_tree_path, probe_run_lock, read_cache_stamp, read_data_version,
+    read_rollback_anchor, rescue_dump_path, restore_db_snapshot, rollback_anchor_path,
+    serving_lock_path, snapshot_db, veto_exit, write_cache_stamp, write_data_version,
+    write_rollback_anchor, Anchor, CacheStamp, CacheStatus, LaunchDecision, LaunchLockError,
     LifecycleDecisionError, LifecycleError, LifecycleEvent, RollbackAnchor, RunLockHeld,
     DB_FILE_NAMES,
 };
+use crate::registry::Platform;
 
 fn version(text: &str) -> semver::Version {
     semver::Version::parse(text).expect("a semver version")
@@ -301,6 +303,168 @@ fn writing_a_version_leaves_no_temp_file_behind() {
     // The write is temp-file-plus-rename so a crash can never leave a truncated
     // record; the rename is also what must leave nothing beside it.
     assert!(!data_subdir.path().join("config.json.tmp").exists());
+}
+
+// --- the cache stamp (plan 024) ---------------------------------------------
+
+fn platform(php_version: &str) -> Platform {
+    Platform {
+        php_version: php_version.to_string(),
+        extensions_hash: "deadbeef".to_string(),
+    }
+}
+
+fn a_stamp() -> CacheStamp {
+    CacheStamp {
+        app_version: "0.6.0".to_string(),
+        snapshot_path: "/home/arnaud/.local/share/TFSApp/hub/apps/tfsapp-test".to_string(),
+        platform: platform("8.5"),
+    }
+}
+
+/// A cache dir with at least one file in it — what a real `cache:warmup`
+/// leaves behind, and what [`read_cache_stamp`] requires beside a matching
+/// stamp before it will call the container reusable.
+fn populate_cache_dir(cache_dir: &Path) {
+    fs::create_dir_all(cache_dir).expect("a cache dir");
+    fs::write(cache_dir.join("container.php"), b"<?php").expect("a cache file");
+}
+
+#[test]
+fn no_stamp_at_all_is_absent() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let cache_dir = data_subdir.path().join("cache");
+    populate_cache_dir(&cache_dir);
+
+    assert_eq!(
+        read_cache_stamp(data_subdir.path(), &cache_dir, &a_stamp()),
+        CacheStatus::Absent
+    );
+}
+
+#[test]
+fn a_matching_stamp_with_a_populated_cache_dir_matches() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let cache_dir = data_subdir.path().join("cache");
+    populate_cache_dir(&cache_dir);
+    write_cache_stamp(data_subdir.path(), &a_stamp()).expect("a written stamp");
+
+    assert_eq!(
+        read_cache_stamp(data_subdir.path(), &cache_dir, &a_stamp()),
+        CacheStatus::Matches
+    );
+}
+
+#[test]
+fn a_different_app_version_is_a_mismatch() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let cache_dir = data_subdir.path().join("cache");
+    populate_cache_dir(&cache_dir);
+    write_cache_stamp(data_subdir.path(), &a_stamp()).expect("a written stamp");
+
+    let mut expected = a_stamp();
+    expected.app_version = "0.7.0".to_string();
+
+    match read_cache_stamp(data_subdir.path(), &cache_dir, &expected) {
+        CacheStatus::Mismatch { reason } => {
+            assert!(reason.contains("app_version"), "names the field: {reason}")
+        }
+        other => panic!("expected a mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_moved_snapshot_path_is_a_mismatch() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let cache_dir = data_subdir.path().join("cache");
+    populate_cache_dir(&cache_dir);
+    write_cache_stamp(data_subdir.path(), &a_stamp()).expect("a written stamp");
+
+    let mut expected = a_stamp();
+    expected.snapshot_path = "/somewhere/else".to_string();
+
+    match read_cache_stamp(data_subdir.path(), &cache_dir, &expected) {
+        CacheStatus::Mismatch { reason } => {
+            assert!(reason.contains("snapshot"), "names the field: {reason}")
+        }
+        other => panic!("expected a mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_different_platform_is_a_mismatch() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let cache_dir = data_subdir.path().join("cache");
+    populate_cache_dir(&cache_dir);
+    write_cache_stamp(data_subdir.path(), &a_stamp()).expect("a written stamp");
+
+    let mut expected = a_stamp();
+    expected.platform = platform("8.6");
+
+    match read_cache_stamp(data_subdir.path(), &cache_dir, &expected) {
+        CacheStatus::Mismatch { reason } => {
+            assert!(reason.contains("platform"), "names the field: {reason}")
+        }
+        other => panic!("expected a mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unparseable_stamp_is_a_mismatch_not_a_crash() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let cache_dir = data_subdir.path().join("cache");
+    populate_cache_dir(&cache_dir);
+    fs::write(cache_stamp_path(data_subdir.path()), b"{not json").expect("a garbled stamp");
+
+    match read_cache_stamp(data_subdir.path(), &cache_dir, &a_stamp()) {
+        CacheStatus::Mismatch { .. } => {}
+        other => panic!("expected a mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_missing_cache_dir_is_a_mismatch_even_with_a_matching_stamp() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let cache_dir = data_subdir.path().join("cache");
+    // Never created — a hand-deleted directory, or one that never existed.
+    write_cache_stamp(data_subdir.path(), &a_stamp()).expect("a written stamp");
+
+    match read_cache_stamp(data_subdir.path(), &cache_dir, &a_stamp()) {
+        CacheStatus::Mismatch { reason } => {
+            assert!(
+                reason.contains("missing or empty"),
+                "names the cause: {reason}"
+            )
+        }
+        other => panic!("expected a mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_empty_cache_dir_is_a_mismatch_even_with_a_matching_stamp() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let cache_dir = data_subdir.path().join("cache");
+    fs::create_dir_all(&cache_dir).expect("an empty cache dir");
+    write_cache_stamp(data_subdir.path(), &a_stamp()).expect("a written stamp");
+
+    match read_cache_stamp(data_subdir.path(), &cache_dir, &a_stamp()) {
+        CacheStatus::Mismatch { reason } => {
+            assert!(
+                reason.contains("missing or empty"),
+                "names the cause: {reason}"
+            )
+        }
+        other => panic!("expected a mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_written_stamp_leaves_no_temp_file_behind() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+
+    write_cache_stamp(data_subdir.path(), &a_stamp()).expect("a written stamp");
+
+    assert!(!data_subdir.path().join("cache.json.tmp").exists());
 }
 
 // --- prepare_dev_launch ----------------------------------------------------

@@ -165,6 +165,156 @@ pub fn write_data_version(data_subdir: &Path, version: &str) -> Result<(), Lifec
     fs::rename(&temporary, &path).map_err(io_error(&path))
 }
 
+/// `<data_subdir>/cache.json` — plan 024's cache stamp: what `cache/`/`build/`
+/// were last compiled against. Beside `config.json`, following the same
+/// temp-file-plus-`rename` write and the same "absent is not an error" read
+/// shape as [`read_data_version`]/[`write_data_version`].
+///
+/// `#[allow(dead_code)]` on this and the rest of the cache-stamp group below:
+/// plan 024 steps 3 and 4 wire `resolve` and `install`/`update` to these —
+/// until then, this file's own tests are the only caller. Same situation as
+/// `registry.rs`'s own `#![allow(dead_code)]`; removed once that wiring lands.
+#[allow(dead_code)]
+pub fn cache_stamp_path(data_subdir: &Path) -> PathBuf {
+    data_subdir.join("cache.json")
+}
+
+/// The three dimensions that can invalidate a compiled Symfony container
+/// (plan 024's Overview): the app's own version, the absolute path of the
+/// installed snapshot the container was compiled from — a stable real path
+/// for an installed app, unlike the station's random `/tmp/.mount_*` — and
+/// the `Platform` fingerprint (`registry.rs`) the PHP that compiled it ran
+/// under. A rollback restoring an older tree changes the first, a hub
+/// self-update moving PHP changes the third; nothing else does.
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct CacheStamp {
+    pub app_version: String,
+    pub snapshot_path: String,
+    pub platform: crate::registry::Platform,
+}
+
+/// [`read_cache_stamp`]'s answer: never a bare bool, so the caller can log
+/// *why* it is about to rebuild rather than rebuilding silently — a launch
+/// that silently rebuilds is the failure mode plan 024 exists to remove.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheStatus {
+    /// The stamp matches `expected` and `cache/` actually holds something —
+    /// the compiled container is safe to reuse.
+    Matches,
+    /// A stamp exists but does not vouch for what is (or is not) on disk —
+    /// named, so `resolve` can say why it is about to wipe.
+    Mismatch { reason: String },
+    /// No stamp has ever been written for this data dir — the state of every
+    /// app installed before this plan, and of the very first launch after a
+    /// successful install/update that stamped it (in which case the caller
+    /// never reaches this branch mismatched, since the stamp is written
+    /// before the launch that would read it).
+    Absent,
+}
+
+/// Whether `cache_dir` has anything in it at all. A directory that does not
+/// exist reads the same as an empty one — both mean "nothing to reuse" — so
+/// callers get one answer instead of having to fold two `Result`/`bool`s
+/// themselves.
+#[allow(dead_code)]
+fn cache_dir_has_entries(cache_dir: &Path) -> bool {
+    fs::read_dir(cache_dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+/// Compare `data_subdir`'s cache stamp against `expected`, the stamp this
+/// launch would write if it rebuilt right now.
+///
+/// A hand-deleted `cache/` overrides an otherwise-matching stamp
+/// (`cache_dir_has_entries` is checked last, precisely so every other branch
+/// gets to explain its own mismatch first): a stamp is a claim about what was
+/// built, not a promise that it is still on disk, and this function must
+/// never tell a caller to reuse a container that is not there.
+#[allow(dead_code)]
+pub fn read_cache_stamp(
+    data_subdir: &Path,
+    cache_dir: &Path,
+    expected: &CacheStamp,
+) -> CacheStatus {
+    let path = cache_stamp_path(data_subdir);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return CacheStatus::Absent,
+        Err(error) => {
+            return CacheStatus::Mismatch {
+                reason: format!("cannot read {}: {error}", path.display()),
+            }
+        }
+    };
+    let stamp: CacheStamp = match serde_json::from_str(&contents) {
+        Ok(stamp) => stamp,
+        Err(error) => {
+            return CacheStatus::Mismatch {
+                reason: format!("cannot parse {}: {error}", path.display()),
+            }
+        }
+    };
+    if stamp.app_version != expected.app_version {
+        return CacheStatus::Mismatch {
+            reason: format!(
+                "app_version changed ({} -> {})",
+                stamp.app_version, expected.app_version
+            ),
+        };
+    }
+    if stamp.snapshot_path != expected.snapshot_path {
+        return CacheStatus::Mismatch {
+            reason: format!(
+                "the installed snapshot moved ({} -> {})",
+                stamp.snapshot_path, expected.snapshot_path
+            ),
+        };
+    }
+    if stamp.platform != expected.platform {
+        return CacheStatus::Mismatch {
+            reason: format!(
+                "the platform changed ({} -> {})",
+                stamp.platform, expected.platform
+            ),
+        };
+    }
+    if !cache_dir_has_entries(cache_dir) {
+        return CacheStatus::Mismatch {
+            reason: format!(
+                "{} is missing or empty despite a matching stamp",
+                cache_dir.display()
+            ),
+        };
+    }
+    CacheStatus::Matches
+}
+
+/// Write `data_subdir`'s cache stamp, atomic temp-file-plus-`rename` like
+/// [`write_data_version`]. Callers own CONTRACT.md §6's "never written
+/// speculatively" rule — this only ever runs after the warm-up it describes
+/// has actually succeeded.
+#[allow(dead_code)]
+pub fn write_cache_stamp(data_subdir: &Path, stamp: &CacheStamp) -> Result<(), LifecycleError> {
+    let path = cache_stamp_path(data_subdir);
+    let json = serde_json::to_string_pretty(stamp).map_err(|error| {
+        LifecycleError::MalformedDataConfig {
+            path: path.clone(),
+            detail: error.to_string(),
+        }
+    })?;
+
+    let io_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| LifecycleError::Io { path, source }
+    };
+    let temporary = data_subdir.join("cache.json.tmp");
+    fs::write(&temporary, json).map_err(io_error(&temporary))?;
+    fs::rename(&temporary, &path).map_err(io_error(&path))
+}
+
 /// The rollback anchor's three halves (CONTRACT.md §6 / the per-app update and
 /// rollback plan): the retained source tree, the pre-update database snapshot
 /// and `rollback.json`, and the primitives that produce, restore and consume
