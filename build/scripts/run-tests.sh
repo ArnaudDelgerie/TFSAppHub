@@ -54,18 +54,22 @@ cd "$ROOT_DIR"
 # failure, or a future timeout), never left to a detached process that
 # `dbus-run-session`'s own bus teardown might or might not reach. Before
 # `cargo test` starts, the shell polls the private bus until
-# `org.freedesktop.secrets` has an owner: D-Bus only *activates* a name's
-# configured service when the name has no owner yet, so once this daemon
-# holds it first, the tests can never trigger activation into a locked,
-# unprompted daemon of their own (audit 004/P3 — the indefinite hang this
-# guards against).
+# `org.freedesktop.secrets` has an owner. That alone is not enough, though:
+# `NameHasOwner` only says *someone* owns the name, not that it is this
+# daemon — caught live during step 5's validation, where a D-Bus-activated,
+# locked `--start` daemon won the name race first and prompted for a
+# password on the real X display (audit 004/P3's exact hang, plus the
+# system dialog from todo 001, both from a name our own poll happily saw as
+# "owned"). `--replace` closes that: it always takes the name over,
+# whoever holds it, so the owner the poll observes is guaranteed to be this
+# unlocked daemon and not an activated stand-in.
 # The single quotes below are the point: this whole block is one script
 # string handed to the inner `bash -c`, expanded by that shell, not this one.
 # shellcheck disable=SC2016
 dbus-run-session -- bash -c '
   set -euo pipefail
 
-  gnome-keyring-daemon --foreground --unlock --components=secrets <<< "" &
+  gnome-keyring-daemon --foreground --replace --unlock --components=secrets <<< "" &
   daemon_pid=$!
   trap "kill $daemon_pid 2>/dev/null" EXIT
 
