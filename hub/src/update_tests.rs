@@ -459,6 +459,61 @@ fn a_failing_pre_update_leaves_the_tree_the_database_and_the_registry_entry_unch
 }
 
 #[test]
+fn an_update_leaves_a_cache_stamp_the_next_launch_will_match() {
+    // Plan 024 step 5, invalidation path 1: an update to a new `app_version`
+    // must leave a stamp naming that new version — the one `open::resolve`
+    // will build as `expected` on the very next launch.
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+
+    runnable_app_tree(source.path(), "0.6.0", "{}");
+    crate::install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the first install");
+
+    runnable_app_tree(source.path(), "0.7.0", "{}");
+    update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
+
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join("data");
+    let cache_dir = data_dir.join("cache");
+    // A real launch always finds `cache/` repopulated by its own warm-up —
+    // this fixture's console never actually writes one, so it is faked here
+    // to isolate what this test cares about: whether the stamp's *fields*
+    // would let a launch reuse it, not whether this fixture writes a cache.
+    fs::create_dir_all(&cache_dir).expect("a cache dir");
+    fs::write(cache_dir.join("marker"), b"warm").expect("a cache entry");
+
+    let entry = registry::load(&paths)
+        .expect("a readable registry")
+        .get("demo")
+        .cloned()
+        .expect("the entry survives");
+    let expected = crate::lifecycle::CacheStamp {
+        app_version: entry.app_version.clone(),
+        snapshot_path: tfsapp_core::sidecar::path_to_string(&app_dir),
+        platform: entry.platform.clone(),
+    };
+
+    assert_eq!(
+        crate::lifecycle::read_cache_stamp(&data_subdir, &cache_dir, &expected),
+        crate::lifecycle::CacheStatus::Matches,
+        "an update's own warm-up must leave a stamp the very next launch reuses"
+    );
+}
+
+#[test]
 fn force_on_an_equal_source_resyncs_without_running_any_hook() {
     if !resources_present() {
         return;
