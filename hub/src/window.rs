@@ -16,8 +16,9 @@
 //! click registered. The station learned this and inverted its own order for it;
 //! the hub inherits the conclusion rather than rediscovering it.
 //!
-//! The splash is the hub's own bundled page, not the app's `splash_path`. That
-//! is a real gap and it is stated where it is met — see [`splash_style`].
+//! The splash shows the app's own `splash_path` page, over [`SPLASH_SCHEME`],
+//! when one is declared and readable; otherwise it falls back to the hub's
+//! own bundled page — see [`splash_style`] and [`resolve_splash_source`].
 
 use std::{
     path::{Path, PathBuf},
@@ -208,21 +209,23 @@ pub fn action_capability(grant: &ActionIpcGrant) -> tauri::ipc::CapabilityBuilde
         .permission(grant.permission)
 }
 
-/// The script that dresses the hub's splash page in the app's own colours.
+/// The script that dresses the hub's own fallback splash page in the app's
+/// colours — used only on [`SplashSource::Fallback`], never alongside the
+/// app's own `splash_path` page.
 ///
-/// **What the hub honours, and what it does not.** `splash_bg` and `splash_text`
-/// are honoured: the bundled page reads them as CSS variables, so an app's
-/// splash carries its own palette and its own name. A whole custom
-/// `splash_path` page is **not** — the station bakes that file into its frontend
-/// bundle at build time, and the hub has no per-app build step to bake anything
-/// into. The app's file is inside the installed snapshot, which is reachable
-/// neither over HTTP (the sidecar is not up yet, and the file sits outside
-/// `public/`) nor from the webview's own origin.
+/// **What the hub honours, and where.** `splash_bg` and `splash_text` are
+/// honoured on the fallback page only: it reads them as CSS variables, so an
+/// app that has not (or could not) supply its own page still gets its own
+/// palette and its own name. An app that declares a working `splash_path`
+/// gets that page verbatim, over [`SPLASH_SCHEME`] and confined to the
+/// snapshot root (`register_splash_scheme`, `resolve_splash_source`) — it
+/// styles itself, inline, since CONTRACT.md documents it as one
+/// self-contained file.
 ///
-/// So the hub falls back to the nearest thing it can serve, and says so at
-/// launch rather than leaving the author to notice their splash never appears —
-/// the family rule for a value a host cannot honour. Serving the app's real
-/// splash needs a custom URI scheme over the snapshot, which is its own plan.
+/// The fallback stays reachable for a `splash_path` that is undeclared,
+/// missing, unreadable, or resolves outside the snapshot root — the family
+/// rule for a value a host cannot honour: fall back to the nearest thing, and
+/// say so (`main::serve`'s warning).
 pub fn splash_style(
     product_name: &str,
     splash_bg: Option<&str>,
