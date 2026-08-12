@@ -56,6 +56,24 @@ exit 1
 }
 
 #[test]
+fn a_spawn_failure_names_the_real_reason_instead_of_only_claiming_not_installed() {
+    let git = Git::at(PathBuf::from("/nonexistent/git"));
+
+    let error = git
+        .ensure_pushed(Path::new("/some/project"), None)
+        .unwrap_err();
+    assert!(matches!(error, GitError::NotInstalled { .. }), "{error}");
+    assert!(
+        error.to_string().contains("No such file"),
+        "expected the spawn's own io::Error in the message, got: {error}"
+    );
+    assert!(
+        std::error::Error::source(&error).is_some(),
+        "NotInstalled should expose its io::Error via Error::source too"
+    );
+}
+
+#[test]
 fn not_a_work_tree_refuses_before_anything_else() {
     let scripts = tempfile::tempdir().expect("a temp dir");
     let git = Git::at(write_fake_git(scripts.path(), "exit 1\n"));

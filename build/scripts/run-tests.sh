@@ -30,6 +30,14 @@ XDG_RUNTIME_DIR="$(mktemp -d)"
 chmod 700 "$XDG_RUNTIME_DIR"
 
 cleanup() {
+  # gvfsd-fuse mounts a FUSE filesystem at $XDG_RUNTIME_DIR/gvfs on demand;
+  # its own teardown races this trap when the private bus goes away, so
+  # `rm -rf` can hit it while still mounted ("Device or resource busy" — the
+  # gvfs failure diagnosed in audit 004/P3, there attributed to the
+  # XDG_DATA_HOME dir rather than this one). Force-unmount it first,
+  # quietly and best-effort: it is often already gone by the time we get
+  # here, and it is never ours to leave mounted either way.
+  fusermount3 -uz "$XDG_RUNTIME_DIR/gvfs" 2>/dev/null || true
   rm -rf "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
 }
 trap cleanup EXIT
@@ -40,13 +48,52 @@ export XDG_RUNTIME_DIR
 # The workspace root, so `cargo test` covers both `core/` and `hub/`.
 cd "$ROOT_DIR"
 
-# gnome-keyring-daemon registers org.freedesktop.secrets on the private bus
-# dbus-run-session hands it — that is all the `keyring` crate needs to find it,
-# no exported control-socket vars required. `dbus-run-session` tears the whole
-# private bus (and everything D-Bus-activated on it, including this daemon)
-# down when the inner command exits, so nothing outlives this script.
+# gnome-keyring-daemon runs in the *foreground*, as a background child of the
+# inner shell below rather than detached via `--daemonize` — its lifetime is
+# therefore exactly this shell's, torn down by the trap on any exit (success,
+# failure, or a future timeout), never left to a detached process that
+# `dbus-run-session`'s own bus teardown might or might not reach. Before
+# `cargo test` starts, the shell polls the private bus until
+# `org.freedesktop.secrets` has an owner. That alone is not enough, though:
+# `NameHasOwner` only says *someone* owns the name, not that it is this
+# daemon — caught live during step 5's validation, where a D-Bus-activated,
+# locked `--start` daemon won the name race first and prompted for a
+# password on the real X display (audit 004/P3's exact hang, plus the
+# system dialog from todo 001, both from a name our own poll happily saw as
+# "owned"). `--replace` closes that: it always takes the name over,
+# whoever holds it, so the owner the poll observes is guaranteed to be this
+# unlocked daemon and not an activated stand-in.
+# The single quotes below are the point: this whole block is one script
+# string handed to the inner `bash -c`, expanded by that shell, not this one.
+# shellcheck disable=SC2016
 dbus-run-session -- bash -c '
   set -euo pipefail
-  gnome-keyring-daemon --daemonize --unlock --components=secrets <<< ""
-  cargo test "$@"
+
+  gnome-keyring-daemon --foreground --replace --unlock --components=secrets <<< "" &
+  daemon_pid=$!
+  trap "kill $daemon_pid 2>/dev/null" EXIT
+
+  waited=0
+  until dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+      /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+      string:org.freedesktop.secrets 2>/dev/null | grep -q "boolean true"; do
+    if [ "$waited" -ge 100 ]; then
+      echo "run-tests.sh: gnome-keyring-daemon (pid $daemon_pid) never took org.freedesktop.secrets on the private bus after 10s — see audit 004/P3." >&2
+      exit 1
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  # A generous ceiling: the suite itself runs in ~5s once compiled, but a
+  # cold invocation compiles the whole workspace first, which alone can take
+  # several minutes. 10 minutes leaves headroom for that while still making
+  # sure a wedged run (audit 004/P3) fails loud instead of hanging a session
+  # forever.
+  status=0
+  timeout 10m cargo test "$@" || status=$?
+  if [ "$status" -eq 124 ]; then
+    echo "run-tests.sh: cargo test did not finish within the 10 minute ceiling -- most likely the Secret Service wedge described in audit 004/P3 (a keyring crate call with no timeout of its own, blocked on a locked Secret Service). Check for a stray gnome-keyring-daemon on this session bus." >&2
+  fi
+  exit "$status"
 ' -- "$@"

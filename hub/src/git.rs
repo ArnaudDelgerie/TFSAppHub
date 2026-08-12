@@ -15,12 +15,42 @@
 
 use std::{
     ffi::OsString,
-    fmt,
+    fmt, io,
     path::{Path, PathBuf},
     process::{Command, Output},
+    thread,
+    time::Duration,
 };
 
 use crate::source;
+
+/// `ETXTBSY` (errno 26 on Linux): the kernel refuses to `exec` a file that
+/// some process, anywhere on the system, still holds open for writing. The
+/// test fixtures write a fresh script and exec it immediately; a `fork()`
+/// from an unrelated, parallel test can transiently inherit another
+/// thread's open-for-write fd on some file between that thread's `fork()`
+/// and its own `exec()`, and the window lands on this exec often enough to
+/// flake `make check`. Production never triggers it — no one else on the
+/// real `git`/`gh` binaries. A bounded retry absorbs the race instead of
+/// this call surfacing it as a false "not installed".
+const ETXTBSY: i32 = 26;
+const SPAWN_RETRY_LIMIT: u32 = 100;
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(5);
+
+/// Run `command`, retrying only on [`ETXTBSY`] up to [`SPAWN_RETRY_LIMIT`]
+/// times — any other outcome, success or failure, returns immediately.
+fn spawn_with_retry(command: &mut Command) -> io::Result<Output> {
+    let mut retries_left = SPAWN_RETRY_LIMIT;
+    loop {
+        match command.output() {
+            Err(error) if retries_left > 0 && error.raw_os_error() == Some(ETXTBSY) => {
+                retries_left -= 1;
+                thread::sleep(SPAWN_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+}
 
 pub struct Git {
     program: OsString,
@@ -49,12 +79,9 @@ impl Git {
     /// caller's to interpret, since what a non-zero exit *means* differs by
     /// call (not a work tree, no such remote, …).
     fn run(&self, project: &Path, args: &[&str]) -> Result<Output, GitError> {
-        Command::new(&self.program)
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .output()
-            .map_err(|_| GitError::NotInstalled)
+        let mut command = Command::new(&self.program);
+        command.arg("-C").arg(project).args(args);
+        spawn_with_retry(&mut command).map_err(|source| GitError::NotInstalled { source })
     }
 
     /// `git -C <project> rev-parse --show-toplevel` — gate 3: refuses when
@@ -269,8 +296,10 @@ fn parse_branch_line(line: &str) -> (String, Option<String>, u32, u32) {
 /// Everything the `git` gate can refuse over.
 #[derive(Debug)]
 pub enum GitError {
-    /// `git` could not be run at all.
-    NotInstalled,
+    /// `git` could not be run at all — the spawn's own `io::Error` (missing
+    /// binary, permission denied, an [`ETXTBSY`] retry exhausted, ...),
+    /// carried rather than discarded.
+    NotInstalled { source: io::Error },
     /// `project` is not inside a git work tree.
     NotAWorkTree { project: PathBuf },
     /// `project` has an uncommitted or untracked file — named, since all of
@@ -290,7 +319,10 @@ pub enum GitError {
 impl fmt::Display for GitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotInstalled => write!(formatter, "git is not installed (or could not be run)."),
+            Self::NotInstalled { source } => write!(
+                formatter,
+                "git is not installed (or could not be run): {source}."
+            ),
             Self::NotAWorkTree { project } => write!(
                 formatter,
                 "{} is not inside a git work tree — publish publishes a commit, and there is \
@@ -326,7 +358,14 @@ impl fmt::Display for GitError {
     }
 }
 
-impl std::error::Error for GitError {}
+impl std::error::Error for GitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotInstalled { source } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 #[path = "git_tests.rs"]
