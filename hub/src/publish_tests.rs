@@ -608,7 +608,7 @@ fn gh_not_installed_refuses_before_the_archive_is_built() {
     )
     .unwrap_err();
     match &error {
-        PublishError::Gh(GhError::NotInstalled) => {}
+        PublishError::Gh(GhError::NotInstalled { .. }) => {}
         other => panic!("expected Gh(NotInstalled), got {other}"),
     }
     assert!(!paths.scratch_dir().exists());

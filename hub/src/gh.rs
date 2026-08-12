@@ -12,11 +12,40 @@
 //! threaded and `PATH` is process-global. Every call is a `Command` with
 //! fixed argv, never through a shell.
 
-use std::{ffi::OsString, fmt, path::Path, process::Command, process::Output};
+use std::{
+    ffi::OsString,
+    fmt, io,
+    path::Path,
+    process::{Command, Output},
+    thread,
+    time::Duration,
+};
 
 use serde::Deserialize;
 
 use crate::release::SHA256SUMS_ASSET_NAME;
+
+/// `ETXTBSY` (errno 26 on Linux) — see `git.rs`'s own copy of this constant
+/// and retry loop for the rationale; the two modules don't share code
+/// (module doc above), so the seam is duplicated rather than factored out.
+const ETXTBSY: i32 = 26;
+const SPAWN_RETRY_LIMIT: u32 = 100;
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(5);
+
+/// Run `command`, retrying only on [`ETXTBSY`] up to [`SPAWN_RETRY_LIMIT`]
+/// times — any other outcome, success or failure, returns immediately.
+fn spawn_with_retry(command: &mut Command) -> io::Result<Output> {
+    let mut retries_left = SPAWN_RETRY_LIMIT;
+    loop {
+        match command.output() {
+            Err(error) if retries_left > 0 && error.raw_os_error() == Some(ETXTBSY) => {
+                retries_left -= 1;
+                thread::sleep(SPAWN_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+}
 
 pub struct Gh {
     program: OsString,
@@ -42,10 +71,9 @@ impl Gh {
     }
 
     fn run(&self, args: &[&str]) -> Result<Output, GhError> {
-        Command::new(&self.program)
-            .args(args)
-            .output()
-            .map_err(|_| GhError::NotInstalled)
+        let mut command = Command::new(&self.program);
+        command.args(args);
+        spawn_with_retry(&mut command).map_err(|source| GhError::NotInstalled { source })
     }
 
     /// Gate 9: `gh --version`. A spawn failure at *any* other call below is
@@ -53,9 +81,13 @@ impl Gh {
     /// installed" is the accurate thing to tell the author, whichever call
     /// happened to be the one that tried it first.
     pub fn ensure_installed(&self) -> Result<(), GhError> {
-        match self.run(&["--version"]) {
-            Ok(output) if output.status.success() => Ok(()),
-            _ => Err(GhError::NotInstalled),
+        let output = self.run(&["--version"])?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(GhError::NotInstalled {
+                source: io::Error::other(format!("gh --version exited with {}", output.status)),
+            })
         }
     }
 
@@ -145,7 +177,8 @@ impl Gh {
         archive_path: &Path,
         sums_path: &Path,
     ) -> Result<String, GhError> {
-        let output = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .arg("release")
             .arg("create")
             .arg(tag)
@@ -158,9 +191,9 @@ impl Gh {
             .arg("--target")
             .arg(target_sha)
             .arg(archive_path)
-            .arg(sums_path)
-            .output()
-            .map_err(|_| GhError::NotInstalled)?;
+            .arg(sums_path);
+        let output =
+            spawn_with_retry(&mut command).map_err(|source| GhError::NotInstalled { source })?;
 
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
@@ -209,8 +242,9 @@ struct ReleaseAsset {
 #[derive(Debug)]
 pub enum GhError {
     /// `gh` could not be run at all — covers "not installed" and any other
-    /// spawn failure, at any call (see [`Gh::ensure_installed`]'s doc).
-    NotInstalled,
+    /// spawn failure, at any call (see [`Gh::ensure_installed`]'s doc); the
+    /// spawn's own `io::Error`, carried rather than discarded.
+    NotInstalled { source: io::Error },
     /// `gh auth status` failed.
     NotAuthenticated,
     /// A release already carries the tag — draft included.
@@ -236,9 +270,9 @@ pub enum GhError {
 impl fmt::Display for GhError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotInstalled => write!(
+            Self::NotInstalled { source } => write!(
                 formatter,
-                "gh is not installed (or could not be run) — install it from \
+                "gh is not installed (or could not be run): {source} — install it from \
                  https://cli.github.com."
             ),
             Self::NotAuthenticated => {
@@ -273,7 +307,14 @@ impl fmt::Display for GhError {
     }
 }
 
-impl std::error::Error for GhError {}
+impl std::error::Error for GhError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotInstalled { source } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 #[path = "gh_tests.rs"]

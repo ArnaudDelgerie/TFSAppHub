@@ -41,7 +41,15 @@ fn the_installed_gate_refuses_when_gh_cannot_be_run() {
     let gh = Gh::at(scripts.path().join("no-such-gh"));
 
     let error = gh.ensure_installed().unwrap_err();
-    assert!(matches!(error, GhError::NotInstalled), "{error}");
+    assert!(matches!(error, GhError::NotInstalled { .. }), "{error}");
+    assert!(
+        error.to_string().contains("No such file"),
+        "expected the spawn's own io::Error in the message, got: {error}"
+    );
+    assert!(
+        std::error::Error::source(&error).is_some(),
+        "NotInstalled should expose its io::Error via Error::source too"
+    );
 }
 
 #[test]
