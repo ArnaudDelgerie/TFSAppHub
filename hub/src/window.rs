@@ -19,9 +19,16 @@
 //! The splash is the hub's own bundled page, not the app's `splash_path`. That
 //! is a real gap and it is stated where it is met — see [`splash_style`].
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+};
 
-use tauri::{webview::NewWindowResponse, Url, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    http::{header, Response, StatusCode},
+    webview::NewWindowResponse,
+    Url, WebviewUrl, WebviewWindowBuilder,
+};
 
 /// Where a navigation or new-window request should end up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +231,67 @@ pub fn splash_style(
         }
     }
     script
+}
+
+/// The scheme an app's real `splash_path` is served over (plan 025). Recognised
+/// by [`classify_navigation`] once wired there (step 4).
+pub const SPLASH_SCHEME: &str = "tfsapp-splash";
+
+/// Resolve `request_path` (a URI scheme request's raw, `/`-prefixed path)
+/// against `canonical_root`, refusing anything that would land outside it once
+/// symlinks and `..` segments are resolved — `canonical_root.join` never sees
+/// a leading `/` (all of them are trimmed first), so it can never fall into
+/// `Path::join`'s own absolute-path-replaces-base behaviour either.
+///
+/// A missing file and an escape attempt both fall through to `None`: the
+/// caller has nothing more specific to say about either, and saying more
+/// would tell a hostile page which one it was.
+fn resolve_within(canonical_root: &Path, request_path: &str) -> Option<PathBuf> {
+    let relative = request_path.trim_start_matches('/');
+    let resolved = std::fs::canonicalize(canonical_root.join(relative)).ok()?;
+    (resolved == canonical_root || resolved.starts_with(canonical_root)).then_some(resolved)
+}
+
+/// Register [`SPLASH_SCHEME`] on `builder`, read-only and scoped to
+/// `snapshot_root` — this process's installed snapshot or live project
+/// directory (`LaunchSpec::app_dir`), resolved well before `Builder` exists
+/// (`main::prepare`, called from `main::open_window` ahead of
+/// `tauri::Builder::default()`). One hub process serves one app, so the
+/// scheme closes over one root for its whole life and can never reach another
+/// app's tree — by construction, not by a check bolted on after the fact.
+///
+/// `snapshot_root` failing to canonicalise makes every request refused rather
+/// than panicking a handler that runs for the rest of the process's life;
+/// every caller has already confirmed it is a directory (`open::resolve`,
+/// `dev::resolve`), so this is a defensive fallback, not an expected path.
+///
+/// `#[allow(dead_code)]`: not called until `main::open_window` wires it into
+/// the splash window's creation (plan 025 step 2) — this step only proves the
+/// scheme safe in isolation.
+#[allow(dead_code)]
+pub fn register_splash_scheme<R: tauri::Runtime>(
+    builder: tauri::Builder<R>,
+    snapshot_root: &Path,
+) -> tauri::Builder<R> {
+    let canonical_root = std::fs::canonicalize(snapshot_root).ok();
+    builder.register_uri_scheme_protocol(SPLASH_SCHEME, move |_ctx, request| {
+        canonical_root
+            .as_deref()
+            .and_then(|root| resolve_within(root, request.uri().path()))
+            .and_then(|path| std::fs::read(path).ok())
+            .map(|bytes| {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                    .body(bytes)
+                    .expect("a valid response")
+            })
+            .unwrap_or_else(|| {
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Vec::new())
+                    .expect("a valid empty response")
+            })
+    })
 }
 
 /// The cold-start window: the hub's bundled page, on the webview's own origin.

@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 
 use tauri::Url;
 
-use super::{classify_navigation, next_window_label_among, splash_style, NavigationTarget};
+use super::{
+    classify_navigation, next_window_label_among, resolve_within, splash_style, NavigationTarget,
+};
 
 fn url(text: &str) -> Url {
     Url::parse(text).expect("a parseable URL")
@@ -92,6 +94,69 @@ fn an_unknown_origin_never_makes_a_target_internal() {
         classify_navigation(None, &url("http://127.0.0.1:8123/")),
         NavigationTarget::ExternalWeb
     );
+}
+
+// --- the splash scheme's path confinement ---------------------------------
+//
+// `resolve_within` is the whole safety argument for plan 025's scheme: one
+// process, one root, and nothing a request can do reaches outside it.
+
+#[test]
+fn a_file_actually_inside_the_root_resolves() {
+    let dir = tempfile::tempdir().expect("a temp snapshot root");
+    let root = dir.path().canonicalize().expect("a canonical root");
+    std::fs::write(root.join("splash.html"), b"<h1>hi</h1>").expect("write the splash file");
+
+    assert_eq!(
+        resolve_within(&root, "/splash.html"),
+        Some(root.join("splash.html"))
+    );
+}
+
+#[test]
+fn a_dot_dot_segment_cannot_escape_the_root() {
+    let dir = tempfile::tempdir().expect("a temp parent dir");
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).expect("create the root");
+    let root = root.canonicalize().expect("a canonical root");
+    std::fs::write(dir.path().join("secret.txt"), b"nope").expect("write the sibling file");
+
+    assert_eq!(resolve_within(&root, "/../secret.txt"), None);
+}
+
+#[test]
+fn a_symlink_pointing_outside_the_root_is_refused() {
+    let dir = tempfile::tempdir().expect("a temp parent dir");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).expect("create the outside dir");
+    std::fs::write(outside.join("secret.txt"), b"nope").expect("write the outside file");
+
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).expect("create the root");
+    std::os::unix::fs::symlink(&outside, root.join("link")).expect("symlink out of the root");
+    let root = root.canonicalize().expect("a canonical root");
+
+    assert_eq!(resolve_within(&root, "/link/secret.txt"), None);
+}
+
+#[test]
+fn a_missing_file_resolves_to_nothing() {
+    let dir = tempfile::tempdir().expect("a temp snapshot root");
+    let root = dir.path().canonicalize().expect("a canonical root");
+
+    assert_eq!(resolve_within(&root, "/missing.html"), None);
+}
+
+#[test]
+fn a_request_for_exactly_the_root_stays_confined() {
+    let dir = tempfile::tempdir().expect("a temp snapshot root");
+    let root = dir.path().canonicalize().expect("a canonical root");
+
+    // Not a useful response on its own (the handler's `fs::read` on a
+    // directory fails and falls back to a refusal) — this only proves the
+    // confinement check itself treats the boundary as inside, not outside.
+    assert_eq!(resolve_within(&root, "/"), Some(root.clone()));
+    assert_eq!(resolve_within(&root, ""), Some(root));
 }
 
 // --- window labels -------------------------------------------------------
