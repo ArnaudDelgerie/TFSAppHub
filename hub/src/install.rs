@@ -186,7 +186,12 @@ pub(crate) fn install_into(
     // Which lifecycle event (CONTRACT.md §6) this install may run, decided
     // against whatever version record survived a `remove`.
     let recorded = lifecycle::read_data_version(&data_dir.join("data"))?;
-    let event = lifecycle_event_for_install(recorded.as_deref(), &manifest.app_version, &data_dir)?;
+    let event = lifecycle_event_for_install(
+        recorded.as_deref(),
+        &manifest.app_version,
+        &data_dir,
+        &manifest.identifier,
+    )?;
 
     // Resolved before the copy — and before the question, since an install
     // nothing could finish is not worth asking about. The fingerprint comes
@@ -539,11 +544,7 @@ pub fn check_id_free(registry: &Registry, paths: &Paths, id: &str) -> Result<(),
 /// explains the data directory better than any version mismatch the
 /// lifecycle gate below would find, so it is reported first.
 pub fn check_identifier_free(registry: &Registry, identifier: &str) -> Result<(), InstallError> {
-    if let Some(entry) = registry
-        .apps
-        .iter()
-        .find(|entry| entry.identifier == identifier)
-    {
+    if let Some(entry) = registry.by_identifier(identifier) {
         return Err(InstallError::IdentifierTaken {
             identifier: identifier.to_string(),
             id: entry.id.clone(),
@@ -639,8 +640,9 @@ pub fn check_port_free(registry: &Registry, app_port: Option<u16>) -> Result<(),
 /// Decide which lifecycle event (CONTRACT.md §6) this install may run under,
 /// from the data directory's own record — the four-row table from the
 /// Overview, and nothing else. No I/O: `recorded` is `read_data_version`'s own
-/// result, already read by the caller; `data_dir` is named only in the
-/// refusals' messages, as the directory a user would delete or wait out.
+/// result, already read by the caller; `data_dir` and `identifier` are named
+/// only in the refusals' messages, as the directory a user would delete or
+/// wait out and the argument `tfsapp-hub purge` takes to do it.
 ///
 /// `app_version` is taken as already-validated semver — `validate` runs
 /// before this is ever called and refuses anything else (CONTRACT.md §2) —
@@ -653,6 +655,7 @@ fn lifecycle_event_for_install(
     recorded: Option<&str>,
     app_version: &str,
     data_dir: &Path,
+    identifier: &str,
 ) -> Result<LifecycleEvent, InstallError> {
     let current = semver::Version::parse(app_version)
         .expect("validate() already refused a non-canonical app_version");
@@ -677,6 +680,7 @@ fn lifecycle_event_for_install(
                 recorded: recorded.to_string(),
                 current: current.to_string(),
                 data_dir: data_dir.to_path_buf(),
+                identifier: identifier.to_string(),
             })
         }
         // The data dir's `version` field parses as JSON but not as semver —
@@ -848,6 +852,11 @@ pub enum InstallError {
         recorded: String,
         current: String,
         data_dir: PathBuf,
+        /// Named in the refusal so it can point at `tfsapp-hub purge
+        /// <identifier>` (plan 023) — the command that actually reaches this
+        /// directory, since no app is registered under it to `remove
+        /// --purge` instead.
+        identifier: String,
     },
     /// The data directory records a version *older* than the source being
     /// installed — the update event (CONTRACT.md §6), which `install` does
@@ -952,13 +961,14 @@ impl fmt::Display for InstallError {
                 recorded,
                 current,
                 data_dir,
+                identifier,
             } => write!(
                 formatter,
                 "{} was last written by app version {recorded}, but {current} is being \
                  installed — running old code against data a newer version wrote is how a \
-                 database gets corrupted quietly (CONTRACT.md §6). Delete that directory by \
-                 hand if you mean to start over: `remove --purge` cannot reach it, since no \
-                 app is registered under this identifier to purge.",
+                 database gets corrupted quietly (CONTRACT.md §6). If you mean to start over, \
+                 `tfsapp-hub purge {identifier}` deletes it — there is no app registered under \
+                 this identifier for `remove --purge` to reach instead.",
                 data_dir.display()
             ),
             Self::DataOlderThanSource {

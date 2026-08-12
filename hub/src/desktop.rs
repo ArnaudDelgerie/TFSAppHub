@@ -175,6 +175,27 @@ pub enum RemovalOutcome {
 /// Delete `identifier`'s entry, but only if it carries `id`'s `X-TFSApp-Id`
 /// marker — see the module header for why that check exists at all.
 pub fn remove(id: &str, identifier: &str, paths: &Paths) -> Result<RemovalOutcome, DesktopError> {
+    remove_if(identifier, paths, |contents| carries_marker(contents, id))
+}
+
+/// [`remove`]'s own version for a subject with no `id` left to verify
+/// against — `purge <identifier>`'s orphan case (plan 023 step 3). The file
+/// is named after `identifier` ([`Paths::desktop_entry_path`]), so *any*
+/// hub-written entry at that path belongs to this identifier regardless of
+/// which `id` wrote it; a hand-written or foreign file — one carrying no
+/// `X-TFSApp-Id=` line at all — is left alone exactly as [`remove`] leaves
+/// one alone.
+pub fn remove_any(identifier: &str, paths: &Paths) -> Result<RemovalOutcome, DesktopError> {
+    remove_if(identifier, paths, carries_any_marker)
+}
+
+/// Shared by [`remove`] and [`remove_any`]: read the entry, decide whether
+/// `carries` says it is this hub's to delete, and delete it if so.
+fn remove_if(
+    identifier: &str,
+    paths: &Paths,
+    carries: impl Fn(&str) -> bool,
+) -> Result<RemovalOutcome, DesktopError> {
     let path = paths.desktop_entry_path(identifier)?;
 
     let contents = match fs::read_to_string(&path) {
@@ -183,7 +204,7 @@ pub fn remove(id: &str, identifier: &str, paths: &Paths) -> Result<RemovalOutcom
         Err(source) => return Err(DesktopError::Io { path, source }),
     };
 
-    if !carries_marker(&contents, id) {
+    if !carries(&contents) {
         return Ok(RemovalOutcome::LeftAlone);
     }
 
@@ -199,6 +220,14 @@ pub fn remove(id: &str, identifier: &str, paths: &Paths) -> Result<RemovalOutcom
 fn carries_marker(contents: &str, id: &str) -> bool {
     let marker = format!("X-TFSApp-Id={}", escape_value(id));
     contents.lines().any(|line| line == marker)
+}
+
+/// Whether `contents` carries an `X-TFSApp-Id=` line at all, regardless of
+/// which id it names — [`remove_any`]'s looser version of [`carries_marker`].
+fn carries_any_marker(contents: &str) -> bool {
+    contents
+        .lines()
+        .any(|line| line.starts_with("X-TFSApp-Id="))
 }
 
 #[derive(Debug)]

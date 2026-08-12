@@ -426,22 +426,33 @@ fn the_snapshot_refuses_to_write_over_an_existing_tree() {
 
 #[test]
 fn no_record_is_the_install_event() {
-    let event = lifecycle_event_for_install(None, "1.0.0", Path::new("/data/demo"))
-        .expect("no record lets the install proceed");
+    let event =
+        lifecycle_event_for_install(None, "1.0.0", Path::new("/data/demo"), "dev.local.demo")
+            .expect("no record lets the install proceed");
     assert_eq!(event, LifecycleEvent::Install);
 }
 
 #[test]
 fn an_equal_record_is_neither_event() {
-    let event = lifecycle_event_for_install(Some("1.0.0"), "1.0.0", Path::new("/data/demo"))
-        .expect("an equal record is not refused");
+    let event = lifecycle_event_for_install(
+        Some("1.0.0"),
+        "1.0.0",
+        Path::new("/data/demo"),
+        "dev.local.demo",
+    )
+    .expect("an equal record is not refused");
     assert_eq!(event, LifecycleEvent::None);
 }
 
 #[test]
 fn an_older_record_is_refused_as_the_update_event_install_does_not_own() {
-    let error = lifecycle_event_for_install(Some("1.0.0"), "1.1.0", Path::new("/data/demo"))
-        .expect_err("install does not run the update event");
+    let error = lifecycle_event_for_install(
+        Some("1.0.0"),
+        "1.1.0",
+        Path::new("/data/demo"),
+        "dev.local.demo",
+    )
+    .expect_err("install does not run the update event");
 
     assert!(
         matches!(error, InstallError::DataOlderThanSource { .. }),
@@ -457,8 +468,13 @@ fn an_older_record_is_refused_as_the_update_event_install_does_not_own() {
 
 #[test]
 fn a_newer_record_is_refused_as_a_downgrade() {
-    let error = lifecycle_event_for_install(Some("2.0.0"), "1.0.0", Path::new("/data/demo"))
-        .expect_err("a downgrade is refused rather than guessed at");
+    let error = lifecycle_event_for_install(
+        Some("2.0.0"),
+        "1.0.0",
+        Path::new("/data/demo"),
+        "dev.local.demo",
+    )
+    .expect_err("a downgrade is refused rather than guessed at");
 
     assert!(
         matches!(error, InstallError::DataNewerThanSource { .. }),
@@ -469,10 +485,14 @@ fn a_newer_record_is_refused_as_a_downgrade() {
         message.contains("2.0.0") && message.contains("1.0.0"),
         "{message}"
     );
-    // Names the directory to delete by hand — `remove --purge` cannot reach
-    // data whose app is no longer registered.
+    // Names the directory, and the `purge` command that actually reaches it
+    // — `remove --purge` cannot, since no app is registered under this
+    // identifier (plan 023 step 5).
     assert!(message.contains("/data/demo"), "{message}");
-    assert!(message.contains("--purge"), "{message}");
+    assert!(
+        message.contains("tfsapp-hub purge dev.local.demo"),
+        "{message}"
+    );
 }
 
 #[test]

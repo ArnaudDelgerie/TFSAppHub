@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::{carries_marker, remove, render, write, RemovalOutcome};
+use super::{carries_marker, remove, remove_any, render, write, RemovalOutcome};
 use crate::{identity::Identity, paths::Paths};
 
 fn temp_paths() -> (tempfile::TempDir, Paths) {
@@ -154,6 +154,46 @@ fn a_foreign_file_with_no_marker_is_left_alone() {
     .expect("a hand-written entry");
 
     let outcome = remove("tfsapp-test", identifier, &paths).expect("removal does not error");
+
+    assert_eq!(outcome, RemovalOutcome::LeftAlone);
+    assert!(path.is_file(), "a foreign entry must survive removal");
+}
+
+#[test]
+fn the_orphan_path_removes_an_entry_carrying_a_different_id() {
+    // The orphan case has no `id` to check the marker against — any hub-
+    // written entry at this identifier's path is its to delete.
+    let (_base, paths) = temp_paths();
+    let entity = identity("dev.local.tfsapp-test", "TFSApp Test", None);
+    let path = write(
+        "some-other-id",
+        &entity,
+        Path::new("/hub/tfsapp-hub"),
+        &paths,
+    )
+    .expect("the entry is written");
+
+    let outcome = remove_any(&entity.identifier, &paths).expect("removal does not error");
+
+    assert_eq!(outcome, RemovalOutcome::Removed);
+    assert!(!path.exists());
+}
+
+#[test]
+fn the_orphan_path_leaves_an_unmarked_entry_alone() {
+    let (_base, paths) = temp_paths();
+    let identifier = "dev.local.tfsapp-test";
+    let path = paths
+        .desktop_entry_path(identifier)
+        .expect("a safe identifier");
+    std::fs::create_dir_all(paths.applications_dir()).expect("the applications dir");
+    std::fs::write(
+        &path,
+        "[Desktop Entry]\nType=Application\nName=Hand Written\n",
+    )
+    .expect("a hand-written entry with no marker");
+
+    let outcome = remove_any(identifier, &paths).expect("removal does not error");
 
     assert_eq!(outcome, RemovalOutcome::LeftAlone);
     assert!(path.is_file(), "a foreign entry must survive removal");

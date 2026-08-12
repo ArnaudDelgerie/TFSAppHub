@@ -189,6 +189,10 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             purge,
             assume_yes,
         } => remove::run(&id, purge, assume_yes),
+        Command::Purge {
+            identifier,
+            assume_yes,
+        } => remove::purge(identifier.as_deref(), assume_yes),
         // The three forms share one `run.rs`, routed here by which
         // `RunInvocation` `cli::parse_run` built — see that module's own
         // header for why the app-resolution step in front of all three is

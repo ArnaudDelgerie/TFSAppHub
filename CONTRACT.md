@@ -876,6 +876,13 @@ exactly as a launch does, naming both versions and the directory: running old
 code against data a newer version wrote is how a database gets corrupted
 quietly, whichever host notices it first.
 
+**What a plain `remove` keeps is not stranded.** `tfsapp-hub purge
+<identifier>` is the guarantee behind the data it leaves: the data directory,
+the same identifier's WebKit website data, and its OS keyring accounts are
+all deletable later, by identifier alone, once no app is registered under
+it — the retained-data path this section describes always ends somewhere,
+never in a directory nothing in the product can clear.
+
 `tfsapp-hub update <id>` owns the update event, and with it the one guarantee
 this section states on its own behalf rather than an app author's: **an
 update must never leave the app's database between two versions.** It does
