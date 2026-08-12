@@ -385,9 +385,12 @@ fn an_update_runs_pre_update_then_post_update_and_no_install_hooks() {
     update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
 
     let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
+    // The hub's own `cache:warmup` (plan 024) closes out each event — the
+    // install's, then the update's — through this same fixture console.
     assert_eq!(
         fs::read_to_string(log).expect("a hook trace"),
-        "about\ndoctrine:migrations:migrate\ncache:clear\nabout\n",
+        "about\ndoctrine:migrations:migrate\ncache:warmup --env=prod --no-debug\n\
+         cache:clear\nabout\ncache:warmup --env=prod --no-debug\n",
         "the install's own hooks must not repeat, and the update's must run in order"
     );
 
@@ -492,9 +495,14 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
     update(&paths, "demo", None, true, true, "0.1.0").expect("--force resyncs");
 
     let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
-    assert!(
-        !log.exists(),
-        "a resync must run no lifecycle command at all"
+    // The initial install ran no declared hook (no `pre-install`/`post-install`
+    // in this manifest) but still ran the hub's own `cache:warmup` (plan 024);
+    // a resync goes through `resync_only`, never `install::prepare`, so it
+    // must add nothing further to this trace.
+    assert_eq!(
+        fs::read_to_string(log).expect("a hook trace"),
+        "cache:warmup --env=prod --no-debug\n",
+        "a resync must run no lifecycle command, and must not warm the cache a second time"
     );
     assert!(
         !previous_tree_path(&paths.app_dir("demo").expect("an app dir")).exists(),

@@ -851,9 +851,12 @@ fn an_archive_older_than_the_installed_app_is_migrated_forward_on_import() {
     );
 
     let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
+    // The hub's own `cache:warmup` (plan 024) closes out the initial install
+    // (no declared hooks there, so it is that event's only line) and then the
+    // migrate-forward's own `install::prepare` call.
     assert_eq!(
         fs::read_to_string(log).expect("a hook trace"),
-        "cache:clear\nabout\n",
+        "cache:warmup --env=prod --no-debug\ncache:clear\nabout\ncache:warmup --env=prod --no-debug\n",
         "the installed manifest's pre-update then post-update must run over the imported data"
     );
 

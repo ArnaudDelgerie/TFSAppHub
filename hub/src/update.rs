@@ -374,6 +374,10 @@ fn apply(
         let _ = lifecycle::restore_db_snapshot(&data_subdir);
         let _ = fs::remove_dir_all(app_dir);
         let _ = restore_tree(app_dir);
+        // A stamp `prepare`'s own warm-up wrote for the version this update
+        // was moving *to* must not survive next to a tree just reverted back
+        // to the version it was moving *from* — plan 024.
+        lifecycle::discard_cache_stamp(&data_subdir);
     };
 
     if let Err(error) = install::snapshot(&resolved.root, app_dir) {
@@ -390,9 +394,14 @@ fn apply(
     let _ = fs::remove_dir_all(data_dir.join("cache"));
     let _ = fs::remove_dir_all(data_dir.join("build"));
 
-    if let Err(error) =
-        install::prepare(paths, toolchain, manifest, app_dir, LifecycleEvent::Update)
-    {
+    if let Err(error) = install::prepare(
+        paths,
+        toolchain,
+        manifest,
+        app_dir,
+        LifecycleEvent::Update,
+        &platform,
+    ) {
         revert();
         return Err(UpdateError::Reverted {
             detail: error.to_string(),

@@ -460,6 +460,7 @@ fn run_import(
             &installed_manifest,
             &app_dir,
             LifecycleEvent::Update,
+            &entry.platform,
         )?;
         true
     } else {

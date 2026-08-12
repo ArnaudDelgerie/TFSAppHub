@@ -286,11 +286,6 @@ pub fn read_cache_stamp(
 /// [`write_data_version`]. Callers own CONTRACT.md §6's "never written
 /// speculatively" rule — this only ever runs after the warm-up it describes
 /// has actually succeeded.
-///
-/// `#[allow(dead_code)]`: plan 024 step 4 wires `install`/`update` to this —
-/// until then, this file's own tests are the only caller. Same situation as
-/// `registry.rs`'s own `#![allow(dead_code)]`; removed once that wiring lands.
-#[allow(dead_code)]
 pub fn write_cache_stamp(data_subdir: &Path, stamp: &CacheStamp) -> Result<(), LifecycleError> {
     let path = cache_stamp_path(data_subdir);
     let json = serde_json::to_string_pretty(stamp).map_err(|error| {
@@ -307,6 +302,21 @@ pub fn write_cache_stamp(data_subdir: &Path, stamp: &CacheStamp) -> Result<(), L
     let temporary = data_subdir.join("cache.json.tmp");
     fs::write(&temporary, json).map_err(io_error(&temporary))?;
     fs::rename(&temporary, &path).map_err(io_error(&path))
+}
+
+/// Discard `data_subdir`'s cache stamp, best-effort — an already-missing file
+/// is not an error, same as [`discard_db_snapshot`]/[`discard_rollback_anchor`].
+///
+/// `update.rs`'s own revert path calls this alongside its database and tree
+/// restores: a stamp written for the version an update was moving *to* must
+/// not survive next to a tree reverted back to the version it was moving
+/// *from*. Reaching for the field of a mismatched dimension covers most such
+/// cases already (`read_cache_stamp`'s `app_version` check), but an update
+/// that resyncs the same version onto a different tree is a case where
+/// nothing else would catch it — so the revert clears it outright rather than
+/// leaning on a comparison that happens to save it most of the time.
+pub fn discard_cache_stamp(data_subdir: &Path) {
+    let _ = fs::remove_file(cache_stamp_path(data_subdir));
 }
 
 /// The rollback anchor's three halves (CONTRACT.md §6 / the per-app update and
