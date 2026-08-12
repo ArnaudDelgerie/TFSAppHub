@@ -26,6 +26,7 @@ mod open;
 mod paths;
 mod php;
 mod platform;
+mod portability;
 mod prompt;
 mod publish;
 mod reconcile;
