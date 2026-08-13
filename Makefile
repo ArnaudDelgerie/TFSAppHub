@@ -1,6 +1,5 @@
 # TFSAppHub — one binary that installs and runs several Symfony apps from their
-# installed source. See README.md and the station's CONTRACT.md §1–§5 for the
-# app contract both hosts share.
+# installed source. See README.md and CONTRACT.md §1–§5 for the app contract.
 #
 # Usage:
 #   make resources

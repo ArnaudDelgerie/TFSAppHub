@@ -1,9 +1,7 @@
 //! The app's `tfsapp.config.json`, parsed at runtime.
 //!
-//! One schema, two hosts (station CONTRACT.md §2). The station reads this file
-//! in **dev** mode and bakes most of it into `tauri.conf.json` at build time
-//! for **packaged** mode; the hub has no `build-app.sh` and never will, so the
-//! manifest of the installed snapshot is its only source for everything —
+//! The hub reads this contract-defined file at runtime. The manifest of the
+//! installed snapshot is its source for everything —
 //! identity, port, icon, lifecycle commands, `run` aliases and the runtime
 //! toggles alike.
 //!
@@ -19,20 +17,15 @@
 //!
 //! Two rules govern how strict this parser is, and they are not the same rule:
 //!
-//! - **Unknown top-level key: warn, never reject.** It is what lets the schema
-//!   grow additively — the hub may read a key the station ignores and the other
-//!   way round, without either host failing on the other's file. Its corollary
-//!   binds just as hard: the hub must never *require* a key the station does
-//!   not know.
-//! - **Known key, wrong type: reject, naming the file and the field.** This is
-//!   where `build-app.sh`'s build-time JSON validation lands for the hub, since
-//!   there is no build step to catch it earlier. A quoted `"async_worker":
+//! - **Unknown top-level key: warn, never reject.** It lets the schema grow
+//!   additively while still catching likely typos.
+//! - **Known key, wrong type: reject, naming the file and the field.** A quoted
+//!   `"async_worker":
 //!   "true"` is not a forward-compatible extra, it is a manifest that means the
 //!   opposite of what its author believes.
 
-// Consumed by the installer (plan 006) and by `open` (007); until those land,
-// this module's own tests are its only callers. Remove the allow with the
-// first real consumer rather than letting it linger.
+// Kept temporarily while a few parser helpers have no production caller. The
+// todo session that removes this module-wide allow will narrow it to tests.
 #![allow(dead_code)]
 
 use std::{
@@ -43,20 +36,16 @@ use std::{
 
 use serde::Deserialize;
 
-/// The manifest's filename at the project root — the station's own constant
-/// spelled out, since a mismatch would silently split the two hosts' idea of
-/// what an app is.
+/// The contract-defined manifest filename at the project root.
 pub const MANIFEST_FILE: &str = "tfsapp.config.json";
 
 /// Top-level keys `tfsapp.config.json` defines (CONTRACT.md §2).
 ///
-/// Kept in sync with the station's `config::KNOWN_PROJECT_CONFIG_KEYS`, and
-/// deliberately *wider* than the fields [`Manifest`] parses: `splash_bg`,
-/// `splash_text` and `releases_repo` are meaningful to the station and not yet
-/// to the hub, and warning about them would turn "the hub does not use this
-/// yet" into "your manifest looks wrong". Anything outside this list is far
-/// more likely a typo (`"app-port"` for `"app_port"`) than a deliberate
-/// extension, which is what the warning is for.
+/// `splash_bg`, `splash_text` and `splash_path` are all honoured by the hub.
+/// `releases_repo` remains a known, inert legacy key so old manifests do not
+/// produce a warning. Anything outside this list is far more likely a typo
+/// (`"app-port"` for `"app_port"`) than a deliberate extension, which is what
+/// the warning is for.
 pub const KNOWN_KEYS: &[&str] = &[
     "product_name",
     "identifier",
@@ -81,10 +70,7 @@ const REQUIRED_KEYS: &[&str] = &["product_name", "identifier", "project_name", "
 
 /// A parsed `tfsapp.config.json`.
 ///
-/// Field-for-field the station's `config::ProjectConfig`, plus the keys that
-/// struct deliberately omits because *dev mode* has no use for them
-/// (`commands`, `run`, `icon_path`, `splash_path`) — the hub does, since it is
-/// the one running the packaged-mode responsibilities without a packaging step.
+/// The fields the hub needs to install, launch and serve a project.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct Manifest {
     /// Human-readable name. Feeds the window title *and* the generated
@@ -103,10 +89,8 @@ pub struct Manifest {
     /// The app's own release version, and the lifecycle authority for
     /// install/update/downgrade (CONTRACT.md §6) — never the git ref, which is
     /// only a source selector. Kept as a string here rather than a
-    /// `semver::Version`: the contract requires canonical semver but only
-    /// `build-app.sh` enforces it, so a hub that rejected a non-semver value
-    /// would refuse an app the station happily runs in dev mode. The installer
-    /// parses it where a comparison is actually needed.
+    /// `semver::Version`: `install::validate` enforces the contract's canonical
+    /// semver rule before a value is compared or recorded.
     pub app_version: String,
     /// Pins `APP_PORT` instead of a fresh dynamic loopback port each launch.
     /// Recorded in the registry too, so the installer can flag a collision
@@ -118,9 +102,9 @@ pub struct Manifest {
     /// no per-app build step to bake an icon into.
     #[serde(default)]
     pub icon_path: Option<String>,
-    /// Project-root-relative path to the cold-start splash page. Parsed, and —
-    /// so far — not honoured: the hub shows its own splash page and says so at
-    /// launch. See `window::splash_style` for why, and for what *is* honoured.
+    /// Project-root-relative path to the cold-start splash page. When it is
+    /// readable inside the snapshot, the hub serves it over its scoped splash
+    /// scheme; otherwise it uses the bundled fallback page.
     #[serde(default)]
     pub splash_path: Option<String>,
     /// The splash's background and text colours. Honoured: the hub's own splash
@@ -130,13 +114,10 @@ pub struct Manifest {
     pub splash_bg: Option<String>,
     #[serde(default)]
     pub splash_text: Option<String>,
-    /// Launch-time lifecycle commands (CONTRACT.md §2/§6). The station's dev
-    /// mode ignores this key — there is no versioned data dir to install or
-    /// update — while the hub is exactly the host that has one.
+    /// Launch-time lifecycle commands (CONTRACT.md §2/§6).
     #[serde(default)]
     pub commands: LifecycleCommands,
-    /// Named `bin/console` aliases a user runs directly. Packaged-only on the
-    /// station, hub-relevant from the moment `run <id> <alias>` exists.
+    /// Named `bin/console` aliases a user runs directly with `run <id> <alias>`.
     #[serde(default)]
     pub run: BTreeMap<String, RunAlias>,
     /// Which native capability groups are reachable, over which transports.
@@ -148,11 +129,9 @@ pub struct Manifest {
     /// silent `false` — see this module's header.
     #[serde(default)]
     pub async_worker: bool,
-    /// The forge repository `publish` targets when `--repo` is not given
-    /// (CONTRACT.md §2's "Keys this contract does not define"). Read in
-    /// exactly one place, `publish.rs`, on the author's own machine — never
-    /// on the install or update path, which never steer a fetch from a value
-    /// recorded inside the source being replaced.
+    /// A legacy key accepted but never read (CONTRACT.md §2's "Keys this
+    /// contract does not define"). `publish` uses `--repo` or the project's
+    /// git remote; install and update never let a source steer its own fetch.
     #[serde(default)]
     pub releases_repo: Option<String>,
 }
@@ -260,8 +239,7 @@ impl Manifest {
 /// Read and parse `<project_path>/tfsapp.config.json`.
 ///
 /// `project_path` is the directory holding the manifest — a source tree at
-/// install time, an installed snapshot at launch time — matching the station's
-/// `load_project_config` so the two hosts take the same argument.
+/// install time or an installed snapshot at launch time.
 pub fn load(project_path: &Path) -> Result<Loaded, ManifestError> {
     let path = project_path.join(MANIFEST_FILE);
     let contents = fs::read_to_string(&path).map_err(|source| ManifestError::Unreadable {

@@ -1,9 +1,7 @@
 //! `registry.json` — what is installed, from where, at what version.
 //!
 //! One file under the hub's own root, holding one entry per installed app plus
-//! a little about the hub that last wrote it. Design source:
-//! `../TFSAppWorkstation/.project/hub/005-hub-update-and-revalidation.md` §2,
-//! which settled the shape **before any code**, on the grounds that
+//! a little about the hub that last wrote it. Its shape is deliberately stable:
 //! retrofitting a field would mean migrating installed users' state.
 //!
 //! Three properties this module owes its callers, in the order they bite:
@@ -28,9 +26,8 @@
 //! actually want to reason about, and a second version number invites
 //! migration machinery that nothing has asked for yet.
 
-// `list` (plan 005) reads the registry; writing one is the installer's job
-// (006), and until it lands `save`/`update`/`upsert` have this module's own
-// tests as their only callers. Remove the allow with the first real writer.
+// Kept temporarily while a few helpers have no production caller. The todo
+// session that removes this module-wide allow will delete or narrow them.
 #![allow(dead_code)]
 
 use std::{

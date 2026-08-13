@@ -206,8 +206,7 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             replace,
         }) => run::start(&id, &alias, &args, replace),
         Command::Platform => print_platform(),
-        // The app's own process, re-executed by `open <id>` (and, once plan 009
-        // lands `dev`'s own foreground parent, by `dev <path>`) above.
+        // The app's own process, re-executed by `open <id>` and by `dev <path>`.
         // Everything it needs to become that app before GTK exists travels in
         // argv — see `open::child_args`.
         Command::OpenChild {
