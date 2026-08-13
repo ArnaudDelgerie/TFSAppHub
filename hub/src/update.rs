@@ -379,6 +379,7 @@ fn apply(
         // was moving *to* must not survive next to a tree just reverted back
         // to the version it was moving *from* — plan 024.
         lifecycle::discard_cache_stamp(&data_subdir);
+        let _ = lifecycle::write_data_version(&data_subdir, &entry.app_version);
         lifecycle::discard_rollback_anchor(&data_subdir);
     };
 
@@ -432,7 +433,7 @@ fn apply(
     // then the desktop entry, since a re-snapshot can change `product_name`
     // or `icon_path`.
     let now = registry::now_timestamp();
-    registry::update(paths, |registry| {
+    if let Err(error) = registry::update(paths, |registry| {
         registry.stamp(hub_version, platform.clone());
         if let Some(existing) = registry.get_mut(id) {
             existing.app_version = manifest.app_version.clone();
@@ -446,7 +447,12 @@ fn apply(
             existing.platform = platform;
             existing.updated_at = now;
         }
-    })?;
+    }) {
+        revert();
+        return Err(UpdateError::Reverted {
+            detail: error.to_string(),
+        });
+    }
 
     install::write_desktop_entry(paths, id, manifest, app_dir);
     println!("Updated {id} to {}.", manifest.app_version);

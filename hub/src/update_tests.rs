@@ -403,6 +403,11 @@ fn an_update_runs_pre_update_then_post_update_and_no_install_hooks() {
         .cloned()
         .expect("the entry survives");
     assert_eq!(updated.app_version, "0.7.0");
+    assert_eq!(
+        crate::lifecycle::read_data_version(&data_subdir).expect("a readable data record"),
+        Some("0.7.0".to_string()),
+        "prepare's success point advances the data version"
+    );
     let anchor = read_rollback_anchor(&data_subdir).expect("a complete rollback anchor");
     assert_eq!(anchor.app_version, "0.6.0");
     assert!(
@@ -461,6 +466,11 @@ fn a_failing_pre_update_leaves_the_tree_the_database_and_the_registry_entry_unch
         registry::load(&paths).expect("the untouched registry"),
         before_registry,
         "the registry must never be touched on a reverted update"
+    );
+    assert_eq!(
+        crate::lifecycle::read_data_version(&data_subdir).expect("a readable data record"),
+        Some("0.6.0".to_string()),
+        "a reverted update leaves its data version at the outgoing release"
     );
     assert!(
         !previous_tree_path(&app_dir).exists(),
