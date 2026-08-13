@@ -271,6 +271,13 @@ fn purge_identifier(
     identifier: &str,
     assume_yes: bool,
 ) -> Result<bool, RemoveError> {
+    // Refusal 0: these names identify infrastructure, never orphaned app data.
+    if paths::is_reserved_identifier(identifier) {
+        return Err(RemoveError::ReservedIdentifier {
+            identifier: identifier.to_string(),
+        });
+    }
+
     // Refusal 1: a registry entry still claims this identifier. Purging
     // under a live install would delete data `remove <id> --purge` is the
     // one command meant to reach.
@@ -745,6 +752,10 @@ fn delete_keyring_account(identifier: &str, account: &str) -> bool {
 pub enum RemoveError {
     Paths(PathsError),
     Registry(RegistryError),
+    /// `purge <identifier>` named a directory owned by the hub or desktop environment.
+    ReservedIdentifier {
+        identifier: String,
+    },
     NotInstalled {
         id: String,
     },
@@ -790,6 +801,21 @@ impl fmt::Display for RemoveError {
         match self {
             Self::Paths(error) => write!(formatter, "{error}"),
             Self::Registry(error) => write!(formatter, "{error}"),
+            Self::ReservedIdentifier { identifier } => match identifier.as_str() {
+                "hub" => write!(
+                    formatter,
+                    "hub is the hub's own directory under TFSApp/ and cannot be purged."
+                ),
+                "TFSApp" => write!(
+                    formatter,
+                    "TFSApp is the shared vendor directory and cannot be purged."
+                ),
+                "applications" => write!(
+                    formatter,
+                    "applications is the XDG desktop-entry directory and cannot be purged."
+                ),
+                _ => unreachable!("only reserved identifiers construct this error"),
+            },
             Self::NotInstalled { id } => write!(
                 formatter,
                 "no app is installed as {id} — `tfsapp-hub list` shows the ones that are."
