@@ -520,11 +520,12 @@ Gates, then archive, then checksums, then one `gh` call — the same order
 2. **Gates 9–11, `gh.rs`'s `Gh`.** `gh` is installed (9) and authenticated
    (10); no release already carries the tag `v<app_version>`, draft included
    (11) — each its own refusal, checked before the archive is ever built.
-3. **The archive**, only once every gate above has passed: the project's
-   tracked source tree, the same exclusion rules `tree_hash` already applies
-   on the install side, packed into `<project_name>-<app_version>.tar.gz`
-   inside a scratch directory under the hub's own root — removed on success
-   or failure alike, exactly as install's own scratch is.
+3. **The archive**, only once every gate above has passed: `git ls-files -z`
+   reads the project's tracked source tree; the same exclusion rules
+   `tree_hash` already applies on the install side then filter that list before
+   it is packed into `<project_name>-<app_version>.tar.gz` inside a scratch
+   directory under the hub's own root — removed on success or failure alike,
+   exactly as install's own scratch is.
 4. **`SHA256SUMS.txt`**, hashed over the archive just built, beside it in the
    same scratch directory.
 5. **The announcement**, then one confirmation (this one does honour

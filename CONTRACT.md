@@ -138,19 +138,19 @@ A release is, on the app's own forge repository:
 
 - a tag `v<app_version>` — `--ref` selects a release this way, never a branch
   or a commit;
-- an asset named `<project_name>-<app_version>.tar.gz`, holding the source
-  tree at that tag exactly as it stands: no `vendor/`, `var/`, `node_modules/`
-  or `.git/`, built frontend assets committed like any other file — the same
-  tree a local install would copy, so no step of the pipeline gets a remote
-  special case;
+- an asset named `<project_name>-<app_version>.tar.gz`, holding the Git-tracked
+  source tree at that commit: no `vendor/`, `var/`, `node_modules/` or `.git/`,
+  built frontend assets committed like any other tracked file — the same tree a
+  local install would copy, so no step of the pipeline gets a remote special
+  case;
 - a `SHA256SUMS.txt` beside it, one `<sha256>  <filename>` line naming the
   archive, checked before a single byte of it reaches the app root;
 - a `## <version>` heading in `CHANGELOG.md` naming what changed.
 
-All four are reachable by hand — a forge's web UI needs nothing more than
-`git archive` and `sha256sum` to publish one. `tfsapp-hub publish
-path/to/project` automates exactly this sequence and is the convenience, never
-the requirement.
+All four are reachable by hand — `git archive` starts from the same tracked
+tree, with the stated exclusions applied before `sha256sum` names the result.
+`tfsapp-hub publish path/to/project` automates exactly this sequence and is the
+convenience, never the requirement.
 
 The convenience needs two things a hand-built release does not: `gh` **and**
 `git`, both installed and authenticated on the **author's own machine** — the
