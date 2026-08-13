@@ -553,13 +553,20 @@ pub fn resolve_id(explicit: Option<&str>, manifest: &Manifest) -> Result<String,
         None => (manifest.project_name.as_str(), true),
     };
 
-    match is_usable_id(id) {
-        true => Ok(id.to_string()),
-        false => Err(InstallError::UnusableId {
+    if !is_usable_id(id) {
+        return Err(InstallError::UnusableId {
             id: id.to_string(),
             derived,
-        }),
+        });
     }
+
+    if id.ends_with(".previous") {
+        return Err(InstallError::RollbackAnchorId {
+            id: id.to_string(),
+            derived,
+        });
+    }
+    Ok(id.to_string())
 }
 
 /// Whether `id` can be both a CLI word and a directory name.
@@ -906,6 +913,11 @@ pub enum InstallError {
         id: String,
         derived: bool,
     },
+    /// This id would collide with the rollback anchor `update` owns.
+    RollbackAnchorId {
+        id: String,
+        derived: bool,
+    },
     /// Another installed app already answers to this `id`.
     IdTaken {
         id: String,
@@ -1001,6 +1013,17 @@ impl fmt::Display for InstallError {
                     "{source} — an app id has to start with a letter or a digit and hold \
                      nothing but letters, digits, \"-\", \"_\" and \".\": it names a \
                      directory and is typed as one word. Pass --as <id> to pick another."
+                )
+            }
+            Self::RollbackAnchorId { id, derived } => {
+                let source = match derived {
+                    true => format!("\"project_name\" is {id:?} in the app's {MANIFEST_FILE}"),
+                    false => format!("--as {id:?}"),
+                };
+                write!(
+                    formatter,
+                    "{source} — apps/{id} is update's rollback anchor, which update deletes and \
+                     recreates. Pick a different id with --as <id>."
                 )
             }
             Self::IdTaken { id, location } => write!(
