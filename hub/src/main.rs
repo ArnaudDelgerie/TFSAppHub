@@ -521,6 +521,14 @@ fn serve(
 ) {
     use tauri::Manager;
 
+    // `prepare_launch` returns no locks for a hand-off to an existing app.
+    // That child must not touch Composer: another launch already owns the
+    // app, and this process has nothing left to serve.
+    let holds_launch_locks = locks.is_some();
+    if !holds_launch_locks {
+        return;
+    }
+
     let (liveness_lock, serving_lock) = match locks {
         Some(locks) => (Some(locks.liveness), Some(locks.serving)),
         None => (None, None),
@@ -541,10 +549,44 @@ fn serve(
 
     let env_mode = match &spec.source {
         launch::Source::Installed { .. } => {
-            app_env::Mode::Launch(spec.expected_cache.clone().expect(
+            let mut expected_cache = spec.expected_cache.clone().expect(
                 "an installed launch's spec always carries its expected cache stamp — \
                  open::resolve is its only constructor",
-            ))
+            );
+            if should_revalidate(holds_launch_locks, spec.pending_revalidation.is_some()) {
+                let last_known_platform = spec
+                    .pending_revalidation
+                    .as_ref()
+                    .expect("the pending revalidation was just checked");
+                let id = spec
+                    .installed_id()
+                    .expect("only installed specs carry a pending revalidation");
+                println!(
+                    "Revalidating {id} behind the splash — it was installed against PHP \
+                     {last_known_platform}. Re-resolving its dependencies…"
+                );
+                match revalidate::revalidate(&paths, id, &spec.app_dir, manifest) {
+                    Ok(revalidate::Outcome::Ready(platform)) => {
+                        println!("{id} is ready.");
+                        // The revalidation just probed this platform. Comparing
+                        // against the registry value that made the work pending
+                        // would incorrectly preserve a cache built for old PHP.
+                        expected_cache.platform = platform;
+                    }
+                    Ok(revalidate::Outcome::Broken) => {
+                        return lifecycle::fatal_post_setup_error(
+                            app,
+                            open::OpenError::Broken {
+                                id: id.to_string(),
+                                platform: last_known_platform.to_string(),
+                            }
+                            .to_string(),
+                        );
+                    }
+                    Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
+                }
+            }
+            app_env::Mode::Launch(expected_cache)
         }
         launch::Source::Live => app_env::Mode::Dev,
     };
@@ -630,4 +672,27 @@ fn serve(
         manifest.actions.update.ipc || manifest.actions.update.bridge,
         Some(environment.log_dir.join("hub.log")),
     );
+}
+
+/// Revalidation is work for the instance that owns the launch locks. A
+/// hand-off reaches this point with neither locks nor a right to change the
+/// installed tree, even if the parent observed a pending revalidation.
+fn should_revalidate(holds_launch_locks: bool, pending_revalidation: bool) -> bool {
+    holds_launch_locks && pending_revalidation
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_revalidate;
+
+    #[test]
+    fn a_hand_off_short_circuits_before_pending_revalidation() {
+        assert!(!should_revalidate(false, true));
+    }
+
+    #[test]
+    fn the_lock_holding_child_runs_pending_revalidation_once() {
+        assert!(should_revalidate(true, true));
+        assert!(!should_revalidate(true, false));
+    }
 }
