@@ -286,19 +286,29 @@ versions.
 4. `Apply`, in order: snapshot `app.db` (+ `-wal`/`-shm`), retain the
    outgoing tree at `apps/<id>.previous` (a rename, never a copy — the cost
    of holding an anchor is one generation of the tree, not a copy pass over
-   it), copy the new tree in, empty the app's own cache/build directories
+   it), write the rollback anchor's third half from the *outgoing* registry
+   entry, copy the new tree in, empty the app's own cache/build directories
    (they are about to boot a container compiled from code that is no longer
    there), run `install::prepare` under the update event (`pre-update` then
    `post-update`, then the same `cache:warmup`-and-stamp `install` itself
-   runs — plan 024), then — only once every step above has succeeded —
-   write the rollback anchor's third half from the *outgoing* registry
-   entry, stamp the registry with the new one, and rewrite the desktop
-   entry.
+   runs — plan 024), then — only once every step above has succeeded — stamp
+   the registry with the new one and rewrite the desktop entry.
 5. Any failure from the tree swap onward reverts the whole attempt: the
    database snapshot is restored, the copied-in tree is removed, the
    outgoing tree is renamed back, the cache stamp `prepare`'s own warm-up
-   may already have written is discarded — and the registry is never
-   touched, so the next `open` does not know an update was attempted at all.
+   may already have written is discarded, and the outgoing data version and
+   rollback record are removed — and the registry is never touched, so the
+   next `open` does not know an update was attempted at all. Every undo is
+   attempted even if another fails; in that exceptional partial-revert case
+   the command names each failed on-disk step instead of claiming the old
+   installation is intact.
+
+`ResyncOnly` has no lifecycle event or rollback-anchor rotation. It renames
+the current tree to `apps/<id>.resync-aside` while it copies the equal-version
+source and runs Composer, restoring that tree if either fails and deleting the
+aside on success. A registry-write failure stays a plain error after that
+success: the new tree is healthy, and the stale revision merely makes a later
+`--force` repeat the resync.
 
 **The rollback anchor is three halves, or none.** `rollback <id>` refuses
 unless all three are present, naming whichever is missing:

@@ -397,8 +397,8 @@ fn announce(
 /// On any failure from the tree swap onwards, the whole attempt is reverted
 /// — the database snapshot restored, the new tree removed, the outgoing tree
 /// renamed back — and the registry is never touched: the installation is
-/// exactly what it was, and the next `open` does not know an update was
-/// attempted (the plan's "What a failed update leaves").
+/// exactly what it was unless an undo itself fails, in which case every undo
+/// is still attempted and the error names the failed paths.
 #[allow(clippy::too_many_arguments)]
 fn apply(
     paths: &Paths,
@@ -600,10 +600,11 @@ fn lifecycle_error_io(error: LifecycleError) -> io::Error {
     io::Error::other(error.to_string())
 }
 
-/// `--force` on an equal record: re-copy the source and re-run its
-/// dependency install, and stop there. No hooks, no database snapshot, no
-/// anchor rotation — the existing rollback point, if any, is left exactly as
-/// it was.
+/// `--force` on an equal record: move the current tree aside, re-copy the
+/// source and re-run its dependency install, then discard the aside. No hooks,
+/// database snapshot or anchor rotation — the existing rollback point, if any,
+/// is left exactly as it was. A copy or Composer failure restores the aside;
+/// only a later registry-write failure keeps the healthy replacement tree.
 fn resync_only(
     paths: &Paths,
     toolchain: &php::Toolchain,
