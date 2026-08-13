@@ -577,6 +577,8 @@ fn a_forced_import_rescue_dumps_the_replaced_database_and_discards_the_anchor() 
     let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
     fs::create_dir_all(&data_subdir).expect("a data subdir");
     fs::write(data_subdir.join("app.db"), b"existing").expect("an existing database");
+    fs::write(data_subdir.join("app.db-wal"), b"stale transactions")
+        .expect("a stale WAL beside the database");
     lifecycle::write_rollback_anchor(
         &data_subdir,
         &lifecycle::RollbackAnchor {
@@ -620,6 +622,22 @@ fn a_forced_import_rescue_dumps_the_replaced_database_and_discards_the_anchor() 
         })
         .expect("the replaced database, rescue-dumped");
     assert_eq!(fs::read(rescue).expect("read the rescue dump"), b"existing");
+    let rescued_wal = fs::read_dir(&data_subdir)
+        .expect("the data directory")
+        .map(|entry| entry.expect("a directory entry").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("app.db-wal.rescue-"))
+        })
+        .expect("the stale WAL must be rescued too");
+    assert_eq!(
+        fs::read(rescued_wal).expect("read the rescued WAL"),
+        b"stale transactions"
+    );
+    assert!(
+        !data_subdir.join("app.db-wal").exists() && !data_subdir.join("app.db-shm").exists(),
+        "the archive supplied neither twin, so no stale SQLite side file may survive it"
+    );
     assert!(
         lifecycle::read_rollback_anchor(&data_subdir).is_none(),
         "the anchor's rollback.json half must be gone"

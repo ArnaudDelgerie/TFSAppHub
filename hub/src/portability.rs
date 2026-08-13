@@ -431,6 +431,7 @@ fn run_import(
     // (an import proceeding has already made it incoherent — see the
     // Overview), and then writes.
     let rescue_path = rescue_dump(&data_subdir)?;
+    remove_live_db_files(&data_subdir)?;
     lifecycle::discard_rollback_anchor(&data_subdir);
     lifecycle::discard_db_snapshot(&data_subdir);
     update::discard_tree(&paths.app_dir(id)?);
@@ -581,6 +582,22 @@ fn rescue_dump(data_subdir: &Path) -> Result<Option<PathBuf>, PortabilityError> 
         }
     }
     Ok(app_db_rescue)
+}
+
+/// Remove the live database set after [`rescue_dump`] has copied it aside and
+/// before an archive writes its replacement. Extraction only creates files it
+/// carries, so leaving an old WAL or SHM beside an archive that has only the
+/// main database could silently replay transactions from the replaced one.
+fn remove_live_db_files(data_subdir: &Path) -> Result<(), PortabilityError> {
+    for name in lifecycle::DB_FILE_NAMES {
+        let path = data_subdir.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(PortabilityError::Io { path, source }),
+        }
+    }
+    Ok(())
 }
 
 /// Which command [`PortabilityError::Busy`] was refusing — its message names
