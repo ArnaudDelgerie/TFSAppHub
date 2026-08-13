@@ -1,17 +1,43 @@
 use std::{fs, path::Path};
 
 use super::{
-    discard_tree, restore_tree, retain_tree, update, update_decision, UpdateAction, UpdateError,
-    UpdateRefusal,
+    discard_resync_aside, discard_tree, restore_tree, resync_aside_path, resync_snapshot,
+    retain_tree, revert, update, update_decision, UpdateAction, UpdateError, UpdateRefusal,
 };
 use crate::{
-    lifecycle::previous_tree_path,
+    lifecycle::{previous_tree_path, read_rollback_anchor},
     paths::Paths,
     registry::{self, Platform, RegistryEntry, Source, SourceKind, State},
 };
 
 fn version(text: &str) -> semver::Version {
     semver::Version::parse(text).expect("a semver version")
+}
+
+#[test]
+fn a_partial_revert_names_its_failed_half_and_never_claims_success() {
+    let data_root = tempfile::tempdir().expect("a data directory");
+    let data_subdir = data_root.path().join("data");
+    let app_dir = tempfile::tempdir()
+        .expect("an apps directory")
+        .path()
+        .join("demo");
+    fs::write(&data_subdir, "not a directory").expect("a blocked data directory");
+
+    let outcome = revert(&data_subdir, &app_dir, "0.6.0");
+    let error = UpdateError::Reverted {
+        detail: "the update command failed.".to_string(),
+        outcome,
+    };
+    let message = error.to_string();
+
+    assert!(message.contains("data version rewrite"), "{message}");
+    assert!(message.contains("config.json"), "{message}");
+    assert!(message.contains("not put back"), "{message}");
+    assert!(
+        !message.contains("was put back to its previous state"),
+        "{message}"
+    );
 }
 
 // --- update_decision -------------------------------------------------------
@@ -170,6 +196,42 @@ fn discarding_an_absent_previous_tree_is_not_an_error() {
     let apps_root = tempfile::tempdir().expect("a temp apps root");
     let app_dir = apps_root.path().join("demo");
     discard_tree(&app_dir); // must not panic
+}
+
+#[test]
+fn a_failed_resync_copy_restores_an_openable_old_tree() {
+    let apps_root = tempfile::tempdir().expect("a temp apps root");
+    let app_dir = apps_root.path().join("demo");
+    let invalid_source = apps_root.path().join("not-a-directory");
+    app_tree(&app_dir, "outgoing");
+    fs::write(&invalid_source, "not a source tree").expect("an invalid source");
+
+    resync_snapshot(&invalid_source, &app_dir).expect_err("the copy must fail");
+
+    assert_eq!(
+        fs::read_to_string(app_dir.join("marker")).expect("the old tree remains openable"),
+        "outgoing"
+    );
+    assert!(!resync_aside_path(&app_dir).exists());
+}
+
+#[test]
+fn a_resync_cleans_a_stale_aside_and_leaves_none_after_its_copy() {
+    let apps_root = tempfile::tempdir().expect("a temp apps root");
+    let app_dir = apps_root.path().join("demo");
+    let source = apps_root.path().join("source");
+    app_tree(&app_dir, "outgoing");
+    app_tree(&resync_aside_path(&app_dir), "stale");
+    app_tree(&source, "replacement");
+
+    resync_snapshot(&source, &app_dir).expect("the copy succeeds");
+    discard_resync_aside(&app_dir).expect("the old tree is discarded after a resync");
+
+    assert_eq!(
+        fs::read_to_string(app_dir.join("marker")).expect("the replacement tree"),
+        "replacement"
+    );
+    assert!(!resync_aside_path(&app_dir).exists());
 }
 
 // --- the `update <id>` command --------------------------------------------
@@ -375,6 +437,9 @@ fn an_update_runs_pre_update_then_post_update_and_no_install_hooks() {
     )
     .expect("the first install");
 
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::write(data_subdir.join("app.db"), b"pre-update-bytes").expect("a seeded database");
+
     // A newer source, with update hooks instead of install ones.
     runnable_app_tree(
         source.path(),
@@ -400,6 +465,18 @@ fn an_update_runs_pre_update_then_post_update_and_no_install_hooks() {
         .cloned()
         .expect("the entry survives");
     assert_eq!(updated.app_version, "0.7.0");
+    assert_eq!(
+        crate::lifecycle::read_data_version(&data_subdir).expect("a readable data record"),
+        Some("0.7.0".to_string()),
+        "prepare's success point advances the data version"
+    );
+    let anchor = read_rollback_anchor(&data_subdir).expect("a complete rollback anchor");
+    assert_eq!(anchor.app_version, "0.6.0");
+    assert!(
+        previous_tree_path(&paths.app_dir("demo").expect("an app dir")).is_dir(),
+        "a successful update keeps the outgoing tree"
+    );
+    assert!(data_subdir.join("app.db.pre-update").is_file());
 }
 
 #[test]
@@ -452,9 +529,22 @@ fn a_failing_pre_update_leaves_the_tree_the_database_and_the_registry_entry_unch
         before_registry,
         "the registry must never be touched on a reverted update"
     );
+    assert_eq!(
+        crate::lifecycle::read_data_version(&data_subdir).expect("a readable data record"),
+        Some("0.6.0".to_string()),
+        "a reverted update leaves its data version at the outgoing release"
+    );
     assert!(
         !previous_tree_path(&app_dir).exists(),
         "a reverted update leaves no anchor behind"
+    );
+    assert!(
+        !data_subdir.join("app.db.pre-update").exists(),
+        "a reverted update consumes the database half of its anchor"
+    );
+    assert!(
+        read_rollback_anchor(&data_subdir).is_none(),
+        "a reverted update consumes the anchor record too"
     );
 }
 
@@ -562,6 +652,10 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
     assert!(
         !previous_tree_path(&paths.app_dir("demo").expect("an app dir")).exists(),
         "a resync must not rotate the anchor"
+    );
+    assert!(
+        !resync_aside_path(&paths.app_dir("demo").expect("an app dir")).exists(),
+        "a successful resync must discard its temporary aside"
     );
 
     let after_registry = registry::load(&paths)

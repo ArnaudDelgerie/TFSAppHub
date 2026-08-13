@@ -904,7 +904,9 @@ update must never leave the app's database between two versions.** It does
 so by snapshotting the database before `pre-update` runs and reverting the
 snapshot, the code and the registry together the moment any step fails — an
 app either finishes the update it declared, or is left exactly where it
-started, never partway through.
+started, never partway through. If an on-disk undo itself fails, the hub still
+attempts every remaining undo and names every failed path instead of claiming
+the installation was put back.
 
 A successful update leaves behind a **rollback anchor** — the outgoing
 source tree and the pre-update database, kept rather than discarded —

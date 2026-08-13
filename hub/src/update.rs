@@ -150,6 +150,59 @@ pub fn discard_tree(app_dir: &Path) {
     let _ = fs::remove_dir_all(lifecycle::previous_tree_path(app_dir));
 }
 
+/// The temporary sibling used while a forced equal-version resync replaces an
+/// app tree. It is deliberately not the `.previous` rollback anchor: a resync
+/// must leave that anchor alone.
+fn resync_aside_path(app_dir: &Path) -> PathBuf {
+    let mut aside = app_dir.as_os_str().to_os_string();
+    aside.push(".resync-aside");
+    PathBuf::from(aside)
+}
+
+/// Move the current tree aside, copy its replacement, and put the current
+/// tree back if the copy fails. A stale aside can only be from an interrupted
+/// earlier resync, so the next resync clears it before creating its own.
+fn resync_snapshot(source_root: &Path, app_dir: &Path) -> Result<(), UpdateError> {
+    let aside = resync_aside_path(app_dir);
+    remove_dir_if_present(&aside).map_err(|source| UpdateError::Io {
+        path: aside.clone(),
+        source,
+    })?;
+    fs::rename(app_dir, &aside).map_err(|source| UpdateError::Io {
+        path: app_dir.to_path_buf(),
+        source,
+    })?;
+
+    if let Err(error) = install::snapshot(source_root, app_dir) {
+        restore_resync_tree(app_dir)?;
+        return Err(UpdateError::Install(error));
+    }
+
+    Ok(())
+}
+
+/// Discard the newly copied tree and restore the pre-resync one. This is the
+/// undo for [`resync_snapshot`] when Composer cannot finish the replacement.
+fn restore_resync_tree(app_dir: &Path) -> Result<(), UpdateError> {
+    remove_dir_if_present(app_dir).map_err(|source| UpdateError::Io {
+        path: app_dir.to_path_buf(),
+        source,
+    })?;
+    let aside = resync_aside_path(app_dir);
+    fs::rename(&aside, app_dir).map_err(|source| UpdateError::Io {
+        path: aside,
+        source,
+    })
+}
+
+fn discard_resync_aside(app_dir: &Path) -> Result<(), UpdateError> {
+    let aside = resync_aside_path(app_dir);
+    remove_dir_if_present(&aside).map_err(|source| UpdateError::Io {
+        path: aside,
+        source,
+    })
+}
+
 /// The whole command: update `id`, or say why not. Returns the process's
 /// exit code.
 pub fn run(
@@ -344,8 +397,8 @@ fn announce(
 /// On any failure from the tree swap onwards, the whole attempt is reverted
 /// — the database snapshot restored, the new tree removed, the outgoing tree
 /// renamed back — and the registry is never touched: the installation is
-/// exactly what it was, and the next `open` does not know an update was
-/// attempted (the plan's "What a failed update leaves").
+/// exactly what it was unless an undo itself fails, in which case every undo
+/// is still attempted and the error names the failed paths.
 #[allow(clippy::too_many_arguments)]
 fn apply(
     paths: &Paths,
@@ -370,20 +423,29 @@ fn apply(
         source,
     })?;
 
-    let revert = || {
-        let _ = lifecycle::restore_db_snapshot(&data_subdir);
-        let _ = fs::remove_dir_all(app_dir);
-        let _ = restore_tree(app_dir);
-        // A stamp `prepare`'s own warm-up wrote for the version this update
-        // was moving *to* must not survive next to a tree just reverted back
-        // to the version it was moving *from* — plan 024.
-        lifecycle::discard_cache_stamp(&data_subdir);
-    };
-
-    if let Err(error) = install::snapshot(&resolved.root, app_dir) {
-        revert();
+    // The three anchor halves describe the same outgoing installation. Write
+    // the registry half before the first operation that can leave the other
+    // two behind, so an interruption never creates a mismatched anchor.
+    if let Err(error) = lifecycle::write_rollback_anchor(
+        &data_subdir,
+        &lifecycle::RollbackAnchor {
+            app_version: entry.app_version.clone(),
+            source_revision: entry.source_revision.clone(),
+            created_at: registry::now_timestamp(),
+        },
+    ) {
+        let outcome = revert(&data_subdir, app_dir, &entry.app_version);
         return Err(UpdateError::Reverted {
             detail: error.to_string(),
+            outcome,
+        });
+    }
+
+    if let Err(error) = install::snapshot(&resolved.root, app_dir) {
+        let outcome = revert(&data_subdir, app_dir, &entry.app_version);
+        return Err(UpdateError::Reverted {
+            detail: error.to_string(),
+            outcome,
         });
     }
 
@@ -402,28 +464,19 @@ fn apply(
         LifecycleEvent::Update,
         &platform,
     ) {
-        revert();
+        let outcome = revert(&data_subdir, app_dir, &entry.app_version);
         return Err(UpdateError::Reverted {
             detail: error.to_string(),
+            outcome,
         });
     }
 
-    // Success, in order (the plan's "On success"): the event's success point
-    // already ran inside `prepare`, then the anchor's registry half, from the
-    // *outgoing* entry — this is what `rollback <id>` restores to — then the
-    // registry entry itself, then the desktop entry, since a re-snapshot can
-    // change `product_name` or `icon_path`.
-    lifecycle::write_rollback_anchor(
-        &data_subdir,
-        &lifecycle::RollbackAnchor {
-            app_version: entry.app_version.clone(),
-            source_revision: entry.source_revision.clone(),
-            created_at: registry::now_timestamp(),
-        },
-    )?;
-
+    // The event's success point already ran inside `prepare`; the complete
+    // anchor already records the outgoing entry. Commit the registry entry,
+    // then the desktop entry, since a re-snapshot can change `product_name`
+    // or `icon_path`.
     let now = registry::now_timestamp();
-    registry::update(paths, |registry| {
+    if let Err(error) = registry::update(paths, |registry| {
         registry.stamp(hub_version, platform.clone());
         if let Some(existing) = registry.get_mut(id) {
             existing.app_version = manifest.app_version.clone();
@@ -437,17 +490,121 @@ fn apply(
             existing.platform = platform;
             existing.updated_at = now;
         }
-    })?;
+    }) {
+        let outcome = revert(&data_subdir, app_dir, &entry.app_version);
+        return Err(UpdateError::Reverted {
+            detail: error.to_string(),
+            outcome,
+        });
+    }
 
     install::write_desktop_entry(paths, id, manifest, app_dir);
     println!("Updated {id} to {}.", manifest.app_version);
     Ok(())
 }
 
-/// `--force` on an equal record: re-copy the source and re-run its
-/// dependency install, and stop there. No hooks, no database snapshot, no
-/// anchor rotation — the existing rollback point, if any, is left exactly as
-/// it was.
+#[derive(Debug, Default)]
+pub struct RevertOutcome {
+    failures: Vec<RevertFailure>,
+}
+
+#[derive(Debug)]
+struct RevertFailure {
+    step: &'static str,
+    path: PathBuf,
+    detail: String,
+}
+
+impl RevertOutcome {
+    fn record(&mut self, step: &'static str, path: PathBuf, result: io::Result<()>) {
+        if let Err(error) = result {
+            self.failures.push(RevertFailure {
+                step,
+                path,
+                detail: error.to_string(),
+            });
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+/// Attempt every half of an update's undo, retaining every failure for the
+/// caller to report. A failed restore must not hide the attempts that follow:
+/// the user needs the full on-disk state before deciding whether to free disk
+/// space and retry `update` or use `rollback`.
+fn revert(data_subdir: &Path, app_dir: &Path, outgoing_version: &str) -> RevertOutcome {
+    let mut outcome = RevertOutcome::default();
+    outcome.record(
+        "database snapshot restore",
+        data_subdir.to_path_buf(),
+        lifecycle::restore_db_snapshot(data_subdir),
+    );
+    for name in lifecycle::DB_FILE_NAMES {
+        let path = lifecycle::db_snapshot_path(data_subdir, name);
+        outcome.record(
+            "database snapshot discard",
+            path.clone(),
+            remove_file_if_present(&path),
+        );
+    }
+    outcome.record(
+        "new tree discard",
+        app_dir.to_path_buf(),
+        remove_dir_if_present(app_dir),
+    );
+    let previous = lifecycle::previous_tree_path(app_dir);
+    outcome.record("tree swap-back", previous, restore_tree(app_dir));
+    // A stamp `prepare`'s own warm-up wrote for the version this update was
+    // moving to must not survive next to a tree just reverted back to the
+    // version it was moving from — plan 024.
+    let stamp = lifecycle::cache_stamp_path(data_subdir);
+    outcome.record(
+        "cache stamp discard",
+        stamp,
+        lifecycle::discard_cache_stamp(data_subdir),
+    );
+    outcome.record(
+        "data version rewrite",
+        lifecycle::data_config_path(data_subdir),
+        lifecycle::write_data_version(data_subdir, outgoing_version).map_err(lifecycle_error_io),
+    );
+    let record = lifecycle::rollback_anchor_path(data_subdir);
+    outcome.record(
+        "rollback record discard",
+        record.clone(),
+        remove_file_if_present(&record),
+    );
+    outcome
+}
+
+fn remove_dir_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn lifecycle_error_io(error: LifecycleError) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
+/// `--force` on an equal record: move the current tree aside, re-copy the
+/// source and re-run its dependency install, then discard the aside. No hooks,
+/// database snapshot or anchor rotation — the existing rollback point, if any,
+/// is left exactly as it was. A copy or Composer failure restores the aside;
+/// only a later registry-write failure keeps the healthy replacement tree.
 fn resync_only(
     paths: &Paths,
     toolchain: &php::Toolchain,
@@ -458,13 +615,9 @@ fn resync_only(
 ) -> Result<(), UpdateError> {
     // Never through `retain_tree`/`lifecycle::previous_tree_path`: that name
     // is the rollback anchor's, and a resync must not rotate it (the plan's
-    // decision table). A plain re-copy in place — `install::snapshot` refuses
-    // an existing target, so the stale tree goes first.
-    fs::remove_dir_all(app_dir).map_err(|source| UpdateError::Io {
-        path: app_dir.to_path_buf(),
-        source,
-    })?;
-    install::snapshot(&resolved.root, app_dir)?;
+    // decision table). Its own aside is a rename, not deletion: a bad source
+    // copy must leave the serving tree usable.
+    resync_snapshot(&resolved.root, app_dir)?;
 
     let state_root = paths.create_app_data_dir(&entry.identifier)?;
     let environment = app_env::resolve(
@@ -474,9 +627,17 @@ fn resync_only(
         &state_root,
         app_env::Mode::Install,
     )?;
-    toolchain.composer_install(app_dir, &environment.vars)?;
+    if let Err(error) = toolchain.composer_install(app_dir, &environment.vars) {
+        restore_resync_tree(app_dir)?;
+        return Err(UpdateError::Php(error));
+    }
+
+    discard_resync_aside(app_dir)?;
 
     let now = registry::now_timestamp();
+    // Do not restore the aside if this write fails: the new tree and its
+    // dependencies are healthy and already serving the resolved source. The
+    // old revision only causes a later `--force` to repeat this safe resync.
     registry::update(paths, |registry| {
         if let Some(existing) = registry.get_mut(&entry.id) {
             existing.source_revision = resolved.revision.clone();
@@ -538,6 +699,7 @@ pub enum UpdateError {
     /// installation already put back to what it was.
     Reverted {
         detail: String,
+        outcome: RevertOutcome,
     },
 }
 
@@ -605,10 +767,27 @@ impl fmt::Display for UpdateError {
                 "the version recorded for {id} does not parse as semver ({detail}) — \
                  reinstall it."
             ),
-            Self::Reverted { detail } => write!(
+            Self::Reverted { detail, outcome } if outcome.is_complete() => write!(
                 formatter,
                 "{detail} The installation was put back to its previous state."
             ),
+            Self::Reverted { detail, outcome } => {
+                write!(
+                    formatter,
+                    "{detail} The installation was not put back to its previous state. \
+                     These revert steps failed:"
+                )?;
+                for failure in &outcome.failures {
+                    write!(
+                        formatter,
+                        " {} at {}: {};",
+                        failure.step,
+                        failure.path.display(),
+                        failure.detail
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 }
