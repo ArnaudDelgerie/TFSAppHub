@@ -37,11 +37,6 @@ pub const EXIT_USAGE: i32 = 2;
 /// nothing about their machine is broken.
 pub const EXIT_UNIMPLEMENTED: i32 = 3;
 
-/// Temporary and hidden — the double underscore says so, and nothing prints it
-/// in a usage line or in `--help`. It exists so the `platform` fingerprint can
-/// be eyeballed against the bundled binary's real `php -m`.
-pub const PLATFORM_SUBCOMMAND: &str = "__platform";
-
 /// Hidden, same convention, and not temporary: this is the form `open <id>`
 /// re-executes the hub binary with (plan 007, see `open.rs`). It is one half of
 /// one command rather than a command of its own — a user has no reason to type
@@ -380,8 +375,6 @@ pub enum Command {
         assume_yes: bool,
     },
     Run(RunInvocation),
-    /// Hidden, temporary — see [`PLATFORM_SUBCOMMAND`].
-    Platform,
     /// Hidden — see [`OPEN_CHILD_SUBCOMMAND`]. Carries the raw strings rather
     /// than an `Identity` so this module stays free of the identity types it
     /// would otherwise have to know about.
@@ -457,7 +450,6 @@ impl Command {
             Self::Export { .. } => "export",
             Self::Import { .. } => "import",
             Self::Run(_) => "run",
-            Self::Platform => PLATFORM_SUBCOMMAND,
             Self::OpenChild { .. } => OPEN_CHILD_SUBCOMMAND,
         }
     }
@@ -617,7 +609,6 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             })
         }
         "run" => parse_run(rest),
-        PLATFORM_SUBCOMMAND => Ok(Command::Platform),
         OPEN_CHILD_SUBCOMMAND => parse_open_child(rest),
         unknown => Err(UsageError {
             message: match unknown.starts_with('-') {

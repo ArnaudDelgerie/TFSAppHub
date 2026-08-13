@@ -65,6 +65,7 @@ fn a_ready_app_shows_what_it_is_and_where_it_came_from() {
         "dev.local.tfsapp-test",
         "0.6.0",
         "ready",
+        "8.5+a1b2c3d4",
         "/home/arnaud/Dev/tfsapp-test",
     ] {
         assert!(

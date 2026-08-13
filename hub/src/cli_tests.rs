@@ -405,8 +405,13 @@ fn every_form_in_the_surface_parses_back_to_its_own_command() {
 }
 
 #[test]
-fn the_hidden_subcommands_stay_reachable_and_unlisted() {
-    assert_eq!(command("__platform"), Command::Platform);
+fn the_hidden_open_subcommand_stays_reachable_and_unlisted() {
+    assert!(
+        refusal("__platform")
+            .message
+            .contains("unknown command __platform"),
+        "the retired platform probe must not stay parseable"
+    );
     assert_eq!(
         command("__open --id demo --identity dev.local.demo --name Demo --icon /tmp/demo.png"),
         Command::OpenChild {

@@ -27,11 +27,6 @@
 //! which is what lets the same binary answer for whatever FrankenPHP it happens
 //! to be shipping.
 
-// Read for real by the revalidation flow and written by the installer (plans
-// 006 and after); today the hidden `__platform` subcommand in `main.rs` is its
-// only caller. Remove the allow with the first real consumer.
-#![allow(dead_code)]
-
 use std::{
     fmt,
     path::{Path, PathBuf},

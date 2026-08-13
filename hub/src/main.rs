@@ -47,8 +47,7 @@ mod window;
 mod worker;
 
 use cli::{
-    Command, Level, OpenChildSource, RunInvocation, EXIT_FAILED, EXIT_OK, EXIT_UNIMPLEMENTED,
-    EXIT_USAGE,
+    Command, Level, OpenChildSource, RunInvocation, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE,
 };
 use identity::Identity;
 
@@ -205,7 +204,6 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             args,
             replace,
         }) => run::start(&id, &alias, &args, replace),
-        Command::Platform => print_platform(),
         // The app's own process, re-executed by `open <id>` and by `dev <path>`.
         // Everything it needs to become that app before GTK exists travels in
         // argv — see `open::child_args`.
@@ -225,42 +223,6 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
                 context,
             );
             EXIT_OK
-        }
-    }
-}
-
-/// Print what the bundled FrankenPHP says it is, and the fingerprint derived
-/// from it. Returns the process exit code.
-///
-/// The extension list is printed in full alongside the hash: the point of this
-/// command is to be checkable against `frankenphp php-cli -m` by eye, and a
-/// 64-character hash on its own is checkable against nothing.
-fn print_platform() -> i32 {
-    let binary = match platform::hub_frankenphp() {
-        Ok(binary) => binary,
-        Err(error) => {
-            eprintln!("tfsapp-hub: {error}");
-            return EXIT_FAILED;
-        }
-    };
-
-    match platform::probe(&binary) {
-        Ok(probe) => {
-            let fingerprint = probe.fingerprint();
-            println!("interpreter: {}", binary.display());
-            println!("php:         {}", probe.php_version);
-            println!(
-                "extensions:  {} — {}",
-                probe.extensions.len(),
-                probe.extensions.join(", ")
-            );
-            println!("hash:        {}", fingerprint.extensions_hash);
-            println!("platform:    {fingerprint}");
-            EXIT_OK
-        }
-        Err(error) => {
-            eprintln!("tfsapp-hub: {error}");
-            EXIT_FAILED
         }
     }
 }
