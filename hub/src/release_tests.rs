@@ -73,6 +73,35 @@ fn a_good_release_resolves_its_tag_and_assets() {
 }
 
 #[test]
+fn a_release_tag_must_name_a_canonical_version() {
+    let error = resolve_assets(&release(
+        "release-1.2.0",
+        vec![asset("demo-1.2.0.tar.gz"), asset("SHA256SUMS.txt")],
+    ))
+    .expect_err("a tag without v is not a release version");
+
+    assert!(matches!(error, ReleaseError::InvalidTag { .. }), "{error}");
+    assert!(error.to_string().contains("release-1.2.0"), "{error}");
+    assert!(error.to_string().contains("v<app_version>"), "{error}");
+}
+
+#[test]
+fn a_source_archive_must_agree_with_its_release_tag() {
+    let error = resolve_assets(&release(
+        "v1.2.0",
+        vec![asset("demo-1.3.0.tar.gz"), asset("SHA256SUMS.txt")],
+    ))
+    .expect_err("an archive for another version is refused");
+
+    assert!(
+        matches!(error, ReleaseError::ArchiveTagMismatch { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("demo-1.3.0.tar.gz"), "{error}");
+    assert!(error.to_string().contains("-1.2.0.tar.gz"), "{error}");
+}
+
+#[test]
 fn a_release_s_body_is_read_when_present_and_none_when_explicitly_null() {
     let (base_url, handle) = stub_once(
         200,

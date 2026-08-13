@@ -5,6 +5,7 @@ use std::{
 
 use super::{classify, current_revision, resolve, tree_hash, Origin, Revision, SourceError};
 use crate::registry::{Source, SourceKind};
+use sha2::{Digest, Sha256};
 
 /// None of this file's `resolve` calls reach the `Origin::Release` arm — every
 /// case here is a local path or a git spelling — so a real base URL is never
@@ -25,6 +26,154 @@ fn local(location: &Path) -> Source {
         reference_kind: None,
         index: None,
     }
+}
+
+fn release_archive(manifest: &str) -> Vec<u8> {
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::fast(),
+    ));
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_size(0);
+    header.set_mode(0o755);
+    header.set_path("demo-1.2.0/").expect("a directory path");
+    header.set_cksum();
+    builder
+        .append(&header, std::io::empty())
+        .expect("the top-level directory");
+
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(manifest.len() as u64);
+    header.set_mode(0o644);
+    header
+        .set_path("demo-1.2.0/tfsapp.config.json")
+        .expect("a manifest path");
+    header.set_cksum();
+    builder
+        .append(&header, manifest.as_bytes())
+        .expect("the manifest");
+    builder
+        .into_inner()
+        .expect("finish the tar")
+        .finish()
+        .expect("finish the gzip")
+}
+
+fn stub_release(archive: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+    let archive_name = "demo-1.2.0.tar.gz";
+    let mut hasher = Sha256::new();
+    hasher.update(&archive);
+    let checksums = format!("{:x}  {archive_name}\n", hasher.finalize());
+    let server = tiny_http::Server::http("127.0.0.1:0").expect("a local stub server");
+    let port = match server.server_addr() {
+        tiny_http::ListenAddr::IP(address) => address.port(),
+        other => panic!("unexpected listen address: {other:?}"),
+    };
+    let base_url = format!("http://127.0.0.1:{port}");
+    let release = format!(
+        r#"{{"tag_name":"v1.2.0","html_url":"{base_url}/release","assets":[{{"name":"{archive_name}","browser_download_url":"{base_url}/assets/{archive_name}","size":{}}},{{"name":"SHA256SUMS.txt","browser_download_url":"{base_url}/assets/SHA256SUMS.txt","size":{}}}]}}"#,
+        archive.len(),
+        checksums.len(),
+    );
+    let handle = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let request = server.recv().expect("a request");
+            match request.url() {
+                "/repos/example/demo/releases/latest" => {
+                    let header = tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"application/json"[..],
+                    )
+                    .expect("a header");
+                    request
+                        .respond(
+                            tiny_http::Response::from_string(release.clone()).with_header(header),
+                        )
+                        .expect("release metadata");
+                }
+                "/assets/demo-1.2.0.tar.gz" => request
+                    .respond(tiny_http::Response::from_data(archive.clone()))
+                    .expect("archive"),
+                "/assets/SHA256SUMS.txt" => request
+                    .respond(tiny_http::Response::from_string(checksums.clone()))
+                    .expect("checksums"),
+                path => panic!("unexpected request path: {path}"),
+            }
+        }
+    });
+    (base_url, handle)
+}
+
+fn remote_manifest(version: &str, project_name: &str) -> String {
+    format!(
+        r#"{{"product_name":"Demo","identifier":"dev.local.demo","project_name":"{project_name}","app_version":"{version}"}}"#
+    )
+}
+
+#[test]
+fn a_release_manifest_must_confirm_its_tag_version() {
+    let (base_url, handle) = stub_release(release_archive(&remote_manifest("1.3.0", "demo")));
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+
+    let error = resolve(
+        &classify("github:example/demo"),
+        None,
+        scratch.path(),
+        &base_url,
+    )
+    .expect_err("a manifest version contradicting the tag is refused");
+    handle.join().expect("the stub thread finishes");
+
+    assert!(
+        matches!(error, SourceError::ManifestVersionMismatch { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("v1.2.0"), "{error}");
+    assert!(error.to_string().contains("1.3.0"), "{error}");
+}
+
+#[test]
+fn a_release_manifest_must_confirm_its_archive_project_name() {
+    let (base_url, handle) = stub_release(release_archive(&remote_manifest("1.2.0", "other")));
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+
+    let error = resolve(
+        &classify("github:example/demo"),
+        None,
+        scratch.path(),
+        &base_url,
+    )
+    .expect_err("a manifest project name contradicting the archive is refused");
+    handle.join().expect("the stub thread finishes");
+
+    assert!(
+        matches!(error, SourceError::ManifestProjectNameMismatch { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("demo-1.2.0.tar.gz"), "{error}");
+    assert!(error.to_string().contains("other"), "{error}");
+}
+
+#[test]
+fn a_conforming_release_records_the_same_release_source() {
+    let (base_url, handle) = stub_release(release_archive(&remote_manifest("1.2.0", "demo")));
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+
+    let resolved = resolve(
+        &classify("github:example/demo"),
+        None,
+        scratch.path(),
+        &base_url,
+    )
+    .expect("a conforming release resolves");
+    handle.join().expect("the stub thread finishes");
+
+    assert_eq!(resolved.source.kind, SourceKind::Release);
+    assert_eq!(resolved.source.location, "example/demo");
+    assert_eq!(resolved.source.reference.as_deref(), Some("v1.2.0"));
+    assert_eq!(resolved.source.index.as_deref(), Some("github"));
 }
 
 #[test]
