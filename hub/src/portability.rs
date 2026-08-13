@@ -30,7 +30,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    archive::{self, ArchiveError},
+    archive,
     cli::{EXIT_FAILED, EXIT_OK},
     install::{self, InstallError},
     lifecycle::{self, LifecycleEvent},
@@ -275,40 +275,69 @@ fn write_archive(
     manifest: &Manifest,
     data_subdir: &Path,
 ) -> Result<Vec<&'static str>, PortabilityError> {
-    let temporary = target.with_extension("tmp");
+    let temporary = export_temp_path(target);
     let io_error = |path: &Path| {
         let path = path.to_path_buf();
         move |source| PortabilityError::Io { path, source }
     };
 
-    let file = fs::File::create(&temporary).map_err(io_error(&temporary))?;
-    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-        file,
-        flate2::Compression::default(),
-    ));
-
-    let manifest_json = serde_json::to_vec_pretty(manifest)
-        .expect("a Manifest holds nothing that can fail to serialise");
-    append_bytes(&mut builder, MANIFEST_FILE, &manifest_json).map_err(io_error(&temporary))?;
-
-    let mut written = Vec::new();
-    for name in lifecycle::DB_FILE_NAMES {
-        let source_path = data_subdir.join(name);
-        if !source_path.is_file() {
-            continue;
-        }
-        let bytes = fs::read(&source_path).map_err(io_error(&source_path))?;
-        let archive_path = format!("{DATA_DIR}/{name}");
-        append_bytes(&mut builder, &archive_path, &bytes).map_err(io_error(&temporary))?;
-        written.push(name);
+    if temporary.exists() {
+        return Err(PortabilityError::TemporaryExists { path: temporary });
     }
 
-    let encoder = builder.into_inner().map_err(io_error(&temporary))?;
-    encoder.finish().map_err(io_error(&temporary))?;
+    let file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+    {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(PortabilityError::TemporaryExists { path: temporary });
+        }
+        Err(source) => return Err(io_error(&temporary)(source)),
+    };
 
-    fs::rename(&temporary, target).map_err(io_error(target))?;
+    let result = (|| {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            file,
+            flate2::Compression::default(),
+        ));
 
-    Ok(written)
+        let manifest_json = serde_json::to_vec_pretty(manifest)
+            .expect("a Manifest holds nothing that can fail to serialise");
+        append_bytes(&mut builder, MANIFEST_FILE, &manifest_json).map_err(io_error(&temporary))?;
+
+        let mut written = Vec::new();
+        for name in lifecycle::DB_FILE_NAMES {
+            let source_path = data_subdir.join(name);
+            if !source_path.is_file() {
+                continue;
+            }
+            let bytes = fs::read(&source_path).map_err(io_error(&source_path))?;
+            let archive_path = format!("{DATA_DIR}/{name}");
+            append_bytes(&mut builder, &archive_path, &bytes).map_err(io_error(&temporary))?;
+            written.push(name);
+        }
+
+        let encoder = builder.into_inner().map_err(io_error(&temporary))?;
+        encoder.finish().map_err(io_error(&temporary))?;
+
+        fs::rename(&temporary, target).map_err(io_error(target))?;
+
+        Ok(written)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// The unfinished archive sits next to its eventual target under its complete
+/// filename, so `backup.tar.gz` becomes `backup.tar.gz.tmp`.
+fn export_temp_path(target: &Path) -> PathBuf {
+    let mut temporary = target.as_os_str().to_os_string();
+    temporary.push(".tmp");
+    PathBuf::from(temporary)
 }
 
 /// Append one in-memory file to `builder` at `archive_path`, with an ordinary
@@ -431,12 +460,47 @@ fn run_import(
     // (an import proceeding has already made it incoherent — see the
     // Overview), and then writes.
     let rescue_path = rescue_dump(&data_subdir)?;
+    remove_live_db_files(&data_subdir).map_err(|error| {
+        import_incomplete(
+            &data_subdir,
+            rescue_path.as_deref(),
+            "the previous database was rescued but could not be fully moved aside",
+            error,
+        )
+    })?;
     lifecycle::discard_rollback_anchor(&data_subdir);
     lifecycle::discard_db_snapshot(&data_subdir);
-    update::discard_tree(&paths.app_dir(id)?);
+    let app_dir = paths.app_dir(id).map_err(|error| {
+        import_incomplete(
+            &data_subdir,
+            rescue_path.as_deref(),
+            "the previous database was rescued but the import could not start",
+            error,
+        )
+    })?;
+    update::discard_tree(&app_dir);
 
-    archive::extract_prefix(archive_path, DATA_DIR, &data_subdir)
-        .map_err(PortabilityError::Archive)?;
+    archive::extract_prefix(archive_path, DATA_DIR, &data_subdir).map_err(|error| {
+        import_incomplete(
+            &data_subdir,
+            rescue_path.as_deref(),
+            "the data directory may be partially extracted",
+            error,
+        )
+    })?;
+
+    // Stamp the archive's version before any forward migration. If a hook
+    // fails now, `open` reads this older record as the same unfinished update
+    // it already knows to refuse, rather than serving an unmigrated database
+    // under the installed version's old, misleading stamp.
+    lifecycle::write_data_version(&data_subdir, &manifest.app_version).map_err(|error| {
+        import_incomplete(
+            &data_subdir,
+            rescue_path.as_deref(),
+            "the database was extracted but its version record could not be written",
+            error,
+        )
+    })?;
 
     // `lifecycle::check_version` — the guard every `open` runs — reads only
     // `data/config.json`; it has no way to tell "an update never finished"
@@ -453,9 +517,24 @@ fn run_import(
     // cross-machine case (the plan's Overview), from landing on data nothing
     // can ever open again.
     let migrated_forward = if archive_version < installed_version {
-        let app_dir = paths.app_dir(id)?;
-        let installed_manifest = manifest::load(&app_dir)?.manifest;
-        let toolchain = php::toolchain(paths)?;
+        let installed_manifest = manifest::load(&app_dir)
+            .map_err(|error| {
+                import_incomplete(
+                    &data_subdir,
+                    rescue_path.as_deref(),
+                    "the database was extracted but not migrated forward",
+                    error,
+                )
+            })?
+            .manifest;
+        let toolchain = php::toolchain(paths).map_err(|error| {
+            import_incomplete(
+                &data_subdir,
+                rescue_path.as_deref(),
+                "the database was extracted but not migrated forward",
+                error,
+            )
+        })?;
         install::prepare(
             paths,
             &toolchain,
@@ -463,13 +542,19 @@ fn run_import(
             &app_dir,
             LifecycleEvent::Update,
             &entry.platform,
-        )?;
+        )
+        .map_err(|error| {
+            import_incomplete(
+                &data_subdir,
+                rescue_path.as_deref(),
+                "the database was extracted but not migrated forward",
+                error,
+            )
+        })?;
         true
     } else {
         // Equal versions only — `import_decision` already refused anything
-        // newer. `install::prepare` writes the version record itself when it
-        // runs above; this is the branch where nothing else does.
-        lifecycle::write_data_version(&data_subdir, &manifest.app_version)?;
+        // newer, and the archive's version record was written above.
         false
     };
 
@@ -583,6 +668,36 @@ fn rescue_dump(data_subdir: &Path) -> Result<Option<PathBuf>, PortabilityError> 
     Ok(app_db_rescue)
 }
 
+/// Remove the live database set after [`rescue_dump`] has copied it aside and
+/// before an archive writes its replacement. Extraction only creates files it
+/// carries, so leaving an old WAL or SHM beside an archive that has only the
+/// main database could silently replay transactions from the replaced one.
+fn remove_live_db_files(data_subdir: &Path) -> Result<(), PortabilityError> {
+    for name in lifecycle::DB_FILE_NAMES {
+        let path = data_subdir.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(PortabilityError::Io { path, source }),
+        }
+    }
+    Ok(())
+}
+
+fn import_incomplete(
+    data_subdir: &Path,
+    rescue_path: Option<&Path>,
+    data_state: &'static str,
+    source: impl std::fmt::Display,
+) -> PortabilityError {
+    PortabilityError::ImportIncomplete {
+        data_subdir: data_subdir.to_path_buf(),
+        rescue_path: rescue_path.map(Path::to_path_buf),
+        data_state,
+        detail: source.to_string(),
+    }
+}
+
 /// Which command [`PortabilityError::Busy`] was refusing — its message names
 /// the risk in the command's own terms rather than a shared, blander one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -598,7 +713,6 @@ pub(crate) enum Action {
 pub enum PortabilityError {
     Paths(PathsError),
     Registry(RegistryError),
-    Archive(ArchiveError),
     Lifecycle(lifecycle::LifecycleError),
     /// Reloading the installed manifest, or running its `pre-update`/
     /// `post-update` commands, to migrate an older archive forward.
@@ -615,6 +729,10 @@ pub enum PortabilityError {
     },
     /// `export`'s target already exists.
     TargetExists {
+        path: PathBuf,
+    },
+    /// `export`'s own unfinished archive is still present.
+    TemporaryExists {
         path: PathBuf,
     },
     /// A live window or an active `run` command holds the data directory.
@@ -635,6 +753,15 @@ pub enum PortabilityError {
     },
     /// [`import_decision`] refused.
     Refused(ImportRefusal),
+    /// An import failed after its rescue dump was safely taken. The ordinary
+    /// error alone is not enough: the caller also needs to know the state now
+    /// left on disk and where the data it replaced can be recovered.
+    ImportIncomplete {
+        data_subdir: PathBuf,
+        rescue_path: Option<PathBuf>,
+        data_state: &'static str,
+        detail: String,
+    },
 }
 
 impl fmt::Display for PortabilityError {
@@ -642,7 +769,6 @@ impl fmt::Display for PortabilityError {
         match self {
             Self::Paths(error) => write!(formatter, "{error}"),
             Self::Registry(error) => write!(formatter, "{error}"),
-            Self::Archive(error) => write!(formatter, "{error}"),
             Self::Lifecycle(error) => write!(formatter, "{error}"),
             Self::Install(error) => write!(formatter, "{error}"),
             Self::Manifest(error) => write!(formatter, "{error}"),
@@ -656,6 +782,12 @@ impl fmt::Display for PortabilityError {
                 formatter,
                 "{} already exists — pick another path, or remove it first. export never \
                  overwrites a file it did not just write.",
+                path.display()
+            ),
+            Self::TemporaryExists { path } => write!(
+                formatter,
+                "{} already exists — it is left over from a failed export and must be \
+                 removed by hand before exporting again.",
                 path.display()
             ),
             Self::Busy { id, holder, action } => {
@@ -698,6 +830,26 @@ impl fmt::Display for PortabilityError {
                 path.display()
             ),
             Self::Refused(refusal) => write!(formatter, "{refusal}"),
+            Self::ImportIncomplete {
+                data_subdir,
+                rescue_path,
+                data_state,
+                detail,
+            } => {
+                write!(
+                    formatter,
+                    "import did not finish: {detail}. {data_state} in {}",
+                    data_subdir.display()
+                )?;
+                match rescue_path {
+                    Some(path) => write!(
+                        formatter,
+                        "; the database it replaced was saved to {}",
+                        path.display()
+                    ),
+                    None => write!(formatter, "; no existing database needed a rescue dump"),
+                }
+            }
         }
     }
 }
@@ -707,7 +859,6 @@ impl std::error::Error for PortabilityError {
         match self {
             Self::Paths(error) => Some(error),
             Self::Registry(error) => Some(error),
-            Self::Archive(error) => Some(error),
             Self::Lifecycle(error) => Some(error),
             Self::Install(error) => Some(error),
             Self::Manifest(error) => Some(error),

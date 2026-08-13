@@ -324,8 +324,9 @@ The third half exists because the first two cannot answer what it does:
 copied with `install`'s own excluded paths — recomputing it from the tree
 would produce a different string that means nothing.
 
-A rollback rescue-dumps the current database first, printing its path, then
-restores the snapshot as the live database, deletes the current tree and
+A rollback rescue-dumps the current database first, printing its timestamped
+`app.db.rescue-<YYYYMMDDTHHMMSSZ>` path (with a numeric suffix on a collision),
+then restores the snapshot as the live database, deletes the current tree and
 renames `.previous` back in its place, restores `data/config.json` and the
 registry entry to the anchor's recorded version, and rewrites the desktop
 entry. It then **consumes** the anchor — the snapshot and `rollback.json`
@@ -378,7 +379,12 @@ override, wait or stop it instead).
 about to replace is moved aside via `lifecycle::rescue_dump_path` — the same
 mechanism `rollback` uses for the database it cannot keep — and the path is
 printed before the confirmation prompt fires, so "wrong archive" costs a
-rename back, not a re-export from wherever the original came from.
+rename back, not a re-export from wherever the original came from. The rescue
+is named `app.db.rescue-<YYYYMMDDTHHMMSSZ>` (or with a numeric collision
+suffix), so a second forced import cannot replace the first rescue. Once the
+copy is safe, import removes each live `DB_FILE_NAMES` file before extraction:
+the database is literally moved aside, and an archive lacking a WAL cannot
+inherit one from the database it replaces.
 
 **A forced import also discards the rollback anchor, both halves.** The
 anchor pairs `apps/<id>.previous` with the `.pre-update` snapshot; seeding
@@ -411,6 +417,18 @@ over the freshly imported database, and the version record lands on what is
 actually installed, not on the archive's older one. An archive at the
 installed version skips this — nothing to migrate — and one newer is already
 refused before either path is reached.
+
+The archive version is written to `data/config.json` immediately after
+extraction, before this forward migration. Thus a migration failure reads as
+an unfinished update on the next `open`, which refuses it; it never lies that
+the installed version's migration completed. Every error after the rescue is
+wrapped with its underlying reason, the resulting data-directory state and the
+full rescue path, rather than leaving a user to infer which database is safe.
+
+**The export temporary is also protected from overwrite.** `write_archive`
+uses the full target filename plus `.tmp`, refuses a pre-existing temp as a
+manual-cleanup leftover from a failed export, and best-effort removes a temp
+it created if a later write or rename fails.
 
 **Extraction reuses `archive.rs`'s safety checks under a different shape.**
 `archive::extract` requires exactly one top-level directory, which does not

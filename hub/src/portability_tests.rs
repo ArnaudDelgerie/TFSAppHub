@@ -1,8 +1,8 @@
 use std::{fs, path::Path};
 
 use super::{
-    append_bytes, data_dir_populated, import_decision, run_export, run_import, ImportRefusal,
-    Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE,
+    append_bytes, data_dir_populated, export_temp_path, import_decision, run_export, run_import,
+    ImportRefusal, Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE,
 };
 use crate::{
     install, lifecycle,
@@ -261,7 +261,62 @@ fn an_app_with_no_database_yet_exports_the_manifest_alone() {
     run_export(&paths, "demo", &target).expect("nothing blocks a never-opened app");
 
     assert_eq!(archive_entries(&target), vec![MANIFEST_FILE.to_string()]);
-    assert!(!target.with_extension("tmp").exists());
+    assert!(!export_temp_path(&target).exists());
+}
+
+#[test]
+fn an_export_temp_uses_the_complete_target_filename() {
+    let target = Path::new("backup.tar.gz");
+
+    assert_eq!(export_temp_path(target), Path::new("backup.tar.gz.tmp"));
+}
+
+#[test]
+fn exporting_refuses_a_leftover_temp_file_without_touching_it() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let target = base.path().join("backup.tar.gz");
+    let temporary = export_temp_path(&target);
+    fs::write(&temporary, b"unfinished archive").expect("a leftover temp file");
+
+    let error = run_export(&paths, "demo", &target).expect_err("the temp file must be kept");
+
+    assert!(
+        matches!(error, PortabilityError::TemporaryExists { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("left over from a failed export"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(&temporary).expect("the leftover remains"),
+        b"unfinished archive"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_export_removes_its_temp_file() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    // `/proc/self/mem` presents as a regular file but reading it reliably
+    // fails, which makes the archive fail only after its temp was created.
+    std::os::unix::fs::symlink("/proc/self/mem", data_subdir.join("app.db"))
+        .expect("a deliberately unreadable database");
+    let target = base.path().join("backup.tar.gz");
+    let temporary = export_temp_path(&target);
+
+    let error = run_export(&paths, "demo", &target).expect_err("the database cannot be read");
+
+    assert!(matches!(error, PortabilityError::Io { .. }), "{error}");
+    assert!(
+        !temporary.exists(),
+        "failed exports clean up their temp file"
+    );
+    assert!(!target.exists(), "the requested target remains untouched");
 }
 
 #[test]
@@ -487,6 +542,10 @@ fn importing_refuses_a_foreign_identifier() {
         ),
         "{error}"
     );
+    assert!(
+        !error.to_string().contains("rescue"),
+        "a refusal before extraction must not imply data was moved aside"
+    );
 }
 
 #[test]
@@ -577,6 +636,8 @@ fn a_forced_import_rescue_dumps_the_replaced_database_and_discards_the_anchor() 
     let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
     fs::create_dir_all(&data_subdir).expect("a data subdir");
     fs::write(data_subdir.join("app.db"), b"existing").expect("an existing database");
+    fs::write(data_subdir.join("app.db-wal"), b"stale transactions")
+        .expect("a stale WAL beside the database");
     lifecycle::write_rollback_anchor(
         &data_subdir,
         &lifecycle::RollbackAnchor {
@@ -611,10 +672,30 @@ fn a_forced_import_rescue_dumps_the_replaced_database_and_discards_the_anchor() 
         fs::read(data_subdir.join("app.db")).expect("the new database"),
         b"incoming"
     );
+    let rescue = fs::read_dir(&data_subdir)
+        .expect("the data directory")
+        .map(|entry| entry.expect("a directory entry").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("app.db.rescue-"))
+        })
+        .expect("the replaced database, rescue-dumped");
+    assert_eq!(fs::read(rescue).expect("read the rescue dump"), b"existing");
+    let rescued_wal = fs::read_dir(&data_subdir)
+        .expect("the data directory")
+        .map(|entry| entry.expect("a directory entry").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("app.db-wal.rescue-"))
+        })
+        .expect("the stale WAL must be rescued too");
     assert_eq!(
-        fs::read(lifecycle::rescue_dump_path(&data_subdir, "app.db"))
-            .expect("the replaced database, rescue-dumped"),
-        b"existing"
+        fs::read(rescued_wal).expect("read the rescued WAL"),
+        b"stale transactions"
+    );
+    assert!(
+        !data_subdir.join("app.db-wal").exists() && !data_subdir.join("app.db-shm").exists(),
+        "the archive supplied neither twin, so no stale SQLite side file may survive it"
     );
     assert!(
         lifecycle::read_rollback_anchor(&data_subdir).is_none(),
@@ -731,7 +812,11 @@ fn an_archive_with_a_traversal_entry_is_refused_by_archives_own_checks() {
 
     let error = run_import(&paths, "demo", &archive, false, true)
         .expect_err("a traversal entry is refused by archive's own checks");
-    assert!(matches!(error, PortabilityError::Archive(_)), "{error}");
+    assert!(
+        matches!(error, PortabilityError::ImportIncomplete { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("partially extracted"), "{error}");
 }
 
 // --- import migrates an older archive forward --------------------------
@@ -864,5 +949,55 @@ fn an_archive_older_than_the_installed_app_is_migrated_forward_on_import() {
         fs::read(data_subdir.join("app.db")).expect("the imported database"),
         b"older-backup",
         "the imported bytes are what the hooks ran against, not a fixture database"
+    );
+}
+
+#[test]
+fn a_failed_forward_migration_leaves_the_archive_version_and_names_the_rescue() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+    runnable_app_tree(source.path(), "1.3.0", r#"{"pre-update": ["boom"]}"#);
+    install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the initial install succeeds")
+    .expect("the user did not decline");
+
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::write(data_subdir.join("app.db"), b"before import").expect("an existing database");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.0")),
+            (&format!("{DATA_DIR}/app.db"), b"archive database"),
+        ],
+    );
+
+    let error = run_import(&paths, "demo", &archive, true, true)
+        .expect_err("the fixture's pre-update hook fails");
+    let message = error.to_string();
+    assert!(
+        matches!(error, PortabilityError::ImportIncomplete { .. }),
+        "{message}"
+    );
+    assert!(
+        message.contains("extracted but not migrated forward"),
+        "{message}"
+    );
+    assert!(message.contains("app.db.rescue-"), "{message}");
+    assert_eq!(
+        lifecycle::read_data_version(&data_subdir).expect("the stamped config"),
+        Some("1.2.0".to_string()),
+        "the next open must see the unfinished forward migration"
     );
 }

@@ -257,7 +257,14 @@ fn a_successful_update_can_be_rolled_back_end_to_end() {
         fs::read(data_subdir.join("app.db")).expect("the restored database"),
         b"pre-update-bytes"
     );
-    let rescue = lifecycle::rescue_dump_path(&data_subdir, "app.db");
+    let rescue = fs::read_dir(&data_subdir)
+        .expect("the data directory")
+        .map(|entry| entry.expect("a directory entry").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("app.db.rescue-"))
+        })
+        .expect("the rescue dump must exist at its printed path");
     assert!(
         rescue.is_file(),
         "the rescue dump must exist at its printed path"
