@@ -1,8 +1,8 @@
 use std::{fs, path::Path};
 
 use super::{
-    discard_tree, restore_tree, retain_tree, revert, update, update_decision, UpdateAction,
-    UpdateError, UpdateRefusal,
+    discard_resync_aside, discard_tree, restore_tree, resync_aside_path, resync_snapshot,
+    retain_tree, revert, update, update_decision, UpdateAction, UpdateError, UpdateRefusal,
 };
 use crate::{
     lifecycle::{previous_tree_path, read_rollback_anchor},
@@ -196,6 +196,42 @@ fn discarding_an_absent_previous_tree_is_not_an_error() {
     let apps_root = tempfile::tempdir().expect("a temp apps root");
     let app_dir = apps_root.path().join("demo");
     discard_tree(&app_dir); // must not panic
+}
+
+#[test]
+fn a_failed_resync_copy_restores_an_openable_old_tree() {
+    let apps_root = tempfile::tempdir().expect("a temp apps root");
+    let app_dir = apps_root.path().join("demo");
+    let invalid_source = apps_root.path().join("not-a-directory");
+    app_tree(&app_dir, "outgoing");
+    fs::write(&invalid_source, "not a source tree").expect("an invalid source");
+
+    resync_snapshot(&invalid_source, &app_dir).expect_err("the copy must fail");
+
+    assert_eq!(
+        fs::read_to_string(app_dir.join("marker")).expect("the old tree remains openable"),
+        "outgoing"
+    );
+    assert!(!resync_aside_path(&app_dir).exists());
+}
+
+#[test]
+fn a_resync_cleans_a_stale_aside_and_leaves_none_after_its_copy() {
+    let apps_root = tempfile::tempdir().expect("a temp apps root");
+    let app_dir = apps_root.path().join("demo");
+    let source = apps_root.path().join("source");
+    app_tree(&app_dir, "outgoing");
+    app_tree(&resync_aside_path(&app_dir), "stale");
+    app_tree(&source, "replacement");
+
+    resync_snapshot(&source, &app_dir).expect("the copy succeeds");
+    discard_resync_aside(&app_dir).expect("the old tree is discarded after a resync");
+
+    assert_eq!(
+        fs::read_to_string(app_dir.join("marker")).expect("the replacement tree"),
+        "replacement"
+    );
+    assert!(!resync_aside_path(&app_dir).exists());
 }
 
 // --- the `update <id>` command --------------------------------------------
@@ -616,6 +652,10 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
     assert!(
         !previous_tree_path(&paths.app_dir("demo").expect("an app dir")).exists(),
         "a resync must not rotate the anchor"
+    );
+    assert!(
+        !resync_aside_path(&paths.app_dir("demo").expect("an app dir")).exists(),
+        "a successful resync must discard its temporary aside"
     );
 
     let after_registry = registry::load(&paths)

@@ -150,6 +150,59 @@ pub fn discard_tree(app_dir: &Path) {
     let _ = fs::remove_dir_all(lifecycle::previous_tree_path(app_dir));
 }
 
+/// The temporary sibling used while a forced equal-version resync replaces an
+/// app tree. It is deliberately not the `.previous` rollback anchor: a resync
+/// must leave that anchor alone.
+fn resync_aside_path(app_dir: &Path) -> PathBuf {
+    let mut aside = app_dir.as_os_str().to_os_string();
+    aside.push(".resync-aside");
+    PathBuf::from(aside)
+}
+
+/// Move the current tree aside, copy its replacement, and put the current
+/// tree back if the copy fails. A stale aside can only be from an interrupted
+/// earlier resync, so the next resync clears it before creating its own.
+fn resync_snapshot(source_root: &Path, app_dir: &Path) -> Result<(), UpdateError> {
+    let aside = resync_aside_path(app_dir);
+    remove_dir_if_present(&aside).map_err(|source| UpdateError::Io {
+        path: aside.clone(),
+        source,
+    })?;
+    fs::rename(app_dir, &aside).map_err(|source| UpdateError::Io {
+        path: app_dir.to_path_buf(),
+        source,
+    })?;
+
+    if let Err(error) = install::snapshot(source_root, app_dir) {
+        restore_resync_tree(app_dir)?;
+        return Err(UpdateError::Install(error));
+    }
+
+    Ok(())
+}
+
+/// Discard the newly copied tree and restore the pre-resync one. This is the
+/// undo for [`resync_snapshot`] when Composer cannot finish the replacement.
+fn restore_resync_tree(app_dir: &Path) -> Result<(), UpdateError> {
+    remove_dir_if_present(app_dir).map_err(|source| UpdateError::Io {
+        path: app_dir.to_path_buf(),
+        source,
+    })?;
+    let aside = resync_aside_path(app_dir);
+    fs::rename(&aside, app_dir).map_err(|source| UpdateError::Io {
+        path: aside,
+        source,
+    })
+}
+
+fn discard_resync_aside(app_dir: &Path) -> Result<(), UpdateError> {
+    let aside = resync_aside_path(app_dir);
+    remove_dir_if_present(&aside).map_err(|source| UpdateError::Io {
+        path: aside,
+        source,
+    })
+}
+
 /// The whole command: update `id`, or say why not. Returns the process's
 /// exit code.
 pub fn run(
@@ -561,13 +614,9 @@ fn resync_only(
 ) -> Result<(), UpdateError> {
     // Never through `retain_tree`/`lifecycle::previous_tree_path`: that name
     // is the rollback anchor's, and a resync must not rotate it (the plan's
-    // decision table). A plain re-copy in place — `install::snapshot` refuses
-    // an existing target, so the stale tree goes first.
-    fs::remove_dir_all(app_dir).map_err(|source| UpdateError::Io {
-        path: app_dir.to_path_buf(),
-        source,
-    })?;
-    install::snapshot(&resolved.root, app_dir)?;
+    // decision table). Its own aside is a rename, not deletion: a bad source
+    // copy must leave the serving tree usable.
+    resync_snapshot(&resolved.root, app_dir)?;
 
     let state_root = paths.create_app_data_dir(&entry.identifier)?;
     let environment = app_env::resolve(
@@ -577,9 +626,17 @@ fn resync_only(
         &state_root,
         app_env::Mode::Install,
     )?;
-    toolchain.composer_install(app_dir, &environment.vars)?;
+    if let Err(error) = toolchain.composer_install(app_dir, &environment.vars) {
+        restore_resync_tree(app_dir)?;
+        return Err(UpdateError::Php(error));
+    }
+
+    discard_resync_aside(app_dir)?;
 
     let now = registry::now_timestamp();
+    // Do not restore the aside if this write fails: the new tree and its
+    // dependencies are healthy and already serving the resolved source. The
+    // old revision only causes a later `--force` to repeat this safe resync.
     registry::update(paths, |registry| {
         if let Some(existing) = registry.get_mut(&entry.id) {
             existing.source_revision = resolved.revision.clone();
