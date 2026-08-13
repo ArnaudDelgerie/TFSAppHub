@@ -108,7 +108,7 @@ fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool
     // never a second probe with its own idea of it. A read-only probe, so a
     // refusal never has the side effect of reaping anything.
     if purge {
-        match busy_holder(&removal_plan.data_dir) {
+        match busy_holder(&removal_plan.data_dir, &identifier) {
             Ok(None) => {}
             Ok(Some(holder)) => {
                 return Err(RemoveError::StillRunning {
@@ -141,11 +141,11 @@ fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool
 /// [`lifecycle::data_dir_holder`] has no opinion about a missing directory
 /// (probing `run.lock` inside one would just fail to open it), and a data
 /// directory that has never been written to is not busy.
-fn busy_holder(data_dir: &Path) -> io::Result<Option<lifecycle::DataDirHolder>> {
+fn busy_holder(data_dir: &Path, identifier: &str) -> io::Result<Option<lifecycle::DataDirHolder>> {
     if !data_dir.is_dir() {
         return Ok(None);
     }
-    lifecycle::data_dir_holder(data_dir)
+    lifecycle::data_dir_holder(data_dir, identifier)
 }
 
 /// Delete every zone `plan` carries: the registry entry and the code-side
@@ -327,7 +327,7 @@ fn purge_identifier(
     // Refusal 4: the same shared guard `remove --purge` now goes through
     // too (step 2) — a live window or an active `run` command holds this
     // data directory.
-    match busy_holder(&data_dir) {
+    match busy_holder(&data_dir, identifier) {
         Ok(None) => {}
         Ok(Some(holder)) => {
             return Err(RemoveError::StillRunning {

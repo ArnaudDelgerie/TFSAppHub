@@ -727,7 +727,7 @@ pub fn prepare_launch(
     // this check, since it is the ordinary "second window on an app that is
     // already up" case and a `concurrent` alias legitimately running beside
     // that window would otherwise be blocked by it.
-    check_run_lock(id, data_dir);
+    check_run_lock(id, data_dir, identifier);
 
     let event = check_version(id, data_subdir, app_version);
     // A data dir with no record at all, under an app the hub installed: the
@@ -852,6 +852,24 @@ pub(crate) enum RunLockHeld {
     Held { alias: Option<String> },
 }
 
+// Turn the flock observation and the shared orphan decision into one answer.
+// The held-lock alias is read only when a live launcher owns the flock.
+pub(crate) fn run_lock_held_decision(
+    flock_held: bool,
+    held_alias: Option<String>,
+    orphan: crate::run::OrphanedRun,
+) -> RunLockHeld {
+    if flock_held {
+        return RunLockHeld::Held { alias: held_alias };
+    }
+    match orphan {
+        crate::run::OrphanedRun::ActiveOrphan { alias, .. } => {
+            RunLockHeld::Held { alias: Some(alias) }
+        }
+        crate::run::OrphanedRun::Stale => RunLockHeld::Free,
+    }
+}
+
 /// Probe `<data_dir>/run.lock` (plan 013, CONTRACT.md §6): the pure,
 /// Result-returning half of [`check_run_lock`], kept apart from it exactly as
 /// [`acquire_launch_locks`] is kept apart from [`prepare_launch`] — so a held
@@ -861,16 +879,24 @@ pub(crate) enum RunLockHeld {
 /// Never retains the lock — probe and drop, the same "never retain, just
 /// observe" pattern [`tfsapp_core::process::is_owner_live`] uses for the
 /// liveness lock.
-pub(crate) fn probe_run_lock(data_dir: &Path) -> std::io::Result<RunLockHeld> {
+pub(crate) fn probe_run_lock(data_dir: &Path, identifier: &str) -> std::io::Result<RunLockHeld> {
     let run_lock_path = data_dir.join("run.lock");
-    if tfsapp_core::process::try_lock_file(&run_lock_path)?.is_some() {
-        return Ok(RunLockHeld::Free);
-    }
-    let alias = fs::read_to_string(&run_lock_path)
-        .ok()
-        .and_then(|contents| crate::run::parse_run_lock(&contents))
-        .map(|record| record.alias);
-    Ok(RunLockHeld::Held { alias })
+    let Some(_lock) = tfsapp_core::process::try_lock_file(&run_lock_path)? else {
+        let alias = fs::read_to_string(&run_lock_path)
+            .ok()
+            .and_then(|contents| crate::run::parse_run_lock(&contents))
+            .map(|record| record.alias);
+        return Ok(run_lock_held_decision(
+            true,
+            alias,
+            crate::run::OrphanedRun::Stale,
+        ));
+    };
+    Ok(run_lock_held_decision(
+        false,
+        None,
+        crate::run::probe_orphaned_run(&run_lock_path, identifier),
+    ))
 }
 
 /// Who is already using a data directory — a live app window, or an active
@@ -901,13 +927,13 @@ pub enum DataDirHolder {
 /// each caller already knows what "nothing to check yet" means for its own
 /// command (an install has nothing to refuse; an export has nothing to
 /// read), so that is decided before this is ever called.
-pub fn data_dir_holder(data_dir: &Path) -> io::Result<Option<DataDirHolder>> {
+pub fn data_dir_holder(data_dir: &Path, identifier: &str) -> io::Result<Option<DataDirHolder>> {
     let pid_file = data_dir.join("sidecar.pid");
     if tfsapp_core::process::is_owner_live(&pid_file).unwrap_or(false) {
         return Ok(Some(DataDirHolder::Window));
     }
 
-    match probe_run_lock(data_dir)? {
+    match probe_run_lock(data_dir, identifier)? {
         RunLockHeld::Free => Ok(None),
         RunLockHeld::Held { alias } => Ok(Some(DataDirHolder::RunCommand { alias })),
     }
@@ -917,8 +943,8 @@ pub fn data_dir_holder(data_dir: &Path) -> io::Result<Option<DataDirHolder>> {
 /// window while a `run` command holds `run.lock` for this app, naming the
 /// active alias when [`probe_run_lock`] found one and pointing at the way to
 /// release it either way.
-fn check_run_lock(id: &str, data_dir: &Path) {
-    match probe_run_lock(data_dir) {
+fn check_run_lock(id: &str, data_dir: &Path, identifier: &str) {
+    match probe_run_lock(data_dir, identifier) {
         Ok(RunLockHeld::Free) => {}
         Ok(RunLockHeld::Held { alias: Some(alias) }) => fatal_startup_error(&format!(
             "{id} cannot open a window while its \"{alias}\" run command is active — stop it \

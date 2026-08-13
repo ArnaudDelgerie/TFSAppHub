@@ -247,7 +247,7 @@ fn update_into(
         .map_err(|refusal| UpdateError::refused(id, refusal))?;
 
     let data_dir = paths.app_data_dir(&entry.identifier)?;
-    install::check_data_dir_available(id, &data_dir)?;
+    install::check_data_dir_available(id, &entry.identifier, &data_dir)?;
 
     // Resolved before the question, since an update nothing could finish is
     // not worth asking about — the same reasoning `install::install` uses.
