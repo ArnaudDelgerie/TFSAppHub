@@ -176,7 +176,7 @@ pub(crate) fn install_into(
     // The third writer's own version of the guard `open` and `run` already
     // enforce: nothing may install into a data directory a live window or an
     // active `run` command still owns.
-    check_data_dir_available(&id, &data_dir)?;
+    check_data_dir_available(&id, &manifest.identifier, &data_dir)?;
     // A fresh install has nothing to roll back to: any rollback anchor left
     // behind under this data directory — by an update this `id` ran before a
     // `remove` without `--purge` — is stale the moment a new tree lands on
@@ -657,7 +657,11 @@ pub fn check_identifier_allowed(identifier: &str) -> Result<(), InstallError> {
 /// `import` (plan 022) also call: this function's own job is only turning
 /// "something holds it" into `install`'s own [`InstallError::DataDirInUse`]
 /// and message, never a second copy of the probing itself.
-pub fn check_data_dir_available(id: &str, data_dir: &Path) -> Result<(), InstallError> {
+pub fn check_data_dir_available(
+    id: &str,
+    identifier: &str,
+    data_dir: &Path,
+) -> Result<(), InstallError> {
     // The ordinary case, by far: a brand new `identifier` has no data
     // directory at all yet. Neither probe below may create one — both open
     // their lock file with `create(true)`, which would fail on a missing
@@ -667,7 +671,7 @@ pub fn check_data_dir_available(id: &str, data_dir: &Path) -> Result<(), Install
         return Ok(());
     }
 
-    match lifecycle::data_dir_holder(data_dir) {
+    match lifecycle::data_dir_holder(data_dir, identifier) {
         Ok(None) => Ok(()),
         Ok(Some(holder)) => Err(InstallError::DataDirInUse {
             id: id.to_string(),

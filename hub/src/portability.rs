@@ -209,10 +209,11 @@ fn run_export(paths: &Paths, id: &str, target: &Path) -> Result<(), PortabilityE
     }
 
     let data_dir = paths.app_data_dir(&entry.identifier)?;
-    let holder = busy_holder(&data_dir).map_err(|source| PortabilityError::Io {
-        path: data_dir.join("run.lock"),
-        source,
-    })?;
+    let holder =
+        busy_holder(&data_dir, &entry.identifier).map_err(|source| PortabilityError::Io {
+            path: data_dir.join("run.lock"),
+            source,
+        })?;
     if let Some(holder) = holder {
         return Err(PortabilityError::Busy {
             id: id.to_string(),
@@ -255,11 +256,11 @@ fn run_export(paths: &Paths, id: &str, target: &Path) -> Result<(), PortabilityE
 /// A data directory that does not exist yet is not busy: nothing has ever
 /// written to it, so there is nothing to guard against, exactly as
 /// `install::check_data_dir_available` treats it.
-fn busy_holder(data_dir: &Path) -> io::Result<Option<lifecycle::DataDirHolder>> {
+fn busy_holder(data_dir: &Path, identifier: &str) -> io::Result<Option<lifecycle::DataDirHolder>> {
     if !data_dir.is_dir() {
         return Ok(None);
     }
-    lifecycle::data_dir_holder(data_dir)
+    lifecycle::data_dir_holder(data_dir, identifier)
 }
 
 /// Write `manifest` and whichever of [`lifecycle::DB_FILE_NAMES`] exist under
@@ -386,10 +387,11 @@ fn run_import(
     })?;
 
     let data_dir = paths.app_data_dir(&entry.identifier)?;
-    let holder = busy_holder(&data_dir).map_err(|source| PortabilityError::Io {
-        path: data_dir.join("run.lock"),
-        source,
-    })?;
+    let holder =
+        busy_holder(&data_dir, &entry.identifier).map_err(|source| PortabilityError::Io {
+            path: data_dir.join("run.lock"),
+            source,
+        })?;
     if let Some(holder) = holder {
         return Err(PortabilityError::Busy {
             id: id.to_string(),

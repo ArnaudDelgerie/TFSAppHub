@@ -818,7 +818,7 @@ nothing.
 | --- | --- | --- |
 | `serving.lock` | Will handing this launch's argv to that process get you a window right now? | a launch's own hand-off probe |
 | `sidecar.pid.lock` (the liveness lock) | Does a process still own this data dir at all? | a launch's reap, and `run`'s own rule-3 concurrency probe |
-| `run.lock` | Is a `run` command already active for this app? | `run`'s own rule 2, and a launch's rule-3-in-reverse refusal |
+| `run.lock` | Is its launcher live, or did its child outlive it? | `run`'s rule 2, launch's rule-3-in-reverse refusal, and data-dir writers |
 
 Rule 3's "is a window live" probe deliberately reads the **liveness** lock,
 not the serving one: a process mid-teardown still owns the data dir, and a
@@ -830,10 +830,15 @@ sibling it is about to hand off to, since a `concurrent` alias legitimately
 running beside an already-open window must not be blocked by a second window
 opening beside it.
 
-`run.lock`'s content is not just a flock — it is a small record, `<alias>`
-then `<alias>\n<pid>` once the child is spawned, so a refusal elsewhere can
-name which alias is active rather than just the file. `run --stop`/`--replace`
-read that record to know what to signal.
+`run.lock` separates the two questions: its flock answers whether the
+launcher still lives, while its durable record — `<alias>`, then
+`<alias>\n<pid>` once the child is spawned — answers what it was running when
+the flock has already gone. Every guard consults the flock and, when it is
+free, identity-proves that recorded pid through `TFS_APP_IDENTIFIER`; a live
+match is an orphaned active command, while a dead or mismatched pid is stale.
+That lets refusals name the alias, and lets `run --stop`/`--replace` know what
+to signal without ever killing a command as a side effect of `open` or a
+data-dir writer.
 
 ### Forwarding a signal past `Child::wait()`'s own retry
 

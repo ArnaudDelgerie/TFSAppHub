@@ -83,7 +83,7 @@ fn rollback(paths: &Paths, id: &str, assume_yes: bool) -> Result<bool, RollbackE
         }
     };
 
-    install::check_data_dir_available(id, &data_dir)?;
+    install::check_data_dir_available(id, &entry.identifier, &data_dir)?;
 
     announce(id, &entry, &target_version);
     if !prompt::confirmed(assume_yes) {

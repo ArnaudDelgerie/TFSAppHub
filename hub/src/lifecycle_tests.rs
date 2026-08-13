@@ -11,12 +11,12 @@ use super::{
     dialog_is_warranted, discard_db_snapshot, discard_rollback_anchor, lifecycle_decision,
     prepare_dev_launch, previous_tree_path, probe_run_lock, read_cache_stamp, read_data_version,
     read_rollback_anchor, rescue_dump_path, restore_db_snapshot, rollback_anchor_path,
-    serving_lock_path, snapshot_db, veto_exit, write_cache_stamp, write_data_version,
-    write_rollback_anchor, Anchor, CacheStamp, CacheStatus, LaunchDecision, LaunchLockError,
-    LifecycleDecisionError, LifecycleError, LifecycleEvent, RollbackAnchor, RunLockHeld,
-    DB_FILE_NAMES,
+    run_lock_held_decision, serving_lock_path, snapshot_db, veto_exit, write_cache_stamp,
+    write_data_version, write_rollback_anchor, Anchor, CacheStamp, CacheStatus, LaunchDecision,
+    LaunchLockError, LifecycleDecisionError, LifecycleError, LifecycleEvent, RollbackAnchor,
+    RunLockHeld, DB_FILE_NAMES,
 };
-use crate::registry::Platform;
+use crate::{registry::Platform, run::OrphanedRun};
 
 fn version(text: &str) -> semver::Version {
     semver::Version::parse(text).expect("a semver version")
@@ -546,10 +546,37 @@ fn a_malformed_record_is_refused_rather_than_read_as_absent() {
 // --- probe_run_lock (plan 013's rule 3 launch-side refusal) ------------------
 
 #[test]
+fn a_live_orphan_is_held_with_its_alias() {
+    let held = run_lock_held_decision(
+        false,
+        None,
+        OrphanedRun::ActiveOrphan {
+            alias: "migrate".to_string(),
+            pid: 42,
+        },
+    );
+
+    assert_eq!(
+        held,
+        RunLockHeld::Held {
+            alias: Some("migrate".to_string())
+        }
+    );
+}
+
+#[test]
+fn a_stale_free_lock_allows_the_data_dir() {
+    assert_eq!(
+        run_lock_held_decision(false, None, OrphanedRun::Stale),
+        RunLockHeld::Free
+    );
+}
+
+#[test]
 fn probe_run_lock_free_when_nothing_holds_it() {
     let data_dir = tempfile::tempdir().expect("a temp data dir");
 
-    let held = probe_run_lock(data_dir.path()).expect("no I/O error");
+    let held = probe_run_lock(data_dir.path(), "dev.local.demo").expect("no I/O error");
 
     assert_eq!(held, RunLockHeld::Free);
 }
@@ -563,7 +590,7 @@ fn probe_run_lock_held_names_the_alias_from_the_record() {
         .unwrap();
     fs::write(&run_lock_path, "mcp-serve\n1234").expect("a run.lock record");
 
-    let held = probe_run_lock(data_dir.path()).expect("no I/O error");
+    let held = probe_run_lock(data_dir.path(), "dev.local.demo").expect("no I/O error");
 
     assert_eq!(
         held,
@@ -584,7 +611,7 @@ fn probe_run_lock_held_with_no_record_names_nothing() {
         .unwrap()
         .unwrap();
 
-    let held = probe_run_lock(data_dir.path()).expect("no I/O error");
+    let held = probe_run_lock(data_dir.path(), "dev.local.demo").expect("no I/O error");
 
     assert_eq!(held, RunLockHeld::Held { alias: None });
 }

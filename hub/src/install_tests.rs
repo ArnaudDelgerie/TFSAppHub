@@ -287,7 +287,7 @@ fn a_live_window_refuses_the_install() {
         .expect("no I/O error")
         .expect("the lock is free to take");
 
-    let error = check_data_dir_available("demo", data_dir.path())
+    let error = check_data_dir_available("demo", "dev.local.demo", data_dir.path())
         .expect_err("a live window owns this data dir");
 
     assert!(
@@ -306,7 +306,7 @@ fn an_active_run_command_refuses_naming_the_alias() {
         .expect("the lock is free to take");
     fs::write(&run_lock_path, "migrate\n1234").expect("a run.lock record");
 
-    let error = check_data_dir_available("demo", data_dir.path())
+    let error = check_data_dir_available("demo", "dev.local.demo", data_dir.path())
         .expect_err("an active run command owns this data dir");
 
     assert!(
@@ -326,7 +326,7 @@ fn a_crashed_instance_does_not_lock_the_app_out_of_reinstall() {
     // left behind.
     let data_dir = tempfile::tempdir().expect("a temp data dir");
 
-    check_data_dir_available("demo", data_dir.path())
+    check_data_dir_available("demo", "dev.local.demo", data_dir.path())
         .expect("a crashed instance must not lock the app out of reinstall");
 }
 
