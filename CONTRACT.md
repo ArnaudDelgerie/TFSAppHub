@@ -964,13 +964,16 @@ exempt — recovering an installation stuck on a stale app layer is one of its
 own jobs, and stopping whatever holds the command's lock never touches this
 record.
 
-**Rule 2 — at most one `run` command per app at a time.** An exclusive lock
+**Rule 2 — at most one `run` command per app at a time.** An exclusive flock
 on the app's own data directory, the same directory two different apps never
-share (§5) — so two apps running commands at once costs nothing, and a
-second `run` of the *same* app is refused, naming the lock. `run --stop`
-reads the lock's own record and stops whatever it names; `run --replace`
-folds a stop into an ordinary start, and is safe to reach for unconditionally
-since a free lock makes it a no-op.
+share (§5), proves a launcher is live. When that flock is free, its durable
+`run.lock` record is still consulted: a recorded pid that is live and carries
+the app's `TFS_APP_IDENTIFIER` is an orphaned command whose launcher died,
+and it refuses exactly like a held flock. Thus two apps running commands at
+once costs nothing, while a second `run` of the *same* app is refused.
+`run --stop` reads that record and stops whichever active command it names;
+`run --replace` folds a stop into an ordinary start, and is safe to reach for
+unconditionally since neither a free flock nor a stale record has work to do.
 
 **Rule 3 — per-alias concurrency permission, the app is always owner-first.**
 Each alias's `concurrent` flag (§2) decides whether it may run alongside an
