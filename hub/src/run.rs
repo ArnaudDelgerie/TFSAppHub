@@ -30,7 +30,11 @@
 //! imperative flow (app resolution, the lock, the spawn, the signal
 //! forwarding) is plan 013 step 2's addition.
 
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use crate::{
     lifecycle::{LifecycleDecisionError, LifecycleEvent},
@@ -149,7 +153,6 @@ pub fn parse_run_lock(contents: &str) -> Option<RunLockRecord> {
 }
 
 /// Result of examining a free run lock record.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrphanedRun {
     ActiveOrphan { alias: String, pid: u32 },
@@ -157,7 +160,6 @@ pub enum OrphanedRun {
 }
 
 /// Pure policy for a run lock whose flock is already known to be free.
-#[allow(dead_code)]
 pub fn orphaned_run_decision(
     record: Option<&RunLockRecord>,
     pid_alive: bool,
@@ -177,7 +179,6 @@ pub fn orphaned_run_decision(
 
 /// Probe a free run lock record for a child that outlived its launcher.
 /// Callers must first establish that the flock is free, or hold it themselves.
-#[allow(dead_code)]
 pub fn probe_orphaned_run(run_lock_path: &Path, identifier: &str) -> OrphanedRun {
     let record = std::fs::read_to_string(run_lock_path)
         .ok()
@@ -199,7 +200,7 @@ pub fn probe_orphaned_run(run_lock_path: &Path, identifier: &str) -> OrphanedRun
 const STOP_LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The outcome of `run --stop`/the stop half of `run --replace <id> <alias>`
-/// — exactly the four states [`stop_active_run`] can end in. Kept as plain
+/// — exactly the six states [`stop_active_run`] can end in. Kept as plain
 /// data — no message text or exit-code logic inside the enum itself — so
 /// [`stop_outcome_message`] below can be unit-tested directly against each
 /// variant without any process I/O.
@@ -208,6 +209,12 @@ pub enum StopOutcome {
     NotRunning,
     /// A record with a pid was found, signalled, and the lock freed.
     Stopped { alias: String },
+    /// A free lock record named a live child whose launcher had already gone;
+    /// the child was terminated and observed gone.
+    StoppedOrphan { alias: String },
+    /// A free lock record named a live child whose launcher had already gone,
+    /// but it remained live after the bounded stop wait.
+    OrphanStillRunning { alias: String, pid: u32 },
     /// The lock is held but its record has no pid yet — the narrow window
     /// between lock acquisition and the post-spawn rewrite.
     PidUnknown { alias: String },
@@ -223,6 +230,13 @@ pub fn stop_outcome_message(outcome: &StopOutcome, run_lock_path: &Path) -> Stri
     match outcome {
         StopOutcome::NotRunning => "no run command is currently active".to_string(),
         StopOutcome::Stopped { alias } => format!("stopped the active run command \"{alias}\""),
+        StopOutcome::StoppedOrphan { alias } => format!(
+            "stopped the orphaned run command \"{alias}\" after its launcher had already gone"
+        ),
+        StopOutcome::OrphanStillRunning { alias, pid } => format!(
+            "signalled the orphaned run command \"{alias}\" (pid {pid}) but it was still live after \
+             waiting"
+        ),
         StopOutcome::PidUnknown { alias } => format!(
             "the run command \"{alias}\" is active but has not yet recorded its child process — \
              retry in a moment"
@@ -237,12 +251,12 @@ pub fn stop_outcome_message(outcome: &StopOutcome, run_lock_path: &Path) -> Stri
 
 /// Whether `run.lock` is free once [`stop_active_run`] returns — `NotRunning`
 /// and `Stopped` mean the app is launchable again; `PidUnknown` and
-/// `LockHeld` mean it is not. Shared by `--stop`'s exit code and
+/// `OrphanStillRunning`, `PidUnknown`, and `LockHeld` mean it is not. Shared by `--stop`'s exit code and
 /// `--replace`'s decision to abort rather than continue into rule 2.
 pub fn stop_outcome_succeeded(outcome: &StopOutcome) -> bool {
     matches!(
         outcome,
-        StopOutcome::NotRunning | StopOutcome::Stopped { .. }
+        StopOutcome::NotRunning | StopOutcome::Stopped { .. } | StopOutcome::StoppedOrphan { .. }
     )
 }
 
@@ -257,10 +271,24 @@ pub fn stop_outcome_succeeded(outcome: &StopOutcome) -> bool {
 pub fn stop_active_run(data_dir: &Path, identifier: &str) -> std::io::Result<StopOutcome> {
     let run_lock_path = data_dir.join("run.lock");
     // A free lock is momentarily reacquired here to observe it, then
-    // immediately dropped — the same "never retain, just probe" pattern
-    // `is_owner_live` uses. Nothing is running, so there is nothing to stop.
+    // immediately dropped. Its durable record may still name a child whose
+    // launcher died, so it must be probed before calling the app idle.
     if tfsapp_core::process::try_lock_file(&run_lock_path)?.is_some() {
-        return Ok(StopOutcome::NotRunning);
+        return match probe_orphaned_run(&run_lock_path, identifier) {
+            OrphanedRun::Stale => Ok(StopOutcome::NotRunning),
+            OrphanedRun::ActiveOrphan { alias, pid } => {
+                tfsapp_core::process::terminate_if_identifier_matches(pid, identifier);
+                let deadline = Instant::now() + STOP_LOCK_RELEASE_TIMEOUT;
+                while tfsapp_core::process::process_exists(pid) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if tfsapp_core::process::process_exists(pid) {
+                    Ok(StopOutcome::OrphanStillRunning { alias, pid })
+                } else {
+                    Ok(StopOutcome::StoppedOrphan { alias })
+                }
+            }
+        };
     }
 
     let record = std::fs::read_to_string(&run_lock_path)

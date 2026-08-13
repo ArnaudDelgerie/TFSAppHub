@@ -203,6 +203,17 @@ fn stop_outcome_message_stopped_names_the_alias() {
 }
 
 #[test]
+fn stop_outcome_message_stopped_orphan_names_the_alias_and_gone_launcher() {
+    let path = Path::new("/data/run.lock");
+    let outcome = StopOutcome::StoppedOrphan {
+        alias: "mcp-serve".to_string(),
+    };
+    let message = stop_outcome_message(&outcome, path);
+    assert!(message.contains("mcp-serve"));
+    assert!(message.contains("launcher had already gone"));
+}
+
+#[test]
 fn stop_outcome_message_pid_unknown_names_the_alias_and_suggests_a_retry() {
     let path = Path::new("/data/run.lock");
     let outcome = StopOutcome::PidUnknown {
@@ -232,6 +243,9 @@ fn stop_outcome_succeeded_true_for_not_running_and_stopped() {
     assert!(stop_outcome_succeeded(&StopOutcome::Stopped {
         alias: "mcp-serve".to_string()
     }));
+    assert!(stop_outcome_succeeded(&StopOutcome::StoppedOrphan {
+        alias: "mcp-serve".to_string()
+    }));
 }
 
 #[test]
@@ -240,6 +254,10 @@ fn stop_outcome_succeeded_false_for_pid_unknown_and_lock_held() {
         alias: "mcp-serve".to_string()
     }));
     assert!(!stop_outcome_succeeded(&StopOutcome::LockHeld {
+        alias: "mcp-serve".to_string(),
+        pid: 4321
+    }));
+    assert!(!stop_outcome_succeeded(&StopOutcome::OrphanStillRunning {
         alias: "mcp-serve".to_string(),
         pid: 4321
     }));
