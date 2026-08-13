@@ -31,6 +31,7 @@ use crate::{
 };
 
 /// What came of re-resolving `id`'s dependencies.
+#[allow(dead_code)] // Plan 033 step 1 defers the only production caller to step 2.
 #[derive(Debug)]
 pub enum Outcome {
     /// Composer resolved cleanly against the running hub's PHP — carrying the
@@ -60,6 +61,7 @@ pub enum Outcome {
 /// read and this call — a `remove` racing an `open` — is not an error here:
 /// there is nothing left to write the outcome onto, and the caller's next
 /// registry read will find it gone and say so in its own words.
+#[allow(dead_code)] // Plan 033 step 1 defers the only production caller to step 2.
 pub fn revalidate(
     paths: &Paths,
     id: &str,
@@ -99,6 +101,7 @@ pub fn revalidate(
     Ok(outcome)
 }
 
+#[allow(dead_code)] // Plan 033 step 1 defers the only production caller to step 2.
 #[derive(Debug)]
 pub enum RevalidateError {
     Php(PhpError),

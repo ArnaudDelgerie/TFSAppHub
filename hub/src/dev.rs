@@ -173,6 +173,7 @@ pub fn resolve(project_path: &str) -> Result<LaunchSpec, DevError> {
         // `Mode::Dev` never wipes `cache/`/`build/` — nothing would ever read
         // this.
         expected_cache: None,
+        pending_revalidation: None,
     })
 }
 

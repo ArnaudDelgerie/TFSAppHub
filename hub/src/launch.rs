@@ -76,6 +76,11 @@ pub struct LaunchSpec {
     /// `None` from `dev::resolve`: a dev session has no registry entry and
     /// `Mode::Dev` never wipes, so nothing would ever read it.
     pub expected_cache: Option<crate::lifecycle::CacheStamp>,
+    /// The platform the installed app was last resolved against, when the
+    /// registry says it needs a fresh dependency resolution. This is carried
+    /// through the fast parent and acted on only by the child after it holds
+    /// the launch locks, behind its splash window.
+    pub pending_revalidation: Option<crate::registry::Platform>,
 }
 
 impl LaunchSpec {
