@@ -107,6 +107,78 @@ fn parse_run_lock_non_numeric_second_line_is_no_pid_not_an_error() {
     assert_eq!(record.pid, None);
 }
 
+// --- orphaned_run_decision / probe_orphaned_run -----------------------------
+
+#[test]
+fn orphaned_run_decision_is_active_only_for_a_live_identity_proven_pid() {
+    let record = RunLockRecord {
+        alias: "mcp-serve".to_string(),
+        pid: Some(1234),
+    };
+    assert_eq!(
+        orphaned_run_decision(Some(&record), true, true),
+        OrphanedRun::ActiveOrphan {
+            alias: "mcp-serve".to_string(),
+            pid: 1234,
+        }
+    );
+    assert_eq!(
+        orphaned_run_decision(Some(&record), false, true),
+        OrphanedRun::Stale
+    );
+    assert_eq!(
+        orphaned_run_decision(Some(&record), true, false),
+        OrphanedRun::Stale
+    );
+    assert_eq!(
+        orphaned_run_decision(None, false, false),
+        OrphanedRun::Stale
+    );
+}
+
+#[test]
+fn probe_orphaned_run_finds_a_live_identity_proven_child_then_stale_after_reaping() {
+    let dir = tempfile::tempdir().unwrap();
+    let run_lock_path = dir.path().join("run.lock");
+    let identifier = "test-identifier";
+    let mut child = spawn_run_lock_holder(&run_lock_path, identifier);
+    let pid = child.id();
+    std::fs::write(&run_lock_path, format_run_lock("mcp-serve", Some(pid))).unwrap();
+
+    assert_eq!(
+        probe_orphaned_run(&run_lock_path, identifier),
+        OrphanedRun::ActiveOrphan {
+            alias: "mcp-serve".to_string(),
+            pid,
+        }
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        probe_orphaned_run(&run_lock_path, identifier),
+        OrphanedRun::Stale
+    );
+}
+
+#[test]
+fn probe_orphaned_run_ignores_a_live_child_with_the_wrong_identifier() {
+    let dir = tempfile::tempdir().unwrap();
+    let run_lock_path = dir.path().join("run.lock");
+    let mut child = spawn_run_lock_holder(&run_lock_path, "another-app");
+    std::fs::write(
+        &run_lock_path,
+        format_run_lock("mcp-serve", Some(child.id())),
+    )
+    .unwrap();
+
+    assert_eq!(
+        probe_orphaned_run(&run_lock_path, "test-identifier"),
+        OrphanedRun::Stale
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
 // --- stop_outcome_message / stop_outcome_succeeded --------------------------
 
 #[test]

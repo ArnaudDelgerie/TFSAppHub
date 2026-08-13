@@ -115,6 +115,7 @@ pub fn format_alias_list(aliases: &BTreeMap<String, RunAlias>) -> String {
 /// the spawned child's pid once recorded. `pid` is `None` in the narrow
 /// window between the lock being acquired and the post-spawn rewrite, never
 /// an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunLockRecord {
     pub alias: String,
     pub pid: Option<u32>,
@@ -145,6 +146,50 @@ pub fn parse_run_lock(contents: &str) -> Option<RunLockRecord> {
         .next()
         .and_then(|line| line.trim().parse::<u32>().ok());
     Some(RunLockRecord { alias, pid })
+}
+
+/// Result of examining a free run lock record.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrphanedRun {
+    ActiveOrphan { alias: String, pid: u32 },
+    Stale,
+}
+
+/// Pure policy for a run lock whose flock is already known to be free.
+#[allow(dead_code)]
+pub fn orphaned_run_decision(
+    record: Option<&RunLockRecord>,
+    pid_alive: bool,
+    identifier_matches: bool,
+) -> OrphanedRun {
+    match record {
+        Some(RunLockRecord {
+            alias,
+            pid: Some(pid),
+        }) if pid_alive && identifier_matches => OrphanedRun::ActiveOrphan {
+            alias: alias.clone(),
+            pid: *pid,
+        },
+        _ => OrphanedRun::Stale,
+    }
+}
+
+/// Probe a free run lock record for a child that outlived its launcher.
+/// Callers must first establish that the flock is free, or hold it themselves.
+#[allow(dead_code)]
+pub fn probe_orphaned_run(run_lock_path: &Path, identifier: &str) -> OrphanedRun {
+    let record = std::fs::read_to_string(run_lock_path)
+        .ok()
+        .and_then(|contents| parse_run_lock(&contents));
+    let (pid_alive, identifier_matches) = match record.as_ref().and_then(|record| record.pid) {
+        Some(pid) => (
+            tfsapp_core::process::process_exists(pid),
+            tfsapp_core::process::process_environ_has_identifier(pid, identifier),
+        ),
+        None => (false, false),
+    };
+    orphaned_run_decision(record.as_ref(), pid_alive, identifier_matches)
 }
 
 /// How long `stop_active_run` waits for `run.lock` to free after signalling
