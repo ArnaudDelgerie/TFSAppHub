@@ -428,6 +428,27 @@ fn purging_an_installed_identifier_names_remove_purge() {
 }
 
 #[test]
+fn reserved_identifiers_refuse_before_purge_reads_the_registry_or_prompts() {
+    for (identifier, directory) in [
+        ("hub", "hub's own directory under TFSApp/"),
+        ("TFSApp", "shared vendor directory"),
+        ("applications", "XDG desktop-entry directory"),
+    ] {
+        let (_base, paths) = temp_paths();
+        fs::create_dir_all(paths.registry_path()).expect("a deliberately unreadable registry");
+
+        let error = purge_identifier(&paths, identifier, false)
+            .expect_err("reserved infrastructure must refuse before every later step");
+
+        assert!(
+            matches!(&error, RemoveError::ReservedIdentifier { identifier: actual } if actual == identifier),
+            "{error}"
+        );
+        assert!(error.to_string().contains(directory), "{error}");
+    }
+}
+
+#[test]
 fn purging_an_identifier_with_no_data_points_at_bare_purge() {
     let (_base, paths) = temp_paths();
 

@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    check_data_dir_available, check_id_free, check_identifier_free, check_port_free,
-    lifecycle_event_for_install, resolve_id, snapshot, validate, InstallError,
+    check_data_dir_available, check_id_free, check_identifier_allowed, check_identifier_free,
+    check_port_free, lifecycle_event_for_install, resolve_id, snapshot, validate, InstallError,
 };
 use crate::{
     lifecycle::LifecycleEvent,
@@ -112,6 +112,48 @@ fn an_id_that_cannot_name_a_directory_is_refused_rather_than_sanitised() {
         assert!(error.to_string().contains("--as"), "{error}");
     }
 }
+#[test]
+fn rollback_anchor_suffix_is_refused_for_explicit_and_derived_ids() {
+    let root = tempfile::tempdir().expect("a temp dir");
+    app_tree(root.path());
+    let mut manifest = manifest(root.path());
+
+    let explicit = resolve_id(Some("foo.previous"), &manifest)
+        .expect_err("an explicit rollback anchor must be refused");
+
+    assert!(
+        matches!(explicit, InstallError::RollbackAnchorId { .. }),
+        "{explicit}"
+    );
+    assert!(
+        explicit.to_string().contains("apps/foo.previous"),
+        "{explicit}"
+    );
+    assert!(
+        explicit.to_string().contains("rollback anchor"),
+        "{explicit}"
+    );
+
+    manifest.project_name = "foo.previous".to_string();
+    let derived =
+        resolve_id(None, &manifest).expect_err("a derived rollback anchor must be refused");
+
+    assert!(
+        matches!(derived, InstallError::RollbackAnchorId { .. }),
+        "{derived}"
+    );
+    assert!(
+        derived.to_string().contains("update deletes and recreates"),
+        "{derived}"
+    );
+
+    for id in ["foo.previous2", "previous"] {
+        assert_eq!(
+            resolve_id(Some(id), &manifest).expect("only the exact suffix is reserved"),
+            id
+        );
+    }
+}
 
 #[test]
 fn an_unusable_project_name_says_where_it_came_from() {
@@ -191,6 +233,26 @@ fn a_second_id_for_the_same_identifier_is_refused_naming_the_first() {
 
     check_identifier_free(&registry, "dev.local.other")
         .expect("a distinct identifier is unaffected");
+}
+
+#[test]
+fn infrastructure_identifiers_are_refused_before_an_install_reads_the_registry() {
+    for (identifier, directory) in [
+        ("hub", "hub's own directory under TFSApp/"),
+        ("TFSApp", "shared vendor directory"),
+        ("applications", "XDG desktop-entry directory"),
+    ] {
+        let error = check_identifier_allowed(identifier)
+            .expect_err("an app may not use infrastructure as its identifier");
+
+        assert!(
+            matches!(&error, InstallError::ReservedIdentifier { identifier: actual } if actual == identifier),
+            "{error}"
+        );
+        assert!(error.to_string().contains(directory), "{error}");
+    }
+
+    check_identifier_allowed("dev.local.demo").expect("an ordinary app identifier is not reserved");
 }
 
 #[test]

@@ -38,7 +38,7 @@ use crate::{
     desktop, hub_bin,
     lifecycle::{self, LifecycleDecisionError, LifecycleError, LifecycleEvent},
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
-    paths::{Paths, PathsError},
+    paths::{is_reserved_identifier, Paths, PathsError},
     php::{self, PhpError, Toolchain},
     platform::{self, PlatformError},
     prompt,
@@ -157,6 +157,7 @@ pub(crate) fn install_into(
     let manifest = &loaded.manifest;
 
     let id = resolve_id(id, manifest)?;
+    check_identifier_allowed(&manifest.identifier)?;
     // One read of the registry for both gates. The window between this read and
     // the write at the end is real but narrow, and the write itself takes the
     // lock — two racing installs cannot corrupt the file, at worst the second
@@ -552,13 +553,20 @@ pub fn resolve_id(explicit: Option<&str>, manifest: &Manifest) -> Result<String,
         None => (manifest.project_name.as_str(), true),
     };
 
-    match is_usable_id(id) {
-        true => Ok(id.to_string()),
-        false => Err(InstallError::UnusableId {
+    if !is_usable_id(id) {
+        return Err(InstallError::UnusableId {
             id: id.to_string(),
             derived,
-        }),
+        });
     }
+
+    if id.ends_with(".previous") {
+        return Err(InstallError::RollbackAnchorId {
+            id: id.to_string(),
+            derived,
+        });
+    }
+    Ok(id.to_string())
 }
 
 /// Whether `id` can be both a CLI word and a directory name.
@@ -612,6 +620,20 @@ pub fn check_identifier_free(registry: &Registry, identifier: &str) -> Result<()
         return Err(InstallError::IdentifierTaken {
             identifier: identifier.to_string(),
             id: entry.id.clone(),
+        });
+    }
+
+    Ok(())
+}
+/// Refuse an identifier that would name a directory owned by the hub or the
+/// desktop environment.
+///
+/// This check deliberately precedes every registry read: a reserved value
+/// cannot become valid just because no app has registered it yet.
+pub fn check_identifier_allowed(identifier: &str) -> Result<(), InstallError> {
+    if is_reserved_identifier(identifier) {
+        return Err(InstallError::ReservedIdentifier {
+            identifier: identifier.to_string(),
         });
     }
 
@@ -891,6 +913,11 @@ pub enum InstallError {
         id: String,
         derived: bool,
     },
+    /// This id would collide with the rollback anchor `update` owns.
+    RollbackAnchorId {
+        id: String,
+        derived: bool,
+    },
     /// Another installed app already answers to this `id`.
     IdTaken {
         id: String,
@@ -900,6 +927,10 @@ pub enum InstallError {
     IdentifierTaken {
         identifier: String,
         id: String,
+    },
+    /// The manifest names a directory the hub or desktop environment owns.
+    ReservedIdentifier {
+        identifier: String,
     },
     /// Something is already using the data directory this install would
     /// write into.
@@ -984,6 +1015,17 @@ impl fmt::Display for InstallError {
                      directory and is typed as one word. Pass --as <id> to pick another."
                 )
             }
+            Self::RollbackAnchorId { id, derived } => {
+                let source = match derived {
+                    true => format!("\"project_name\" is {id:?} in the app's {MANIFEST_FILE}"),
+                    false => format!("--as {id:?}"),
+                };
+                write!(
+                    formatter,
+                    "{source} — apps/{id} is update's rollback anchor, which update deletes and \
+                     recreates. Pick a different id with --as <id>."
+                )
+            }
             Self::IdTaken { id, location } => write!(
                 formatter,
                 "{id} is already installed, from {location}. Pick another handle with \
@@ -996,6 +1038,21 @@ impl fmt::Display for InstallError {
                  hub-local handle, not a different app: remove {id} first, or check this is \
                  genuinely a different app before installing it."
             ),
+            Self::ReservedIdentifier { identifier } => match identifier.as_str() {
+                "hub" => write!(
+                    formatter,
+                    "hub is the hub's own directory under TFSApp/ and cannot be an app identifier."
+                ),
+                "TFSApp" => write!(
+                    formatter,
+                    "TFSApp is the shared vendor directory and cannot be an app identifier."
+                ),
+                "applications" => write!(
+                    formatter,
+                    "applications is the XDG desktop-entry directory and cannot be an app identifier."
+                ),
+                _ => unreachable!("only reserved identifiers construct this error"),
+            },
             Self::DataDirInUse {
                 id,
                 data_dir,
