@@ -16,6 +16,7 @@
 use std::{
     ffi::OsString,
     fmt, io,
+    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
     process::{Command, Output},
     thread,
@@ -127,6 +128,20 @@ impl Git {
             });
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// `git -C <project> ls-files -z` — the project's tracked paths, relative
+    /// to `project`. `publish` calls this only after [`Self::ensure_pushed`]
+    /// proved the tracked tree is clean and pushed, so this list is precisely
+    /// the commit whose sha it will tag.
+    pub fn ls_files(&self, project: &Path) -> Result<Vec<PathBuf>, GitError> {
+        let output = self.run(project, &["ls-files", "-z"])?;
+        if !output.status.success() {
+            return Err(GitError::NotAWorkTree {
+                project: project.to_path_buf(),
+            });
+        }
+        Ok(parse_ls_files(&output.stdout))
     }
 
     /// `git -C <project> remote get-url <remote>` — gate 6's other half, once
@@ -259,6 +274,17 @@ fn parse_status(stdout: &str) -> Status {
         behind,
         dirty_paths,
     }
+}
+
+/// The pure half of [`Git::ls_files`]: split its NUL-delimited output without
+/// interpreting filenames as text, since Git permits both newlines and bytes
+/// outside UTF-8 in a tracked path.
+fn parse_ls_files(stdout: &[u8]) -> Vec<PathBuf> {
+    stdout
+        .split(|byte| *byte == b'\0')
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(OsString::from_vec(path.to_vec())))
+        .collect()
 }
 
 /// The `## ` header line's four fields. Handles every shape `--porcelain -b`

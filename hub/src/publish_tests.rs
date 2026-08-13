@@ -2,10 +2,12 @@ use std::{
     fs,
     os::unix::fs::{symlink, PermissionsExt},
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use super::{
-    build_archive, changelog_section, is_owner_repo_shape, publish, run_local_gates, PublishError,
+    build_archive, changelog_section, excluded_from_archive, is_owner_repo_shape, publish,
+    run_local_gates, PublishError,
 };
 use crate::{
     archive,
@@ -83,6 +85,12 @@ case "$3" in
   status)
     printf '## main...origin/main\n'
     exit 0
+    ;;
+  ls-files)
+    [ "$4" = "-z" ] && {
+      printf 'CHANGELOG.md\0link-to-main\0src/main.php\0tfsapp.config.json\0'
+      exit 0
+    }
     ;;
   remote)
     [ "$4" = "get-url" ] && { echo "https://github.com/owner/repo"; exit 0; }
@@ -387,15 +395,30 @@ fn write_source_files(root: &Path) {
     }
 }
 
+fn tracked_source_paths() -> Vec<PathBuf> {
+    Vec::from([
+        PathBuf::from("link-to-main"),
+        PathBuf::from("src/main.php"),
+        PathBuf::from("tfsapp.config.json"),
+    ])
+}
+
 #[test]
 fn the_archive_extracts_to_a_tree_hashing_the_same_as_the_source() {
     let project = tempfile::tempdir().expect("a temp project dir");
     write_manifest(project.path(), "1.2.0", "");
     write_source_files(project.path());
     let scratch = tempfile::tempdir().expect("a temp scratch dir");
+    let tracked_paths = tracked_source_paths();
 
-    let assets = build_archive(project.path(), "demo", "1.2.0", scratch.path())
-        .expect("the archive to build");
+    let assets = build_archive(
+        project.path(),
+        &tracked_paths,
+        "demo",
+        "1.2.0",
+        scratch.path(),
+    )
+    .expect("the archive to build");
     assert_eq!(assets.archive_name, "demo-1.2.0.tar.gz");
     assert!(assets.archive_path.is_file());
     assert!(assets.sums_path.is_file());
@@ -421,14 +444,140 @@ fn the_archive_extracts_to_a_tree_hashing_the_same_as_the_source() {
 }
 
 #[test]
+fn ignored_files_on_disk_are_not_written_to_the_archive() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    write_manifest(project.path(), "1.2.0", "");
+    write_source_files(project.path());
+    fs::write(project.path().join(".env.local"), "APP_SECRET=development").expect("a local env");
+    let secrets = project.path().join("config/secrets/prod");
+    fs::create_dir_all(&secrets).expect("a prod secrets dir");
+    fs::write(
+        secrets.join("prod.decrypt.private.php"),
+        "<?php return [\x27key\x27 => \x27secret\x27];",
+    )
+    .expect("a prod secrets key");
+    let cache = project.path().join(".phpunit.cache");
+    fs::create_dir_all(&cache).expect("a PHPUnit cache dir");
+    fs::write(cache.join("test-results"), "cache").expect("a PHPUnit cache entry");
+    let scratch = tempfile::tempdir().expect("a temp scratch dir");
+    let tracked_paths = tracked_source_paths();
+
+    let assets = build_archive(
+        project.path(),
+        &tracked_paths,
+        "demo",
+        "1.2.0",
+        scratch.path(),
+    )
+    .expect("the archive to build");
+    let root = archive::extract(&assets.archive_path, &scratch.path().join("extracted"))
+        .expect("the archive to extract");
+
+    for ignored in [
+        ".env.local",
+        "config/secrets/prod/prod.decrypt.private.php",
+        ".phpunit.cache/test-results",
+    ] {
+        assert!(
+            !root.join(ignored).exists(),
+            "{ignored} must not be published"
+        );
+    }
+}
+
+#[test]
+fn a_real_repository_archive_contains_exactly_its_tracked_paths() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let root = project.path();
+    write_manifest(root, "1.2.0", "");
+    write_changelog(root, CHANGELOG);
+    fs::create_dir_all(root.join("src")).expect("a source dir");
+    fs::write(root.join("src/main.php"), "<?php\n").expect("a source file");
+    fs::write(
+        root.join(".gitignore"),
+        ".env.local\n.env.*.local\n/.phpunit.cache/\n/config/secrets/prod/prod.decrypt.private.php\n",
+    )
+    .expect("a Symfony-shaped gitignore");
+
+    for arguments in [
+        Vec::from(["init", "--quiet"]),
+        Vec::from(["config", "user.email", "test.invalid"]),
+        Vec::from(["config", "user.name", "TFSApp test"]),
+        Vec::from(["add", "."]),
+        Vec::from(["commit", "--quiet", "-m", "initial source"]),
+    ] {
+        assert!(
+            Command::new("git")
+                .args(arguments)
+                .current_dir(root)
+                .status()
+                .expect("git to run")
+                .success(),
+            "git fixture setup must succeed"
+        );
+    }
+
+    fs::write(root.join(".env.local"), "APP_SECRET=development").expect("a local env");
+    let secrets = root.join("config/secrets/prod");
+    fs::create_dir_all(&secrets).expect("a prod secrets dir");
+    fs::write(secrets.join("prod.decrypt.private.php"), "<?php return [];")
+        .expect("a prod secrets key");
+    let cache = root.join(".phpunit.cache");
+    fs::create_dir_all(&cache).expect("a PHPUnit cache dir");
+    fs::write(cache.join("test-results"), "cache").expect("a PHPUnit cache entry");
+
+    let tracked_paths = Git::new().ls_files(root).expect("a tracked file list");
+    let archive_paths: Vec<_> = tracked_paths
+        .into_iter()
+        .filter(|path| !excluded_from_archive(path))
+        .collect();
+    let scratch = tempfile::tempdir().expect("a temp scratch dir");
+    let assets = build_archive(root, &archive_paths, "demo", "1.2.0", scratch.path())
+        .expect("the archive to build");
+
+    let file = fs::File::open(&assets.archive_path).expect("a readable archive");
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let listed_paths: Vec<_> = archive
+        .entries()
+        .expect("archive entries")
+        .map(|entry| {
+            entry
+                .expect("a readable entry")
+                .path()
+                .expect("an entry path")
+                .into_owned()
+        })
+        .collect();
+    let prefix = PathBuf::from("demo-1.2.0");
+    assert_eq!(
+        listed_paths,
+        Vec::from([
+            prefix.clone(),
+            prefix.join(".gitignore"),
+            prefix.join("CHANGELOG.md"),
+            prefix.join("src"),
+            prefix.join("src/main.php"),
+            prefix.join("tfsapp.config.json"),
+        ])
+    );
+}
+
+#[test]
 fn the_sums_file_verifies_against_the_archive_it_names() {
     let project = tempfile::tempdir().expect("a temp project dir");
     write_manifest(project.path(), "1.2.0", "");
     write_source_files(project.path());
     let scratch = tempfile::tempdir().expect("a temp scratch dir");
+    let tracked_paths = tracked_source_paths();
 
-    let assets = build_archive(project.path(), "demo", "1.2.0", scratch.path())
-        .expect("the archive to build");
+    let assets = build_archive(
+        project.path(),
+        &tracked_paths,
+        "demo",
+        "1.2.0",
+        scratch.path(),
+    )
+    .expect("the archive to build");
 
     let sums_body = fs::read_to_string(&assets.sums_path).expect("a readable sums file");
     assert_eq!(
@@ -455,8 +604,17 @@ fn an_escaping_symlink_is_refused_before_anything_is_uploaded() {
     write_source_files(project.path());
     symlink("../../outside", project.path().join("evil")).expect("an escaping symlink");
     let scratch = tempfile::tempdir().expect("a temp scratch dir");
+    let mut tracked_paths = tracked_source_paths();
+    tracked_paths.push(PathBuf::from("evil"));
 
-    let error = build_archive(project.path(), "demo", "1.2.0", scratch.path()).unwrap_err();
+    let error = build_archive(
+        project.path(),
+        &tracked_paths,
+        "demo",
+        "1.2.0",
+        scratch.path(),
+    )
+    .unwrap_err();
     match &error {
         PublishError::EscapingSymlink { path } => {
             assert_eq!(path, &project.path().join("evil"));
@@ -689,7 +847,9 @@ fn an_escaping_symlink_refuses_after_every_gh_gate_and_still_leaves_no_scratch_b
     symlink("../../outside", project.path().join("evil")).expect("an escaping symlink");
 
     let git_scripts = tempfile::tempdir().expect("a temp dir for the fake git");
-    let git = Git::at(write_fake(git_scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+    let git_body =
+        GIT_CLEAN_AND_PUSHED.replace("tfsapp.config.json\\0'", "tfsapp.config.json\\0evil\\0'");
+    let git = Git::at(write_fake(git_scripts.path(), "git", &git_body));
     let gh_scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
     let gh = Gh::at(write_fake(gh_scripts.path(), "gh", GH_EVERY_GATE_PASSES));
     let (_base, paths) = temp_paths();

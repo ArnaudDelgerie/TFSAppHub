@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{parse_branch_line, parse_status, Git, GitError};
+use super::{parse_branch_line, parse_ls_files, parse_status, Git, GitError};
 
 /// A fake `git` at `dir/git`, logging its own argv (space-joined) to
 /// `dir/argv.log` before dispatching — see `gh_tests.rs`'s own copy of this
@@ -284,4 +284,40 @@ fn parse_branch_line_reads_a_branch_with_no_upstream() {
     assert_eq!(branch, "main");
     assert_eq!(upstream, None);
     assert_eq!((ahead, behind), (0, 0));
+}
+
+#[test]
+fn parse_ls_files_keeps_nul_delimited_paths_verbatim() {
+    assert!(parse_ls_files(b"").is_empty());
+    assert_eq!(
+        parse_ls_files(b"src/main.php\0"),
+        vec![PathBuf::from("src/main.php")]
+    );
+    assert_eq!(
+        parse_ls_files(b"a file.php\0a\nnewline.php\0"),
+        vec![PathBuf::from("a file.php"), PathBuf::from("a\nnewline.php")]
+    );
+}
+
+#[test]
+fn ls_files_uses_nul_delimiters_and_returns_relative_paths() {
+    let scripts = tempfile::tempdir().expect("a temp dir");
+    let git = Git::at(write_fake_git(
+        scripts.path(),
+        r#"
+case "$3" in
+  ls-files)
+    [ "$4" = "-z" ] && { printf 'src/main.php\0a file.php\0'; exit 0; }
+    ;;
+esac
+exit 1
+"#,
+    ));
+
+    assert_eq!(
+        git.ls_files(Path::new("/repo/app"))
+            .expect("a tracked file list"),
+        vec![PathBuf::from("src/main.php"), PathBuf::from("a file.php")]
+    );
+    assert!(argv_log(scripts.path()).contains("-C /repo/app ls-files -z"));
 }

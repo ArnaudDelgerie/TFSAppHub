@@ -10,6 +10,7 @@
 //! `gh release create`. [`run`] is the command `main.rs` reaches.
 
 use std::{
+    collections::BTreeSet,
     fmt, fs, io,
     path::{Path, PathBuf},
 };
@@ -96,18 +97,18 @@ pub struct Assets {
 }
 
 /// Build `<project_name>-<app_version>.tar.gz` and its `SHA256SUMS.txt` into
-/// `destination`, from `project_path`'s tree as it stands right now —
-/// `CONTRACT.md` §1's artefact.
+/// `destination`, from the explicit Git-tracked paths under `project_path`.
 ///
-/// The walk shares [`source::EXCLUDED_FROM_HASH`] with `source::tree_hash`
-/// rather than a second list, which is what buys the property this step
-/// exists for: `tree_hash` of the archive, once extracted, equals
-/// `tree_hash` of the tree it was built from. A symlink whose target would
-/// resolve outside the extracted tree is refused before a byte of the
-/// archive is written, with the exact lexical rule `archive::extract` applies
-/// at the other end (`archive::link_target_escapes`).
+/// The list is filtered with [`source::EXCLUDED_FROM_HASH`] before reaching
+/// here, which is what buys the property this step exists for: `tree_hash` of
+/// the archive, once extracted, equals `tree_hash` of the tracked tree minus
+/// those standing exclusions. A symlink whose target would resolve outside the
+/// extracted tree is refused before a byte of the archive is written, with the
+/// exact lexical rule `archive::extract` applies at the other end
+/// (`archive::link_target_escapes`).
 pub fn build_archive(
     project_path: &Path,
+    tracked_paths: &[PathBuf],
     project_name: &str,
     app_version: &str,
     destination: &Path,
@@ -143,7 +144,40 @@ pub fn build_archive(
             path: project_path.to_path_buf(),
             source,
         })?;
-    append_tree(&mut builder, project_path, &archive_root, 0)?;
+
+    for (relative_path, is_directory) in archive_paths(tracked_paths) {
+        let source_path = project_path.join(&relative_path);
+        let archive_path = archive_root.join(&relative_path);
+        if is_directory {
+            builder
+                .append_dir(&archive_path, &source_path)
+                .map_err(|source| PublishError::Io {
+                    path: source_path,
+                    source,
+                })?;
+            continue;
+        }
+
+        let metadata = fs::symlink_metadata(&source_path).map_err(|source| PublishError::Io {
+            path: source_path.clone(),
+            source,
+        })?;
+        if metadata.is_symlink() {
+            let target = fs::read_link(&source_path).map_err(|source| PublishError::Io {
+                path: source_path.clone(),
+                source,
+            })?;
+            if archive::link_target_escapes(&archive_path, &target) {
+                return Err(PublishError::EscapingSymlink { path: source_path });
+            }
+        }
+        builder
+            .append_path_with_name(&source_path, &archive_path)
+            .map_err(|source| PublishError::Io {
+                path: source_path,
+                source,
+            })?;
+    }
 
     let encoder = builder.into_inner().map_err(|source| PublishError::Io {
         path: archive_path.clone(),
@@ -179,79 +213,46 @@ pub fn build_archive(
     })
 }
 
-/// Append `directory`'s entries under `archive_dir`, sorted, recursing into
-/// subdirectories — the same walk `source::hash_directory` performs, over the
-/// same [`source::EXCLUDED_FROM_HASH`] predicate at `depth == 0`.
-fn append_tree<W: io::Write>(
-    builder: &mut tar::Builder<W>,
-    directory: &Path,
-    archive_dir: &Path,
-    depth: usize,
-) -> Result<(), PublishError> {
-    let mut entries: Vec<PathBuf> = fs::read_dir(directory)
-        .map_err(|source| PublishError::Io {
-            path: directory.to_path_buf(),
-            source,
-        })?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<io::Result<Vec<_>>>()
-        .map_err(|source| PublishError::Io {
-            path: directory.to_path_buf(),
-            source,
-        })?;
-    entries.sort();
-
-    for entry in entries {
-        let Some(name) = entry.file_name() else {
-            continue;
-        };
-        if depth == 0
-            && source::EXCLUDED_FROM_HASH
-                .iter()
-                .any(|excluded| name == *excluded)
-        {
-            continue;
-        }
-
-        let archive_path = archive_dir.join(name);
-        let metadata = fs::symlink_metadata(&entry).map_err(|source| PublishError::Io {
-            path: entry.clone(),
-            source,
-        })?;
-
-        if metadata.is_symlink() {
-            let target = fs::read_link(&entry).map_err(|source| PublishError::Io {
-                path: entry.clone(),
-                source,
-            })?;
-            if archive::link_target_escapes(&archive_path, &target) {
-                return Err(PublishError::EscapingSymlink { path: entry });
+/// Sorted archive entries derived from Git's tracked files: every parent
+/// directory once, before files below it. Git does not track empty directories,
+/// so deriving them loses nothing.
+fn archive_paths(tracked_paths: &[PathBuf]) -> Vec<(PathBuf, bool)> {
+    let files: BTreeSet<PathBuf> = tracked_paths.iter().cloned().collect();
+    let mut directories = BTreeSet::new();
+    for path in &files {
+        let mut parent = path.parent();
+        while let Some(directory) = parent {
+            if directory.as_os_str().is_empty() {
+                break;
             }
-            builder
-                .append_path_with_name(&entry, &archive_path)
-                .map_err(|source| PublishError::Io {
-                    path: entry.clone(),
-                    source,
-                })?;
-        } else if metadata.is_dir() {
-            builder
-                .append_dir(&archive_path, &entry)
-                .map_err(|source| PublishError::Io {
-                    path: entry.clone(),
-                    source,
-                })?;
-            append_tree(builder, &entry, &archive_path, depth + 1)?;
-        } else {
-            builder
-                .append_path_with_name(&entry, &archive_path)
-                .map_err(|source| PublishError::Io {
-                    path: entry.clone(),
-                    source,
-                })?;
+            directories.insert(directory.to_path_buf());
+            parent = directory.parent();
         }
     }
 
-    Ok(())
+    let mut entries: Vec<_> = directories
+        .into_iter()
+        .map(|path| (path, true))
+        .chain(files.into_iter().map(|path| (path, false)))
+        .collect();
+    entries.sort_by(
+        |(left_path, left_is_directory), (right_path, right_is_directory)| {
+            left_path
+                .cmp(right_path)
+                .then_with(|| right_is_directory.cmp(left_is_directory))
+        },
+    );
+    entries
+}
+
+/// Whether a Git-tracked path is still excluded from the archive because a
+/// local install and `tree_hash` both exclude its top-level component.
+fn excluded_from_archive(path: &Path) -> bool {
+    path.components().next().is_some_and(|component| {
+        source::EXCLUDED_FROM_HASH
+            .iter()
+            .any(|excluded| component.as_os_str() == *excluded)
+    })
 }
 
 /// `tfsapp-hub publish <local-path>` — resolve `Paths`, run the pipeline into
@@ -320,6 +321,11 @@ fn publish_into(
     gh: &Gh,
 ) -> Result<bool, PublishError> {
     let gates = run_local_gates(project_path, repo, git)?;
+    let tracked_paths: Vec<_> = git
+        .ls_files(project_path)?
+        .into_iter()
+        .filter(|path| !excluded_from_archive(path))
+        .collect();
     let manifest = &gates.loaded.manifest;
     let tag = format!("v{}", manifest.app_version);
 
@@ -329,6 +335,7 @@ fn publish_into(
 
     let assets = build_archive(
         project_path,
+        &tracked_paths,
         &manifest.project_name,
         &manifest.app_version,
         scratch,
