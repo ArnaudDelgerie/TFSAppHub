@@ -68,6 +68,23 @@ pub const HUB_EXECUTABLE_FILE: &str = "tfsapp-hub";
 /// The XDG applications directory's name, under the OS data dir.
 pub const APPLICATIONS_DIR: &str = "applications";
 
+/// Names that identify directories the hub or the desktop environment owns.
+///
+/// These values are valid path segments, but never valid app identifiers:
+/// using one would make an app's data directory overlap infrastructure the
+/// hub must not install into or purge.
+pub const RESERVED_IDENTIFIERS: [&str; 3] = [HUB_DIR, DATA_DIR_VENDOR, APPLICATIONS_DIR];
+
+/// Whether `identifier` would collide with a directory owned by the hub or
+/// the desktop environment.
+///
+/// This is deliberately an exact, case-sensitive comparison. It is a value
+/// rule for the callers that create or remove app data, distinct from
+/// [`safe_segment`]'s path-shape validation.
+pub fn is_reserved_identifier(identifier: &str) -> bool {
+    RESERVED_IDENTIFIERS.contains(&identifier)
+}
+
 /// A generated `.desktop` entry's extension.
 pub const DESKTOP_ENTRY_EXTENSION: &str = "desktop";
 

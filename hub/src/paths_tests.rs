@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::{Paths, PathsError, DATA_DIR_VENDOR};
+use super::{is_reserved_identifier, Paths, PathsError, DATA_DIR_VENDOR, RESERVED_IDENTIFIERS};
 
 fn temp_paths() -> (tempfile::TempDir, Paths) {
     let base = tempfile::tempdir().expect("a temp data dir");
@@ -31,6 +31,25 @@ fn the_hub_root_sits_under_the_shared_vendor_folder() {
         paths.update_cache_lock_path(),
         base.path().join("TFSApp/hub/update_cache.lock")
     );
+}
+
+#[test]
+fn infrastructure_directory_names_are_reserved_identifiers() {
+    assert_eq!(RESERVED_IDENTIFIERS, ["hub", "TFSApp", "applications"]);
+
+    for identifier in RESERVED_IDENTIFIERS {
+        assert!(
+            is_reserved_identifier(identifier),
+            "{identifier:?} must be reserved"
+        );
+    }
+
+    for identifier in ["hub2", "Hub", "application"] {
+        assert!(
+            !is_reserved_identifier(identifier),
+            "{identifier:?} must remain available"
+        );
+    }
 }
 
 #[test]
