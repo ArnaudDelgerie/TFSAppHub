@@ -179,6 +179,37 @@ fn probe_orphaned_run_ignores_a_live_child_with_the_wrong_identifier() {
     child.wait().unwrap();
 }
 
+// --- run_start_guard_decision -----------------------------------------------
+
+#[test]
+fn run_start_guard_decision_refuses_a_live_orphan_after_acquiring_the_flock() {
+    assert_eq!(
+        run_start_guard_decision(
+            true,
+            OrphanedRun::ActiveOrphan {
+                alias: "mcp-serve".to_string(),
+                pid: 1234,
+            },
+        ),
+        RunStartGuard::ActiveOrphan {
+            alias: "mcp-serve".to_string(),
+            pid: 1234,
+        }
+    );
+}
+
+#[test]
+fn run_start_guard_decision_allows_stale_records_and_refuses_held_flocks() {
+    assert_eq!(
+        run_start_guard_decision(true, OrphanedRun::Stale),
+        RunStartGuard::MayStart
+    );
+    assert_eq!(
+        run_start_guard_decision(false, OrphanedRun::Stale),
+        RunStartGuard::ActiveLauncher
+    );
+}
+
 // --- stop_outcome_message / stop_outcome_succeeded --------------------------
 
 #[test]

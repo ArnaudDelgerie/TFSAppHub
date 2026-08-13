@@ -193,6 +193,27 @@ pub fn probe_orphaned_run(run_lock_path: &Path, identifier: &str) -> OrphanedRun
     orphaned_run_decision(record.as_ref(), pid_alive, identifier_matches)
 }
 
+/// Rule 2 after attempting to acquire `run.lock`. A free flock still refuses
+/// when its durable record identity-proves a child that outlived its launcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunStartGuard {
+    MayStart,
+    ActiveLauncher,
+    ActiveOrphan { alias: String, pid: u32 },
+}
+
+/// Pure Rule-2 decision. `orphan` is relevant only after acquiring the flock,
+/// before that acquisition rewrites its record.
+pub fn run_start_guard_decision(flock_acquired: bool, orphan: OrphanedRun) -> RunStartGuard {
+    if !flock_acquired {
+        return RunStartGuard::ActiveLauncher;
+    }
+    match orphan {
+        OrphanedRun::ActiveOrphan { alias, pid } => RunStartGuard::ActiveOrphan { alias, pid },
+        OrphanedRun::Stale => RunStartGuard::MayStart,
+    }
+}
+
 /// How long `stop_active_run` waits for `run.lock` to free after signalling
 /// the recorded child — must outlast `terminate`'s own SIGTERM-then-3s-SIGKILL
 /// escalation plus a little slack for the launcher to actually observe
@@ -531,7 +552,22 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
     // process dies without a clean exit.
     let run_lock_path = data_dir.join("run.lock");
     let mut run_lock = match tfsapp_core::process::try_lock_file(&run_lock_path) {
-        Ok(Some(lock)) => lock,
+        Ok(Some(lock)) => {
+            match run_start_guard_decision(true, probe_orphaned_run(&run_lock_path, &identifier)) {
+                RunStartGuard::MayStart => lock,
+                RunStartGuard::ActiveOrphan { alias, pid } => {
+                    eprintln!(
+                        "tfsapp-hub: cannot start \"{alias_name}\": orphaned run command \"{alias}\" \
+                     (pid {pid}) is still active for {id} — stop it with `tfsapp-hub run --stop {id}` \
+                     or replace it with `tfsapp-hub run --replace {id} {alias_name}`."
+                    );
+                    return EXIT_FAILED;
+                }
+                RunStartGuard::ActiveLauncher => {
+                    unreachable!("a held lock cannot yield a lock handle")
+                }
+            }
+        }
         Ok(None) => {
             eprintln!(
                 "tfsapp-hub: another run command is already active for {id} ({})",
