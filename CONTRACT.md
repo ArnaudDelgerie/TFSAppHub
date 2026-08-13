@@ -961,8 +961,10 @@ window attached, and every asset pipeline in the world already has a `--watch`.
 
 Nothing is lost by it. Assets belong in the app's repository, built and
 committed by whatever built them; `composer install` runs at install time with
-the very interpreter that will later serve the app, which is the only build-like
-step the contract needs.
+the very interpreter that will later serve the app. If that interpreter later
+changes, the next open re-runs it against the existing lock behind the app's
+splash, after its launch locks are held. Those are the only build-like steps
+the contract needs.
 
 ### Command strings are argv, never a shell
 
