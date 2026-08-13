@@ -807,6 +807,33 @@ not travel either** — they live in the OS keyring under the destination's own
 identifier (§7), untouched by an import, and must be re-provisioned there by
 whatever provisioned them the first time.
 
+**Export never overwrites either name it might encounter.** It writes beside
+the requested target as the complete filename plus `.tmp` — for example,
+`backup.tar.gz.tmp` — then renames that file into place only on success. An
+existing target is refused, and so is an existing temporary file: the latter
+is treated as a leftover from a failed export and must be removed by hand,
+never silently clobbered. A failed export best-effort removes only the temp it
+created itself.
+
+**A forced import moves the database aside before writing the archive.** Each
+database file being replaced is rescued as
+`<name>.rescue-<YYYYMMDDTHHMMSSZ>` (with a numeric suffix for a same-second
+collision); the primary database's `app.db.rescue-*` path is printed.
+Consecutive forced imports therefore never overwrite an earlier rescue. The
+live `app.db`, `app.db-wal` and
+`app.db-shm` are removed after that rescue and before extraction, so an archive
+that carries only `app.db` cannot inherit a stale WAL from the data it
+replaced.
+
+After extraction, import immediately records the archive's version in
+`data/config.json` before any forward migration runs. If the import fails
+after the rescue point, its error retains the underlying reason and names both
+the data directory's resulting state (partially extracted, unmigrated, or
+otherwise unable to proceed) and the rescue path. In particular, a failed
+forward migration leaves the archive's older version on disk; the next `open`
+recognises it as an unfinished update and refuses it rather than serving an
+unmigrated database.
+
 ---
 
 ## 6. Lifecycle
