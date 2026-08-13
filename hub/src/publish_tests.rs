@@ -2,10 +2,12 @@ use std::{
     fs,
     os::unix::fs::{symlink, PermissionsExt},
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use super::{
-    build_archive, changelog_section, is_owner_repo_shape, publish, run_local_gates, PublishError,
+    build_archive, changelog_section, excluded_from_archive, is_owner_repo_shape, publish,
+    run_local_gates, PublishError,
 };
 use crate::{
     archive,
@@ -481,6 +483,83 @@ fn ignored_files_on_disk_are_not_written_to_the_archive() {
             "{ignored} must not be published"
         );
     }
+}
+
+#[test]
+fn a_real_repository_archive_contains_exactly_its_tracked_paths() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let root = project.path();
+    write_manifest(root, "1.2.0", "");
+    write_changelog(root, CHANGELOG);
+    fs::create_dir_all(root.join("src")).expect("a source dir");
+    fs::write(root.join("src/main.php"), "<?php\n").expect("a source file");
+    fs::write(
+        root.join(".gitignore"),
+        ".env.local\n.env.*.local\n/.phpunit.cache/\n/config/secrets/prod/prod.decrypt.private.php\n",
+    )
+    .expect("a Symfony-shaped gitignore");
+
+    for arguments in [
+        Vec::from(["init", "--quiet"]),
+        Vec::from(["config", "user.email", "test.invalid"]),
+        Vec::from(["config", "user.name", "TFSApp test"]),
+        Vec::from(["add", "."]),
+        Vec::from(["commit", "--quiet", "-m", "initial source"]),
+    ] {
+        assert!(
+            Command::new("git")
+                .args(arguments)
+                .current_dir(root)
+                .status()
+                .expect("git to run")
+                .success(),
+            "git fixture setup must succeed"
+        );
+    }
+
+    fs::write(root.join(".env.local"), "APP_SECRET=development").expect("a local env");
+    let secrets = root.join("config/secrets/prod");
+    fs::create_dir_all(&secrets).expect("a prod secrets dir");
+    fs::write(secrets.join("prod.decrypt.private.php"), "<?php return [];")
+        .expect("a prod secrets key");
+    let cache = root.join(".phpunit.cache");
+    fs::create_dir_all(&cache).expect("a PHPUnit cache dir");
+    fs::write(cache.join("test-results"), "cache").expect("a PHPUnit cache entry");
+
+    let tracked_paths = Git::new().ls_files(root).expect("a tracked file list");
+    let archive_paths: Vec<_> = tracked_paths
+        .into_iter()
+        .filter(|path| !excluded_from_archive(path))
+        .collect();
+    let scratch = tempfile::tempdir().expect("a temp scratch dir");
+    let assets = build_archive(root, &archive_paths, "demo", "1.2.0", scratch.path())
+        .expect("the archive to build");
+
+    let file = fs::File::open(&assets.archive_path).expect("a readable archive");
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let listed_paths: Vec<_> = archive
+        .entries()
+        .expect("archive entries")
+        .map(|entry| {
+            entry
+                .expect("a readable entry")
+                .path()
+                .expect("an entry path")
+                .into_owned()
+        })
+        .collect();
+    let prefix = PathBuf::from("demo-1.2.0");
+    assert_eq!(
+        listed_paths,
+        Vec::from([
+            prefix.clone(),
+            prefix.join(".gitignore"),
+            prefix.join("CHANGELOG.md"),
+            prefix.join("src"),
+            prefix.join("src/main.php"),
+            prefix.join("tfsapp.config.json"),
+        ])
+    );
 }
 
 #[test]
