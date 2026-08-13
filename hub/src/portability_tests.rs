@@ -1,8 +1,8 @@
 use std::{fs, path::Path};
 
 use super::{
-    append_bytes, data_dir_populated, import_decision, run_export, run_import, ImportRefusal,
-    Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE,
+    append_bytes, data_dir_populated, export_temp_path, import_decision, run_export, run_import,
+    ImportRefusal, Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE,
 };
 use crate::{
     install, lifecycle,
@@ -261,7 +261,62 @@ fn an_app_with_no_database_yet_exports_the_manifest_alone() {
     run_export(&paths, "demo", &target).expect("nothing blocks a never-opened app");
 
     assert_eq!(archive_entries(&target), vec![MANIFEST_FILE.to_string()]);
-    assert!(!target.with_extension("tmp").exists());
+    assert!(!export_temp_path(&target).exists());
+}
+
+#[test]
+fn an_export_temp_uses_the_complete_target_filename() {
+    let target = Path::new("backup.tar.gz");
+
+    assert_eq!(export_temp_path(target), Path::new("backup.tar.gz.tmp"));
+}
+
+#[test]
+fn exporting_refuses_a_leftover_temp_file_without_touching_it() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let target = base.path().join("backup.tar.gz");
+    let temporary = export_temp_path(&target);
+    fs::write(&temporary, b"unfinished archive").expect("a leftover temp file");
+
+    let error = run_export(&paths, "demo", &target).expect_err("the temp file must be kept");
+
+    assert!(
+        matches!(error, PortabilityError::TemporaryExists { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("left over from a failed export"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(&temporary).expect("the leftover remains"),
+        b"unfinished archive"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_export_removes_its_temp_file() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    // `/proc/self/mem` presents as a regular file but reading it reliably
+    // fails, which makes the archive fail only after its temp was created.
+    std::os::unix::fs::symlink("/proc/self/mem", data_subdir.join("app.db"))
+        .expect("a deliberately unreadable database");
+    let target = base.path().join("backup.tar.gz");
+    let temporary = export_temp_path(&target);
+
+    let error = run_export(&paths, "demo", &target).expect_err("the database cannot be read");
+
+    assert!(matches!(error, PortabilityError::Io { .. }), "{error}");
+    assert!(
+        !temporary.exists(),
+        "failed exports clean up their temp file"
+    );
+    assert!(!target.exists(), "the requested target remains untouched");
 }
 
 #[test]

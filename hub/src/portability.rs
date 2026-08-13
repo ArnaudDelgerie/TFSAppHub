@@ -275,40 +275,69 @@ fn write_archive(
     manifest: &Manifest,
     data_subdir: &Path,
 ) -> Result<Vec<&'static str>, PortabilityError> {
-    let temporary = target.with_extension("tmp");
+    let temporary = export_temp_path(target);
     let io_error = |path: &Path| {
         let path = path.to_path_buf();
         move |source| PortabilityError::Io { path, source }
     };
 
-    let file = fs::File::create(&temporary).map_err(io_error(&temporary))?;
-    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-        file,
-        flate2::Compression::default(),
-    ));
-
-    let manifest_json = serde_json::to_vec_pretty(manifest)
-        .expect("a Manifest holds nothing that can fail to serialise");
-    append_bytes(&mut builder, MANIFEST_FILE, &manifest_json).map_err(io_error(&temporary))?;
-
-    let mut written = Vec::new();
-    for name in lifecycle::DB_FILE_NAMES {
-        let source_path = data_subdir.join(name);
-        if !source_path.is_file() {
-            continue;
-        }
-        let bytes = fs::read(&source_path).map_err(io_error(&source_path))?;
-        let archive_path = format!("{DATA_DIR}/{name}");
-        append_bytes(&mut builder, &archive_path, &bytes).map_err(io_error(&temporary))?;
-        written.push(name);
+    if temporary.exists() {
+        return Err(PortabilityError::TemporaryExists { path: temporary });
     }
 
-    let encoder = builder.into_inner().map_err(io_error(&temporary))?;
-    encoder.finish().map_err(io_error(&temporary))?;
+    let file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+    {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(PortabilityError::TemporaryExists { path: temporary });
+        }
+        Err(source) => return Err(io_error(&temporary)(source)),
+    };
 
-    fs::rename(&temporary, target).map_err(io_error(target))?;
+    let result = (|| {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            file,
+            flate2::Compression::default(),
+        ));
 
-    Ok(written)
+        let manifest_json = serde_json::to_vec_pretty(manifest)
+            .expect("a Manifest holds nothing that can fail to serialise");
+        append_bytes(&mut builder, MANIFEST_FILE, &manifest_json).map_err(io_error(&temporary))?;
+
+        let mut written = Vec::new();
+        for name in lifecycle::DB_FILE_NAMES {
+            let source_path = data_subdir.join(name);
+            if !source_path.is_file() {
+                continue;
+            }
+            let bytes = fs::read(&source_path).map_err(io_error(&source_path))?;
+            let archive_path = format!("{DATA_DIR}/{name}");
+            append_bytes(&mut builder, &archive_path, &bytes).map_err(io_error(&temporary))?;
+            written.push(name);
+        }
+
+        let encoder = builder.into_inner().map_err(io_error(&temporary))?;
+        encoder.finish().map_err(io_error(&temporary))?;
+
+        fs::rename(&temporary, target).map_err(io_error(target))?;
+
+        Ok(written)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// The unfinished archive sits next to its eventual target under its complete
+/// filename, so `backup.tar.gz` becomes `backup.tar.gz.tmp`.
+fn export_temp_path(target: &Path) -> PathBuf {
+    let mut temporary = target.as_os_str().to_os_string();
+    temporary.push(".tmp");
+    PathBuf::from(temporary)
 }
 
 /// Append one in-memory file to `builder` at `archive_path`, with an ordinary
@@ -702,6 +731,10 @@ pub enum PortabilityError {
     TargetExists {
         path: PathBuf,
     },
+    /// `export`'s own unfinished archive is still present.
+    TemporaryExists {
+        path: PathBuf,
+    },
     /// A live window or an active `run` command holds the data directory.
     Busy {
         id: String,
@@ -749,6 +782,12 @@ impl fmt::Display for PortabilityError {
                 formatter,
                 "{} already exists — pick another path, or remove it first. export never \
                  overwrites a file it did not just write.",
+                path.display()
+            ),
+            Self::TemporaryExists { path } => write!(
+                formatter,
+                "{} already exists — it is left over from a failed export and must be \
+                 removed by hand before exporting again.",
                 path.display()
             ),
             Self::Busy { id, holder, action } => {
