@@ -63,6 +63,18 @@ fn rollback(
     appimage_env: Option<&str>,
     assume_yes: bool,
 ) -> Result<bool, HubRollbackError> {
+    rollback_after_binary(paths, appimage_env, assume_yes, |_| {})
+}
+
+/// The rollback pipeline with a test seam immediately after the previous
+/// binary has been put back. Production passes a no-op; the seam lets the
+/// harness exercise the one partial state that only exists after that rename.
+fn rollback_after_binary(
+    paths: &Paths,
+    appimage_env: Option<&str>,
+    assume_yes: bool,
+    after_binary: impl FnOnce(&Paths),
+) -> Result<bool, HubRollbackError> {
     let anchor_binary = hub_bin::anchor_path(paths);
     let anchor_registry = hub_bin::anchor_registry_path(paths);
 
@@ -94,11 +106,22 @@ fn rollback(
         source,
     })?;
 
+    after_binary(paths);
+
     if live.app_entries_match(&snapshot) {
-        registry::restore_from(paths, &anchor_registry).map_err(HubRollbackError::Registry)?;
+        registry::restore_from(paths, &anchor_registry).map_err(|source| {
+            HubRollbackError::RegistryRestoreFailed {
+                snapshot_path: anchor_registry.clone(),
+                source,
+            }
+        })?;
     } else {
-        registry::restore_hub_stamp_from(paths, &anchor_registry)
-            .map_err(HubRollbackError::Registry)?;
+        registry::restore_hub_stamp_from(paths, &anchor_registry).map_err(|source| {
+            HubRollbackError::RegistryRestoreFailed {
+                snapshot_path: anchor_registry.clone(),
+                source,
+            }
+        })?;
     }
 
     // Both halves are safely back — the anchor is consumed here, before the
@@ -211,6 +234,12 @@ fn report(restoring_to: Option<&str>, missing_appimage: Option<&Path>, kept_entr
 #[derive(Debug)]
 pub enum HubRollbackError {
     Registry(RegistryError),
+    /// The previous binary is already back, but restoring the registry after
+    /// that irreversible anchor-consuming rename failed.
+    RegistryRestoreFailed {
+        snapshot_path: PathBuf,
+        source: RegistryError,
+    },
     Io {
         path: PathBuf,
         source: io::Error,
@@ -234,6 +263,16 @@ impl fmt::Display for HubRollbackError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Registry(error) => write!(formatter, "{error}"),
+            Self::RegistryRestoreFailed {
+                snapshot_path,
+                source,
+            } => write!(
+                formatter,
+                "the previous hub binary is back — every generated launcher already runs it — \
+                 but the registry was not restored: {source}. The registry snapshot remains at \
+                 {}; restore it there by hand.",
+                snapshot_path.display()
+            ),
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::NoAnchor { missing } => write!(
                 formatter,
@@ -258,6 +297,7 @@ impl std::error::Error for HubRollbackError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Registry(error) => Some(error),
+            Self::RegistryRestoreFailed { source, .. } => Some(source),
             Self::Io { source, .. } => Some(source),
             Self::NoAnchor { .. } => None,
             Self::AppimageSwapFailed { source, .. } => Some(source),

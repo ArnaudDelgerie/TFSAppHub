@@ -1,6 +1,6 @@
 use std::fs;
 
-use super::{rollback, HubRollbackError};
+use super::{rollback, rollback_after_binary, HubRollbackError};
 use crate::{
     hub_bin,
     hub_update::MissingAnchorHalf,
@@ -203,6 +203,41 @@ fn an_app_updated_since_update_keeps_the_version_that_matches_its_tree() {
     let restored = registry::load(&paths).expect("the merged registry reads");
     assert_eq!(restored.get("first").unwrap().app_version, "2.0.0");
     assert_eq!(restored.hub_version.as_deref(), Some("0.1.0"));
+}
+
+#[test]
+fn a_post_rename_registry_restore_failure_names_the_state_and_keeps_the_snapshot() {
+    let (_base, paths) = temp_paths();
+    let snapshot = snapshot_body("0.1.0");
+    seed_anchor(&paths, b"hub v1 bytes", &snapshot);
+    let snapshot_path = hub_bin::anchor_registry_path(&paths);
+
+    let error = rollback_after_binary(&paths, None, true, |paths| {
+        fs::create_dir(paths.registry_path()).expect("the registry path blocks its restore");
+    })
+    .expect_err("the registry cannot be restored");
+
+    let message = error.to_string();
+    assert!(matches!(
+        error,
+        HubRollbackError::RegistryRestoreFailed { .. }
+    ));
+    assert!(message.contains("previous hub binary is back"));
+    assert!(message.contains("every generated launcher already runs it"));
+    assert!(message.contains("registry was not restored"));
+    assert!(message.contains(&snapshot_path.display().to_string()));
+    assert!(
+        snapshot_path.is_file(),
+        "the snapshot remains for manual recovery"
+    );
+    assert_eq!(
+        fs::read(paths.hub_executable_path()).expect("the previous binary is restored"),
+        b"hub v1 bytes"
+    );
+    assert!(
+        !hub_bin::anchor_path(&paths).exists(),
+        "the binary half was consumed by its restoring rename"
+    );
 }
 
 #[test]
