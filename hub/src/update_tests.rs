@@ -5,7 +5,7 @@ use super::{
     UpdateRefusal,
 };
 use crate::{
-    lifecycle::previous_tree_path,
+    lifecycle::{previous_tree_path, read_rollback_anchor},
     paths::Paths,
     registry::{self, Platform, RegistryEntry, Source, SourceKind, State},
 };
@@ -375,6 +375,9 @@ fn an_update_runs_pre_update_then_post_update_and_no_install_hooks() {
     )
     .expect("the first install");
 
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::write(data_subdir.join("app.db"), b"pre-update-bytes").expect("a seeded database");
+
     // A newer source, with update hooks instead of install ones.
     runnable_app_tree(
         source.path(),
@@ -400,6 +403,13 @@ fn an_update_runs_pre_update_then_post_update_and_no_install_hooks() {
         .cloned()
         .expect("the entry survives");
     assert_eq!(updated.app_version, "0.7.0");
+    let anchor = read_rollback_anchor(&data_subdir).expect("a complete rollback anchor");
+    assert_eq!(anchor.app_version, "0.6.0");
+    assert!(
+        previous_tree_path(&paths.app_dir("demo").expect("an app dir")).is_dir(),
+        "a successful update keeps the outgoing tree"
+    );
+    assert!(data_subdir.join("app.db.pre-update").is_file());
 }
 
 #[test]
@@ -455,6 +465,14 @@ fn a_failing_pre_update_leaves_the_tree_the_database_and_the_registry_entry_unch
     assert!(
         !previous_tree_path(&app_dir).exists(),
         "a reverted update leaves no anchor behind"
+    );
+    assert!(
+        !data_subdir.join("app.db.pre-update").exists(),
+        "a reverted update consumes the database half of its anchor"
+    );
+    assert!(
+        read_rollback_anchor(&data_subdir).is_none(),
+        "a reverted update consumes the anchor record too"
     );
 }
 

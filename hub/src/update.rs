@@ -372,13 +372,32 @@ fn apply(
 
     let revert = || {
         let _ = lifecycle::restore_db_snapshot(&data_subdir);
+        lifecycle::discard_db_snapshot(&data_subdir);
         let _ = fs::remove_dir_all(app_dir);
         let _ = restore_tree(app_dir);
         // A stamp `prepare`'s own warm-up wrote for the version this update
         // was moving *to* must not survive next to a tree just reverted back
         // to the version it was moving *from* — plan 024.
         lifecycle::discard_cache_stamp(&data_subdir);
+        lifecycle::discard_rollback_anchor(&data_subdir);
     };
+
+    // The three anchor halves describe the same outgoing installation. Write
+    // the registry half before the first operation that can leave the other
+    // two behind, so an interruption never creates a mismatched anchor.
+    if let Err(error) = lifecycle::write_rollback_anchor(
+        &data_subdir,
+        &lifecycle::RollbackAnchor {
+            app_version: entry.app_version.clone(),
+            source_revision: entry.source_revision.clone(),
+            created_at: registry::now_timestamp(),
+        },
+    ) {
+        revert();
+        return Err(UpdateError::Reverted {
+            detail: error.to_string(),
+        });
+    }
 
     if let Err(error) = install::snapshot(&resolved.root, app_dir) {
         revert();
@@ -408,20 +427,10 @@ fn apply(
         });
     }
 
-    // Success, in order (the plan's "On success"): the event's success point
-    // already ran inside `prepare`, then the anchor's registry half, from the
-    // *outgoing* entry — this is what `rollback <id>` restores to — then the
-    // registry entry itself, then the desktop entry, since a re-snapshot can
-    // change `product_name` or `icon_path`.
-    lifecycle::write_rollback_anchor(
-        &data_subdir,
-        &lifecycle::RollbackAnchor {
-            app_version: entry.app_version.clone(),
-            source_revision: entry.source_revision.clone(),
-            created_at: registry::now_timestamp(),
-        },
-    )?;
-
+    // The event's success point already ran inside `prepare`; the complete
+    // anchor already records the outgoing entry. Commit the registry entry,
+    // then the desktop entry, since a re-snapshot can change `product_name`
+    // or `icon_path`.
     let now = registry::now_timestamp();
     registry::update(paths, |registry| {
         registry.stamp(hub_version, platform.clone());
