@@ -252,6 +252,26 @@ fn update_at(
     current: &semver::Version,
     assume_yes: bool,
 ) -> Result<UpdateOutcome, HubUpdateError> {
+    update_at_after_anchor(
+        paths,
+        scratch,
+        base_url,
+        appimage_env,
+        current,
+        assume_yes,
+        |_| {},
+    )
+}
+
+fn update_at_after_anchor(
+    paths: &Paths,
+    scratch: &Path,
+    base_url: &str,
+    appimage_env: Option<&str>,
+    current: &semver::Version,
+    assume_yes: bool,
+    after_anchor: impl FnOnce(&Paths),
+) -> Result<UpdateOutcome, HubUpdateError> {
     // 1. `$APPIMAGE` is set — otherwise refuse, nothing contacted.
     let appimage_target =
         resolve_appimage_target(appimage_env).ok_or(HubUpdateError::NotPackaged)?;
@@ -341,7 +361,20 @@ fn update_at(
         path: stable_path.clone(),
         source,
     })?;
-    hub_bin::ensure_current_at(&archive_path, &stable_path).map_err(HubUpdateError::HubBin)?;
+    after_anchor(paths);
+    if let Err(source) = hub_bin::ensure_current_at(&archive_path, &stable_path) {
+        return match fs::rename(hub_bin::anchor_path(paths), &stable_path) {
+            Ok(()) => {
+                let _ = fs::remove_file(hub_bin::anchor_registry_path(paths));
+                Err(HubUpdateError::StableSwapUndone { source })
+            }
+            Err(undo_source) => Err(HubUpdateError::StableSwapFailed {
+                stable_path,
+                source,
+                undo_source,
+            }),
+        };
+    }
 
     // 9. Swap $APPIMAGE, unless it is the same file — reusing
     // `ensure_current_at`'s own canonicalize comparison (the "same file"
@@ -427,6 +460,14 @@ pub enum HubUpdateError {
         appimage_path: PathBuf,
         source: HubBinError,
     },
+    StableSwapUndone {
+        source: HubBinError,
+    },
+    StableSwapFailed {
+        stable_path: PathBuf,
+        source: HubBinError,
+        undo_source: io::Error,
+    },
 }
 
 impl fmt::Display for HubUpdateError {
@@ -465,6 +506,21 @@ impl fmt::Display for HubUpdateError {
                  {} could not be replaced: {source}. Run `tfsapp-hub --update` again, or \
                  replace that file by hand with the release's .AppImage.",
                 appimage_path.display()
+            ),
+            Self::StableSwapUndone { source } => write!(
+                formatter,
+                "the downloaded hub could not be installed: {source}. Nothing was changed."
+            ),
+            Self::StableSwapFailed {
+                stable_path,
+                source,
+                undo_source,
+            } => write!(
+                formatter,
+                "{} is missing: the downloaded hub could not be installed ({source}) and the previous \
+                 hub could not be put back ({undo_source}). Every generated launcher is down until \
+                 repaired; the complete rollback anchor remains and `tfsapp-hub --rollback` repairs it.",
+                stable_path.display()
             ),
         }
     }
