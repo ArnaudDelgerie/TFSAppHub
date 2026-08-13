@@ -104,9 +104,11 @@ impl Sidecar {
 
         if let Ok(mut worker) = self.worker.lock() {
             if let Some(mut child) = worker.take() {
-                println!("Stopping the Messenger worker pid {}", child.id());
-                tfsapp_core::process::terminate(child.id());
-                let _ = child.wait();
+                if worker_needs_termination(&mut child) {
+                    println!("Stopping the Messenger worker pid {}", child.id());
+                    tfsapp_core::process::terminate(child.id());
+                    let _ = child.wait();
+                }
             }
         }
         if let Some(mut child) = self.server.take() {
@@ -127,6 +129,17 @@ impl Sidecar {
         // ends: the OS closing every fd when it dies. See the field's own
         // doc comment.
     }
+}
+
+/// Whether teardown still owns a live worker it must signal.
+///
+/// The supervisor may already have reaped the child while it remains in the
+/// shared slot during its backoff. `Child` caches that exit status, so a later
+/// `try_wait` returns `Ok(Some(_))`; signalling its numeric pid then could hit
+/// an unrelated process after pid reuse. A polling error remains conservative:
+/// an unpollable child is treated as live, matching the supervisor's posture.
+fn worker_needs_termination(child: &mut Child) -> bool {
+    !matches!(child.try_wait(), Ok(Some(_)))
 }
 
 impl Drop for Sidecar {
