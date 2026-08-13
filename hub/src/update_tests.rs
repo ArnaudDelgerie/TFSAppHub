@@ -1,8 +1,8 @@
 use std::{fs, path::Path};
 
 use super::{
-    discard_tree, restore_tree, retain_tree, update, update_decision, UpdateAction, UpdateError,
-    UpdateRefusal,
+    discard_tree, restore_tree, retain_tree, revert, update, update_decision, UpdateAction,
+    UpdateError, UpdateRefusal,
 };
 use crate::{
     lifecycle::{previous_tree_path, read_rollback_anchor},
@@ -12,6 +12,32 @@ use crate::{
 
 fn version(text: &str) -> semver::Version {
     semver::Version::parse(text).expect("a semver version")
+}
+
+#[test]
+fn a_partial_revert_names_its_failed_half_and_never_claims_success() {
+    let data_root = tempfile::tempdir().expect("a data directory");
+    let data_subdir = data_root.path().join("data");
+    let app_dir = tempfile::tempdir()
+        .expect("an apps directory")
+        .path()
+        .join("demo");
+    fs::write(&data_subdir, "not a directory").expect("a blocked data directory");
+
+    let outcome = revert(&data_subdir, &app_dir, "0.6.0");
+    let error = UpdateError::Reverted {
+        detail: "the update command failed.".to_string(),
+        outcome,
+    };
+    let message = error.to_string();
+
+    assert!(message.contains("data version rewrite"), "{message}");
+    assert!(message.contains("config.json"), "{message}");
+    assert!(message.contains("not put back"), "{message}");
+    assert!(
+        !message.contains("was put back to its previous state"),
+        "{message}"
+    );
 }
 
 // --- update_decision -------------------------------------------------------

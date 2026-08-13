@@ -370,19 +370,6 @@ fn apply(
         source,
     })?;
 
-    let revert = || {
-        let _ = lifecycle::restore_db_snapshot(&data_subdir);
-        lifecycle::discard_db_snapshot(&data_subdir);
-        let _ = fs::remove_dir_all(app_dir);
-        let _ = restore_tree(app_dir);
-        // A stamp `prepare`'s own warm-up wrote for the version this update
-        // was moving *to* must not survive next to a tree just reverted back
-        // to the version it was moving *from* — plan 024.
-        lifecycle::discard_cache_stamp(&data_subdir);
-        let _ = lifecycle::write_data_version(&data_subdir, &entry.app_version);
-        lifecycle::discard_rollback_anchor(&data_subdir);
-    };
-
     // The three anchor halves describe the same outgoing installation. Write
     // the registry half before the first operation that can leave the other
     // two behind, so an interruption never creates a mismatched anchor.
@@ -394,16 +381,18 @@ fn apply(
             created_at: registry::now_timestamp(),
         },
     ) {
-        revert();
+        let outcome = revert(&data_subdir, app_dir, &entry.app_version);
         return Err(UpdateError::Reverted {
             detail: error.to_string(),
+            outcome,
         });
     }
 
     if let Err(error) = install::snapshot(&resolved.root, app_dir) {
-        revert();
+        let outcome = revert(&data_subdir, app_dir, &entry.app_version);
         return Err(UpdateError::Reverted {
             detail: error.to_string(),
+            outcome,
         });
     }
 
@@ -422,9 +411,10 @@ fn apply(
         LifecycleEvent::Update,
         &platform,
     ) {
-        revert();
+        let outcome = revert(&data_subdir, app_dir, &entry.app_version);
         return Err(UpdateError::Reverted {
             detail: error.to_string(),
+            outcome,
         });
     }
 
@@ -448,15 +438,113 @@ fn apply(
             existing.updated_at = now;
         }
     }) {
-        revert();
+        let outcome = revert(&data_subdir, app_dir, &entry.app_version);
         return Err(UpdateError::Reverted {
             detail: error.to_string(),
+            outcome,
         });
     }
 
     install::write_desktop_entry(paths, id, manifest, app_dir);
     println!("Updated {id} to {}.", manifest.app_version);
     Ok(())
+}
+
+#[derive(Debug, Default)]
+pub struct RevertOutcome {
+    failures: Vec<RevertFailure>,
+}
+
+#[derive(Debug)]
+struct RevertFailure {
+    step: &'static str,
+    path: PathBuf,
+    detail: String,
+}
+
+impl RevertOutcome {
+    fn record(&mut self, step: &'static str, path: PathBuf, result: io::Result<()>) {
+        if let Err(error) = result {
+            self.failures.push(RevertFailure {
+                step,
+                path,
+                detail: error.to_string(),
+            });
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+/// Attempt every half of an update's undo, retaining every failure for the
+/// caller to report. A failed restore must not hide the attempts that follow:
+/// the user needs the full on-disk state before deciding whether to free disk
+/// space and retry `update` or use `rollback`.
+fn revert(data_subdir: &Path, app_dir: &Path, outgoing_version: &str) -> RevertOutcome {
+    let mut outcome = RevertOutcome::default();
+    outcome.record(
+        "database snapshot restore",
+        data_subdir.to_path_buf(),
+        lifecycle::restore_db_snapshot(data_subdir),
+    );
+    for name in lifecycle::DB_FILE_NAMES {
+        let path = lifecycle::db_snapshot_path(data_subdir, name);
+        outcome.record(
+            "database snapshot discard",
+            path.clone(),
+            remove_file_if_present(&path),
+        );
+    }
+    outcome.record(
+        "new tree discard",
+        app_dir.to_path_buf(),
+        remove_dir_if_present(app_dir),
+    );
+    let previous = lifecycle::previous_tree_path(app_dir);
+    outcome.record("tree swap-back", previous, restore_tree(app_dir));
+    // A stamp `prepare`'s own warm-up wrote for the version this update was
+    // moving to must not survive next to a tree just reverted back to the
+    // version it was moving from — plan 024.
+    let stamp = lifecycle::cache_stamp_path(data_subdir);
+    outcome.record(
+        "cache stamp discard",
+        stamp,
+        lifecycle::discard_cache_stamp(data_subdir),
+    );
+    outcome.record(
+        "data version rewrite",
+        lifecycle::data_config_path(data_subdir),
+        lifecycle::write_data_version(data_subdir, outgoing_version).map_err(lifecycle_error_io),
+    );
+    let record = lifecycle::rollback_anchor_path(data_subdir);
+    outcome.record(
+        "rollback record discard",
+        record.clone(),
+        remove_file_if_present(&record),
+    );
+    outcome
+}
+
+fn remove_dir_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn lifecycle_error_io(error: LifecycleError) -> io::Error {
+    io::Error::other(error.to_string())
 }
 
 /// `--force` on an equal record: re-copy the source and re-run its
@@ -553,6 +641,7 @@ pub enum UpdateError {
     /// installation already put back to what it was.
     Reverted {
         detail: String,
+        outcome: RevertOutcome,
     },
 }
 
@@ -620,10 +709,27 @@ impl fmt::Display for UpdateError {
                 "the version recorded for {id} does not parse as semver ({detail}) — \
                  reinstall it."
             ),
-            Self::Reverted { detail } => write!(
+            Self::Reverted { detail, outcome } if outcome.is_complete() => write!(
                 formatter,
                 "{detail} The installation was put back to its previous state."
             ),
+            Self::Reverted { detail, outcome } => {
+                write!(
+                    formatter,
+                    "{detail} The installation was not put back to its previous state. \
+                     These revert steps failed:"
+                )?;
+                for failure in &outcome.failures {
+                    write!(
+                        formatter,
+                        " {} at {}: {};",
+                        failure.step,
+                        failure.path.display(),
+                        failure.detail
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 }

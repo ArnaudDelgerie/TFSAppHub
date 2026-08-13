@@ -304,8 +304,8 @@ pub fn write_cache_stamp(data_subdir: &Path, stamp: &CacheStamp) -> Result<(), L
     fs::rename(&temporary, &path).map_err(io_error(&path))
 }
 
-/// Discard `data_subdir`'s cache stamp, best-effort — an already-missing file
-/// is not an error, same as [`discard_db_snapshot`]/[`discard_rollback_anchor`].
+/// Discard `data_subdir`'s cache stamp — an already-missing file is not an
+/// error, same as [`discard_db_snapshot`]/[`discard_rollback_anchor`].
 ///
 /// `update.rs`'s own revert path calls this alongside its database and tree
 /// restores: a stamp written for the version an update was moving *to* must
@@ -315,8 +315,12 @@ pub fn write_cache_stamp(data_subdir: &Path, stamp: &CacheStamp) -> Result<(), L
 /// that resyncs the same version onto a different tree is a case where
 /// nothing else would catch it — so the revert clears it outright rather than
 /// leaning on a comparison that happens to save it most of the time.
-pub fn discard_cache_stamp(data_subdir: &Path) {
-    let _ = fs::remove_file(cache_stamp_path(data_subdir));
+pub fn discard_cache_stamp(data_subdir: &Path) -> io::Result<()> {
+    match fs::remove_file(cache_stamp_path(data_subdir)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// The rollback anchor's three halves (CONTRACT.md §6 / the per-app update and
