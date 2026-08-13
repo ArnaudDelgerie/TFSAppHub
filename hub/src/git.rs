@@ -130,7 +130,6 @@ impl Git {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    #[allow(dead_code)] // Called by publish after step 2 of plan 029.
     /// `git -C <project> ls-files -z` — the project's tracked paths, relative
     /// to `project`. `publish` calls this only after [`Self::ensure_pushed`]
     /// proved the tracked tree is clean and pushed, so this list is precisely
@@ -277,7 +276,6 @@ fn parse_status(stdout: &str) -> Status {
     }
 }
 
-#[allow(dead_code)] // Called by Git::ls_files after step 2 of plan 029.
 /// The pure half of [`Git::ls_files`]: split its NUL-delimited output without
 /// interpreting filenames as text, since Git permits both newlines and bytes
 /// outside UTF-8 in a tracked path.

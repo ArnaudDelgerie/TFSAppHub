@@ -50,11 +50,11 @@ use crate::{
 /// touched no source at all. Top-level only, so a legitimately named `src/var/`
 /// still counts.
 ///
-/// `pub(crate)` so `publish.rs`'s archive builder walks under the exact same
-/// predicate `tree_hash` does, rather than a second list that could drift from
-/// it — the property `../plan/019-publish-an-app.md` step 2 exists for is
-/// `tree_hash` of a published archive, once extracted, equalling `tree_hash`
-/// of the tree it was built from.
+/// `pub(crate)` so `publish.rs` filters Git's tracked file list with the
+/// exact predicate `tree_hash` uses, rather than a second list that could drift
+/// from it — the property `../plan/029-publish-ships-the-tracked-tree-only.md`
+/// exists for is `tree_hash` of a published archive, once extracted, equalling
+/// `tree_hash` of the tracked tree minus these exclusions.
 pub(crate) const EXCLUDED_FROM_HASH: &[&str] =
     &[".git", "vendor", "var", "node_modules", "tfsapp_build"];
 
