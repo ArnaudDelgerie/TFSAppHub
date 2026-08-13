@@ -1,7 +1,12 @@
 use std::fs;
 
-use super::{rollback, HubRollbackError};
-use crate::{hub_bin, hub_update::MissingAnchorHalf, paths::Paths, registry};
+use super::{rollback, rollback_after_binary, HubRollbackError};
+use crate::{
+    hub_bin,
+    hub_update::MissingAnchorHalf,
+    paths::Paths,
+    registry::{self, Platform, Registry, RegistryEntry, Source, SourceKind, State},
+};
 
 fn temp_paths() -> (tempfile::TempDir, Paths) {
     let base = tempfile::tempdir().expect("a temp data dir");
@@ -14,6 +19,60 @@ fn temp_paths() -> (tempfile::TempDir, Paths) {
 /// written in `--update`'s step 7.
 fn snapshot_body(hub_version: &str) -> String {
     format!(r#"{{"hub_version": "{hub_version}", "apps": []}}"#)
+}
+
+fn app(id: &str, version: &str) -> RegistryEntry {
+    RegistryEntry {
+        id: id.into(),
+        identifier: format!("org.example.{id}"),
+        source: Source {
+            kind: SourceKind::LocalPath,
+            location: format!("/sources/{id}"),
+            reference: None,
+            reference_kind: None,
+            index: None,
+        },
+        app_version: version.into(),
+        source_revision: format!("revision-{version}"),
+        app_port: None,
+        platform: Platform {
+            php_version: "8.4".into(),
+            extensions_hash: "old-platform".into(),
+        },
+        state: State::Ready,
+        installed_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+        unknown: serde_json::Map::new(),
+    }
+}
+
+fn registry_body(hub_version: &str, apps: Vec<RegistryEntry>) -> String {
+    serde_json::to_string_pretty(&Registry {
+        hub_version: Some(hub_version.into()),
+        platform: Some(Platform {
+            php_version: "8.4".into(),
+            extensions_hash: format!("platform-{hub_version}"),
+        }),
+        apps,
+        unknown: serde_json::Map::new(),
+    })
+    .unwrap()
+}
+
+fn seed_live_registry(paths: &Paths, hub_version: &str, apps: Vec<RegistryEntry>) {
+    registry::save(
+        paths,
+        &Registry {
+            hub_version: Some(hub_version.into()),
+            platform: Some(Platform {
+                php_version: "8.5".into(),
+                extensions_hash: "new-platform".into(),
+            }),
+            apps,
+            unknown: serde_json::Map::new(),
+        },
+    )
+    .expect("the live registry is written");
 }
 
 /// Write both anchor halves, and the "current" (newer) hub the rollback is
@@ -91,6 +150,94 @@ fn the_whole_flow_restores_the_binary_and_a_byte_identical_registry_and_consumes
     // The anchor is fully consumed: neither half is left behind.
     assert!(!hub_bin::anchor_path(&paths).is_file());
     assert!(!hub_bin::anchor_registry_path(&paths).is_file());
+}
+
+#[test]
+fn an_app_installed_since_update_stays_registered_when_rolling_back() {
+    let (_base, paths) = temp_paths();
+    let snapshot = registry_body("0.1.0", vec![app("first", "1.0.0")]);
+    seed_anchor(&paths, b"hub v1", &snapshot);
+    seed_live_registry(
+        &paths,
+        "0.2.0",
+        vec![app("first", "1.0.0"), app("second", "1.0.0")],
+    );
+
+    rollback(&paths, None, true).expect("the rollback succeeds");
+
+    let restored = registry::load(&paths).expect("the merged registry reads");
+    assert_eq!(restored.hub_version.as_deref(), Some("0.1.0"));
+    assert_eq!(
+        restored
+            .apps
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+}
+
+#[test]
+fn an_app_removed_since_update_stays_removed_when_rolling_back() {
+    let (_base, paths) = temp_paths();
+    let snapshot = registry_body("0.1.0", vec![app("first", "1.0.0")]);
+    seed_anchor(&paths, b"hub v1", &snapshot);
+    seed_live_registry(&paths, "0.2.0", vec![]);
+
+    rollback(&paths, None, true).expect("the rollback succeeds");
+
+    let restored = registry::load(&paths).expect("the merged registry reads");
+    assert!(restored.apps.is_empty());
+    assert_eq!(restored.hub_version.as_deref(), Some("0.1.0"));
+}
+
+#[test]
+fn an_app_updated_since_update_keeps_the_version_that_matches_its_tree() {
+    let (_base, paths) = temp_paths();
+    let snapshot = registry_body("0.1.0", vec![app("first", "1.0.0")]);
+    seed_anchor(&paths, b"hub v1", &snapshot);
+    seed_live_registry(&paths, "0.2.0", vec![app("first", "2.0.0")]);
+
+    rollback(&paths, None, true).expect("the rollback succeeds");
+
+    let restored = registry::load(&paths).expect("the merged registry reads");
+    assert_eq!(restored.get("first").unwrap().app_version, "2.0.0");
+    assert_eq!(restored.hub_version.as_deref(), Some("0.1.0"));
+}
+
+#[test]
+fn a_post_rename_registry_restore_failure_names_the_state_and_keeps_the_snapshot() {
+    let (_base, paths) = temp_paths();
+    let snapshot = snapshot_body("0.1.0");
+    seed_anchor(&paths, b"hub v1 bytes", &snapshot);
+    let snapshot_path = hub_bin::anchor_registry_path(&paths);
+
+    let error = rollback_after_binary(&paths, None, true, |paths| {
+        fs::create_dir(paths.registry_path()).expect("the registry path blocks its restore");
+    })
+    .expect_err("the registry cannot be restored");
+
+    let message = error.to_string();
+    assert!(matches!(
+        error,
+        HubRollbackError::RegistryRestoreFailed { .. }
+    ));
+    assert!(message.contains("previous hub binary is back"));
+    assert!(message.contains("every generated launcher already runs it"));
+    assert!(message.contains("registry was not restored"));
+    assert!(message.contains(&snapshot_path.display().to_string()));
+    assert!(
+        snapshot_path.is_file(),
+        "the snapshot remains for manual recovery"
+    );
+    assert_eq!(
+        fs::read(paths.hub_executable_path()).expect("the previous binary is restored"),
+        b"hub v1 bytes"
+    );
+    assert!(
+        !hub_bin::anchor_path(&paths).exists(),
+        "the binary half was consumed by its restoring rename"
+    );
 }
 
 #[test]

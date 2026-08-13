@@ -1,8 +1,8 @@
 use std::fs;
 
 use super::{
-    anchor_state, check, resolve_appimage_target, update_at, HubUpdateCheck, HubUpdateError,
-    MissingAnchorHalf, UpdateOutcome,
+    anchor_state, check, resolve_appimage_target, update_at, update_at_after_anchor,
+    HubUpdateCheck, HubUpdateError, MissingAnchorHalf, UpdateOutcome,
 };
 use crate::{
     hub_bin,
@@ -383,6 +383,80 @@ fn the_whole_flow_swaps_both_files_snapshots_the_registry_and_anchors_the_old_bi
     let snapshot: serde_json::Value =
         serde_json::from_str(&snapshot).expect("the snapshot is valid JSON");
     assert_eq!(snapshot["apps"], serde_json::json!([]));
+}
+
+#[test]
+fn a_step_eight_install_failure_is_undone_in_place() {
+    let (_base, paths) = temp_paths();
+    let downloads = tempfile::tempdir().expect("a downloads dir");
+    let appimage = downloads.path().join("hub.AppImage");
+    fs::write(&appimage, b"hub v1").unwrap();
+    let asset_name = "hub.AppImage";
+    let bytes = b"hub v2".to_vec();
+    let (base, handle) = stub_hub_release(
+        "v0.2.0",
+        asset_name,
+        bytes,
+        sha256sums_line(asset_name, b"hub v2"),
+    );
+    let scratch = tempfile::tempdir().unwrap();
+
+    let error = update_at_after_anchor(
+        &paths,
+        scratch.path(),
+        &base,
+        Some(appimage.to_str().unwrap()),
+        &semver::Version::parse("0.1.0").unwrap(),
+        true,
+        |_| {
+            fs::remove_file(scratch.path().join(asset_name)).unwrap();
+        },
+    );
+    handle.join().unwrap();
+    assert!(matches!(
+        error,
+        Err(HubUpdateError::StableSwapUndone { .. })
+    ));
+    assert_eq!(fs::read(paths.hub_executable_path()).unwrap(), b"hub v1");
+    assert!(!hub_bin::anchor_path(&paths).exists());
+    assert!(!hub_bin::anchor_registry_path(&paths).exists());
+}
+
+#[test]
+fn a_step_eight_failure_that_cannot_be_undone_names_the_broken_launchers() {
+    let (_base, paths) = temp_paths();
+    let downloads = tempfile::tempdir().expect("a downloads dir");
+    let appimage = downloads.path().join("hub.AppImage");
+    fs::write(&appimage, b"hub v1").unwrap();
+    let asset_name = "hub.AppImage";
+    let bytes = b"hub v2".to_vec();
+    let (base, handle) = stub_hub_release(
+        "v0.2.0",
+        asset_name,
+        bytes,
+        sha256sums_line(asset_name, b"hub v2"),
+    );
+    let scratch = tempfile::tempdir().unwrap();
+
+    let error = update_at_after_anchor(
+        &paths,
+        scratch.path(),
+        &base,
+        Some(appimage.to_str().unwrap()),
+        &semver::Version::parse("0.1.0").unwrap(),
+        true,
+        |paths| {
+            fs::create_dir(paths.hub_executable_path()).unwrap();
+        },
+    )
+    .expect_err("the directory blocks both the install and the undo");
+    handle.join().unwrap();
+    let message = error.to_string();
+    assert!(message.contains("is missing"));
+    assert!(message.contains("Every generated launcher is down"));
+    assert!(message.contains("--rollback"));
+    assert!(hub_bin::anchor_path(&paths).is_file());
+    assert!(hub_bin::anchor_registry_path(&paths).is_file());
 }
 
 #[test]
