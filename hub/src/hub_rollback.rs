@@ -27,7 +27,7 @@ use crate::{
     hub_update::{self, MissingAnchorHalf},
     paths::Paths,
     prompt,
-    registry::{self, RegistryError},
+    registry::{self, Registry, RegistryError},
 };
 
 /// `tfsapp-hub --rollback [--yes]` — resolve `Paths`, read `$APPIMAGE`, and
@@ -77,7 +77,10 @@ fn rollback(
     // rollback is restoring, read here so both the prompt and the final
     // report can name it without re-parsing the file `restore_from` is about
     // to overwrite.
-    let restoring_to = restoring_version(&anchor_registry);
+    let snapshot = registry::load_from(&anchor_registry).map_err(HubRollbackError::Registry)?;
+    let restoring_to = snapshot.hub_version.clone();
+    let live = registry::load(paths).map_err(HubRollbackError::Registry)?;
+    let kept_entries = kept_entries(&live, &snapshot);
 
     announce(restoring_to.as_deref());
     if !prompt::confirmed(assume_yes) {
@@ -91,7 +94,12 @@ fn rollback(
         source,
     })?;
 
-    registry::restore_from(paths, &anchor_registry).map_err(HubRollbackError::Registry)?;
+    if live.app_entries_match(&snapshot) {
+        registry::restore_from(paths, &anchor_registry).map_err(HubRollbackError::Registry)?;
+    } else {
+        registry::restore_hub_stamp_from(paths, &anchor_registry)
+            .map_err(HubRollbackError::Registry)?;
+    }
 
     // Both halves are safely back — the anchor is consumed here, before the
     // $APPIMAGE swap below, which is best-effort from this point on and not
@@ -100,7 +108,11 @@ fn rollback(
 
     let missing_appimage = restore_appimage(&stable_path, appimage_env)?;
 
-    report(restoring_to.as_deref(), missing_appimage.as_deref());
+    report(
+        restoring_to.as_deref(),
+        missing_appimage.as_deref(),
+        &kept_entries,
+    );
     Ok(true)
 }
 
@@ -140,10 +152,24 @@ fn restore_appimage(
 /// being rolled back to, before the update that replaced it. `None` keeps the
 /// report honest instead of guessing: an unreadable or malformed snapshot, or
 /// one old enough to predate `hub_version` itself.
-fn restoring_version(anchor_registry: &Path) -> Option<String> {
-    let contents = fs::read_to_string(anchor_registry).ok()?;
-    let registry: registry::Registry = serde_json::from_str(&contents).ok()?;
-    registry.hub_version
+fn kept_entries(live: &Registry, snapshot: &Registry) -> Vec<String> {
+    let mut kept = Vec::new();
+    for entry in &live.apps {
+        match snapshot.get(&entry.id) {
+            None => kept.push(format!("{} (installed since update)", entry.id)),
+            Some(previous) if previous != entry => kept.push(format!(
+                "{} (recorded state changed since update)",
+                entry.id
+            )),
+            Some(_) => {}
+        }
+    }
+    for entry in &snapshot.apps {
+        if live.get(&entry.id).is_none() {
+            kept.push(format!("{} (removed since update)", entry.id));
+        }
+    }
+    kept
 }
 
 fn announce(restoring_to: Option<&str>) {
@@ -153,17 +179,25 @@ fn announce(restoring_to: Option<&str>) {
     }
     println!(
         "  every generated launcher, and the file you downloaded if it is still there, go \
-         back to that binary; installed apps' recorded states go back with it. Offline — no \
+         back to that binary; the hub stamp goes back with it, while installed apps keep their \
+         current recorded states if they changed since the update. Offline — no \
          network call is made on this path."
     );
 }
 
-fn report(restoring_to: Option<&str>, missing_appimage: Option<&Path>) {
+fn report(restoring_to: Option<&str>, missing_appimage: Option<&Path>, kept_entries: &[String]) {
     match restoring_to {
         Some(version) => println!("Rolled back to hub {version}."),
         None => println!("Rolled back to the previous hub."),
     }
-    println!("Installed apps' recorded states came back with it.");
+    if kept_entries.is_empty() {
+        println!("Installed apps' recorded states came back with it.");
+    } else {
+        println!("Kept installed apps' recorded states that changed since the update:");
+        for entry in kept_entries {
+            println!("  {entry}");
+        }
+    }
     if let Some(path) = missing_appimage {
         println!(
             "  {} no longer exists — nothing to restore there, but every generated launcher \

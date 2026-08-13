@@ -244,6 +244,14 @@ impl fmt::Display for Platform {
 }
 
 impl Registry {
+    /// Whether both registries describe the same installed apps. The
+    /// hub-level stamp is deliberately excluded: a hub rollback restores that
+    /// stamp from its snapshot while app entries continue to describe the
+    /// trees that are actually on disk.
+    pub fn app_entries_match(&self, other: &Self) -> bool {
+        self.apps == other.apps
+    }
+
     pub fn get(&self, id: &str) -> Option<&RegistryEntry> {
         self.apps.iter().find(|entry| entry.id == id)
     }
@@ -449,6 +457,37 @@ pub fn restore_from(paths: &Paths, source: &std::path::Path) -> Result<(), Regis
     })?;
     let _lock = lock(paths)?;
     write_bytes_locked(paths, &bytes)
+}
+
+/// Read a registry snapshot without changing the live registry.
+pub fn load_from(source: &std::path::Path) -> Result<Registry, RegistryError> {
+    let contents = fs::read_to_string(source).map_err(|source_error| RegistryError::Io {
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    serde_json::from_str(&contents).map_err(|error| RegistryError::Malformed {
+        path: source.to_path_buf(),
+        detail: error.to_string(),
+    })
+}
+
+/// Keep the live app entries, but restore the hub-level stamp from `source`.
+///
+/// The operation holds the same exclusive lock as [`restore_from`], including
+/// while it reads the live registry and writes the merged result. It returns
+/// the live registry that won, so callers can report the entries they kept.
+pub fn restore_hub_stamp_from(
+    paths: &Paths,
+    source: &std::path::Path,
+) -> Result<Registry, RegistryError> {
+    let snapshot = load_from(source)?;
+    let _lock = lock(paths)?;
+    let mut live = load(paths)?;
+    let kept = live.clone();
+    live.hub_version = snapshot.hub_version;
+    live.platform = snapshot.platform;
+    write_locked(paths, &live)?;
+    Ok(kept)
 }
 
 /// RFC 3339 in UTC, for `installed_at` / `updated_at`.
