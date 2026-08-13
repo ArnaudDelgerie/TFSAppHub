@@ -1011,16 +1011,35 @@ could already describe a state the new hub had begun to change. One
 generation, like the per-app anchor `update <id>` leaves: a second
 `--update` before a `--rollback` overwrites it rather than keeping two.
 
+`--update` first swaps the stable copy. If placing the verified download at
+`bin/tfsapp-hub` then fails, it immediately tries to rename
+`tfsapp-hub.previous` back and removes the registry snapshot; a successful
+undo leaves nothing changed. If that undo fails too, `bin/tfsapp-hub` is
+missing and every generated launcher is down until repaired, but the complete
+anchor remains: `tfsapp-hub --rollback` repairs that state.
+
 `--rollback` (`hub_rollback.rs`) touches no network at all. Its precondition
 — both anchor halves present — is checked before anything else, including the
 confirmation prompt, so a half-written anchor from an interrupted `--update`
-reads as "nothing to roll back to" rather than a network problem. On
-success it restores the binary, the registry (byte-identical to the
-snapshot, not merely re-serialised from it) and `$APPIMAGE` — skipped
-when that already names the stable copy, and noted rather than failed when
-the user's own download no longer exists — then deletes the anchor: it is
-consumed by the rollback that uses it, so a second `--rollback` finds
-nothing rather than re-downloading an already-restored version.
+reads as "nothing to roll back to" rather than a network problem. It restores
+the previous binary first. The registry restore is a merge: when the live app
+entries match the snapshot it copies the snapshot byte-for-byte; when they
+differ, live app entries follow the installed trees while only `hub_version`
+and the platform stamp return from the snapshot. Thus app installs, removals
+and updates made since the hub update remain coherent, and the report names
+the entries whose recorded state was kept. This supersedes plan 020's
+historical claim that a rollback always restores the whole registry exactly.
+
+Once the registry is safely back, `$APPIMAGE` is restored — skipped when it
+already names the stable copy, and noted rather than failed when the user's
+own download no longer exists — and the anchor is consumed. A second
+`--rollback` therefore finds no anchor rather than re-downloading an
+already-restored version. If restoring or merging the registry fails after
+the binary rename, the previous binary is nevertheless back and every
+generated launcher already runs it; the registry was not restored and
+`registry.json.previous` remains at its path for manual restoration. Retrying
+`--rollback` is not a recovery path because its binary anchor half has already
+been consumed.
 
 ## The CLI grammar
 
