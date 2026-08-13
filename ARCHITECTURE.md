@@ -212,8 +212,12 @@ sized for a multi-hundred-megabyte archive landing on the same filesystem
 `update`) once it is done, on success or failure alike. The order is the
 guarantee:
 
-1. **Download** the release's `<project_name>-<app_version>.tar.gz` asset,
-   streamed to a file — never buffered whole in memory.
+1. **Name-check, then download**: the release tag must be
+   `v<canonical-semver>` and its one source archive must end in
+   `-<version>.tar.gz`; only then is that
+   `<project_name>-<app_version>.tar.gz` asset streamed to a file — never
+   buffered whole in memory. The tag supplies the version, but not yet the
+   project name.
 2. **Verify** it against the `SHA256SUMS.txt` asset beside it, hashed the same
    way. A missing line for the archive's own name is a failure, never a pass
    by absence.
@@ -221,8 +225,11 @@ guarantee:
    before it is written (no absolute path, no `..` component, no symlink or
    hard link resolving outside the extraction root), and the whole archive
    rejected unless it holds exactly one top-level directory.
-4. **Walk** the extracted tree (`tree_hash`) and read its manifest, which
-   step 2 above validates exactly as it would a local path's.
+4. **Walk and confirm identity**: read the extracted manifest without
+   reporting its warnings yet, refuse it unless its `app_version` equals the
+   tag's version and its `project_name` equals the archive-name prefix, then
+   walk the tree (`tree_hash`). `install` later loads the accepted manifest in
+   its normal warning-reporting path.
 
 Nothing about `apps/<id>/` is touched until all four have succeeded — a
 refusal at any point leaves scratch removed by the caller and the app root
