@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    check_data_dir_available, check_id_free, check_identifier_free, check_port_free,
-    lifecycle_event_for_install, resolve_id, snapshot, validate, InstallError,
+    check_data_dir_available, check_id_free, check_identifier_allowed, check_identifier_free,
+    check_port_free, lifecycle_event_for_install, resolve_id, snapshot, validate, InstallError,
 };
 use crate::{
     lifecycle::LifecycleEvent,
@@ -191,6 +191,26 @@ fn a_second_id_for_the_same_identifier_is_refused_naming_the_first() {
 
     check_identifier_free(&registry, "dev.local.other")
         .expect("a distinct identifier is unaffected");
+}
+
+#[test]
+fn infrastructure_identifiers_are_refused_before_an_install_reads_the_registry() {
+    for (identifier, directory) in [
+        ("hub", "hub's own directory under TFSApp/"),
+        ("TFSApp", "shared vendor directory"),
+        ("applications", "XDG desktop-entry directory"),
+    ] {
+        let error = check_identifier_allowed(identifier)
+            .expect_err("an app may not use infrastructure as its identifier");
+
+        assert!(
+            matches!(&error, InstallError::ReservedIdentifier { identifier: actual } if actual == identifier),
+            "{error}"
+        );
+        assert!(error.to_string().contains(directory), "{error}");
+    }
+
+    check_identifier_allowed("dev.local.demo").expect("an ordinary app identifier is not reserved");
 }
 
 #[test]
