@@ -60,9 +60,8 @@ fn registry_body(hub_version: &str, apps: Vec<RegistryEntry>) -> String {
 }
 
 fn seed_live_registry(paths: &Paths, hub_version: &str, apps: Vec<RegistryEntry>) {
-    registry::save(
-        paths,
-        &Registry {
+    registry::update(paths, |stored| {
+        *stored = Registry {
             hub_version: Some(hub_version.into()),
             platform: Some(Platform {
                 php_version: "8.5".into(),
@@ -70,8 +69,8 @@ fn seed_live_registry(paths: &Paths, hub_version: &str, apps: Vec<RegistryEntry>
             }),
             apps,
             unknown: serde_json::Map::new(),
-        },
-    )
+        };
+    })
     .expect("the live registry is written");
 }
 

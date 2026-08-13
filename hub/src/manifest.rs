@@ -24,10 +24,6 @@
 //!   "true"` is not a forward-compatible extra, it is a manifest that means the
 //!   opposite of what its author believes.
 
-// Kept temporarily while a few parser helpers have no production caller. The
-// todo session that removes this module-wide allow will narrow it to tests.
-#![allow(dead_code)]
-
 use std::{
     collections::BTreeMap,
     fmt, fs, io,

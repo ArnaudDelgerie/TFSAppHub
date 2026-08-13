@@ -1,6 +1,6 @@
 use super::{
-    load, now_timestamp, save, update, Platform, ReferenceKind, Registry, RegistryEntry,
-    RegistryError, Source, SourceKind, State,
+    load, now_timestamp, update, Platform, ReferenceKind, Registry, RegistryEntry, RegistryError,
+    Source, SourceKind, State,
 };
 use crate::paths::Paths;
 
@@ -58,7 +58,7 @@ fn a_registry_survives_a_write_and_a_read() {
         ..entry("other")
     });
 
-    save(&paths, &registry).expect("it writes");
+    update(&paths, |stored| *stored = registry.clone()).expect("it writes");
 
     assert_eq!(load(&paths).expect("it reads"), registry);
 }
@@ -95,7 +95,7 @@ fn an_unreadable_registry_says_so_and_names_the_file() {
 /// Save `registry` and read the file back as raw JSON — the shape a *later*
 /// hub version will meet, which is what these tests are really about.
 fn saved_json(paths: &Paths, registry: &Registry) -> (String, serde_json::Value) {
-    save(paths, registry).expect("it writes");
+    update(paths, |stored| *stored = registry.clone()).expect("it writes");
     let raw = std::fs::read_to_string(paths.registry_path()).expect("it is there");
     let json = serde_json::from_str(&raw).expect("valid JSON");
     (raw, json)
@@ -314,7 +314,7 @@ fn concurrent_installs_all_land_in_one_valid_file() {
 fn a_write_never_leaves_its_temp_file_behind() {
     let (_base, paths) = temp_paths();
 
-    save(&paths, &Registry::default()).expect("it writes");
+    update(&paths, |stored| *stored = Registry::default()).expect("it writes");
 
     let leftovers: Vec<_> = std::fs::read_dir(paths.hub_root())
         .expect("the hub root")

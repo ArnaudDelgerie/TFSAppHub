@@ -26,10 +26,6 @@
 //! actually want to reason about, and a second version number invites
 //! migration machinery that nothing has asked for yet.
 
-// Kept temporarily while a few helpers have no production caller. The todo
-// session that removes this module-wide allow will delete or narrow them.
-#![allow(dead_code)]
-
 use std::{
     fmt, fs,
     io::{self, Write},
@@ -325,16 +321,6 @@ pub fn load(paths: &Paths) -> Result<Registry, RegistryError> {
         path,
         detail: error.to_string(),
     })
-}
-
-/// Write `registry`, atomically, under the exclusive lock.
-///
-/// Callers that need to read *and* write should use [`update`] instead: this
-/// one takes the lock only for the write, so two racing read-modify-write
-/// cycles built on top of it would lose one of the two modifications.
-pub fn save(paths: &Paths, registry: &Registry) -> Result<(), RegistryError> {
-    let _lock = lock(paths)?;
-    write_locked(paths, registry)
 }
 
 /// Read, modify and write under one lock — the primitive an install wants.

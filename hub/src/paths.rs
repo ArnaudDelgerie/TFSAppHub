@@ -23,10 +23,6 @@
 //! resolved once. Tests build one on a temp dir; the hub builds one from
 //! [`Paths::resolve`].
 
-// Kept temporarily while `rooted_at` is only used by tests. The todo session
-// that removes this module-wide allow will narrow it to that helper.
-#![allow(dead_code)]
-
 use std::{fmt, fs, io, path::PathBuf};
 
 /// The vendor folder under the OS data dir that groups every TFSApp's data
@@ -130,6 +126,7 @@ impl Paths {
     }
 
     /// Build on an arbitrary base. For tests, and for nothing else.
+    #[cfg(test)]
     pub fn rooted_at(data_dir_base: impl Into<PathBuf>) -> Self {
         Self {
             data_dir_base: data_dir_base.into(),
