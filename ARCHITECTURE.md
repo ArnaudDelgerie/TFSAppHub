@@ -95,6 +95,15 @@ That gives two distinct keys per app, kept apart on purpose:
 | `id` | a directory under the hub's root, and the handle you type | assigned at install, recorded in the registry |
 | `identifier` | the data dir, the keyring namespace, the window identity | the app's own manifest |
 
+`paths::RESERVED_IDENTIFIERS` is the single, case-sensitive vocabulary that
+keeps app data out of the infrastructure above: `hub` is the hub root,
+`TFSApp` the shared vendor directory, and `applications` the XDG desktop-entry
+directory. `install` refuses those manifest `identifier` values and explicit
+`purge` refuses them before it reads the registry. The hub-local `id` has a
+separate collision rule: one ending in `.previous` would occupy the rollback
+anchor an `update` deletes and recreates, so `install` refuses it whether it
+was derived from `project_name` or passed with `--as`.
+
 ## Runtime identity: one binary, N applications
 
 The hard problem, and the one that gated the whole design.

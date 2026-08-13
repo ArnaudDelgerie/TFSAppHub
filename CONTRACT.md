@@ -187,6 +187,17 @@ project but does not have to equal this field. `project_name` remains required
 because a project without a slug has nothing to derive from, not because
 anything downstream is keyed on it.
 
+At install time, `identifier` may not be exactly `hub`, `TFSApp`, or
+`applications`. Those values name, respectively, the hub's own root, the shared
+vendor directory, and the XDG desktop-entry directory; the hub refuses them
+rather than letting an app overlap its infrastructure. This is a rule about
+known **values**: unknown top-level keys still only warn and never refuse.
+
+The hub-local `id`, whether derived from `project_name` or supplied with
+`--as`, may not end in `.previous`. `update` deletes and recreates
+`apps/<id>.previous` as its rollback anchor, so an app installed under that
+suffix would be destroyed by another app's update.
+
 ### Optional fields
 
 | Field | Type | Meaning |
