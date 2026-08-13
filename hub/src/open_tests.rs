@@ -4,7 +4,6 @@ use super::{child_args, launch_header, prepare_hub_log, resolve, OpenError};
 use crate::{
     launch::Source as LaunchSource,
     paths::Paths,
-    php, platform,
     registry::{self, now_timestamp, Platform, Registry, RegistryEntry, Source, SourceKind, State},
 };
 
@@ -84,24 +83,6 @@ fn temp_paths() -> (tempfile::TempDir, Paths) {
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     (base, paths)
-}
-
-/// The bundled interpreter and Composer, or a reason to skip — the same gate
-/// `install_tests.rs` uses, duplicated rather than imported: each `_tests.rs`
-/// file is self-contained, and a 170 MB download is not something a unit test
-/// should trigger.
-fn resources_present() -> bool {
-    let missing: Vec<_> = [platform::bundled_frankenphp(), php::bundled_composer()]
-        .into_iter()
-        .filter(|candidates| !candidates.iter().any(|path| path.is_file()))
-        .collect();
-
-    for candidates in &missing {
-        eprintln!(
-            "skipped: none of {candidates:?} are there — run `make resources` to cover this one"
-        );
-    }
-    missing.is_empty()
 }
 
 /// A ready app, registered and snapshotted, under `id`.
@@ -210,34 +191,25 @@ fn a_broken_app_is_refused_rather_than_opened_to_fail_deeper() {
 }
 
 #[test]
-fn a_needs_revalidation_app_with_a_satisfiable_lock_revalidates_and_opens() {
-    if !resources_present() {
-        return;
-    }
+fn a_needs_revalidation_app_resolves_without_running_composer() {
     let (_base, paths) = temp_paths();
     install(&paths, entry("demo", State::NeedsRevalidation));
     let app_dir = paths.app_dir("demo").expect("an app dir path");
     snapshot_with_composer(&app_dir, "dev.local.demo", "");
 
-    // The mark means "its dependencies were resolved against another PHP",
-    // which `resolve` answers by re-resolving them right here — never by
-    // keeping a user out of their own data.
-    assert!(resolve(&paths, "demo").is_ok());
+    let resolved = resolve(&paths, "demo").expect("the pending launch resolves");
+    assert_eq!(
+        resolved.pending_revalidation,
+        Some(entry("demo", State::NeedsRevalidation).platform)
+    );
 
     let after = registry::load(&paths).expect("it reads");
     let after_entry = after.get("demo").expect("still there");
-    assert_eq!(after_entry.state, State::Ready);
-    assert_eq!(
-        after_entry.platform,
-        platform::hub_platform().expect("a probe of the same interpreter")
-    );
+    assert_eq!(after_entry.state, State::NeedsRevalidation);
 }
 
 #[test]
-fn a_needs_revalidation_app_with_an_unsatisfiable_lock_is_refused_as_broken() {
-    if !resources_present() {
-        return;
-    }
+fn a_needs_revalidation_app_with_an_unsatisfiable_lock_still_resolves() {
     let (_base, paths) = temp_paths();
     install(&paths, entry("demo", State::NeedsRevalidation));
     let app_dir = paths.app_dir("demo").expect("an app dir path");
@@ -245,11 +217,13 @@ fn a_needs_revalidation_app_with_an_unsatisfiable_lock_is_refused_as_broken() {
     // alone, with no package resolution or network involved.
     snapshot_with_composer(&app_dir, "dev.local.demo", "\"php\": \"^99.0\"");
 
-    let error = resolve(&paths, "demo").expect_err("an unsatisfiable requirement");
-
-    assert!(matches!(error, OpenError::Broken { .. }));
+    let resolved = resolve(&paths, "demo").expect("the pending launch resolves");
+    assert!(resolved.pending_revalidation.is_some());
     let after = registry::load(&paths).expect("it reads");
-    assert_eq!(after.get("demo").expect("still there").state, State::Broken);
+    assert_eq!(
+        after.get("demo").expect("still there").state,
+        State::NeedsRevalidation
+    );
 }
 
 #[test]

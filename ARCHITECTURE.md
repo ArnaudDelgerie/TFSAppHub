@@ -681,14 +681,14 @@ three no longer matches, logging which one to `hub.log` before it does:
   outside the hub's own commands — not something anything here does, but
   cheap to check since the stamp already carries it.
 - **the `Platform` fingerprint** moves when a hub self-update changes the
-  bundled PHP or its extensions. `open::resolve` never trusts the registry
-  entry's own `platform` field blindly for this: when `needs-revalidation`
-  sends it through `revalidate::revalidate` first, it builds the stamp to
-  compare against from the freshly re-probed `Platform` that call returns,
-  not the (possibly stale, in-memory) one it started with — otherwise a
-  revalidation that itself detected the drift would immediately paper back
-  over it. `revalidate.rs` itself never touches `cache.json`: the mismatch
-  is caught here, naturally, the same way a rollback's is.
+  bundled PHP or its extensions. `open::resolve` carries the registry entry's
+  platform provisionally into the child; after the splash is painted and the
+  launch locks are held, `revalidate::revalidate` returns the freshly probed
+  `Platform`, which replaces that provisional value before the stamp is
+  compared or written. Otherwise a revalidation that itself detected the
+  drift would immediately paper back over it. `revalidate.rs` itself never
+  touches `cache.json`: the mismatch is caught here, naturally, the same way
+  a rollback's is.
 - **a hand-emptied `cache/`** overrides an otherwise-matching stamp: the
   stamp is a claim about what was built, not a promise that it is still on
   disk, and a launch must never reuse a container that is not there.
@@ -989,9 +989,12 @@ lock just as surely as a version bump. Both come from one `php-cli` call at
 runtime; nothing is baked.
 
 After a self-update, apps whose fingerprint differs are marked for revalidation:
-`composer install` against the **existing lock**, lazily, on that app's next use.
-Never `composer update` — re-resolving a dependency tree during what the user
-experiences as a *hub* update is the worst possible moment for a surprise.
+`composer install` against the **existing lock**, lazily, on that app's next
+use. The parent detects and announces the pending work, then returns with the
+child pid; the child runs it behind the already-painted splash after it owns
+the launch locks. Never `composer update` — re-resolving a dependency tree
+during what the user experiences as a *hub* update is the worst possible
+moment for a surprise.
 
 **It is not a security check and not a version pin.** It authenticates nothing
 and blocks no launch on its own. An app whose fingerprint differs is
@@ -1015,8 +1018,10 @@ package, a `--rollback` — where a hook on `--update`'s own success would
 silently miss every one of them.
 
 Revalidation itself (`revalidate.rs`) is what a marked app's next `open` runs
-into — described above. None of §6's lifecycle commands run alongside it: the
-app's own version has not moved, so no event fires.
+behind its splash — described above. The lock timing is intentionally only the
+launch-facing seam here; audit 005 owns lock semantics themselves. None of
+§6's lifecycle commands run alongside it: the app's own version has not moved,
+so no event fires.
 
 Two files must end up holding the new binary, not one: the stable copy under
 `<hub root>/bin/tfsapp-hub`, which every generated `.desktop` entry's `Exec=`

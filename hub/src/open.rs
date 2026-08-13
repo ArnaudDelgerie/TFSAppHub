@@ -49,7 +49,6 @@ use crate::{
     manifest::{self, ManifestError},
     paths::{Paths, PathsError},
     registry::{self, now_timestamp, RegistryError, State},
-    revalidate::{self, RevalidateError},
     update_check,
 };
 
@@ -72,6 +71,12 @@ pub fn run(id: &str) -> i32 {
     let launched = resolve(&paths, id).and_then(|resolved| {
         for warning in &resolved.warnings {
             eprintln!("tfsapp-hub: warning: {warning}");
+        }
+        if let Some(platform) = &resolved.pending_revalidation {
+            println!(
+                "Revalidating {id} behind the splash — it was installed against PHP {platform}; \
+                 follow hub.log."
+            );
         }
         launch(&paths, &resolved)
     });
@@ -99,13 +104,13 @@ pub fn run(id: &str) -> i32 {
 /// Every refusal below names the app and the way out, because the audience is
 /// someone at a terminal who typed one word and got nothing. The one state
 /// that is *not* an immediate refusal is `needs-revalidation`: the app's
-/// dependencies were resolved against a PHP that has since moved, which
-/// `revalidate::revalidate` resolves right here — a fresh `composer install`
-/// against the existing `composer.lock`, before the launch proceeds — rather
-/// than a reason to keep the user out of their own data. `Broken`, already
-/// recorded from an earlier attempt, is refused without retrying: nothing has
-/// changed since it failed, and retrying it on every `open` would only repeat
-/// the same minutes of work for the same answer.
+/// dependencies were resolved against a PHP that has since moved. The spec
+/// carries that pending work into the child, where it runs behind the splash
+/// after the launch locks are held, rather than making the parent wait through
+/// a fresh `composer install`. `Broken`, already recorded from an earlier
+/// attempt, is refused without retrying: nothing has changed since it failed,
+/// and retrying it on every `open` would only repeat the same minutes of work
+/// for the same answer.
 pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
     let installed = registry::load(paths)?;
     let entry = installed
@@ -118,14 +123,8 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
             platform: entry.platform.to_string(),
         });
     }
-    let needs_revalidation = entry.state == State::NeedsRevalidation;
-    let last_known_platform = entry.platform.to_string();
-    // The `Platform` plan 024's cache stamp compares against — the entry's own
-    // in-memory copy, unless revalidation below actually runs and advances it.
-    // Read from the registry rather than re-probed: `revalidate::Outcome::Ready`
-    // carries the very probe it just took, precisely so this never compares a
-    // platform change against its own stale value.
-    let mut cache_platform = entry.platform.clone();
+    let pending_revalidation =
+        (entry.state == State::NeedsRevalidation).then(|| entry.platform.clone());
 
     let app_dir = paths.app_dir(id)?;
     if !app_dir.is_dir() {
@@ -152,28 +151,6 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
         });
     }
 
-    // Announced before it starts, not after: a `composer install` is minutes
-    // of work, and silence for that long reads as a hang rather than as
-    // progress.
-    if needs_revalidation {
-        println!(
-            "Revalidating {id} — it was installed against PHP {last_known_platform} and \
-             this hub now runs something else. Re-resolving its dependencies…"
-        );
-        match revalidate::revalidate(paths, id, &app_dir, &manifest)? {
-            revalidate::Outcome::Ready(platform) => {
-                println!("{id} is ready.");
-                cache_platform = platform;
-            }
-            revalidate::Outcome::Broken => {
-                return Err(OpenError::Broken {
-                    id: id.to_string(),
-                    platform: last_known_platform,
-                })
-            }
-        }
-    }
-
     let state_root = paths.app_data_dir(&manifest.identifier)?;
     let identity = manifest.identity(&app_dir);
     // The stamp this launch would write if it rebuilt right now (plan 024) —
@@ -183,7 +160,10 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
     let expected_cache = CacheStamp {
         app_version: manifest.app_version.clone(),
         snapshot_path: path_to_string(&app_dir),
-        platform: cache_platform,
+        // Provisional when `pending_revalidation` is `Some`: the serve thread
+        // replaces it with the freshly probed platform before comparing or
+        // writing this stamp.
+        platform: entry.platform.clone(),
     };
 
     Ok(LaunchSpec {
@@ -200,6 +180,7 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
             cache_path: paths.update_cache_path(),
         },
         expected_cache: Some(expected_cache),
+        pending_revalidation,
     })
 }
 
@@ -345,7 +326,6 @@ pub enum OpenError {
     Registry(RegistryError),
     Manifest(ManifestError),
     Paths(PathsError),
-    Revalidate(RevalidateError),
     NotInstalled {
         id: String,
     },
@@ -375,7 +355,6 @@ impl fmt::Display for OpenError {
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Manifest(error) => write!(formatter, "{error}"),
             Self::Paths(error) => write!(formatter, "{error}"),
-            Self::Revalidate(error) => write!(formatter, "{error}"),
             Self::NotInstalled { id } => write!(
                 formatter,
                 "no app is installed under {id}. `tfsapp-hub list` shows what is, \
@@ -421,7 +400,6 @@ impl std::error::Error for OpenError {
             Self::Registry(error) => Some(error),
             Self::Manifest(error) => Some(error),
             Self::Paths(error) => Some(error),
-            Self::Revalidate(error) => Some(error),
             Self::NoExecutable(source) => Some(source),
             Self::Unstartable { source, .. } => Some(source),
             _ => None,
@@ -444,12 +422,6 @@ impl From<ManifestError> for OpenError {
 impl From<PathsError> for OpenError {
     fn from(error: PathsError) -> Self {
         Self::Paths(error)
-    }
-}
-
-impl From<RevalidateError> for OpenError {
-    fn from(error: RevalidateError) -> Self {
-        Self::Revalidate(error)
     }
 }
 

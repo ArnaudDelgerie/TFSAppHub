@@ -25,6 +25,7 @@ fn spec(source: Source) -> LaunchSpec {
         warnings: vec![],
         update: update_check::Context::Dev,
         expected_cache: None,
+        pending_revalidation: None,
     }
 }
 

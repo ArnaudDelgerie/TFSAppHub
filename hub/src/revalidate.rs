@@ -1,12 +1,13 @@
 //! Lazy revalidation — the other half of `needs-revalidation`.
 //!
 //! `reconcile.rs` marks; this module clears the mark, or turns it into
-//! `broken`. It runs from `open::resolve`, on the very next `open <id>` of
-//! that app after a hub self-update moved its PHP, and nowhere else — there is
-//! no background job and no revalidation at update time, because the whole
-//! point of the mark is that most installed apps are never opened again
-//! before the *next* self-update, and resolving dependencies for an app
-//! nobody is about to run would be wasted work most of the time.
+//! `broken`. The fast parent `open::resolve` only carries the mark; the child
+//! runs this from its serve thread, behind the splash and after it holds the
+//! launch locks, on that app's next `open <id>` after a hub self-update moved
+//! its PHP. There is no background job and no revalidation at update time,
+//! because the whole point of the mark is that most installed apps are never
+//! opened again before the *next* self-update, and resolving dependencies for
+//! an app nobody is about to run would be wasted work most of the time.
 //!
 //! **What actually changed, and what this deliberately does not do.** A hub
 //! self-update can move two things: the FrankenPHP binary and the extensions
