@@ -1,11 +1,13 @@
 use std::{
-    sync::{atomic::AtomicBool, Arc},
+    process::Command,
+    sync::{atomic::AtomicBool, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 use super::{
-    sleep_backoff_or_shutdown, supervisor_decision, SupervisorDecision, WORKER_MIN_HEALTHY_UPTIME,
+    arbitrate_respawn, sleep_backoff_or_shutdown, supervisor_decision, RespawnArbitration,
+    SupervisorDecision, WORKER_MIN_HEALTHY_UPTIME,
 };
 
 // The station's own table, ported unchanged. The policy is the app's guarantee
@@ -93,4 +95,51 @@ fn a_backoff_that_no_one_interrupts_runs_its_course() {
         Duration::from_millis(300),
         &shutting_down
     ));
+}
+
+#[test]
+fn a_respawn_is_adopted_while_teardown_is_not_requested() {
+    let worker = Mutex::new(None);
+    let shutting_down = AtomicBool::new(false);
+    let mut command = Command::new("sleep");
+    command.arg("60");
+    tfsapp_core::process::set_own_process_group(&mut command);
+    let child = command.spawn().expect("spawn throwaway worker");
+    let worker_pid = child.id();
+
+    assert!(matches!(
+        arbitrate_respawn(&worker, &shutting_down, child),
+        RespawnArbitration::Adopted { worker_pid: adopted_pid } if adopted_pid == worker_pid
+    ));
+    let mut child = worker
+        .lock()
+        .expect("worker mutex")
+        .take()
+        .expect("worker is adopted");
+    tfsapp_core::process::terminate(child.id());
+    let _ = child.wait();
+}
+
+#[test]
+fn a_respawn_cancelled_by_teardown_remains_the_supervisors_child() {
+    let worker = Mutex::new(None);
+    let shutting_down = AtomicBool::new(true);
+    let mut command = Command::new("sleep");
+    command.arg("60");
+    tfsapp_core::process::set_own_process_group(&mut command);
+    let child = command.spawn().expect("spawn throwaway worker");
+    let worker_pid = child.id();
+
+    let RespawnArbitration::CancelledByShutdown(mut child) =
+        arbitrate_respawn(&worker, &shutting_down, child)
+    else {
+        panic!("shutdown must leave the child with the supervisor");
+    };
+    assert!(worker.lock().expect("worker mutex").is_none());
+    tfsapp_core::process::terminate(child.id());
+    let _ = child.wait();
+    assert!(
+        !tfsapp_core::process::process_exists(worker_pid),
+        "the supervisor must reap the cancelled respawn"
+    );
 }
