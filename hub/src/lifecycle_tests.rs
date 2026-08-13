@@ -704,12 +704,27 @@ fn discarding_an_absent_db_snapshot_is_not_an_error() {
 }
 
 #[test]
-fn the_rescue_dump_path_names_a_rescue_twin_beside_the_live_file() {
-    let data_subdir = Path::new("/tmp/does-not-need-to-exist");
-    assert_eq!(
-        rescue_dump_path(data_subdir, "app.db"),
-        data_subdir.join("app.db.rescue")
-    );
+fn consecutive_rescue_dumps_get_distinct_timestamped_names() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let first = rescue_dump_path(data_subdir.path(), "app.db");
+    fs::write(&first, b"first rescue").expect("write the first rescue");
+    let second = rescue_dump_path(data_subdir.path(), "app.db");
+    fs::write(&second, b"second rescue").expect("write the second rescue");
+
+    assert_ne!(first, second, "a later rescue must not overwrite the first");
+    for rescue in [&first, &second] {
+        let name = rescue.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with("app.db.rescue-") && name.contains('T') && name.ends_with('Z')
+                || name.rsplit_once('-').is_some_and(|(stem, suffix)| {
+                    stem.starts_with("app.db.rescue-")
+                        && stem.contains('T')
+                        && suffix.parse::<u32>().is_ok()
+                }),
+            "{name} must retain the timestamped rescue pattern"
+        );
+        assert!(rescue.is_file(), "each rescue must remain on disk");
+    }
 }
 
 // --- the rollback anchor's tree half: previous_tree_path -------------------

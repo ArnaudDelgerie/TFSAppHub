@@ -611,11 +611,15 @@ fn a_forced_import_rescue_dumps_the_replaced_database_and_discards_the_anchor() 
         fs::read(data_subdir.join("app.db")).expect("the new database"),
         b"incoming"
     );
-    assert_eq!(
-        fs::read(lifecycle::rescue_dump_path(&data_subdir, "app.db"))
-            .expect("the replaced database, rescue-dumped"),
-        b"existing"
-    );
+    let rescue = fs::read_dir(&data_subdir)
+        .expect("the data directory")
+        .map(|entry| entry.expect("a directory entry").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("app.db.rescue-"))
+        })
+        .expect("the replaced database, rescue-dumped");
+    assert_eq!(fs::read(rescue).expect("read the rescue dump"), b"existing");
     assert!(
         lifecycle::read_rollback_anchor(&data_subdir).is_none(),
         "the anchor's rollback.json half must be gone"

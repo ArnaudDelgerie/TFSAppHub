@@ -393,13 +393,30 @@ pub fn discard_db_snapshot(data_subdir: &Path) {
     }
 }
 
-/// `<data_subdir>/<name>.rescue` — where `rollback <id>` copies the *current*
-/// (post-update) database before overwriting it with the restored pre-update
-/// snapshot: a manual-recovery artefact at the new schema, never auto-restored
-/// — moving the data aside, not losing it. A second consecutive rollback
-/// overwrites the previous rescue dump.
+/// `<data_subdir>/<name>.rescue-<YYYYMMDDTHHMMSSZ>` — where `rollback <id>`
+/// copies the *current* (post-update) database before overwriting it with the
+/// restored pre-update snapshot: a manual-recovery artefact at the new schema,
+/// never auto-restored — moving the data aside, not losing it. A same-second
+/// collision receives a numeric suffix, so every rescue remains recoverable.
 pub fn rescue_dump_path(data_subdir: &Path, name: &str) -> PathBuf {
-    data_subdir.join(format!("{name}.rescue"))
+    let format =
+        time::format_description::parse_borrowed::<2>("[year][month][day]T[hour][minute][second]Z")
+            .expect("the fixed rescue timestamp format is valid");
+    let timestamp = time::OffsetDateTime::now_utc()
+        .format(&format)
+        .expect("UTC always fits the fixed rescue timestamp format");
+    let base = data_subdir.join(format!("{name}.rescue-{timestamp}"));
+    if !base.exists() {
+        return base;
+    }
+
+    for suffix in 2_u32.. {
+        let candidate = data_subdir.join(format!("{name}.rescue-{timestamp}-{suffix}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("a u32 suffix range never ends")
 }
 
 /// `apps/<id>.previous` — the rollback anchor's tree half: the outgoing
