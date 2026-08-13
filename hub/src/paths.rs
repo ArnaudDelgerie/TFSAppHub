@@ -1,7 +1,6 @@
 //! Where the hub keeps things.
 //!
-//! Two roots, deliberately siblings rather than nested (design source:
-//! `../TFSAppWorkstation/.project/hub/004-app-sources-and-versioning.md` §1):
+//! Two roots, deliberately siblings rather than nested:
 //!
 //! ```text
 //! <OS data dir>/TFSApp/hub/apps/<id>/     the installed snapshot — what actually runs
@@ -11,12 +10,9 @@
 //!
 //! The last line is the load-bearing one. It derives from `identifier` alone —
 //! not from the hub, not from `id`, not from where the binary lives — which is
-//! exactly the station's `packaged::packaged_data_dir`. That is what makes the
-//! migration scenario hold by construction: a user of a packaged AppImage who
-//! installs the same app in the hub opens it and finds the same DB, the same
-//! `APP_SECRET`, the same sessions. The hub must never invent its own layout
-//! for installed *app data*; its own root holds the installed source and the
-//! registry, and nothing else.
+//! the contract-defined app-data layout. The hub must never invent a separate
+//! layout for installed *app data*; its own root holds the installed source and
+//! the registry, and nothing else.
 //!
 //! Hence the two distinct keys per app, which this module keeps apart on
 //! purpose: the hub-local `id` is a CLI handle and names a directory under the
@@ -27,18 +23,10 @@
 //! resolved once. Tests build one on a temp dir; the hub builds one from
 //! [`Paths::resolve`].
 
-// `list` (plan 005) resolves the hub root and the registry path through this
-// module; the app-directory and data-directory halves wait for the installer
-// (006) and `open` (007), with this module's own tests as their only callers
-// until then. Remove the allow when those land, rather than letting it linger.
-#![allow(dead_code)]
-
 use std::{fmt, fs, io, path::PathBuf};
 
 /// The vendor folder under the OS data dir that groups every TFSApp's data
-/// directory (station CONTRACT.md §6). Same constant, same spelling and same
-/// position as the station's `config::DATA_DIR_VENDOR` — the two hosts share
-/// this directory, so a divergence here is a divergence in user data.
+/// directory (CONTRACT.md §6).
 pub const DATA_DIR_VENDOR: &str = "TFSApp";
 
 /// The hub's own root, a sibling of every app data dir rather than a parent of
@@ -122,8 +110,7 @@ pub const UPDATE_CACHE_LOCK_FILE: &str = "update_cache.lock";
 ///
 /// The base is a field rather than a call so the whole module is testable
 /// against a temp dir. Real callers use [`Paths::resolve`], which reads the
-/// same `dirs::data_dir()` the station's `packaged_data_dir` reads (and which
-/// `app.path().data_dir()` wraps), so both hosts land on the same bytes.
+/// same OS data-directory base specified by CONTRACT.md.
 pub struct Paths {
     data_dir_base: PathBuf,
 }
@@ -139,6 +126,7 @@ impl Paths {
     }
 
     /// Build on an arbitrary base. For tests, and for nothing else.
+    #[cfg(test)]
     pub fn rooted_at(data_dir_base: impl Into<PathBuf>) -> Self {
         Self {
             data_dir_base: data_dir_base.into(),
@@ -321,13 +309,9 @@ impl Paths {
 /// mistyped CLI argument, name a directory outside the root it was meant to
 /// stay in, and nothing else.
 ///
-/// Being no stricter than that is a contract rule, not taste: the hub must
-/// never *refuse* what the station accepts, and the station accepts any
-/// `identifier` string its `packaged_data_dir` can join. A value refused here
-/// would already be broken over there — `dev.local/../../evil` does not name
-/// one data dir on either host. A tighter charset for the hub-local `id`
-/// (which the hub itself generates) may come with the installer; it must never
-/// spread to `identifier`, which is the app's to choose.
+/// Being no stricter than that is a contract rule, not taste: `identifier` is
+/// the app's to choose, while the hub generates its own local `id`. A tighter
+/// charset for `id` must never spread to `identifier`.
 fn safe_segment<'a>(kind: &'static str, value: &'a str) -> Result<&'a str, PathsError> {
     let unsafe_segment = value.is_empty()
         || value == "."

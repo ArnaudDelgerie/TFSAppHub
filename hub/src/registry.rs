@@ -1,9 +1,7 @@
 //! `registry.json` — what is installed, from where, at what version.
 //!
 //! One file under the hub's own root, holding one entry per installed app plus
-//! a little about the hub that last wrote it. Design source:
-//! `../TFSAppWorkstation/.project/hub/005-hub-update-and-revalidation.md` §2,
-//! which settled the shape **before any code**, on the grounds that
+//! a little about the hub that last wrote it. Its shape is deliberately stable:
 //! retrofitting a field would mean migrating installed users' state.
 //!
 //! Three properties this module owes its callers, in the order they bite:
@@ -27,11 +25,6 @@
 //! records which hub last wrote the file, which is what a future reader would
 //! actually want to reason about, and a second version number invites
 //! migration machinery that nothing has asked for yet.
-
-// `list` (plan 005) reads the registry; writing one is the installer's job
-// (006), and until it lands `save`/`update`/`upsert` have this module's own
-// tests as their only callers. Remove the allow with the first real writer.
-#![allow(dead_code)]
 
 use std::{
     fmt, fs,
@@ -328,16 +321,6 @@ pub fn load(paths: &Paths) -> Result<Registry, RegistryError> {
         path,
         detail: error.to_string(),
     })
-}
-
-/// Write `registry`, atomically, under the exclusive lock.
-///
-/// Callers that need to read *and* write should use [`update`] instead: this
-/// one takes the lock only for the write, so two racing read-modify-write
-/// cycles built on top of it would lose one of the two modifications.
-pub fn save(paths: &Paths, registry: &Registry) -> Result<(), RegistryError> {
-    let _lock = lock(paths)?;
-    write_locked(paths, registry)
 }
 
 /// Read, modify and write under one lock — the primitive an install wants.

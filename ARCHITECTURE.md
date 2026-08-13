@@ -1180,7 +1180,7 @@ are the primary documentation of the code; this file is the map above them.
 
 The queued design work lives in `.project/plan/000-index.md` rather than here, so
 that one list stays authoritative. The structural decisions that outrank
-everything else are in `.project/decisions/`.
+everything else are in `.project/decision/`.
 
 The one worth naming here, because it shapes what is above rather than extending
 it: the hub is a single point of failure for every installed app, and nothing in

@@ -651,6 +651,6 @@ mod registry {
             updated_at: now_timestamp(),
             unknown: serde_json::Map::new(),
         });
-        crate::registry::save(paths, &registry).expect("a written registry");
+        crate::registry::update(paths, |stored| *stored = registry).expect("a written registry");
     }
 }

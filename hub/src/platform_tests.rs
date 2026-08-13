@@ -99,8 +99,7 @@ fn the_bundled_interpreter_answers_for_itself() {
     // The only test that runs the real binary, and it is skipped rather than
     // failed when it is absent: `make check` must stay green on a fresh clone
     // where `make sidecar` has never run, and the 170 MB download is not
-    // something a unit test should trigger. The manual counterpart is
-    // `tfsapp-hub __platform`, eyeballed against the binary's own `php -m`.
+    // something a unit test should trigger.
     let candidates = bundled_frankenphp();
     let Some(binary) = candidates.iter().find(|path| path.is_file()) else {
         eprintln!(

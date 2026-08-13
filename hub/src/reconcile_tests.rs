@@ -69,7 +69,7 @@ fn a_matching_hub_version_probes_nothing_and_changes_nothing() {
     // here despite the matching version, this entry would be marked, which is
     // exactly what this test is checking does not happen.
     registry.upsert(entry("demo", implausible_platform(), State::Ready));
-    registry::save(&paths, &registry).expect("a seeded registry");
+    registry::update(&paths, |stored| *stored = registry.clone()).expect("a seeded registry");
 
     reconcile(&paths, "0.6.0").expect("a matching version is not an error");
 
@@ -88,7 +88,7 @@ fn a_different_version_with_a_matching_fingerprint_is_restamped_and_touches_no_a
     let mut registry = Registry::default();
     registry.stamp("0.1.0", running.clone());
     registry.upsert(entry("demo", running.clone(), State::Ready));
-    registry::save(&paths, &registry).expect("a seeded registry");
+    registry::update(&paths, |stored| *stored = registry.clone()).expect("a seeded registry");
 
     reconcile(&paths, "0.2.0").expect("it reconciles");
 
@@ -110,7 +110,7 @@ fn a_different_fingerprint_marks_only_the_apps_that_differ() {
     registry.stamp("0.1.0", implausible_platform());
     registry.upsert(entry("matches", running.clone(), State::Ready));
     registry.upsert(entry("stale", implausible_platform(), State::Ready));
-    registry::save(&paths, &registry).expect("a seeded registry");
+    registry::update(&paths, |stored| *stored = registry.clone()).expect("a seeded registry");
 
     reconcile(&paths, "0.2.0").expect("it reconciles");
 
@@ -137,7 +137,7 @@ fn an_already_broken_app_is_left_alone() {
     let mut registry = Registry::default();
     registry.stamp("0.1.0", implausible_platform());
     registry.upsert(entry("broken", implausible_platform(), State::Broken));
-    registry::save(&paths, &registry).expect("a seeded registry");
+    registry::update(&paths, |stored| *stored = registry.clone()).expect("a seeded registry");
 
     reconcile(&paths, "0.2.0").expect("it reconciles");
 

@@ -64,6 +64,7 @@ pub fn render(registry: &Registry, revision: impl Fn(&Source) -> Revision) -> St
         "identifier".to_string(),
         "version".to_string(),
         "state".to_string(),
+        "platform".to_string(),
         "source".to_string(),
     ]];
 
@@ -73,13 +74,14 @@ pub fn render(registry: &Registry, revision: impl Fn(&Source) -> Revision) -> St
             entry.identifier.clone(),
             entry.app_version.clone(),
             entry.state.to_string(),
+            entry.platform.to_string(),
             describe_source(&entry.source, &entry.source_revision, &revision),
         ]);
     }
 
     // The last column carries the markers and never needs padding, so only the
-    // four before it are measured.
-    let widths: Vec<usize> = (0..4)
+    // columns before it are measured.
+    let widths: Vec<usize> = (0..5)
         .map(|column| {
             rows.iter()
                 .map(|row| row[column].chars().count())
@@ -93,7 +95,7 @@ pub fn render(registry: &Registry, revision: impl Fn(&Source) -> Revision) -> St
         for (column, width) in widths.iter().enumerate() {
             text.push_str(&format!("{:width$}  ", row[column], width = width));
         }
-        text.push_str(&row[4]);
+        text.push_str(&row[5]);
         text.push('\n');
     }
     text

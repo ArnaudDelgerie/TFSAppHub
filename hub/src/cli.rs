@@ -2,11 +2,8 @@
 //!
 //! > **`--flags` act on the hub. Bare words act on an app.**
 //!
-//! One sentence, no ambiguous case, and nothing new to learn: it is the line
-//! the station already draws today, where `--update`/`--uninstall`/`--export`
-//! are station-level lifecycle flags and the single bare-word subcommand,
-//! `run`, is the app-level one. Design source:
-//! `../TFSAppWorkstation/.project/hub/003-cli-surface.md` §1–§2.
+//! One sentence, no ambiguous case, and nothing new to learn: hub-level flags
+//! act on the host while a bare-word subcommand acts on a selected app.
 //!
 //! Two rules keep this module the size the station's `cli.rs` stayed across
 //! sixty plans:
@@ -39,13 +36,6 @@ pub const EXIT_USAGE: i32 = 2;
 /// both of the above on purpose: nothing the user types will fix it, and
 /// nothing about their machine is broken.
 pub const EXIT_UNIMPLEMENTED: i32 = 3;
-
-/// Temporary and hidden — the double underscore says so, and nothing prints it
-/// in a usage line or in `--help`. It exists so the `platform` fingerprint can
-/// be eyeballed against the bundled binary's real `php -m` before anything
-/// depends on it, and it goes away once an installed app records one and `list`
-/// can show it.
-pub const PLATFORM_SUBCOMMAND: &str = "__platform";
 
 /// Hidden, same convention, and not temporary: this is the form `open <id>`
 /// re-executes the hub binary with (plan 007, see `open.rs`). It is one half of
@@ -97,9 +87,8 @@ pub struct Spec {
 
 /// The whole CLI surface, in the order `--help` prints it.
 ///
-/// Declared in full from plan 005, implemented across plans 005–012. Several
-/// rows may share a `name` (`run` has three forms); [`spec`] answers with the
-/// first, which is the form a usage error quotes.
+/// Several rows may share a `name` (`run` has three forms); [`spec`] answers
+/// with the first, which is the form a usage error quotes.
 pub const SURFACE: &[Spec] = &[
     Spec {
         name: "--version",
@@ -339,8 +328,8 @@ pub enum Command {
     },
     Publish {
         path: String,
-        /// `--repo owner/repo`: wins over the manifest's `releases_repo` when
-        /// given.
+        /// `--repo owner/repo`: selects the release repository; otherwise the
+        /// project's git remote is used.
         repo: Option<String>,
         /// `--yes`: skips the confirmation before `gh release create` runs.
         /// The `actions.secrets.ipc` gate (CONTRACT.md §7) is a separate
@@ -386,8 +375,6 @@ pub enum Command {
         assume_yes: bool,
     },
     Run(RunInvocation),
-    /// Hidden, temporary — see [`PLATFORM_SUBCOMMAND`].
-    Platform,
     /// Hidden — see [`OPEN_CHILD_SUBCOMMAND`]. Carries the raw strings rather
     /// than an `Identity` so this module stays free of the identity types it
     /// would otherwise have to know about.
@@ -463,7 +450,6 @@ impl Command {
             Self::Export { .. } => "export",
             Self::Import { .. } => "import",
             Self::Run(_) => "run",
-            Self::Platform => PLATFORM_SUBCOMMAND,
             Self::OpenChild { .. } => OPEN_CHILD_SUBCOMMAND,
         }
     }
@@ -623,7 +609,6 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             })
         }
         "run" => parse_run(rest),
-        PLATFORM_SUBCOMMAND => Ok(Command::Platform),
         OPEN_CHILD_SUBCOMMAND => parse_open_child(rest),
         unknown => Err(UsageError {
             message: match unknown.starts_with('-') {

@@ -10,13 +10,12 @@ use crate::{
 /// A registry holding one app, written to disk under `paths` — `open` reads the
 /// real file, so its tests write one rather than hand it a struct.
 fn install(paths: &Paths, entry: RegistryEntry) {
-    registry::save(
-        paths,
-        &Registry {
+    registry::update(paths, |stored| {
+        *stored = Registry {
             apps: vec![entry],
             ..Registry::default()
-        },
-    )
+        };
+    })
     .expect("a written registry");
 }
 
