@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     archive::{self, ArchiveError},
+    manifest::{self, ManifestError},
     registry::{ReferenceKind, Source, SourceKind},
     release::{self, ReleaseError},
 };
@@ -315,6 +316,36 @@ fn resolve_release(
     }
 
     let root = archive::extract(&archive_path, &scratch.join("extracted"))?;
+    // The archive name's project-name half cannot be known until this point.
+    // Do not report manifest warnings here: `install` loads it again once the
+    // source is accepted, and remains the one user-facing warning path.
+    let manifest = manifest::load(&root).map_err(|source| SourceError::ReleaseManifest {
+        tag: release.tag_name.clone(),
+        archive_name: assets.archive_name.to_string(),
+        source,
+    })?;
+    let version = release
+        .tag_name
+        .strip_prefix('v')
+        .expect("resolve_assets accepted only v<canonical-semver> tags");
+    if manifest.manifest.app_version != version {
+        return Err(SourceError::ManifestVersionMismatch {
+            tag: release.tag_name.clone(),
+            archive_name: assets.archive_name.to_string(),
+            manifest_version: manifest.manifest.app_version,
+        });
+    }
+    let archive_project_name = assets
+        .archive_name
+        .strip_suffix(&format!("-{version}.tar.gz"))
+        .expect("resolve_assets accepted only an archive matching the tag");
+    if manifest.manifest.project_name != archive_project_name {
+        return Err(SourceError::ManifestProjectNameMismatch {
+            tag: release.tag_name.clone(),
+            archive_name: assets.archive_name.to_string(),
+            manifest_project_name: manifest.manifest.project_name,
+        });
+    }
     let revision = tree_hash(&root).map_err(|source| SourceError::Unreadable {
         path: root.clone(),
         source,
@@ -375,6 +406,25 @@ pub enum SourceError {
     ChecksumMissing {
         archive_name: String,
     },
+    /// The archive passed its checksum but its manifest is not an app
+    /// manifest. The release cannot be installed until its author corrects it.
+    ReleaseManifest {
+        tag: String,
+        archive_name: String,
+        source: ManifestError,
+    },
+    /// The extracted manifest names a version different from its release tag.
+    ManifestVersionMismatch {
+        tag: String,
+        archive_name: String,
+        manifest_version: String,
+    },
+    /// The extracted manifest names a project different from its archive.
+    ManifestProjectNameMismatch {
+        tag: String,
+        archive_name: String,
+        manifest_project_name: String,
+    },
     /// The archive passed its checksum but could not be safely extracted —
     /// `archive::ArchiveError`'s own taxonomy (a path escaping the tree, a
     /// malformed top level).
@@ -426,6 +476,35 @@ impl fmt::Display for SourceError {
                 "SHA256SUMS.txt has no line for {archive_name} — a release missing an \
                  entry for its own archive cannot be verified, so it is refused rather \
                  than installed unverified."
+            ),
+            Self::ReleaseManifest {
+                tag,
+                archive_name,
+                source,
+            } => write!(
+                formatter,
+                "release {tag}'s archive {archive_name} has an invalid manifest ({source}) — \
+                 ask the app's author to fix and republish the release."
+            ),
+            Self::ManifestVersionMismatch {
+                tag,
+                archive_name,
+                manifest_version,
+            } => write!(
+                formatter,
+                "release {tag}'s archive {archive_name} declares app_version {manifest_version:?} \
+                 in its manifest, not the tag's version — ask the app's author to fix and \
+                 republish the release."
+            ),
+            Self::ManifestProjectNameMismatch {
+                tag,
+                archive_name,
+                manifest_project_name,
+            } => write!(
+                formatter,
+                "release {tag}'s archive {archive_name} declares project_name \
+                 {manifest_project_name:?} in its manifest, not the archive's project name — \
+                 ask the app's author to fix and republish the release."
             ),
             Self::Archive(error) => write!(formatter, "{error}"),
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
