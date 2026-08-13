@@ -104,9 +104,11 @@ impl Sidecar {
 
         if let Ok(mut worker) = self.worker.lock() {
             if let Some(mut child) = worker.take() {
-                println!("Stopping the Messenger worker pid {}", child.id());
-                tfsapp_core::process::terminate(child.id());
-                let _ = child.wait();
+                if worker_needs_termination(&mut child) {
+                    println!("Stopping the Messenger worker pid {}", child.id());
+                    tfsapp_core::process::terminate(child.id());
+                    let _ = child.wait();
+                }
             }
         }
         if let Some(mut child) = self.server.take() {
@@ -127,6 +129,17 @@ impl Sidecar {
         // ends: the OS closing every fd when it dies. See the field's own
         // doc comment.
     }
+}
+
+/// Whether teardown still owns a live worker it must signal.
+///
+/// The supervisor may already have reaped the child while it remains in the
+/// shared slot during its backoff. `Child` caches that exit status, so a later
+/// `try_wait` returns `Ok(Some(_))`; signalling its numeric pid then could hit
+/// an unrelated process after pid reuse. A polling error remains conservative:
+/// an unpollable child is treated as live, matching the supervisor's posture.
+fn worker_needs_termination(child: &mut Child) -> bool {
+    !matches!(child.try_wait(), Ok(Some(_)))
 }
 
 impl Drop for Sidecar {
@@ -247,50 +260,66 @@ pub fn start(
 
     println!("{} is listening at {url}", app_dir.display());
 
-    let server_pid = server.id();
-    let shutting_down = Arc::new(AtomicBool::new(false));
+    // From `spawn()` onward the server is never loose: every fallible piece
+    // of startup below runs against this value, so an `Err` drops it and
+    // `Sidecar::stop` reaps both the server and any worker already adopted.
+    let sidecar = Sidecar {
+        server: Some(server),
+        worker: Arc::new(Mutex::new(None)),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        pid_file,
+        lock,
+        serving,
+    };
+    let server_pid = sidecar
+        .server
+        .as_ref()
+        .expect("a freshly constructed Sidecar owns its server")
+        .id();
+
+    // The pid file starts with the server alone. If spawning the worker or
+    // updating this file fails, `sidecar` drops and removes this partial record
+    // while reaping the server it has owned since `spawn()` returned.
+    fs::write(&sidecar.pid_file, format!("{server_pid}\n"))?;
 
     // Only the worker is gated on `async_worker`. The Mercure hub is always
     // mounted: it is a Caddy directive, not a process, and costs nothing at
     // rest — which is what lets an app use it without declaring anything.
-    let worker = if async_worker {
+    if async_worker {
         let child =
             worker::spawn_worker(&toolchain.frankenphp, app_dir, &envs, &environment.log_dir)
                 .map_err(|error| format!("Cannot start the Messenger worker: {error}"))?;
         let worker_spawned_at = Instant::now();
 
+        // Adopt before the fallible pid-file rewrite. From this point a failed
+        // write drops `sidecar`, which owns and stops this worker too.
+        let worker_pid = child.id();
+        *sidecar
+            .worker
+            .lock()
+            .expect("the worker slot is uncontended before its supervisor starts") = Some(child);
+
         // Both pids, server first, worker second — the order CONTRACT.md §6
         // fixes, and the order the next launch's reap reads them back in.
-        fs::write(&pid_file, format!("{server_pid}\n{}\n", child.id()))?;
+        fs::write(&sidecar.pid_file, format!("{server_pid}\n{worker_pid}\n"))?;
 
-        let worker = Arc::new(Mutex::new(Some(child)));
         worker::spawn_worker_supervisor(worker::WorkerSupervisorConfig {
-            worker: Arc::clone(&worker),
-            shutting_down: Arc::clone(&shutting_down),
+            worker: Arc::clone(&sidecar.worker),
+            shutting_down: Arc::clone(&sidecar.shutting_down),
             frankenphp: toolchain.frankenphp.clone(),
             app_dir: app_dir.to_path_buf(),
             envs: envs.clone(),
-            pid_file: pid_file.clone(),
+            pid_file: sidecar.pid_file.clone(),
             server_pid,
             log_dir: environment.log_dir.clone(),
             worker_spawned_at,
             app: app.clone(),
         });
-        worker
-    } else {
-        fs::write(&pid_file, format!("{server_pid}\n"))?;
-        Arc::new(Mutex::new(None))
-    };
+    }
 
-    Ok((
-        Sidecar {
-            server: Some(server),
-            worker,
-            shutting_down,
-            pid_file,
-            lock,
-            serving,
-        },
-        url,
-    ))
+    Ok((sidecar, url))
 }
+
+#[cfg(test)]
+#[path = "sidecar_tests.rs"]
+mod tests;

@@ -186,6 +186,44 @@ pub struct WorkerSupervisorConfig {
     pub app: tauri::AppHandle,
 }
 
+/// The result of offering a freshly spawned worker to the shared sidecar slot.
+///
+/// Until the slot accepts it, the supervisor owns the child and must reap it.
+/// Keeping that ownership in the return value makes a failed hand-off unable to
+/// silently turn into an orphan.
+enum RespawnArbitration {
+    Adopted { worker_pid: u32 },
+    CancelledByShutdown(Child),
+    CannotAdopt(Child),
+}
+
+/// Put a respawned worker under sidecar ownership unless teardown won the race.
+///
+/// `stop()` sets `shutting_down` before taking this same mutex. Consequently,
+/// while the mutex is held, either teardown will later find the child in the
+/// slot, or this re-check observes shutdown and `Option::take` gives the child
+/// back to the supervisor as its sole killer. The mutex and `take` therefore
+/// serialize the hand-off and make exactly one side responsible for reaping it.
+fn arbitrate_respawn(
+    worker: &Mutex<Option<Child>>,
+    shutting_down: &AtomicBool,
+    child: Child,
+) -> RespawnArbitration {
+    let Ok(mut guard) = worker.lock() else {
+        return RespawnArbitration::CannotAdopt(child);
+    };
+
+    let worker_pid = child.id();
+    *guard = Some(child);
+    if shutting_down.load(Ordering::SeqCst) {
+        return RespawnArbitration::CancelledByShutdown(
+            guard.take().expect("worker was inserted immediately above"),
+        );
+    }
+
+    RespawnArbitration::Adopted { worker_pid }
+}
+
 /// Watch the worker and respawn it under [`supervisor_decision`]'s policy.
 ///
 /// Without this the worker would stop consuming after its first time or memory
@@ -298,19 +336,43 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
                 }
 
                 match spawn_worker(&frankenphp, &app_dir, &envs, &log_dir) {
-                    Ok(child) => {
-                        let worker_pid = child.id();
-                        let line = format!("Restarted Messenger worker pid {worker_pid}");
-                        println!("{line}");
-                        log::append_log(&sidecar_log, &line);
-                        spawned_at = Instant::now();
-                        let _ = fs::write(&pid_file, format!("{server_pid}\n{worker_pid}\n"));
-                        let Ok(mut guard) = worker.lock() else {
+                    Ok(child) => match arbitrate_respawn(&worker, &shutting_down, child) {
+                        RespawnArbitration::Adopted { worker_pid } => {
+                            // The child is in the slot before this durable
+                            // record exists, so teardown can always take it.
+                            // If shutdown begins just after the arbitration,
+                            // its own cleanup removes this file; the final
+                            // check below also covers teardown deleting it
+                            // between this write and that cleanup.
+                            let _ = fs::write(&pid_file, format!("{server_pid}\n{worker_pid}\n"));
+                            if shutting_down.load(Ordering::SeqCst) {
+                                let _ = fs::remove_file(&pid_file);
+                                return;
+                            }
+
+                            let line = format!("Restarted Messenger worker pid {worker_pid}");
+                            println!("{line}");
+                            log::append_log(&sidecar_log, &line);
+                            spawned_at = Instant::now();
+                            continue 'watch;
+                        }
+                        RespawnArbitration::CancelledByShutdown(mut child) => {
+                            let line = "Messenger worker respawn cancelled by shutdown";
+                            println!("{line}");
+                            log::append_log(&sidecar_log, line);
+                            tfsapp_core::process::terminate(child.id());
+                            let _ = child.wait();
                             return;
-                        };
-                        *guard = Some(child);
-                        continue 'watch;
-                    }
+                        }
+                        RespawnArbitration::CannotAdopt(mut child) => {
+                            let line = "Cannot supervise respawned Messenger worker; stopping it";
+                            eprintln!("{line}");
+                            log::append_log(&sidecar_log, line);
+                            tfsapp_core::process::terminate(child.id());
+                            let _ = child.wait();
+                            return;
+                        }
+                    },
                     Err(error) => {
                         let line = format!("Cannot restart the Messenger worker: {error}");
                         eprintln!("{line}");
