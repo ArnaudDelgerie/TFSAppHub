@@ -403,7 +403,7 @@ fn announce(gates: &LocalGates, tag: &str, assets: &Assets) {
 /// published tag and archive name are both built from, and CONTRACT.md §2's
 /// own requirement.
 fn validate_version(manifest: &Manifest, manifest_path: &Path) -> Result<(), PublishError> {
-    semver::Version::parse(&manifest.app_version).map_err(|error| {
+    release::canonical_semver(&manifest.app_version).map_err(|error| {
         PublishError::UnusableVersion {
             path: manifest_path.to_path_buf(),
             version: manifest.app_version.clone(),

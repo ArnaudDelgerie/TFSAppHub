@@ -13,16 +13,14 @@
 //! timer; `install` and `update` are one-shot commands a human just typed, and
 //! a cache would only hide a release published thirty seconds ago.
 //!
-//! **[`resolve_assets`] cannot ask for `<project_name>-<app_version>.tar.gz`
-//! by its exact name.** That name needs `project_name`, which lives in a
-//! manifest inside the very archive this function is looking for — so the
-//! rule it applies here is what it *can* know before the archive is opened:
-//! exactly one asset ending in `.tar.gz`, and one named `SHA256SUMS.txt`. A
-//! misnamed archive is not a security hole — `SHA256SUMS.txt` still has to
-//! name it exactly, so whatever is installed is still what the author
-//! published — only a cosmetic one, and cross-checking it against the
-//! manifest read after extraction is left for whenever that turns out to
-//! matter.
+//! **[`resolve_assets`] cannot ask for the full
+//! `<project_name>-<app_version>.tar.gz` name.** `project_name` lives in the
+//! manifest inside the archive, but the tag already supplies the other half:
+//! before extraction this module refuses anything but `v<canonical-semver>`
+//! and an archive ending in `-<version>.tar.gz`. [`source::resolve_release`]
+//! confirms the remaining project-name half against the extracted manifest.
+//! Together those checks implement plan 018's release identity rule: a
+//! mismatch is refused, never merely warned about.
 //!
 //! [`download_to`], [`sha256_file`] and [`verify`] are this plan's step 3:
 //! downloading the assets this module locates and checking them against
@@ -71,6 +69,12 @@ const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// `CONTRACT.md`'s publishing clause, whether the archive was produced by
 /// hand or by `tfsapp-hub publish` (`../plan/019-publish-an-app.md`).
 pub const SHA256SUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
+
+/// Parse the canonical semantic-version spelling the publishing gate accepts.
+/// Kept here so a release tag and `publish` use one definition of a version.
+pub(crate) fn canonical_semver(version: &str) -> Result<semver::Version, semver::Error> {
+    semver::Version::parse(version)
+}
 
 /// The subset of GitHub's release response this resolver reads.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -166,6 +170,14 @@ fn find_checksums(release: &GitHubRelease) -> Result<&GitHubAsset, ReleaseError>
 /// Find `release`'s source archive and its `SHA256SUMS.txt`, or say which one
 /// is missing (or ambiguous).
 pub fn resolve_assets(release: &GitHubRelease) -> Result<ResolvedAssets<'_>, ReleaseError> {
+    let version = release
+        .tag_name
+        .strip_prefix('v')
+        .filter(|version| !version.is_empty())
+        .filter(|version| canonical_semver(version).is_ok())
+        .ok_or_else(|| ReleaseError::InvalidTag {
+            tag: release.tag_name.clone(),
+        })?;
     let archives: Vec<&GitHubAsset> = release
         .assets
         .iter()
@@ -186,6 +198,14 @@ pub fn resolve_assets(release: &GitHubRelease) -> Result<ResolvedAssets<'_>, Rel
             })
         }
     };
+    let expected_suffix = format!("-{version}.tar.gz");
+    if !archive.name.ends_with(&expected_suffix) {
+        return Err(ReleaseError::ArchiveTagMismatch {
+            tag: release.tag_name.clone(),
+            archive: archive.name.clone(),
+            expected_suffix,
+        });
+    }
     let checksums = find_checksums(release)?;
 
     Ok(ResolvedAssets {
@@ -373,6 +393,14 @@ pub enum ReleaseError {
     NotFound,
     /// The response was not the JSON this resolver expected.
     InvalidResponse(String),
+    /// A release tag does not name a canonical app version.
+    InvalidTag { tag: String },
+    /// The source archive's version does not agree with the release tag.
+    ArchiveTagMismatch {
+        tag: String,
+        archive: String,
+        expected_suffix: String,
+    },
     /// A release exists but is missing one of the two assets it must carry.
     MissingAsset { tag: String, missing: &'static str },
     /// Downloading an asset, fetching its checksums text, or hashing it back
@@ -401,6 +429,20 @@ impl fmt::Display for ReleaseError {
             Self::InvalidResponse(detail) => write!(
                 formatter,
                 "GitHub answered with something this hub could not read ({detail})."
+            ),
+            Self::InvalidTag { tag } => write!(
+                formatter,
+                "release tag {tag:?} does not follow the required v<app_version> form, with a \
+                 canonical semantic version — ask the app's author to fix the release."
+            ),
+            Self::ArchiveTagMismatch {
+                tag,
+                archive,
+                expected_suffix,
+            } => write!(
+                formatter,
+                "release {tag} carries {archive}, but its source archive must end in \
+                 {expected_suffix} — ask the app's author to fix the release."
             ),
             Self::MissingAsset { tag, missing } => write!(
                 formatter,
