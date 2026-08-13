@@ -487,6 +487,10 @@ fn importing_refuses_a_foreign_identifier() {
         ),
         "{error}"
     );
+    assert!(
+        !error.to_string().contains("rescue"),
+        "a refusal before extraction must not imply data was moved aside"
+    );
 }
 
 #[test]
@@ -753,7 +757,11 @@ fn an_archive_with_a_traversal_entry_is_refused_by_archives_own_checks() {
 
     let error = run_import(&paths, "demo", &archive, false, true)
         .expect_err("a traversal entry is refused by archive's own checks");
-    assert!(matches!(error, PortabilityError::Archive(_)), "{error}");
+    assert!(
+        matches!(error, PortabilityError::ImportIncomplete { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("partially extracted"), "{error}");
 }
 
 // --- import migrates an older archive forward --------------------------
@@ -886,5 +894,55 @@ fn an_archive_older_than_the_installed_app_is_migrated_forward_on_import() {
         fs::read(data_subdir.join("app.db")).expect("the imported database"),
         b"older-backup",
         "the imported bytes are what the hooks ran against, not a fixture database"
+    );
+}
+
+#[test]
+fn a_failed_forward_migration_leaves_the_archive_version_and_names_the_rescue() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+    runnable_app_tree(source.path(), "1.3.0", r#"{"pre-update": ["boom"]}"#);
+    install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the initial install succeeds")
+    .expect("the user did not decline");
+
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::write(data_subdir.join("app.db"), b"before import").expect("an existing database");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.0")),
+            (&format!("{DATA_DIR}/app.db"), b"archive database"),
+        ],
+    );
+
+    let error = run_import(&paths, "demo", &archive, true, true)
+        .expect_err("the fixture's pre-update hook fails");
+    let message = error.to_string();
+    assert!(
+        matches!(error, PortabilityError::ImportIncomplete { .. }),
+        "{message}"
+    );
+    assert!(
+        message.contains("extracted but not migrated forward"),
+        "{message}"
+    );
+    assert!(message.contains("app.db.rescue-"), "{message}");
+    assert_eq!(
+        lifecycle::read_data_version(&data_subdir).expect("the stamped config"),
+        Some("1.2.0".to_string()),
+        "the next open must see the unfinished forward migration"
     );
 }
