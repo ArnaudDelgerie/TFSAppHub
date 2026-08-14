@@ -3,12 +3,14 @@ set -euo pipefail
 
 # Run the workspace's `cargo test` inside a private D-Bus session backed by an
 # ephemeral gnome-keyring-daemon, so the suite never touches the developer's
-# real login keyring. The keyring-backed modules arrive with plan 007 and some
-# of their tests deliberately exercise a *real* Secret Service; this wrapper is
-# what gives them one to talk to without any risk to the host. It is in place
-# from plan 001 on purpose — a test that reaches the login keyring once has
-# already done the damage, so the isolation must never be the thing added
-# afterwards.
+# real login keyring. Its repository-owned bus configuration has no activation
+# service directories: the daemon below is the sole explicit Secret Service
+# provider, and the wrapper verifies its PID before Cargo can use it. The
+# keyring-backed modules arrive with plan 007 and some of their tests
+# deliberately exercise a *real* Secret Service; this wrapper is what gives
+# them one to talk to without any risk to the host. It is in place from plan
+# 001 on purpose — a test that reaches the login keyring once has already done
+# the damage, so the isolation must never be the thing added afterwards.
 #
 # All arguments are passed through to `cargo test`, so e.g.
 # `build/scripts/run-tests.sh --test keyring_health` still works.
