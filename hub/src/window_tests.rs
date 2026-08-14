@@ -3,8 +3,9 @@ use std::collections::BTreeSet;
 use tauri::Url;
 
 use super::{
-    action_capability_is_local, classify_navigation, next_window_label_among,
-    resolve_splash_source, resolve_within, splash_style, NavigationTarget, SplashSource,
+    action_capability_is_local, classify_navigation, declared_action_ipc_grants,
+    next_window_label_among, resolve_splash_source, resolve_within, splash_style, NavigationTarget,
+    SplashSource,
 };
 
 fn url(text: &str) -> Url {
@@ -128,6 +129,19 @@ fn actions_capability_is_not_granted_to_the_splash_origin() {
     // value straight to `CapabilityBuilder::local`, so false confines actions
     // to its explicit loopback `remote` target instead.
     assert!(!action_capability_is_local());
+}
+
+#[test]
+fn action_ipc_grants_are_default_off_and_picker_is_independent() {
+    let mut actions = crate::manifest::ActionsConfig::default();
+    assert!(declared_action_ipc_grants(&actions).next().is_none());
+
+    actions.picker.ipc = true;
+    let grants: Vec<_> = declared_action_ipc_grants(&actions)
+        .map(|grant| (grant.capability_identifier, grant.permission))
+        .collect();
+
+    assert_eq!(grants, [("actions-picker", "allow-picker")]);
 }
 
 // --- the splash scheme's path confinement ---------------------------------

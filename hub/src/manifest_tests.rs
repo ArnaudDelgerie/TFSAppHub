@@ -51,7 +51,8 @@ const FULL: &str = r#"{
   },
   "actions": {
     "secrets": { "ipc": true, "bridge": true, "keys": ["openai", "anthropic"] },
-    "update": { "ipc": true, "bridge": true }
+    "update": { "ipc": true, "bridge": true },
+    "picker": { "ipc": true }
   }
 }"#;
 
@@ -84,6 +85,7 @@ fn a_full_manifest_parses_into_typed_values() {
     assert!(manifest.actions.secrets.ipc);
     assert_eq!(manifest.actions.secrets.keys, ["openai", "anthropic"]);
     assert!(manifest.actions.update.bridge);
+    assert!(manifest.actions.picker.ipc);
 
     // `releases_repo` is a known key the hub does not read yet, and
     // `pre-build`/`post-build` are build-machine keys nested under `commands`.
@@ -104,6 +106,41 @@ fn a_minimal_manifest_defaults_everything_optional() {
     assert_eq!(manifest.commands, super::LifecycleCommands::default());
     assert_eq!(manifest.actions, super::ActionsConfig::default());
     assert!(loaded.warnings.is_empty());
+}
+
+#[test]
+fn picker_ipc_is_off_when_actions_or_picker_is_absent() {
+    assert!(!parse_ok(MINIMAL).manifest.actions.picker.ipc);
+
+    let without_picker = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"update": {"ipc": true}}"#,
+    );
+    assert!(!parse_ok(&without_picker).manifest.actions.picker.ipc);
+}
+
+#[test]
+fn picker_bridge_is_refused_even_when_false() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"picker": {"ipc": true, "bridge": false}}"#,
+    );
+
+    let error = parse_err(&contents);
+
+    assert!(matches!(
+        error,
+        ManifestError::UnsupportedActionTransport {
+            group: "picker",
+            transport: "bridge",
+            ..
+        }
+    ));
+    assert!(
+        error.to_string().contains("actions.picker.bridge"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("no bridge transport"), "{error}");
 }
 
 #[test]
