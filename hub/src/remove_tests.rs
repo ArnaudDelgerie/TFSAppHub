@@ -98,6 +98,10 @@ fn an_unreadable_manifest_costs_the_declared_keys_and_nothing_else() {
         planned.keyring_accounts,
         vec![APP_SECRET_ACCOUNT.to_string(), PROBE_ACCOUNT.to_string()]
     );
+    assert!(
+        !planned.keyring_note_found,
+        "the purge caveat must name declared accounts it cannot inspect"
+    );
 }
 
 #[test]
