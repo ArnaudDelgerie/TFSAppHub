@@ -98,6 +98,10 @@ fn an_unreadable_manifest_costs_the_declared_keys_and_nothing_else() {
         planned.keyring_accounts,
         vec![APP_SECRET_ACCOUNT.to_string(), PROBE_ACCOUNT.to_string()]
     );
+    assert!(
+        !planned.keyring_note_found,
+        "the purge caveat must name declared accounts it cannot inspect"
+    );
 }
 
 #[test]
@@ -191,6 +195,26 @@ fn a_live_window_refuses_a_purge() {
 
     assert!(matches!(error, RemoveError::StillRunning { .. }), "{error}");
     assert!(error.to_string().contains("demo"), "{error}");
+}
+
+#[test]
+fn a_live_window_refuses_a_plain_remove() {
+    let (_base, paths) = temp_paths();
+    installed_snapshot(&paths, "demo");
+    registry::save_entry(&paths, "demo");
+    let data_dir = paths.app_data_dir(IDENTIFIER).expect("a data dir");
+    fs::create_dir_all(&data_dir).expect("a data dir");
+    let pid_file = data_dir.join("sidecar.pid");
+    let _holder = tfsapp_core::process::try_lock_file(&tfsapp_core::process::lock_path(&pid_file))
+        .expect("no I/O error")
+        .expect("the lock is free to take");
+
+    let error = remove(&paths, "demo", false, true)
+        .expect_err("a live window must keep its served tree intact");
+
+    assert!(matches!(error, RemoveError::StillRunning { .. }), "{error}");
+    assert!(error.to_string().contains("demo"), "{error}");
+    assert!(paths.app_dir("demo").expect("an app dir").exists());
 }
 
 #[test]

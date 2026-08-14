@@ -15,9 +15,9 @@
 //! source afterwards changes nothing until an explicit `update`. There is no
 //! symlink into the working tree and no watcher — that is what makes `composer
 //! install`, migrations and cache warm-up mean anything, since they ran against
-//! *this* tree and it cannot move underneath them. Live editing is the
-//! station's `make tauri-dev`, and the hub must not grow a second, worse
-//! version of it.
+//! *this* tree and it cannot move underneath them. Live source belongs to the
+//! hub's distinct `dev` mode: it serves source in place, but watches, compiles
+//! and builds no assets. That boundary keeps `install` a snapshot.
 //!
 //! **Every step is restartable.** A failure leaves no half-installed app: the
 //! copied directory is removed, and the registry is written only at the very
@@ -177,15 +177,7 @@ pub(crate) fn install_into(
     // enforce: nothing may install into a data directory a live window or an
     // active `run` command still owns.
     check_data_dir_available(&id, &manifest.identifier, &data_dir)?;
-    // A fresh install has nothing to roll back to: any rollback anchor left
-    // behind under this data directory — by an update this `id` ran before a
-    // `remove` without `--purge` — is stale the moment a new tree lands on
-    // top of it, and `rollback <id>` reading it afterwards would restore the
-    // wrong code over the right database. Best-effort, same as every other
-    // anchor-consuming call (`rollback.rs`).
     let data_subdir = data_dir.join("data");
-    lifecycle::discard_db_snapshot(&data_subdir);
-    lifecycle::discard_rollback_anchor(&data_subdir);
     // Which lifecycle event (CONTRACT.md §6) this install may run, decided
     // against whatever version record survived a `remove`.
     let recorded = lifecycle::read_data_version(&data_dir.join("data"))?;
@@ -217,6 +209,16 @@ pub(crate) fn install_into(
         println!("Aborted — nothing was installed.");
         return Ok(None);
     }
+    // A fresh install has nothing to roll back to: any rollback anchor left
+    // behind under this data directory — by an update this `id` ran before a
+    // `remove` without `--purge` — is stale the moment a new tree lands on
+    // top of it, and `rollback <id>` reading it afterwards would restore the
+    // wrong code over the right database. Do this only once every refusal and
+    // the confirmation have passed, so an aborted install leaves the old
+    // state exactly as it was. Best-effort, same as every other
+    // anchor-consuming call (`rollback.rs`).
+    lifecycle::discard_db_snapshot(&data_subdir);
+    lifecycle::discard_rollback_anchor(&data_subdir);
     snapshot(&resolved.root, &app_dir)?;
 
     // Everything from here runs the app's own PHP, so everything from here can

@@ -998,6 +998,52 @@ fn a_fresh_install_discards_any_rollback_anchor_left_in_the_data_directory() {
 }
 
 #[test]
+fn a_declined_install_leaves_an_existing_rollback_anchor_intact() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    app_tree(source.path());
+    seed_data_record(&paths, "dev.local.demo", "0.6.0");
+
+    let data_dir = paths.app_data_dir("dev.local.demo").expect("a data dir");
+    let data_subdir = data_dir.join("data");
+    fs::write(data_subdir.join("app.db.pre-update"), b"old snapshot").expect("a seeded snapshot");
+    crate::lifecycle::write_rollback_anchor(
+        &data_subdir,
+        &crate::lifecycle::RollbackAnchor {
+            app_version: "0.5.0".to_string(),
+            source_revision: "sha256:stale".to_string(),
+            created_at: now_timestamp(),
+        },
+    )
+    .expect("a seeded anchor");
+
+    let result = super::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        false,
+        true,
+        "0.1.0",
+    )
+    .expect("a declined install is not an error");
+
+    assert_eq!(result, None, "the non-interactive prompt declines");
+    assert!(
+        data_subdir.join("app.db.pre-update").exists(),
+        "a declined install must not discard the database snapshot"
+    );
+    assert!(
+        crate::lifecycle::rollback_anchor_path(&data_subdir).exists(),
+        "a declined install must not discard the rollback record"
+    );
+}
+
+#[test]
 fn a_failing_hook_leaves_no_directory_and_nothing_registered() {
     // The restartability rule, measured: an app whose install failed halfway
     // must not exist at all, or the next attempt meets a tree nobody wrote and

@@ -632,6 +632,18 @@ fn resync_only(
         return Err(UpdateError::Php(error));
     }
 
+    // A forced equal-version resync replaces the tree without changing any of
+    // the fields a cache stamp compares. Keeping that stamp would let the next
+    // launch reuse a container compiled from the tree just moved aside.
+    let data_subdir = state_root.join("data");
+    if let Err(error) = lifecycle::discard_cache_stamp(&data_subdir) {
+        restore_resync_tree(app_dir)?;
+        return Err(UpdateError::Io {
+            path: lifecycle::cache_stamp_path(&data_subdir),
+            source: error,
+        });
+    }
+
     discard_resync_aside(app_dir)?;
 
     let now = registry::now_timestamp();

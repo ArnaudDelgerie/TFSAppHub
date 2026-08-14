@@ -627,6 +627,27 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
     )
     .expect("the first install");
 
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join("data");
+    let cache_dir = data_dir.join("cache");
+    fs::create_dir_all(&cache_dir).expect("a cache dir");
+    fs::write(cache_dir.join("container.php"), b"old container").expect("a cache entry");
+    let entry = registry::load(&paths)
+        .expect("a readable registry")
+        .get("demo")
+        .cloned()
+        .expect("the entry");
+    crate::lifecycle::write_cache_stamp(
+        &data_subdir,
+        &crate::lifecycle::CacheStamp {
+            app_version: entry.app_version,
+            snapshot_path: tfsapp_core::sidecar::path_to_string(&app_dir),
+            platform: entry.platform,
+        },
+    )
+    .expect("a stamp for the old tree");
+
     let before_registry = registry::load(&paths)
         .expect("a readable registry")
         .get("demo")
@@ -650,12 +671,16 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
         "a resync must run no lifecycle command, and must not warm the cache a second time"
     );
     assert!(
-        !previous_tree_path(&paths.app_dir("demo").expect("an app dir")).exists(),
+        !previous_tree_path(&app_dir).exists(),
         "a resync must not rotate the anchor"
     );
     assert!(
-        !resync_aside_path(&paths.app_dir("demo").expect("an app dir")).exists(),
+        !resync_aside_path(&app_dir).exists(),
         "a successful resync must discard its temporary aside"
+    );
+    assert!(
+        !data_subdir.join("cache.json").exists(),
+        "a resync must discard the stamp for the tree it replaced"
     );
 
     let after_registry = registry::load(&paths)

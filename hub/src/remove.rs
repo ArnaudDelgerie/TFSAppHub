@@ -100,29 +100,28 @@ fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool
 
     let removal_plan = plan(paths, id, &identifier)?;
 
-    // Only for `--purge`, and only because that is the form that deletes
-    // data: a live window has an open SQLite file under it, and an active
-    // `run` command is reading or writing the same directory. Shared with
+    // Both forms remove the snapshot that a live window is serving, and a
+    // `--purge` also deletes its data: a live window has an open SQLite file
+    // under it, and an active `run` command is reading or writing the same
+    // directory. Shared with
     // `export`/`import` (plan 022) and, from plan 023 step 3, `purge
     // <identifier>` — one definition of "who holds this data directory",
     // never a second probe with its own idea of it. A read-only probe, so a
     // refusal never has the side effect of reaping anything.
-    if purge {
-        match busy_holder(&removal_plan.data_dir, &identifier) {
-            Ok(None) => {}
-            Ok(Some(holder)) => {
-                return Err(RemoveError::StillRunning {
-                    id: Some(id.to_string()),
-                    identifier: identifier.clone(),
-                    holder,
-                })
-            }
-            Err(source) => {
-                return Err(RemoveError::Io {
-                    path: removal_plan.data_dir.clone(),
-                    source,
-                })
-            }
+    match busy_holder(&removal_plan.data_dir, &identifier) {
+        Ok(None) => {}
+        Ok(Some(holder)) => {
+            return Err(RemoveError::StillRunning {
+                id: Some(id.to_string()),
+                identifier: identifier.clone(),
+                holder,
+            })
+        }
+        Err(source) => {
+            return Err(RemoveError::Io {
+                path: removal_plan.data_dir.clone(),
+                source,
+            })
         }
     }
 
@@ -549,9 +548,13 @@ fn plan(paths: &Paths, id: &str, identifier: &str) -> Result<RemovalPlan, Remove
     // Read from the snapshot, and best-effort: an unreadable manifest costs
     // the declared keys, not the removal. The two above are the hub's own
     // and need no manifest to know about.
-    if let Ok(loaded) = manifest::load(&app_dir) {
-        keyring_accounts.extend(loaded.manifest.actions.secrets.keys);
-    }
+    let keyring_note_found = match manifest::load(&app_dir) {
+        Ok(loaded) => {
+            keyring_accounts.extend(loaded.manifest.actions.secrets.keys);
+            true
+        }
+        Err(_) => false,
+    };
 
     Ok(RemovalPlan {
         id: Some(id.to_string()),
@@ -561,7 +564,7 @@ fn plan(paths: &Paths, id: &str, identifier: &str) -> Result<RemovalPlan, Remove
         webkit_data_dir: paths.webkit_data_dir(identifier)?,
         identifier: identifier.to_string(),
         keyring_accounts,
-        keyring_note_found: true,
+        keyring_note_found,
     })
 }
 
@@ -677,13 +680,12 @@ fn announce(plan: &RemovalPlan, purge: bool) {
                 "This deletes the app's database, sessions and secrets. Nothing here \
                  is recoverable, and reinstalling gives you an empty app."
             );
-            // The orphan subject has no installed app left to read declared
-            // `actions.secrets` keys from — a note a retaining `remove` left
-            // behind (plan 023 step 4) is the only way it can know the full
-            // set. No note found means only the two hub-owned accounts above
-            // are known; say the limit out loud rather than silently
-            // under-purging.
-            if plan.id.is_none() && !plan.keyring_note_found {
+            // An orphan subject needs the note a retaining `remove` left
+            // behind (plan 023 step 4), while an installed subject needs its
+            // live manifest, to know the full declared set. If either is
+            // absent, only the two hub-owned accounts above are known; say
+            // the limit out loud rather than silently under-purging.
+            if !plan.keyring_note_found {
                 println!(
                     "This identifier's data carries no note of declared secret keys (an older \
                      hub's leftover, or a packaged station app's data) — only the two accounts \
