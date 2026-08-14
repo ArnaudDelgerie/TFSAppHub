@@ -195,6 +195,12 @@ pub const ACTION_IPC_GRANTS: &[ActionIpcGrantEntry] = &[
     (|actions| actions.update.ipc, UPDATE_IPC_GRANT),
 ];
 
+/// Action capabilities apply only to the backend origin, never to a local
+/// splash page. [`tauri::ipc::CapabilityBuilder`] defaults this to `true`.
+fn action_capability_is_local() -> bool {
+    false
+}
+
 /// Build one group's runtime capability grant.
 ///
 /// `main*` rather than a literal `main`, because a relaunch adds `main-2`,
@@ -205,6 +211,7 @@ pub const ACTION_IPC_GRANTS: &[ActionIpcGrantEntry] = &[
 pub fn action_capability(grant: &ActionIpcGrant) -> tauri::ipc::CapabilityBuilder {
     tauri::ipc::CapabilityBuilder::new(grant.capability_identifier)
         .window("main*")
+        .local(action_capability_is_local())
         .remote("http://127.0.0.1:*".to_string())
         .permission(grant.permission)
 }

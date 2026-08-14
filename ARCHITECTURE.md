@@ -220,7 +220,8 @@ guarantee:
    project name.
 2. **Verify** it against the `SHA256SUMS.txt` asset beside it, hashed the same
    way. A missing line for the archive's own name is a failure, never a pass
-   by absence.
+   by absence. This establishes integrity, not publisher authenticity; the
+   user chooses which source to trust ([decision 004](.project/decision/004-integrity-not-authenticity.md)).
 3. **Extract**, only once the checksum has matched — every entry checked
    before it is written (no absolute path, no `..` component, no symlink or
    hard link resolving outside the extraction root), and the whole archive
