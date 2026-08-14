@@ -28,7 +28,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 XDG_DATA_HOME="$(mktemp -d)"
 XDG_RUNTIME_DIR="$(mktemp -d)"
 COMPOSER_ROOT="$XDG_DATA_HOME/composer"
-mkdir -p "$COMPOSER_ROOT"
+# Composer's XDG data directory is $XDG_DATA_HOME/composer. Its separate
+# per-user home and cache are explicit too, so a test run cannot read or write
+# the developer's global Composer configuration or cache.
+COMPOSER_HOME="$COMPOSER_ROOT/home"
+COMPOSER_CACHE_DIR="$COMPOSER_ROOT/cache"
+mkdir -p "$COMPOSER_HOME" "$COMPOSER_CACHE_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 
 cleanup() {
@@ -36,7 +41,7 @@ cleanup() {
   # the cleanup diagnostic without relying on an intermittent external leak.
   # It retains only paths this wrapper recorded as its own.
   if [ "${RUN_TESTS_TEST_CLEANUP_FAILURE:-}" = "1" ]; then
-    echo "run-tests.sh: test-only cleanup failure seam retained harness-owned paths: XDG_DATA_HOME=$XDG_DATA_HOME XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR COMPOSER_ROOT=$COMPOSER_ROOT" >&2
+    echo "run-tests.sh: test-only cleanup failure seam retained harness-owned paths: XDG_DATA_HOME=$XDG_DATA_HOME XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR COMPOSER_ROOT=$COMPOSER_ROOT COMPOSER_HOME=$COMPOSER_HOME COMPOSER_CACHE_DIR=$COMPOSER_CACHE_DIR" >&2
     return 1
   fi
 
@@ -54,6 +59,8 @@ trap cleanup EXIT
 
 export XDG_DATA_HOME
 export XDG_RUNTIME_DIR
+export COMPOSER_HOME
+export COMPOSER_CACHE_DIR
 
 # The workspace root, so `cargo test` covers both `core/` and `hub/`.
 cd "$ROOT_DIR"
