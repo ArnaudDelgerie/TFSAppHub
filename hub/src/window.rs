@@ -250,8 +250,8 @@ pub fn splash_style(
     script
 }
 
-/// The scheme an app's real `splash_path` is served over (plan 025). Recognised
-/// by [`classify_navigation`] once wired there (step 4).
+/// The scheme an app's real `splash_path` is served over (plan 025), recognised
+/// by [`classify_navigation`] before the backend hand-over.
 pub const SPLASH_SCHEME: &str = "tfsapp-splash";
 
 /// The CSP on every response [`register_splash_scheme`] serves.
@@ -302,16 +302,11 @@ fn resolve_within(canonical_root: &Path, request_path: &str) -> Option<PathBuf> 
 /// every caller has already confirmed it is a directory (`open::resolve`,
 /// `dev::resolve`), so this is a defensive fallback, not an expected path.
 ///
-/// `#[allow(dead_code)]`: not called until `main::open_window` wires it into
-/// the splash window's creation (plan 025 step 2) — this step only proves the
-/// scheme safe in isolation.
-///
 /// Every response — success or 404 alike — carries [`SPLASH_CSP`]. There is
 /// no HTTP request here for an app-set header to override (CONTRACT.md §4's
 /// override rule is specific to the sidecar's own responses), and no author
 /// gets a chance to set one either, so the host's policy is the only one a
 /// splash page ever gets.
-#[allow(dead_code)]
 pub fn register_splash_scheme<R: tauri::Runtime>(
     builder: tauri::Builder<R>,
     snapshot_root: &Path,

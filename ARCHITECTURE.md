@@ -819,7 +819,7 @@ manifest mean two different things.
 
 The worker belongs to the **sidecar's** lifetime, not the window's. A second
 `open` of the same app cannot spawn a second consumer, because it never gets
-past the liveness lock.
+past the serving lock.
 
 ### Navigation policy
 
@@ -828,8 +828,9 @@ Every window enforces the same classification:
 | target | outcome |
 | --- | --- |
 | the backend's own origin, or the bundled-asset origin | let through |
+| `tfsapp-splash:` before the backend hand-over | let through |
 | another `http`/`https` origin | cancelled here, opened in the user's own browser |
-| `javascript:`, `file:`, `data:`, `blob:`, a custom scheme | cancelled, and said so |
+| `javascript:`, `file:`, `data:`, `blob:`, or a custom scheme after hand-over | cancelled, and said so |
 
 No in-app popup is ever created. An external link belongs in the browser where
 the user has their bookmarks, their sessions and an address bar.

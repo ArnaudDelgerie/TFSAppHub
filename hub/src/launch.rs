@@ -14,14 +14,6 @@
 //! `main::open_window`, `main::serve`, `app_env::resolve`, `sidecar::start`)
 //! reads a `&LaunchSpec` and does not care which constructor built it.
 
-// `Source::Live`, `state_root` and `label` have no reader yet: `open::resolve`
-// is still this module's only constructor, and `main.rs` still re-derives its
-// own data dir and still prints the raw `id` it was called with rather than a
-// spec's `label`. Plan 009 steps 2–4 are their real consumers — the `dev`
-// constructor, and the guards that read a spec instead of an installed `id`.
-// Remove the allow as each lands, rather than letting it linger.
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 use crate::{identity::Identity, manifest::Manifest, update_check};
