@@ -25,6 +25,7 @@ mod manifest;
 mod open;
 mod paths;
 mod php;
+mod picker;
 mod platform;
 mod portability;
 mod prompt;
@@ -407,6 +408,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             secrets::secret_delete,
             secrets::secret_list,
             update_check::update_check,
+            picker::pick_path,
         ])
         .setup(move |app| {
             // Greyscale rather than subpixel text antialiasing, for every
