@@ -96,11 +96,11 @@ echo "Releasing $TAG"
 # is a heading that merely contains the version, so "## 1.2.0.1" never
 # answers for 1.2.0.
 #
-# The matched section becomes the release notes verbatim — never the whole
-# file, never a generic fallback — extracted to a temp file cleaned up on
-# exit. The extractor below matches the heading with this same regex: the two
-# must never drift apart, or the gate would pass on a heading the extractor
-# then fails to find, publishing empty notes.
+# The content below the matched heading becomes the release notes verbatim —
+# never the whole file, never a generic fallback — extracted to a temp file
+# cleaned up on exit. The extractor below matches the heading with this same
+# regex: the two must never drift apart, or the gate would pass on a heading
+# the extractor then fails to find, publishing empty notes.
 CHANGELOG_FILE="$ROOT_DIR/CHANGELOG.md"
 [[ -f "$CHANGELOG_FILE" ]] \
   || die "no CHANGELOG.md found at $CHANGELOG_FILE."
@@ -119,7 +119,7 @@ grep -qE "$HEADING_RE" "$CHANGELOG_FILE" \
 NOTES_FILE="$(mktemp)"
 trap 'rm -f "$NOTES_FILE"' EXIT
 awk -v heading_re="$HEADING_RE" '
-  $0 ~ heading_re { found=1; print; next }
+  $0 ~ heading_re { found=1; next }
   found && /^## / { exit }
   found { print }
 ' "$CHANGELOG_FILE" >"$NOTES_FILE"
