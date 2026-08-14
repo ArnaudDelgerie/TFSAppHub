@@ -15,9 +15,9 @@
 //! source afterwards changes nothing until an explicit `update`. There is no
 //! symlink into the working tree and no watcher — that is what makes `composer
 //! install`, migrations and cache warm-up mean anything, since they ran against
-//! *this* tree and it cannot move underneath them. Live editing is the
-//! station's `make tauri-dev`, and the hub must not grow a second, worse
-//! version of it.
+//! *this* tree and it cannot move underneath them. Live source belongs to the
+//! hub's distinct `dev` mode: it serves source in place, but watches, compiles
+//! and builds no assets. That boundary keeps `install` a snapshot.
 //!
 //! **Every step is restartable.** A failure leaves no half-installed app: the
 //! copied directory is removed, and the registry is written only at the very
