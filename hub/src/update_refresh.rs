@@ -138,6 +138,10 @@ fn refresh_if_due(paths: &Paths, base_url: &str, source: &registry::Source) -> R
         .map(|_| release.tag_name.clone());
 
     let write = update_cache::update(paths, |cache| {
+        let unknown = cache
+            .get(&source.location)
+            .map(|entry| entry.unknown.clone())
+            .unwrap_or_default();
         cache.insert(
             source.location.clone(),
             update_cache::CachedRelease {
@@ -145,7 +149,7 @@ fn refresh_if_due(paths: &Paths, base_url: &str, source: &registry::Source) -> R
                 tag: release.tag_name.clone(),
                 release_url: release.html_url.clone(),
                 notes: release.body.clone().unwrap_or_default(),
-                unknown: serde_json::Map::new(),
+                unknown,
             },
         );
     });

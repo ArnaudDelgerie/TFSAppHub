@@ -1,6 +1,6 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
-use super::{ensure_current_at, resolve_running_image, Outcome};
+use super::{ensure_current_at, resolve_running_image, temporary_path, Outcome};
 
 fn write_source(dir: &std::path::Path, contents: &[u8]) -> PathBuf {
     let path = dir.join("source-hub");
@@ -104,4 +104,33 @@ fn current_exe_is_the_fallback_with_no_appimage() {
         resolve_running_image(None, || Ok(fallback.clone())).expect("the fallback resolves");
 
     assert_eq!(resolved, fallback);
+}
+
+#[test]
+fn a_temp_for_a_dotted_target_appends_instead_of_replacing_its_extension() {
+    let target = PathBuf::from("/tmp/TFSAppHub_0.3.0_amd64.AppImage");
+
+    let temporary = temporary_path(&target);
+    let expected = format!("TFSAppHub_0.3.0_amd64.AppImage.{}.tmp", std::process::id());
+
+    assert_eq!(
+        temporary.file_name().and_then(|name| name.to_str()),
+        Some(expected.as_str())
+    );
+}
+
+#[test]
+fn a_failed_rename_removes_the_temporary_copy() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let source = write_source(dir.path(), b"hub v1");
+    let target = dir.path().join("bin/tfsapp-hub");
+    fs::create_dir_all(&target).expect("a directory at the target path");
+
+    let error = ensure_current_at(&source, &target).unwrap_err();
+
+    assert!(error.to_string().contains("Is a directory"), "{error}");
+    assert!(
+        !temporary_path(&target).exists(),
+        "the failed copy must not leave its staging file behind"
+    );
 }

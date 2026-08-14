@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{Gh, GhError};
+use super::{release_view_failure, Gh, GhError, ReleaseViewFailure};
 
 /// A fake `gh` at `dir/gh`: every call is first appended (as its
 /// space-joined argv) to `dir/argv.log`, then dispatched to `body` — a shell
@@ -105,7 +105,7 @@ fn the_version_guard_passes_when_no_release_carries_the_tag() {
         scripts.path(),
         r#"
 case "$1 $2" in
-  "release view") exit 1 ;;
+  "release view") echo 'release not found' 1>&2; exit 1 ;;
 esac
 exit 0
 "#,
@@ -114,6 +114,45 @@ exit 0
 
     gh.ensure_no_existing_release("owner/repo", "v1.2.0")
         .expect("no colliding release should pass the gate");
+}
+
+#[test]
+fn only_ghs_not_found_reply_means_no_release_exists() {
+    assert_eq!(
+        release_view_failure("release not found"),
+        ReleaseViewFailure::NotFound
+    );
+    assert_eq!(
+        release_view_failure("HTTP 502: Bad Gateway"),
+        ReleaseViewFailure::Other
+    );
+    assert_eq!(
+        release_view_failure("failed to connect to github.com"),
+        ReleaseViewFailure::Other
+    );
+}
+
+#[test]
+fn the_version_guard_propagates_a_release_view_failure() {
+    let scripts = tempfile::tempdir().expect("a temp dir");
+    let gh_path = write_fake_gh(
+        scripts.path(),
+        r#"
+case "$1 $2" in
+  "release view") echo 'failed to connect to github.com' 1>&2; exit 1 ;;
+esac
+exit 0
+"#,
+    );
+    let gh = Gh::at(gh_path);
+
+    let error = gh
+        .ensure_no_existing_release("owner/repo", "v1.2.0")
+        .unwrap_err();
+    assert!(
+        matches!(error, GhError::ReleaseViewFailed { .. }),
+        "{error}"
+    );
 }
 
 #[test]
@@ -343,4 +382,39 @@ exit 1
     }
     assert!(!error.to_string().contains("was deleted"));
     assert!(!argv_log(scripts.path()).contains("release delete"));
+}
+
+#[test]
+fn a_failed_upload_propagates_a_failed_cleanup_lookup() {
+    let scripts = tempfile::tempdir().expect("a temp dir");
+    let gh_path = write_fake_gh(
+        scripts.path(),
+        r#"
+case "$1 $2" in
+  "release create") echo '422 asset upload failed' 1>&2; exit 1 ;;
+  "release view") echo 'failed to connect to github.com' 1>&2; exit 1 ;;
+esac
+exit 1
+"#,
+    );
+    let gh = Gh::at(gh_path);
+    let assets = tempfile::tempdir().expect("a temp dir for the assets");
+    let (notes_path, archive_path, sums_path) = write_assets(assets.path());
+
+    let error = gh
+        .create_release(
+            "owner/repo",
+            "v1.2.0",
+            &notes_path,
+            "deadbeefcafe",
+            "demo-1.2.0.tar.gz",
+            &archive_path,
+            &sums_path,
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, GhError::ReleaseViewFailed { .. }),
+        "{error}"
+    );
 }

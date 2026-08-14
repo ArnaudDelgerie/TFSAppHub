@@ -27,6 +27,7 @@
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
+    process,
 };
 
 use crate::paths::Paths;
@@ -189,17 +190,32 @@ fn write_copy(source: &Path, source_meta: &fs::Metadata, target: &Path) -> Resul
         .expect("hub_executable_path always names a file inside a directory");
     fs::create_dir_all(parent).map_err(io_error(parent))?;
 
-    let temporary = target.with_extension("tmp");
-    fs::copy(source, &temporary).map_err(io_error(&temporary))?;
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))
-        .map_err(io_error(&temporary))?;
-    if let Ok(modified) = source_meta.modified() {
-        let file = fs::File::open(&temporary).map_err(io_error(&temporary))?;
-        let _ = file.set_modified(modified);
-    }
-    fs::rename(&temporary, target).map_err(io_error(target))?;
+    let temporary = temporary_path(target);
+    let result = (|| {
+        fs::copy(source, &temporary).map_err(io_error(&temporary))?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))
+            .map_err(io_error(&temporary))?;
+        if let Ok(modified) = source_meta.modified() {
+            let file = fs::File::open(&temporary).map_err(io_error(&temporary))?;
+            let _ = file.set_modified(modified);
+        }
+        fs::rename(&temporary, target).map_err(io_error(target))?;
 
-    Ok(())
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// A temp beside `target`, retaining its full name so a dotted filename keeps
+/// its extension, and separated by process so two hubs do not copy through
+/// the same staging inode.
+fn temporary_path(target: &Path) -> PathBuf {
+    let mut temporary = target.as_os_str().to_os_string();
+    temporary.push(format!(".{}.tmp", process::id()));
+    PathBuf::from(temporary)
 }
 
 #[derive(Debug)]

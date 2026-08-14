@@ -27,12 +27,6 @@
 //! No network anywhere in this module — it only ever reads and writes what
 //! `release.rs` already fetched.
 
-// `update_check::answer_now` (step 4) is this module's first real caller, of
-// `load`/`load_from`. `update` and `UpdateCacheError` are still only
-// exercised by this module's own tests — the background refresh (step 5) is
-// their real caller. Remove the allow once that lands too.
-#![allow(dead_code)]
-
 use std::{
     collections::BTreeMap,
     fmt, fs,

@@ -107,6 +107,45 @@ fn a_stale_entry_is_replaced_with_the_latest_release() {
 }
 
 #[test]
+fn refreshing_a_stale_entry_preserves_its_unknown_fields() {
+    let (_base, paths) = temp_paths();
+    crate::update_cache::update(&paths, |cache| {
+        cache.insert(
+            "owner/repo".to_string(),
+            CachedRelease {
+                checked_at: hours_ago(25),
+                tag: "v1.0.0".to_string(),
+                release_url: "https://github.com/owner/repo/releases/tag/v1.0.0".to_string(),
+                notes: String::new(),
+                unknown: serde_json::Map::from_iter([(
+                    "newer_hubs_field".to_string(),
+                    serde_json::json!({"kept": true}),
+                )]),
+            },
+        );
+    })
+    .expect("seeding the cache writes");
+    let (base_url, handle) = stub_once(
+        200,
+        r#"{"tag_name": "v1.2.0", "html_url": "https://github.com/owner/repo/releases/tag/v1.2.0", "assets": []}"#,
+    );
+
+    let outcome = refresh_if_due(&paths, &base_url, &release_source());
+    handle.join().expect("the stub thread finishes");
+
+    assert_eq!(
+        outcome,
+        RefreshOutcome::Refreshed {
+            malformed_tag: None
+        }
+    );
+    assert_eq!(
+        crate::update_cache::load(&paths)["owner/repo"].unknown["newer_hubs_field"],
+        serde_json::json!({"kept": true})
+    );
+}
+
+#[test]
 fn a_fresh_entry_is_left_alone_with_no_request_made() {
     let (_base, paths) = temp_paths();
     seed(&paths, &hours_ago(1), "v1.0.0");
