@@ -194,6 +194,26 @@ fn a_live_window_refuses_a_purge() {
 }
 
 #[test]
+fn a_live_window_refuses_a_plain_remove() {
+    let (_base, paths) = temp_paths();
+    installed_snapshot(&paths, "demo");
+    registry::save_entry(&paths, "demo");
+    let data_dir = paths.app_data_dir(IDENTIFIER).expect("a data dir");
+    fs::create_dir_all(&data_dir).expect("a data dir");
+    let pid_file = data_dir.join("sidecar.pid");
+    let _holder = tfsapp_core::process::try_lock_file(&tfsapp_core::process::lock_path(&pid_file))
+        .expect("no I/O error")
+        .expect("the lock is free to take");
+
+    let error = remove(&paths, "demo", false, true)
+        .expect_err("a live window must keep its served tree intact");
+
+    assert!(matches!(error, RemoveError::StillRunning { .. }), "{error}");
+    assert!(error.to_string().contains("demo"), "{error}");
+    assert!(paths.app_dir("demo").expect("an app dir").exists());
+}
+
+#[test]
 fn an_active_run_command_now_refuses_a_purge() {
     // The gap this step closes: `remove --purge` used to probe only
     // `sidecar.pid` and ignore `run.lock`, so an active `run` command did not

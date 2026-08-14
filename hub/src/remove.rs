@@ -100,29 +100,28 @@ fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool
 
     let removal_plan = plan(paths, id, &identifier)?;
 
-    // Only for `--purge`, and only because that is the form that deletes
-    // data: a live window has an open SQLite file under it, and an active
-    // `run` command is reading or writing the same directory. Shared with
+    // Both forms remove the snapshot that a live window is serving, and a
+    // `--purge` also deletes its data: a live window has an open SQLite file
+    // under it, and an active `run` command is reading or writing the same
+    // directory. Shared with
     // `export`/`import` (plan 022) and, from plan 023 step 3, `purge
     // <identifier>` — one definition of "who holds this data directory",
     // never a second probe with its own idea of it. A read-only probe, so a
     // refusal never has the side effect of reaping anything.
-    if purge {
-        match busy_holder(&removal_plan.data_dir, &identifier) {
-            Ok(None) => {}
-            Ok(Some(holder)) => {
-                return Err(RemoveError::StillRunning {
-                    id: Some(id.to_string()),
-                    identifier: identifier.clone(),
-                    holder,
-                })
-            }
-            Err(source) => {
-                return Err(RemoveError::Io {
-                    path: removal_plan.data_dir.clone(),
-                    source,
-                })
-            }
+    match busy_holder(&removal_plan.data_dir, &identifier) {
+        Ok(None) => {}
+        Ok(Some(holder)) => {
+            return Err(RemoveError::StillRunning {
+                id: Some(id.to_string()),
+                identifier: identifier.clone(),
+                holder,
+            })
+        }
+        Err(source) => {
+            return Err(RemoveError::Io {
+                path: removal_plan.data_dir.clone(),
+                source,
+            })
         }
     }
 
