@@ -24,6 +24,7 @@ if ! command -v gnome-keyring-daemon >/dev/null; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DBUS_CONFIG_FILE="$ROOT_DIR/build/scripts/test-session.conf"
 
 XDG_DATA_HOME="$(mktemp -d)"
 XDG_RUNTIME_DIR="$(mktemp -d)"
@@ -153,7 +154,7 @@ cd "$ROOT_DIR"
 # The single quotes below are the point: this whole block is one script
 # string handed to the inner `bash -c`, expanded by that shell, not this one.
 # shellcheck disable=SC2016
-dbus-run-session -- bash -c '
+dbus-run-session --config-file="$DBUS_CONFIG_FILE" -- bash -c '
   set -euo pipefail
 
   gnome-keyring-daemon --foreground --replace --unlock --components=secrets <<< "" &
