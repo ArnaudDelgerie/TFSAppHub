@@ -96,7 +96,7 @@ pub fn wait_for_healthz(
                 return Err(healthz_timeout_message(&url, timeout, sidecar_log).into());
             }
             HealthzPollOutcome::KeepWaiting => {
-                if let Ok(response) = ureq::get(&url).call() {
+                if let Ok(response) = ureq::get(&url).timeout(Duration::from_secs(2)).call() {
                     if response.status() == 200 {
                         return Ok(());
                     }

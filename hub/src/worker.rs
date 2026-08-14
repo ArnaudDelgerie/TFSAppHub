@@ -20,7 +20,8 @@
 //! **The worker belongs to the sidecar's lifetime, not the window's.** A second
 //! `open` of the same app attaches a window to the sidecar already running and
 //! must not spawn a second consumer — which falls out of the process model:
-//! that second `open` never gets past the liveness lock. Teardown stops the
+//! the serving lock sends that second `open` down the hand-off path, and the
+//! hand-off — not a lock — prevents the second worker. Teardown stops the
 //! worker before the server, and the worker's pid is the second line of
 //! `sidecar.pid` (CONTRACT.md §6), which is what lets the next launch reap it if
 //! this process dies without tearing anything down.

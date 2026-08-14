@@ -950,7 +950,7 @@ pub enum DataDirHolder {
 /// read), so that is decided before this is ever called.
 pub fn data_dir_holder(data_dir: &Path, identifier: &str) -> io::Result<Option<DataDirHolder>> {
     let pid_file = data_dir.join("sidecar.pid");
-    if tfsapp_core::process::is_owner_live(&pid_file).unwrap_or(false) {
+    if tfsapp_core::process::is_owner_live(&pid_file)? {
         return Ok(Some(DataDirHolder::Window));
     }
 
