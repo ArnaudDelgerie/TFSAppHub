@@ -357,6 +357,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
     // splash is built long before that origin exists.
     let app_origin = window::new_app_origin_slot();
     let relaunch_origin = app_origin.clone();
+    let relaunch_icon_path = identity.icon_path.clone();
 
     window::register_splash_scheme(tauri::Builder::default(), &spec.app_dir)
         // Registered before every other plugin, per the plugin's own guidance,
@@ -378,12 +379,21 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
                     println!("tfsapp-hub: still starting — the window is on its way.");
                     return;
                 };
-                if let Err(error) = window::create_app_window(
+                let result = window::create_app_window(
                     app,
                     &launch.url,
                     &launch.product_name,
                     &relaunch_origin,
-                ) {
+                )
+                .and_then(|window| {
+                    if let Some(path) = &relaunch_icon_path {
+                        if let Some(icon) = identity::load_icon(path) {
+                            window.set_icon(icon)?;
+                        }
+                    }
+                    Ok(())
+                });
+                if let Err(error) = result {
                     eprintln!("tfsapp-hub: cannot open another window: {error}");
                 }
             },
