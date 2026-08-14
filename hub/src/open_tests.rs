@@ -3,6 +3,7 @@ use std::{fs, path::Path};
 use super::{child_args, launch_header, prepare_hub_log, resolve, OpenError};
 use crate::{
     launch::Source as LaunchSource,
+    lifecycle,
     paths::Paths,
     registry::{self, now_timestamp, Platform, Registry, RegistryEntry, Source, SourceKind, State},
 };
@@ -361,6 +362,29 @@ fn prepare_hub_log_rotates_an_oversized_file_before_opening_it() {
 
     assert!(log_dir.join("hub.log.1").exists());
     assert_eq!(fs::read_to_string(&hub_log).unwrap(), "fresh-line\n");
+}
+
+#[test]
+fn prepare_hub_log_leaves_a_live_instance_s_log_untouched() {
+    let (_base, paths) = temp_paths();
+    let data_dir = paths
+        .create_app_data_dir("dev.local.demo")
+        .expect("a created data dir");
+    let log_dir = data_dir.join("log");
+    fs::create_dir_all(&log_dir).expect("a created log dir");
+    let hub_log = log_dir.join("hub.log");
+    let original = vec![b'x'; tfsapp_core::log::MAX_LOG_BYTES as usize];
+    fs::write(&hub_log, &original).unwrap();
+    let _serving = tfsapp_core::process::try_lock_file(&lifecycle::serving_lock_path(&data_dir))
+        .expect("the serving lock opens")
+        .expect("the serving lock is held for the live instance");
+
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "printf 'hand-off-line\\n'"]);
+    assert!(prepare_hub_log(&paths, "dev.local.demo", &mut command).is_none());
+
+    assert!(!log_dir.join("hub.log.1").exists());
+    assert_eq!(fs::read(&hub_log).unwrap(), original);
 }
 
 #[test]

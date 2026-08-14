@@ -249,10 +249,11 @@ fn launch(paths: &Paths, spec: &LaunchSpec) -> Result<u32, OpenError> {
 }
 
 /// Points `command`'s stdio at `<state_root>/log/hub.log`, creating the
-/// directory and rotating the file first. Returns the log path on success, so
-/// the caller can write the launch header to it once the child's pid is
-/// known; `None` means every line below already explained itself on stderr
-/// and `command` was left with its default (inherited) stdio.
+/// directory and, when this launch will serve, rotating the file first.
+/// Returns the log path on success, so the caller can write the launch header
+/// to it once the child's pid is known; `None` means every line below already
+/// explained itself on stderr, or a live sibling will receive this launch as a
+/// hand-off, and `command` was left with its default (inherited) stdio.
 ///
 /// **Best-effort, on purpose.** A launch is not refused, and output is not
 /// dropped, just because its log file could not be opened — inherited stdio
@@ -263,10 +264,13 @@ fn launch(paths: &Paths, spec: &LaunchSpec) -> Result<u32, OpenError> {
 /// than a bare `create_dir_all`, so its `0700` (CONTRACT.md §5) is applied by
 /// whoever gets there first — this parent, or the child a moment later —
 /// with no window in which the app's data directory exists at the umask's
-/// permissions. Rotation happens here, before the file is opened for the
-/// child: `app_env::resolve`'s own `rotate_logs` runs in the child, after
-/// this fd is already open, and renaming a file out from under an open
-/// `O_APPEND` handle would silently send the whole session's lines into
+/// permissions. Before rotating, the parent probes the serving lock. A held
+/// lock means this child exists only to hand its argv to the live instance, so
+/// it must not rename that instance's open `hub.log` fd or add a launch header
+/// of its own. When the lock is free, rotation happens here, before the file is
+/// opened for the child: `app_env::resolve`'s own `rotate_logs` runs in the
+/// child after this fd is already open, and renaming a file out from under an
+/// open `O_APPEND` handle would silently send the whole session's lines into
 /// `hub.log.1` instead of `hub.log`.
 fn prepare_hub_log(paths: &Paths, identifier: &str, command: &mut Command) -> Option<PathBuf> {
     let warn = |context: String, error: &dyn fmt::Display| {
@@ -290,6 +294,18 @@ fn prepare_hub_log(paths: &Paths, identifier: &str, command: &mut Command) -> Op
     if let Err(error) = std::fs::create_dir_all(&log_dir) {
         warn(format!("cannot create {}", log_dir.display()), &error);
         return None;
+    }
+
+    match tfsapp_core::process::try_lock_file(&crate::lifecycle::serving_lock_path(&data_dir)) {
+        Ok(None) => return None,
+        Ok(Some(_)) => {}
+        Err(error) => {
+            warn(
+                "cannot tell whether the app is already serving".to_string(),
+                &error,
+            );
+            return None;
+        }
     }
 
     let hub_log = log_dir.join("hub.log");
