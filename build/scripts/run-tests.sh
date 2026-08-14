@@ -27,9 +27,19 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 XDG_DATA_HOME="$(mktemp -d)"
 XDG_RUNTIME_DIR="$(mktemp -d)"
+COMPOSER_ROOT="$XDG_DATA_HOME/composer"
+mkdir -p "$COMPOSER_ROOT"
 chmod 700 "$XDG_RUNTIME_DIR"
 
 cleanup() {
+  # This is deliberately a narrow, test-only seam: step 3 uses it to prove
+  # the cleanup diagnostic without relying on an intermittent external leak.
+  # It retains only paths this wrapper recorded as its own.
+  if [ "${RUN_TESTS_TEST_CLEANUP_FAILURE:-}" = "1" ]; then
+    echo "run-tests.sh: test-only cleanup failure seam retained harness-owned paths: XDG_DATA_HOME=$XDG_DATA_HOME XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR COMPOSER_ROOT=$COMPOSER_ROOT" >&2
+    return 1
+  fi
+
   # gvfsd-fuse mounts a FUSE filesystem at $XDG_RUNTIME_DIR/gvfs on demand;
   # its own teardown races this trap when the private bus goes away, so
   # `rm -rf` can hit it while still mounted ("Device or resource busy" — the
@@ -38,7 +48,7 @@ cleanup() {
   # quietly and best-effort: it is often already gone by the time we get
   # here, and it is never ours to leave mounted either way.
   fusermount3 -uz "$XDG_RUNTIME_DIR/gvfs" 2>/dev/null || true
-  rm -rf "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
+  rm -rf "$COMPOSER_ROOT" "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
 }
 trap cleanup EXIT
 
