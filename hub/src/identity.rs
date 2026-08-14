@@ -26,9 +26,8 @@
 /// The resolved identity of the app the hub is about to open.
 ///
 /// `manifest::Manifest::identity` builds it from the app's
-/// `tfsapp.config.json` (plan 004) — the one place it will come from once
-/// `open <id>` resolves an installed app (plan 007). Until then the temporary
-/// `open --identity <id>` form in `main.rs` still builds it from argv.
+/// `tfsapp.config.json`; both installed and live launches resolve that
+/// manifest before opening their window.
 #[derive(Debug)]
 pub struct Identity {
     /// Reverse-DNS application identifier, e.g. `dev.tfsapp.test`. It is at
