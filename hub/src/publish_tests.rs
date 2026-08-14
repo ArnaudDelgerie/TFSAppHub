@@ -646,7 +646,7 @@ case "$1" in
 esac
 case "$1 $2" in
   "auth status") exit 0 ;;
-  "release view") exit 1 ;;
+  "release view") echo 'release not found' 1>&2; exit 1 ;;
   "release create")
     echo "https://github.com/owner/repo/releases/tag/v1.2.0"
     exit 0

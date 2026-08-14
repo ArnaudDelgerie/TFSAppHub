@@ -117,9 +117,10 @@ impl Gh {
     }
 
     /// `gh release view <tag> --repo <repo> --json isDraft,assets` — `None`
-    /// when no release carries `tag` at all (a failing `gh` exit, which is
-    /// how `gh` reports "not found"), `Some` otherwise, carrying the two
-    /// fields both the version guard and the post-upload cleanup need.
+    /// only when `gh` reports that no release carries `tag`; other failed
+    /// exits are propagated rather than mistaken for an absent release.
+    /// `Some` carries the two fields both the version guard and the
+    /// post-upload cleanup need.
     fn existing_release(&self, repo: &str, tag: &str) -> Result<Option<ReleaseView>, GhError> {
         let output = self.run(&[
             "release",
@@ -131,7 +132,11 @@ impl Gh {
             "isDraft,assets",
         ])?;
         if !output.status.success() {
-            return Ok(None);
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return match release_view_failure(&stderr) {
+                ReleaseViewFailure::NotFound => Ok(None),
+                ReleaseViewFailure::Other => Err(GhError::ReleaseViewFailed { stderr }),
+            };
         }
         let view =
             serde_json::from_slice(&output.stdout).map_err(|error| GhError::UnreadableJson {
@@ -200,7 +205,8 @@ impl Gh {
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let incomplete_release_deleted = self.clean_up_incomplete_release(repo, tag, archive_name);
+        let incomplete_release_deleted =
+            self.clean_up_incomplete_release(repo, tag, archive_name)?;
         Err(GhError::CreateFailed {
             stderr,
             incomplete_release_deleted,
@@ -211,17 +217,39 @@ impl Gh {
     /// but only if it is missing either asset — a release that somehow has
     /// both is not this cleanup's business to touch. Returns whether a
     /// deletion actually happened.
-    fn clean_up_incomplete_release(&self, repo: &str, tag: &str, archive_name: &str) -> bool {
-        let Ok(Some(view)) = self.existing_release(repo, tag) else {
-            return false;
+    fn clean_up_incomplete_release(
+        &self,
+        repo: &str,
+        tag: &str,
+        archive_name: &str,
+    ) -> Result<bool, GhError> {
+        let Some(view) = self.existing_release(repo, tag)? else {
+            return Ok(false);
         };
         let complete = view.assets.iter().any(|asset| asset.name == archive_name)
             && view
                 .assets
                 .iter()
                 .any(|asset| asset.name == SHA256SUMS_ASSET_NAME);
-        !complete && self.delete_release(repo, tag)
+        Ok(!complete && self.delete_release(repo, tag))
     }
+}
+
+/// The two meanings `gh release view` gives a non-zero exit. GitHub CLI's
+/// exact not-found reply is deliberately matched here; an outage, permission
+/// refusal, or any other diagnostic must reach the caller instead.
+fn release_view_failure(stderr: &str) -> ReleaseViewFailure {
+    if stderr == "release not found" {
+        ReleaseViewFailure::NotFound
+    } else {
+        ReleaseViewFailure::Other
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReleaseViewFailure {
+    NotFound,
+    Other,
 }
 
 /// The subset of `gh release view`'s JSON this module reads.
@@ -253,6 +281,9 @@ pub enum GhError {
         tag: String,
         draft: bool,
     },
+    /// `gh release view` failed for a reason other than the release being
+    /// absent, so neither the version guard nor cleanup can safely continue.
+    ReleaseViewFailed { stderr: String },
     /// `gh release create` failed; `incomplete_release_deleted` says whether
     /// a half-created release (missing an asset) was found and removed.
     CreateFailed {
@@ -285,6 +316,9 @@ impl fmt::Display for GhError {
                 if *draft { " as a draft" } else { "" },
                 if *draft { "draft" } else { "existing" },
             ),
+            Self::ReleaseViewFailed { stderr } => {
+                write!(formatter, "gh release view failed: {stderr}")
+            }
             Self::CreateFailed {
                 stderr,
                 incomplete_release_deleted,
