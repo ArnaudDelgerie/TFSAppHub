@@ -208,7 +208,7 @@ suffix would be destroyed by another app's update.
 | `splash_bg` / `splash_text` | string, `#rgb` or `#rrggbb` | Recolour the cold-start page's background and text without authoring one. Either or both; an unset one keeps the default. |
 | `commands` | object | Lifecycle commands the hub runs around an install or an update — §6. |
 | `run` | object | Named `bin/console` aliases a user can run directly. |
-| `actions` | object | Which native capabilities the app's own code may reach, and over which transport — §7. |
+| `actions` | object | Which native capabilities the app's own code may reach, and over which transport — §7. `actions.picker` is IPC-only: `{ "ipc": true }`. |
 | `async_worker` | boolean | Declares that the app has work to consume off the request cycle — see "Declaring off-window work" below. |
 
 A minimal manifest is four lines:
@@ -1044,13 +1044,15 @@ Not what the user may do — the commands a person types are the host's, and the
 run because that person typed them, which is a different act with different
 consent. This section is about the doors application code can knock on.
 
-There are two of them today, and each is declared per **transport**:
+There are three capability groups today. `secrets` and `update` may declare
+either of the two transports; `picker` is deliberately IPC-only:
 
 ```json
 {
   "actions": {
     "secrets": { "ipc": false, "bridge": true, "keys": ["openai", "anthropic"] },
-    "update":  { "ipc": true,  "bridge": true }
+    "update":  { "ipc": true,  "bridge": true },
+    "picker":  { "ipc": true }
   }
 }
 ```
@@ -1060,11 +1062,13 @@ There are two of them today, and each is declared per **transport**:
 | `ipc` | the webview's own JS, through the host's IPC channel |
 | `bridge` | PHP, through a loopback HTTP server — see "The bridge wire contract" below |
 
-Granularity is **group × transport, all or nothing per group**; there is no
-per-command configuration. Absent means off, at every level: no `actions`, an
-absent group, and an absent transport all mean the same thing. A group declared
-on neither transport is completely unreachable — no server thread, no
-environment variables, no grant — and the app is unaffected either way.
+Granularity is **group × available transport, all or nothing per group**; there
+is no per-command configuration. `picker` has only the IPC transport, so a
+`bridge` member there is refused rather than held as a future permission.
+Absent means off, at every level: no `actions`, an absent group, and an absent
+transport all mean the same thing. A group declared on none of its available
+transports is completely unreachable — no server thread, no environment
+variables, no grant — and the app is unaffected either way.
 
 ### `secrets`
 
@@ -1166,11 +1170,46 @@ edits by hand is whatever they last typed there, and the question has no other
 meaning. (`host_resolves_updates_itself`, an earlier reason token, is retired;
 it will not reappear.)
 
+### `picker`
+
+Shows one native chooser owned by the calling app window. It is for selecting a
+directory, or for retaining the local path an integration itself understands;
+it is not the normal way to upload a file. For an upload, prefer the browser's
+`<input type="file">`: it provides a `File` object and owns the upload flow.
+
+`picker` has one transport and one exact manifest shape:
+
+```json
+{"picker": {"ipc": true}}
+```
+
+There is no `bridge` transport, HTTP route, bridge environment variable, or PHP
+permission for this group. PHP processes, workers, lifecycle commands and a
+page on the splash origin cannot open a chooser. A manifest that names
+`actions.picker.bridge` is invalid and says that this group has no bridge
+transport.
+
+The webview calls Tauri's raw IPC as either
+`invoke("pick_path", { kind: "file" })` or
+`invoke("pick_path", { kind: "directory" })`. `kind` is required; any other
+value is invalid input and returns an IPC error. A selection resolves to its
+absolute path as a string, and cancellation resolves successfully to `null`.
+
+The dialog is the person's consent to that one selection. It does **not** grant
+the app filesystem scope, read the selected file or directory, copy it, upload
+it, retain an OS file descriptor, or persist anything. A returned path remains
+privacy-relevant information: an app that sends it to its PHP backend or saves
+it is responsible for that choice. Treat a saved path as machine-local
+configuration, never as exportable application state or a promise that it will
+survive another computer, an OS migration, a missing mount, or a permission
+change.
+
 ### The bridge wire contract
 
 PHP cannot see the webview's IPC channel. The bridge is the transport that gives
-the app's PHP side the same capabilities, and it starts as soon as *any* group
-declares `bridge: true`.
+the app's PHP side the capabilities whose groups declare it, and it starts as
+soon as *any* such group declares `bridge: true`. It does not expose IPC-only
+groups such as `picker`.
 
 **Transport.** Plain HTTP on `127.0.0.1`, on a free port chosen at launch
 (`TFS_BRIDGE_URL`), with a random bearer token regenerated every launch and
@@ -1337,7 +1376,8 @@ as the rest of this document: what the app sees, never how the hub does it.
 §4's HTTP contract holds exactly. §5's isolation holds — a dev session gets
 its own data directory, its own cookie store, its own liveness lock, by the
 same identifier-keyed rules an installed app gets; it is simply a different
-identifier. §7's `actions` behave identically over both transports, and
+identifier. §7's `actions` use the same available transports and ACL boundaries
+in dev as when installed — including `picker`'s IPC-only boundary — and
 `actions.update` already answers the same way in both: `unavailable` /
 `local_source`, since a dev session has no release feed to compare against
 regardless of which mode is asking.
