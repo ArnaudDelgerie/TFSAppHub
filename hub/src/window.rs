@@ -183,6 +183,10 @@ pub const UPDATE_IPC_GRANT: ActionIpcGrant = ActionIpcGrant {
     capability_identifier: "actions-update",
     permission: "allow-update",
 };
+pub const PICKER_IPC_GRANT: ActionIpcGrant = ActionIpcGrant {
+    capability_identifier: "actions-picker",
+    permission: "allow-picker",
+};
 
 /// The table the launch walks, pairing each group's `ipc` flag with the grant it
 /// activates. A third group is one entry here, not another `if` at the call
@@ -193,7 +197,18 @@ pub type ActionIpcGrantEntry = (fn(&crate::manifest::ActionsConfig) -> bool, Act
 pub const ACTION_IPC_GRANTS: &[ActionIpcGrantEntry] = &[
     (|actions| actions.secrets.ipc, SECRETS_IPC_GRANT),
     (|actions| actions.update.ipc, UPDATE_IPC_GRANT),
+    (|actions| actions.picker.ipc, PICKER_IPC_GRANT),
 ];
+
+/// The action grants a manifest opted into. Kept separate from Builder setup so
+/// the default-off and per-group independence rules remain unit-testable.
+pub fn declared_action_ipc_grants(
+    actions: &crate::manifest::ActionsConfig,
+) -> impl Iterator<Item = &ActionIpcGrant> {
+    ACTION_IPC_GRANTS
+        .iter()
+        .filter_map(move |(declared, grant)| declared(actions).then_some(grant))
+}
 
 /// Action capabilities apply only to the backend origin, never to a local
 /// splash page. [`tauri::ipc::CapabilityBuilder`] defaults this to `true`.

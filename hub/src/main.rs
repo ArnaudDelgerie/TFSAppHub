@@ -25,6 +25,7 @@ mod manifest;
 mod open;
 mod paths;
 mod php;
+mod picker;
 mod platform;
 mod portability;
 mod prompt;
@@ -343,13 +344,11 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
     // `capabilities/default.json` grants nothing at all, so an `invoke` for a
     // group this app did not declare is refused by Tauri's own ACL before any
     // handler runs. Registering the commands is not the boundary; this is.
-    for (declared, grant) in window::ACTION_IPC_GRANTS {
-        if declared(&spec.manifest.actions) {
-            context
-                .runtime_authority_mut()
-                .add_capability(window::action_capability(grant))
-                .expect("a valid action capability");
-        }
+    for grant in window::declared_action_ipc_grants(&spec.manifest.actions) {
+        context
+            .runtime_authority_mut()
+            .add_capability(window::action_capability(grant))
+            .expect("a valid action capability");
     }
 
     // One slot per process, shared by every window this process builds: the
@@ -409,6 +408,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             secrets::secret_delete,
             secrets::secret_list,
             update_check::update_check,
+            picker::pick_path,
         ])
         .setup(move |app| {
             // Greyscale rather than subpixel text antialiasing, for every

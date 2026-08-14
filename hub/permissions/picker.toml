@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-picker"
+description = "Allows an app's frontend to reach actions.picker over Tauri's own IPC (pick_path). The picker is deliberately IPC-only: it creates no HTTP bridge route, environment value or PHP permission. Granted at runtime, per launch, only when the installed app's own manifest declares actions.picker.ipc; the static capability grants nothing."
+commands.allow = ["pick_path"]

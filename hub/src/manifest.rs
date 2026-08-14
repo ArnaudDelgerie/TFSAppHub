@@ -166,6 +166,8 @@ pub struct ActionsConfig {
     pub secrets: SecretsActions,
     #[serde(default)]
     pub update: UpdateActions,
+    #[serde(default)]
+    pub picker: PickerActions,
 }
 
 /// The `secrets` group, per transport. `keys` is a manifest — typo-catching,
@@ -188,6 +190,15 @@ pub struct UpdateActions {
     pub ipc: bool,
     #[serde(default)]
     pub bridge: bool,
+}
+
+/// The `picker` group is intentionally IPC-only. The native chooser belongs to
+/// a visible webview and its owning window; no PHP process receives a route or
+/// environment value through which it could open one.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq)]
+pub struct PickerActions {
+    #[serde(default)]
+    pub ipc: bool,
 }
 
 /// A manifest and whatever the parse wanted to say about it.
@@ -302,6 +313,23 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
         }
     }
 
+    // Unlike a new top-level key, `actions.picker.bridge` cannot be safely
+    // ignored: this group has no bridge transport, so accepting it would make
+    // a future-looking manifest appear to grant something it never can.
+    if object
+        .get("actions")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|actions| actions.get("picker"))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|picker| picker.contains_key("bridge"))
+    {
+        return Err(ManifestError::UnsupportedActionTransport {
+            path: path.to_path_buf(),
+            group: "picker",
+            transport: "bridge",
+        });
+    }
+
     let warnings = object
         .keys()
         .filter(|key| !KNOWN_KEYS.contains(&key.as_str()))
@@ -357,6 +385,11 @@ pub enum ManifestError {
         expected: &'static str,
         found: &'static str,
     },
+    UnsupportedActionTransport {
+        path: PathBuf,
+        group: &'static str,
+        transport: &'static str,
+    },
     Invalid {
         path: PathBuf,
         detail: String,
@@ -389,6 +422,15 @@ impl fmt::Display for ManifestError {
             } => write!(
                 formatter,
                 "\"{field}\" in {} must be {expected}, found {found} (CONTRACT.md §2).",
+                path.display()
+            ),
+            Self::UnsupportedActionTransport {
+                path,
+                group,
+                transport,
+            } => write!(
+                formatter,
+                "\"actions.{group}.{transport}\" in {} is not supported: actions.{group} has no {transport} transport (CONTRACT.md §7).",
                 path.display()
             ),
             Self::Invalid { path, detail } => {
