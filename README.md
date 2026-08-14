@@ -190,6 +190,10 @@ No sandbox is claimed. Sources default to a pinned tag or commit, never a branch
 For a developer audience this is exactly `composer require`, and pretending
 otherwise would be worse than saying it.
 
+Checking `SHA256SUMS.txt` establishes download integrity, not publisher
+authenticity; choosing which source or repository to trust remains the user's
+call ([decision 004](.project/decision/004-integrity-not-authenticity.md)).
+
 ### Stored secrets are namespaced, not isolated
 
 Each app's secrets go into the OS keyring under that app's `identifier` as the
