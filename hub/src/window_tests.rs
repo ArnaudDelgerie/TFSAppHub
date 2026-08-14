@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use tauri::Url;
 
 use super::{
-    classify_navigation, next_window_label_among, resolve_splash_source, resolve_within,
-    splash_style, NavigationTarget, SplashSource,
+    action_capability_is_local, classify_navigation, next_window_label_among,
+    resolve_splash_source, resolve_within, splash_style, NavigationTarget, SplashSource,
 };
 
 fn url(text: &str) -> Url {
@@ -119,6 +119,15 @@ fn an_unknown_origin_never_makes_a_target_internal() {
         classify_navigation(None, &url("http://127.0.0.1:8123/")),
         NavigationTarget::ExternalWeb
     );
+}
+
+#[test]
+fn actions_capability_is_not_granted_to_the_splash_origin() {
+    // Tauri's `local` capability target includes the app's bundled fallback
+    // (`tauri:`) and custom splash scheme. `action_capability` passes this
+    // value straight to `CapabilityBuilder::local`, so false confines actions
+    // to its explicit loopback `remote` target instead.
+    assert!(!action_capability_is_local());
 }
 
 // --- the splash scheme's path confinement ---------------------------------
