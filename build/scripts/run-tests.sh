@@ -36,14 +36,42 @@ COMPOSER_CACHE_DIR="$COMPOSER_ROOT/cache"
 mkdir -p "$COMPOSER_HOME" "$COMPOSER_CACHE_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 
-cleanup() {
-  # This is deliberately a narrow, test-only seam: step 3 uses it to prove
-  # the cleanup diagnostic without relying on an intermittent external leak.
-  # It retains only paths this wrapper recorded as its own.
-  if [ "${RUN_TESTS_TEST_CLEANUP_FAILURE:-}" = "1" ]; then
-    echo "run-tests.sh: test-only cleanup failure seam retained harness-owned paths: XDG_DATA_HOME=$XDG_DATA_HOME XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR COMPOSER_ROOT=$COMPOSER_ROOT COMPOSER_HOME=$COMPOSER_HOME COMPOSER_CACHE_DIR=$COMPOSER_CACHE_DIR" >&2
-    return 1
+cleanup_diagnostic() {
+  local path="$1"
+  local operation="$2"
+  local status="$3"
+
+  printf 'run-tests.sh: cleanup failed: operation=%s path=%s status=%s\n' \
+    "$operation" "$path" "$status" >&2
+
+  if command -v findmnt >/dev/null; then
+    printf 'run-tests.sh: mount information for %s:\n' "$path" >&2
+    findmnt -T "$path" -o TARGET,SOURCE,FSTYPE,OPTIONS 2>&1 || true
   fi
+
+  if command -v fuser >/dev/null; then
+    printf 'run-tests.sh: processes using %s:\n' "$path" >&2
+    fuser -v "$path" 2>&1 || true
+  fi
+}
+
+cleanup_path() {
+  local path="$1"
+  local status=0
+
+  if timeout 10s rm -rf -- "$path"; then
+    return 0
+  else
+    status=$?
+  fi
+
+  cleanup_diagnostic "$path" "timeout 10s rm -rf --" "$status"
+  return "$status"
+}
+
+cleanup_paths() {
+  local cleanup_status=0
+  local path
 
   # gvfsd-fuse mounts a FUSE filesystem at $XDG_RUNTIME_DIR/gvfs on demand;
   # its own teardown races this trap when the private bus goes away, so
@@ -52,8 +80,46 @@ cleanup() {
   # XDG_DATA_HOME dir rather than this one). Force-unmount it first,
   # quietly and best-effort: it is often already gone by the time we get
   # here, and it is never ours to leave mounted either way.
-  fusermount3 -uz "$XDG_RUNTIME_DIR/gvfs" 2>/dev/null || true
-  rm -rf "$COMPOSER_ROOT" "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
+  timeout 5s fusermount3 -uz "$XDG_RUNTIME_DIR/gvfs" 2>/dev/null || true
+
+  # This is deliberately a narrow, test-only seam: it retains only paths the
+  # wrapper recorded as its own, so the failure diagnostic is testable without
+  # relying on an intermittent external leak.
+  if [ "${RUN_TESTS_TEST_CLEANUP_FAILURE:-}" = "1" ]; then
+    cleanup_diagnostic "$COMPOSER_ROOT" "test-only cleanup failure seam" "forced"
+    cleanup_status=1
+  else
+    cleanup_path "$COMPOSER_ROOT" || cleanup_status=1
+    cleanup_path "$XDG_DATA_HOME" || cleanup_status=1
+    cleanup_path "$XDG_RUNTIME_DIR" || cleanup_status=1
+  fi
+
+  for path in "$COMPOSER_ROOT" "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"; do
+    if [ -e "$path" ]; then
+      cleanup_diagnostic "$path" "post-cleanup existence check" "still exists"
+      cleanup_status=1
+    fi
+  done
+
+  return "$cleanup_status"
+}
+
+cleanup() {
+  local test_status=$?
+  local cleanup_status=0
+
+  trap - EXIT
+  cleanup_paths || cleanup_status=$?
+
+  if [ "$cleanup_status" -ne 0 ]; then
+    if [ "$test_status" -eq 0 ]; then
+      echo "run-tests.sh: tests passed but cleanup failed; exiting with cleanup status 70." >&2
+      exit 70
+    fi
+    echo "run-tests.sh: cleanup failed after test status $test_status; preserving the original test failure status." >&2
+  fi
+
+  exit "$test_status"
 }
 trap cleanup EXIT
 
@@ -61,6 +127,10 @@ export XDG_DATA_HOME
 export XDG_RUNTIME_DIR
 export COMPOSER_HOME
 export COMPOSER_CACHE_DIR
+
+if [ "${RUN_TESTS_RECORD_PATHS:-}" = "1" ]; then
+  echo "run-tests.sh: harness-owned paths: XDG_DATA_HOME=$XDG_DATA_HOME XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR COMPOSER_ROOT=$COMPOSER_ROOT COMPOSER_HOME=$COMPOSER_HOME COMPOSER_CACHE_DIR=$COMPOSER_CACHE_DIR" >&2
+fi
 
 # The workspace root, so `cargo test` covers both `core/` and `hub/`.
 cd "$ROOT_DIR"
