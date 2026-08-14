@@ -7,14 +7,14 @@ use std::{
 };
 
 use super::{
-    acquire_launch_locks, anchor_state, cache_stamp_path, db_snapshot_path, decide_launch,
-    dialog_is_warranted, discard_db_snapshot, discard_rollback_anchor, lifecycle_decision,
-    prepare_dev_launch, previous_tree_path, probe_run_lock, read_cache_stamp, read_data_version,
-    read_rollback_anchor, rescue_dump_path, restore_db_snapshot, rollback_anchor_path,
-    run_lock_held_decision, serving_lock_path, snapshot_db, veto_exit, write_cache_stamp,
-    write_data_version, write_rollback_anchor, Anchor, CacheStamp, CacheStatus, LaunchDecision,
-    LaunchLockError, LifecycleDecisionError, LifecycleError, LifecycleEvent, RollbackAnchor,
-    RunLockHeld, DB_FILE_NAMES,
+    acquire_launch_locks, anchor_state, cache_stamp_path, data_dir_holder, db_snapshot_path,
+    decide_launch, dialog_is_warranted, discard_db_snapshot, discard_rollback_anchor,
+    lifecycle_decision, prepare_dev_launch, previous_tree_path, probe_run_lock, read_cache_stamp,
+    read_data_version, read_rollback_anchor, rescue_dump_path, restore_db_snapshot,
+    rollback_anchor_path, run_lock_held_decision, serving_lock_path, snapshot_db, veto_exit,
+    write_cache_stamp, write_data_version, write_rollback_anchor, Anchor, CacheStamp, CacheStatus,
+    LaunchDecision, LaunchLockError, LifecycleDecisionError, LifecycleError, LifecycleEvent,
+    RollbackAnchor, RunLockHeld, DB_FILE_NAMES,
 };
 use crate::{registry::Platform, run::OrphanedRun};
 
@@ -614,6 +614,21 @@ fn probe_run_lock_held_with_no_record_names_nothing() {
     let held = probe_run_lock(data_dir.path(), "dev.local.demo").expect("no I/O error");
 
     assert_eq!(held, RunLockHeld::Held { alias: None });
+}
+
+#[test]
+fn data_dir_holder_propagates_an_unprobeable_window_lock() {
+    let root = tempfile::tempdir().expect("a temp root");
+    let data_dir = root.path().join("not-a-directory");
+    fs::write(&data_dir, "not a directory").expect("a file where a data directory would be");
+
+    let error = data_dir_holder(&data_dir, "dev.local.demo")
+        .expect_err("an unprobeable sidecar lock must not be treated as free");
+
+    assert!(
+        matches!(error.kind(), std::io::ErrorKind::NotADirectory),
+        "unexpected error: {error}"
+    );
 }
 
 // --- dialog_is_warranted --------------------------------------------------
