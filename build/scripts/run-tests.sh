@@ -3,12 +3,14 @@ set -euo pipefail
 
 # Run the workspace's `cargo test` inside a private D-Bus session backed by an
 # ephemeral gnome-keyring-daemon, so the suite never touches the developer's
-# real login keyring. The keyring-backed modules arrive with plan 007 and some
-# of their tests deliberately exercise a *real* Secret Service; this wrapper is
-# what gives them one to talk to without any risk to the host. It is in place
-# from plan 001 on purpose — a test that reaches the login keyring once has
-# already done the damage, so the isolation must never be the thing added
-# afterwards.
+# real login keyring. Its repository-owned bus configuration has no activation
+# service directories: the daemon below is the sole explicit Secret Service
+# provider, and the wrapper verifies its PID before Cargo can use it. The
+# keyring-backed modules arrive with plan 007 and some of their tests
+# deliberately exercise a *real* Secret Service; this wrapper is what gives
+# them one to talk to without any risk to the host. It is in place from plan
+# 001 on purpose — a test that reaches the login keyring once has already done
+# the damage, so the isolation must never be the thing added afterwards.
 #
 # All arguments are passed through to `cargo test`, so e.g.
 # `build/scripts/run-tests.sh --test keyring_health` still works.
@@ -24,6 +26,7 @@ if ! command -v gnome-keyring-daemon >/dev/null; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DBUS_CONFIG_FILE="$ROOT_DIR/build/scripts/test-session.conf"
 
 XDG_DATA_HOME="$(mktemp -d)"
 XDG_RUNTIME_DIR="$(mktemp -d)"
@@ -141,32 +144,68 @@ cd "$ROOT_DIR"
 # failure, or a future timeout), never left to a detached process that
 # `dbus-run-session`'s own bus teardown might or might not reach. Before
 # `cargo test` starts, the shell polls the private bus until
-# `org.freedesktop.secrets` has an owner. That alone is not enough, though:
-# `NameHasOwner` only says *someone* owns the name, not that it is this
-# daemon — caught live during step 5's validation, where a D-Bus-activated,
-# locked `--start` daemon won the name race first and prompted for a
-# password on the real X display (audit 004/P3's exact hang, plus the
-# system dialog from todo 001, both from a name our own poll happily saw as
-# "owned"). `--replace` closes that: it always takes the name over,
-# whoever holds it, so the owner the poll observes is guaranteed to be this
-# unlocked daemon and not an activated stand-in.
+# `org.freedesktop.secrets` belongs to that exact child. `NameHasOwner` alone
+# only says *someone* owns the name, which previously let an activation-started,
+# locked daemon through. The activation-free bus makes this daemon the only
+# possible provider; the unique-name-to-PID check below proves it before Cargo
+# can use the service.
 # The single quotes below are the point: this whole block is one script
 # string handed to the inner `bash -c`, expanded by that shell, not this one.
 # shellcheck disable=SC2016
-dbus-run-session -- bash -c '
+dbus-run-session --config-file="$DBUS_CONFIG_FILE" -- bash -c '
   set -euo pipefail
 
-  gnome-keyring-daemon --foreground --replace --unlock --components=secrets <<< "" &
+  gnome-keyring-daemon --foreground --unlock --components=secrets <<< "" &
   daemon_pid=$!
-  trap "kill $daemon_pid 2>/dev/null" EXIT
+
+  cleanup_daemon() {
+    kill "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+  }
+  trap cleanup_daemon EXIT
+
+  startup_failure() {
+    echo "run-tests.sh: Secret Service startup failed: $1" >&2
+    exit 1
+  }
 
   waited=0
-  until dbus-send --session --print-reply --dest=org.freedesktop.DBus \
-      /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
-      string:org.freedesktop.secrets 2>/dev/null | grep -q "boolean true"; do
+  while :; do
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then
+      startup_failure "gnome-keyring-daemon (pid $daemon_pid) exited before owning org.freedesktop.secrets"
+    fi
+
+    owner_name="$(dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+      /org/freedesktop/DBus org.freedesktop.DBus.GetNameOwner \
+      string:org.freedesktop.secrets 2>/dev/null | awk '\''/string/ { gsub(/"/, "", $2); print $2; exit }'\'' || true)"
+
+    if [ -n "$owner_name" ]; then
+      owner_pid="$(dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+        /org/freedesktop/DBus org.freedesktop.DBus.GetConnectionUnixProcessID \
+        string:"$owner_name" 2>/dev/null | awk '\''/uint32/ { print $2; exit }'\'')"
+
+      if ! [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
+        startup_failure "GetConnectionUnixProcessID returned an unparsable PID for $owner_name"
+      fi
+
+      # Narrow test-only seam for the failed-proof path. It cannot affect a
+      # normal run and demonstrates that Cargo never starts after a mismatch.
+      if [ "${RUN_TESTS_TEST_OWNER_PROOF_FAILURE:-}" = "1" ]; then
+        owner_pid=$((daemon_pid + 1))
+      fi
+
+      if [ "$owner_pid" != "$daemon_pid" ]; then
+        startup_failure "org.freedesktop.secrets owner PID $owner_pid does not match harness daemon PID $daemon_pid"
+      fi
+
+      if [ "${RUN_TESTS_RECORD_PATHS:-}" = "1" ]; then
+        echo "run-tests.sh: Secret Service ownership: daemon_pid=$daemon_pid owner_pid=$owner_pid" >&2
+      fi
+      break
+    fi
+
     if [ "$waited" -ge 100 ]; then
-      echo "run-tests.sh: gnome-keyring-daemon (pid $daemon_pid) never took org.freedesktop.secrets on the private bus after 10s — see audit 004/P3." >&2
-      exit 1
+      startup_failure "gnome-keyring-daemon (pid $daemon_pid) did not own org.freedesktop.secrets after 10s"
     fi
     sleep 0.1
     waited=$((waited + 1))
