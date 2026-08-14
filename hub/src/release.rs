@@ -48,10 +48,6 @@ pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
 /// (publishing) and this constant (the hub's own `--update`, `../plan/020-
 /// hub-self-update-and-revalidation.md`) read one shared source of truth
 /// rather than two copies of the same string.
-///
-/// `#[allow(dead_code)]`: step 1 only introduces the constant; `hub_update.rs`
-/// (step 2) is its first real reader.
-#[allow(dead_code)]
 pub const RELEASES_REPO: &str = env!("TFSAPP_RELEASES_REPO");
 
 /// Timeouts for a `releases/latest` or `releases/tags/<tag>` call — small
