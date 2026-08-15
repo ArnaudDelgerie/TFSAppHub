@@ -11,7 +11,7 @@
 //! would invite a "rollback forward" this plan does not define).
 //!
 //! The one thing it does not throw away is the database it is about to
-//! replace: [`lifecycle::rescue_dump_path`] carries it forward as a
+//! replace: [`lifecycle::copy_rescue_dump`] carries it forward as a
 //! manual-recovery artefact, named on screen, so "I rolled back too eagerly"
 //! never costs data that was never wrong.
 
@@ -183,11 +183,11 @@ fn rescue_dump(data_subdir: &Path) -> Result<Option<std::path::PathBuf>, Rollbac
         if !source.is_file() {
             continue;
         }
-        let rescue = lifecycle::rescue_dump_path(data_subdir, name);
-        fs::copy(&source, &rescue).map_err(|error| RollbackError::Io {
-            path: rescue.clone(),
-            source: error,
-        })?;
+        let rescue =
+            lifecycle::copy_rescue_dump(data_subdir, name).map_err(|error| RollbackError::Io {
+                path: error.path,
+                source: error.source,
+            })?;
         if name == "app.db" {
             app_db_rescue = Some(rescue);
         }

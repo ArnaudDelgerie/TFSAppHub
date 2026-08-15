@@ -647,7 +647,7 @@ fn announce_overwrite(
     println!(
         "  its current database will be replaced — the database being replaced will be saved \
          to {}",
-        lifecycle::rescue_dump_path(data_subdir, "app.db").display()
+        lifecycle::rescue_dump_pattern(data_subdir, "app.db").display()
     );
     println!(
         "  its rollback anchor, if any, will be discarded — a rollback after this import would \
@@ -662,7 +662,7 @@ fn announce_overwrite(
 ///
 /// `rollback.rs`'s own `rescue_dump`, duplicated rather than shared: both are
 /// small, module-private pipeline steps over the same
-/// [`lifecycle::rescue_dump_path`], and the two commands' error types differ.
+/// [`lifecycle::copy_rescue_dump`], and the two commands' error types differ.
 fn rescue_dump(data_subdir: &Path) -> Result<Option<PathBuf>, PortabilityError> {
     let mut app_db_rescue = None;
     for name in lifecycle::DB_FILE_NAMES {
@@ -670,10 +670,11 @@ fn rescue_dump(data_subdir: &Path) -> Result<Option<PathBuf>, PortabilityError> 
         if !source.is_file() {
             continue;
         }
-        let rescue = lifecycle::rescue_dump_path(data_subdir, name);
-        fs::copy(&source, &rescue).map_err(|error| PortabilityError::Io {
-            path: rescue.clone(),
-            source: error,
+        let rescue = lifecycle::copy_rescue_dump(data_subdir, name).map_err(|error| {
+            PortabilityError::Io {
+                path: error.path,
+                source: error.source,
+            }
         })?;
         if name == "app.db" {
             app_db_rescue = Some(rescue);
