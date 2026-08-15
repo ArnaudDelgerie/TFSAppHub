@@ -59,6 +59,11 @@ pub struct Journal {
     pub kind: TransactionKind,
     pub outgoing: RegistryEntry,
     pub phase: Phase,
+    /// Database members that existed when the outgoing snapshot completed.
+    /// Absence is meaningful for SQLite's optional WAL/SHM twins, so recovery
+    /// must never infer it from a missing staging file.
+    #[serde(default)]
+    pub database_members: Vec<String>,
     #[serde(flatten)]
     pub unknown: serde_json::Map<String, serde_json::Value>,
 }
@@ -70,6 +75,7 @@ impl Journal {
             kind,
             outgoing,
             phase: Phase::Prepared,
+            database_members: Vec::new(),
             unknown: Default::default(),
         }
     }
@@ -149,27 +155,39 @@ pub fn read(data_dir: &Path) -> Result<Option<Journal>, JournalError> {
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(JournalError::Io { path, source }),
     };
-    serde_json::from_str(&text)
-        .map(Some)
-        .map_err(|error| JournalError::Malformed {
-            path,
+    let journal: Journal =
+        serde_json::from_str(&text).map_err(|error| JournalError::Malformed {
+            path: path.clone(),
             detail: error.to_string(),
-        })
+        })?;
+    if journal.format_version != FORMAT_VERSION {
+        return Err(JournalError::Malformed {
+            path,
+            detail: format!(
+                "unsupported transaction format version {}",
+                journal.format_version
+            ),
+        });
+    }
+    Ok(Some(journal))
 }
 
-pub fn snapshot_db(data_subdir: &Path, data_dir: &Path) -> io::Result<()> {
+pub fn snapshot_db(data_subdir: &Path, data_dir: &Path) -> io::Result<Vec<String>> {
     let staging = staging_dir(data_dir);
     fs::create_dir_all(&staging)?;
+    let mut members = Vec::new();
     for name in lifecycle::DB_FILE_NAMES {
         let source = data_subdir.join(name);
         let target = staged_db_path(data_dir, name);
         if source.is_file() {
             fs::copy(source, target)?;
+            members.push(name.to_string());
         } else {
             let _ = fs::remove_file(target);
         }
     }
-    fs::File::open(staging)?.sync_all()
+    fs::File::open(staging)?.sync_all()?;
+    Ok(members)
 }
 
 pub fn retain_tree(app_dir: &Path) -> io::Result<()> {

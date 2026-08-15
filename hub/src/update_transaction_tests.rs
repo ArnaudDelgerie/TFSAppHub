@@ -1,10 +1,14 @@
 use std::fs;
 
 use crate::{
+    lifecycle::{self, read_data_version},
+    paths::Paths,
+    registry,
     registry::{Platform, RegistryEntry, Source, SourceKind, State},
+    update::recover_transaction,
     update_transaction::{
-        journal_path, read, staged_db_path, staged_tree_path, write, Journal, Phase,
-        TransactionKind,
+        journal_path, read, retain_tree, snapshot_db, staged_db_path, staged_tree_path, write,
+        Journal, Phase, TransactionKind,
     },
 };
 
@@ -31,6 +35,80 @@ fn entry() -> RegistryEntry {
         updated_at: "now".into(),
         unknown: Default::default(),
     }
+}
+
+fn seeded_paths() -> (
+    tempfile::TempDir,
+    Paths,
+    RegistryEntry,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let base = tempfile::tempdir().unwrap();
+    let paths = Paths::rooted_at(base.path());
+    let entry = entry();
+    registry::update(&paths, |registry| registry.apps.push(entry.clone())).unwrap();
+    let data_dir = paths.create_app_data_dir(&entry.identifier).unwrap();
+    let app_dir = paths.app_dir(&entry.id).unwrap();
+    fs::create_dir_all(app_dir.join("public")).unwrap();
+    fs::write(app_dir.join("public/version"), "old").unwrap();
+    fs::create_dir_all(data_dir.join("data")).unwrap();
+    fs::write(data_dir.join("data/app.db"), "old-db").unwrap();
+    lifecycle::write_data_version(&data_dir.join("data"), &entry.app_version).unwrap();
+    (base, paths, entry, data_dir, app_dir)
+}
+
+#[test]
+fn recovery_restores_a_replacement_from_the_durable_outgoing_state() {
+    let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+    let mut journal = Journal::prepared(TransactionKind::Apply, entry.clone());
+    journal.database_members = snapshot_db(&data_dir.join("data"), &data_dir).unwrap();
+    journal.advance(Phase::SnapshotComplete);
+    retain_tree(&app_dir).unwrap();
+    journal.advance(Phase::TreeRetained);
+    fs::create_dir_all(app_dir.join("public")).unwrap();
+    fs::write(app_dir.join("public/version"), "new").unwrap();
+    fs::write(data_dir.join("data/app.db"), "new-db").unwrap();
+    lifecycle::write_data_version(&data_dir.join("data"), "0.7.0").unwrap();
+    registry::update(&paths, |registry| {
+        registry.get_mut("demo").unwrap().app_version = "0.7.0".into();
+    })
+    .unwrap();
+    journal.advance(Phase::RegistryCommitted);
+    write(&data_dir, &journal).unwrap();
+
+    let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+    assert!(outcome.is_complete());
+    assert_eq!(
+        fs::read_to_string(app_dir.join("public/version")).unwrap(),
+        "old"
+    );
+    assert_eq!(
+        fs::read_to_string(data_dir.join("data/app.db")).unwrap(),
+        "old-db"
+    );
+    assert_eq!(
+        read_data_version(&data_dir.join("data"))
+            .unwrap()
+            .as_deref(),
+        Some("0.6.0")
+    );
+    assert_eq!(registry::load(&paths).unwrap().get("demo").unwrap(), &entry);
+    assert!(read(&data_dir).unwrap().is_none());
+}
+
+#[test]
+fn failed_recovery_keeps_its_journal_for_a_later_retry() {
+    let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+    let mut journal = Journal::prepared(TransactionKind::Apply, entry);
+    journal.database_members = vec!["app.db".into()];
+    journal.advance(Phase::SnapshotComplete);
+    fs::create_dir_all(staged_db_path(&data_dir, "app.db")).unwrap();
+    write(&data_dir, &journal).unwrap();
+
+    let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+    assert!(!outcome.is_complete());
+    assert!(read(&data_dir).unwrap().is_some());
 }
 
 #[test]
