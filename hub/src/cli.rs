@@ -168,6 +168,13 @@ pub const SURFACE: &[Spec] = &[
         availability: Availability::Implemented,
     },
     Spec {
+        name: "repair",
+        form: "repair <id> [--yes]",
+        summary: "Restore an interrupted update before using that app again.",
+        level: Level::App,
+        availability: Availability::Implemented,
+    },
+    Spec {
         name: "rollback",
         form: "rollback <id> [--yes]",
         summary: "Undo the last update, restoring the previous version and database.",
@@ -346,6 +353,10 @@ pub enum Command {
         /// same escape for a script.
         assume_yes: bool,
     },
+    Repair {
+        id: String,
+        assume_yes: bool,
+    },
     Rollback {
         id: String,
         /// `--yes`: skip the confirmation, same escape as `install` and
@@ -444,6 +455,7 @@ impl Command {
             Self::Dev { .. } => "dev",
             Self::Publish { .. } => "publish",
             Self::Update { .. } => "update",
+            Self::Repair { .. } => "repair",
             Self::Rollback { .. } => "rollback",
             Self::Remove { .. } => "remove",
             Self::Purge { .. } => "purge",
@@ -568,6 +580,13 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
                 id: options.exactly_one("update", "an app id")?,
                 reference: options.value("--ref"),
                 force: options.flag("--force"),
+                assume_yes: options.assume_yes(),
+            })
+        }
+        "repair" => {
+            let mut options = options("repair", rest, &[], &["--yes", "-y"])?;
+            Ok(Command::Repair {
+                id: options.exactly_one("repair", "an app id")?,
                 assume_yes: options.assume_yes(),
             })
         }

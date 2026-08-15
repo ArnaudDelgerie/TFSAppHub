@@ -299,32 +299,33 @@ from removing the first update's `apps/<id>.previous` anchor.
    - no record at all → refused; that moment belongs to `install`.
 3. Guard the data directory exactly as `install` does (016's
    `check_data_dir_available`), then confirm.
-4. `Apply`, in order: snapshot `app.db` (+ `-wal`/`-shm`), retain the
-   outgoing tree at `apps/<id>.previous` (a rename, never a copy — the cost
-   of holding an anchor is one generation of the tree, not a copy pass over
-   it), write the rollback anchor's third half from the *outgoing* registry
-   entry, copy the new tree in, empty the app's own cache/build directories
+4. `Apply`, in order: write a durable, outgoing-only transaction journal at
+   `<data>/update-transaction.json`, snapshot `app.db` (+ `-wal`/`-shm`) into
+   `<data>/.update-transaction/`, retain the outgoing tree at
+   `apps/<id>.update-transaction`, copy the new tree in, empty the app's own
+   cache/build directories
    (they are about to boot a container compiled from code that is no longer
    there), run `install::prepare` under the update event (`pre-update` then
    `post-update`, then the same `cache:warmup`-and-stamp `install` itself
    runs — plan 024), then — only once every step above has succeeded — stamp
-   the registry with the new one and rewrite the desktop entry.
-5. Any failure from the tree swap onward reverts the whole attempt: the
-   database snapshot is restored, the copied-in tree is removed, the
-   outgoing tree is renamed back, the cache stamp `prepare`'s own warm-up
-   may already have written is discarded, and the outgoing data version and
-   rollback record are removed — and the registry is never touched, so the
-   next `open` does not know an update was attempted at all. Every undo is
-   attempted even if another fails; in that exceptional partial-revert case
-   the command names each failed on-disk step instead of claiming the old
-   installation is intact.
+   the registry with the new one and rewrite the desktop entry. Only then is
+   the private retained tree promoted to the public one-generation
+   `apps/<id>.previous` rollback anchor, its database snapshot and its
+   outgoing registry record; the journal is then discarded.
+5. A normal failure attempts that same outgoing restoration. A kill or crash
+   leaves the journal deliberately: it is a recovery decision, not something
+   the next command silently guesses. Every ordinary command for that app
+   refuses and names `tfsapp-hub repair <id>`; `repair --yes` restores only
+   the recorded outgoing tree, database, version record and registry entry,
+   then removes the journal. It never chooses the partly-installed version,
+   never resumes the update, and never rotates the public rollback anchor.
+   A malformed or future journal also refuses safely. Interrupted imports and
+   rollbacks have no such recovery protocol.
 
-`ResyncOnly` has no lifecycle event or rollback-anchor rotation. It renames
-the current tree to `apps/<id>.resync-aside` while it copies the equal-version
-source and runs Composer, restoring that tree if either fails and deleting the
-aside on success. A registry-write failure stays a plain error after that
-success: the new tree is healthy, and the stale revision merely makes a later
-`--force` repeat the resync.
+`ResyncOnly` has no lifecycle event or rollback-anchor rotation. It uses the
+same journal and private retained tree, but no database snapshot; repair still
+chooses the outgoing tree and registry entry. The existing public rollback
+anchor is untouched until the re-sync is fully committed.
 
 **The rollback anchor is three halves, or none.** `rollback <id>` refuses
 unless all three are present, naming whichever is missing:

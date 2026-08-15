@@ -964,6 +964,16 @@ being left behind aside as a named rescue dump rather than deleting it. A
 rollback is one step back; it leaves nothing behind to roll back a second
 time.
 
+**An interrupted update requires an explicit repair.** If the hub is stopped
+after it has started an update or a forced re-sync, it retains an outgoing-only
+recovery journal in the app data directory. Until the user runs
+`tfsapp-hub repair <id>` (and confirms it, or passes `--yes`), `open`, `run`,
+`update`, `rollback`, `export`, `import` and removal refuse for that app. Repair
+restores the pre-attempt tree, database, version record and registry entry; it
+does not resume the update or choose the partially installed version. This is
+separate from the successful-update rollback anchor and remains one generation
+only. The promise does not extend to interrupted imports or rollbacks.
+
 That install-time placement is better than it had to be. A migration and a cache
 warm-up run once, while someone is watching a terminal that can print an error,
 instead of inside a launch where every failure has to become a dialog.

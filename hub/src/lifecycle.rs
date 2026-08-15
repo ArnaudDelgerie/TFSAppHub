@@ -351,6 +351,7 @@ pub fn db_snapshot_path(data_subdir: &Path, name: &str) -> PathBuf {
 /// leftover twin from an earlier attempt is removed rather than left stale, so
 /// [`restore_db_snapshot`] correctly deletes a partially created file on
 /// restore instead of resurrecting an unrelated older one.
+#[allow(dead_code)] // Transaction-private snapshots supersede this public-anchor helper.
 pub fn snapshot_db(data_subdir: &Path) -> io::Result<()> {
     for name in DB_FILE_NAMES {
         let source = data_subdir.join(name);
