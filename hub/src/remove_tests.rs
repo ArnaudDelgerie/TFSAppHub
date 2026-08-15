@@ -1,14 +1,15 @@
 use std::fs;
 
 use super::{
-    keyring_note_path, orphaned_data, plan, plan_orphan, purge_identifier, read_keyring_note,
-    remove, render_orphans, write_keyring_note, KeyringNote, OrphanedData, RemoveError,
-    APP_SECRET_ACCOUNT, PROBE_ACCOUNT,
+    keyring_note_path, orphaned_data, plan, plan_orphan, purge_identifier,
+    purge_identifier_with_keyring, read_keyring_note, remove, render_orphans, write_keyring_note,
+    KeyringNote, OrphanedData, RemoveError, APP_SECRET_ACCOUNT, PROBE_ACCOUNT,
 };
 use crate::{
     identity::Identity,
     paths::Paths,
     registry::{now_timestamp, Platform, Registry, RegistryEntry, Source, SourceKind, State},
+    secrets::{new_fake_keyring, secrets_get, secrets_set},
 };
 
 /// This module's own `identifier`, and deliberately not the one every other
@@ -633,17 +634,23 @@ fn a_purge_with_a_note_deletes_the_declared_accounts() {
     fs::create_dir_all(data_dir.join("data")).expect("an orphan data dir");
     write_keyring_note(&data_dir, &["openai".to_string()]).expect("a note is written");
 
-    let entry = keyring::Entry::new(ORPHAN_IDENTIFIER, "openai").expect("a keyring entry");
-    entry
-        .set_password("secret")
-        .expect("a real keyring account");
-
-    assert!(purge_identifier(&paths, ORPHAN_IDENTIFIER, true).expect("it purges"));
+    let keyring = new_fake_keyring();
+    let store = keyring.store(ORPHAN_IDENTIFIER);
+    secrets_set(&store, "openai", "secret".to_string());
+    secrets_set(&store, "undeclared", "keep".to_string());
 
     assert!(
-        entry.get_password().is_err(),
+        purge_identifier_with_keyring(&paths, ORPHAN_IDENTIFIER, true, |service, account| {
+            crate::secrets::secrets_delete(&keyring.store(service), account)
+        })
+        .expect("it purges")
+    );
+
+    assert!(
+        secrets_get(&store, "openai").is_none(),
         "the account this note declared must be gone"
     );
+    assert_eq!(secrets_get(&store, "undeclared").as_deref(), Some("keep"));
 }
 
 /// Registry fixtures, kept out of the tests above so they read as what they are

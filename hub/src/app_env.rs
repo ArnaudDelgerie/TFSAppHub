@@ -161,6 +161,27 @@ pub fn resolve(
     state_root: &Path,
     mode: Mode,
 ) -> Result<AppEnvironment, EnvError> {
+    resolve_with_store(
+        manifest,
+        app_dir,
+        identifier,
+        state_root,
+        mode,
+        crate::secrets::new_store,
+    )
+}
+
+fn resolve_with_store<F>(
+    manifest: &Manifest,
+    app_dir: &Path,
+    identifier: &str,
+    state_root: &Path,
+    mode: Mode,
+    new_store: F,
+) -> Result<AppEnvironment, EnvError>
+where
+    F: FnOnce(&str, &Path) -> crate::secrets::SecretStore,
+{
     let data_dir = state_root.to_path_buf();
     let data_subdir = data_dir.join("data");
     let cache_dir = data_dir.join("cache");
@@ -234,7 +255,7 @@ pub fn resolve(
     // in dev and keeps a dev session's declared secrets from ever resolving to
     // the same keyring entry as the installed app's own (CONTRACT.md's dev
     // section; the trap the station's own `dev_secrets_service` already solved).
-    let secret_store = crate::secrets::new_store(identifier, &data_subdir);
+    let secret_store = new_store(identifier, &data_subdir);
 
     // `APP_SECRET` is the one value dev does not run through the store above:
     // a fixed, throwaway constant, neither generated, persisted nor read from
@@ -316,6 +337,27 @@ pub fn resolve(
         port,
         secret_store,
     })
+}
+
+/// Test-only store injection for environment resolution paths that need to
+/// model a working keyring without probing the host Secret Service.
+#[cfg(test)]
+pub fn resolve_with_secret_store_for_test(
+    manifest: &Manifest,
+    app_dir: &Path,
+    identifier: &str,
+    state_root: &Path,
+    mode: Mode,
+    secret_store: crate::secrets::SecretStore,
+) -> Result<AppEnvironment, EnvError> {
+    resolve_with_store(
+        manifest,
+        app_dir,
+        identifier,
+        state_root,
+        mode,
+        move |_, _| secret_store,
+    )
 }
 
 #[derive(Debug)]
