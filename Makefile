@@ -33,12 +33,14 @@ composer:
 # rustfmt.toml. The ordinary unit suite never starts or contacts a Secret
 # Service, so `make check` is safe without D-Bus or gnome-keyring-daemon. A
 # separate explicit integration target will exercise that production backend.
+# The hub test binary includes process and filesystem lifecycle probes; run it
+# in one thread so one probe's short-lived child cannot race another's cleanup.
 # No Tauri/AppImage integration here: opening a real window stays manual, as it
 # does over there.
 check:
 	cargo fmt --check
 	cargo clippy --all-targets --all-features -- -D warnings
-	cargo test
+	cargo test -- --test-threads=1
 	shellcheck build/scripts/*.sh
 
 # The deliberately explicit production-backend smoke check. It alone starts

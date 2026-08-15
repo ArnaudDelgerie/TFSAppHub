@@ -45,8 +45,13 @@ mod update;
 mod update_cache;
 mod update_check;
 mod update_refresh;
+#[allow(dead_code)] // Step 2 wires the persisted protocol into update/resync.
+mod update_transaction;
 mod window;
 mod worker;
+
+#[cfg(test)]
+mod update_transaction_tests;
 
 use cli::{
     Command, Level, OpenChildSource, RunInvocation, EXIT_OK, EXIT_UNIMPLEMENTED, EXIT_USAGE,
