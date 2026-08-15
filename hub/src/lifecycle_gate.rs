@@ -3,9 +3,6 @@
 //! The advisory text is useful for an actionable refusal, but the retained
 //! flock is authoritative. A stale record therefore never grants access.
 //!
-//! This first step defines the API; its callers land in the following plan
-//! steps, so its public-to-the-hub surface is intentionally not live yet.
-#![allow(dead_code)]
 
 use std::{
     fmt, fs, io,
@@ -69,6 +66,7 @@ pub struct ActivityLease {
 /// A retained maintenance lease. The record is written only after exclusivity
 /// is acquired, so contenders can name this operation without trusting it for
 /// ownership.
+#[allow(dead_code)] // Maintenance callers arrive in plan 040 step 3.
 pub struct MaintenanceLease {
     _file: std::fs::File,
 }
@@ -79,6 +77,13 @@ fn busy_decision(path: &Path) -> GateDecision {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+    }
+}
+
+fn held_operation(path: &Path) -> Option<String> {
+    match busy_decision(path) {
+        GateDecision::Busy { operation } => operation,
+        GateDecision::Granted => unreachable!("a read-only record probe cannot grant a flock"),
     }
 }
 
@@ -113,13 +118,7 @@ pub fn acquire_activity(paths: &Paths, identifier: &str) -> Result<ActivityLease
         source,
     })? {
         Some(file) => Ok(ActivityLease { _file: file }),
-        None => match gate_decision(
-            false,
-            match busy_decision(&path) {
-                GateDecision::Busy { operation } => operation,
-                GateDecision::Granted => unreachable!(),
-            },
-        ) {
+        None => match gate_decision(false, held_operation(&path)) {
             GateDecision::Busy { operation } => Err(GateError::Busy {
                 identifier: identifier.to_string(),
                 operation,
@@ -129,6 +128,7 @@ pub fn acquire_activity(paths: &Paths, identifier: &str) -> Result<ActivityLease
     }
 }
 
+#[allow(dead_code)] // Maintenance callers arrive in plan 040 step 3.
 pub fn acquire_maintenance(
     paths: &Paths,
     identifier: &str,
@@ -141,13 +141,7 @@ pub fn acquire_maintenance(
             source,
         })?
     else {
-        return match gate_decision(
-            false,
-            match busy_decision(&path) {
-                GateDecision::Busy { operation } => operation,
-                GateDecision::Granted => unreachable!(),
-            },
-        ) {
+        return match gate_decision(false, held_operation(&path)) {
             GateDecision::Busy { operation } => Err(GateError::Busy {
                 identifier: identifier.to_string(),
                 operation,

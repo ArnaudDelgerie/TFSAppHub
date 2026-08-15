@@ -353,7 +353,7 @@ use std::io::{Seek, SeekFrom, Write};
 use crate::{
     app_env,
     cli::{EXIT_FAILED, EXIT_OK},
-    open,
+    lifecycle_gate, open,
     paths::Paths,
     php,
 };
@@ -411,6 +411,13 @@ pub fn stop(id: &str) -> i32 {
     }
 
     let identifier = &spec.identity.identifier;
+    let _activity = match lifecycle_gate::acquire_activity(&paths, identifier) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
     let data_dir = match paths.create_app_data_dir(identifier) {
         Ok(data_dir) => data_dir,
         Err(error) => {
@@ -482,6 +489,15 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
     };
 
     let identifier = spec.identity.identifier.clone();
+    // This covers all foreground forms, including one `--replace` stop/start
+    // transition. Its retained handle lives through `child.wait()` below.
+    let _activity = match lifecycle_gate::acquire_activity(&paths, &identifier) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
     let data_dir = match paths.create_app_data_dir(&identifier) {
         Ok(data_dir) => data_dir,
         Err(error) => {
