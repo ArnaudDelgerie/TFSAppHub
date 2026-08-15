@@ -342,6 +342,17 @@ pub fn lock_path(pid_file: &Path) -> PathBuf {
 /// the lock must be held, it releases on drop. `Ok(None)` means another live
 /// process already holds it.
 pub fn try_lock_file(path: &Path) -> std::io::Result<Option<File>> {
+    try_lock_file_with_mode(path, libc::LOCK_EX)
+}
+
+/// Try to take a non-blocking shared lock on `path` (created if missing).
+/// The returned handle retains the lock until it is dropped. Shared holders
+/// may coexist, but an exclusive holder excludes both kinds of acquisition.
+pub fn try_lock_file_shared(path: &Path) -> std::io::Result<Option<File>> {
+    try_lock_file_with_mode(path, libc::LOCK_SH)
+}
+
+fn try_lock_file_with_mode(path: &Path, mode: libc::c_int) -> std::io::Result<Option<File>> {
     // This handle only ever holds an flock; it never reads or writes the
     // file's bytes, so truncating on open is neither meaningful nor harmful.
     let file = OpenOptions::new()
@@ -349,7 +360,7 @@ pub fn try_lock_file(path: &Path) -> std::io::Result<Option<File>> {
         .write(true)
         .truncate(false)
         .open(path)?;
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let result = unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) };
     if result == 0 {
         Ok(Some(file))
     } else {

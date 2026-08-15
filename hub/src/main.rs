@@ -20,6 +20,7 @@ mod identity;
 mod install;
 mod launch;
 mod lifecycle;
+mod lifecycle_gate;
 mod list;
 mod manifest;
 mod open;
