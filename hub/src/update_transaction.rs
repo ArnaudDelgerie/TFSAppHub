@@ -11,7 +11,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::registry::RegistryEntry;
+use crate::{lifecycle, registry::RegistryEntry};
 
 pub const FORMAT_VERSION: u32 = 1;
 const JOURNAL_FILE: &str = "update-transaction.json";
@@ -155,4 +155,96 @@ pub fn read(data_dir: &Path) -> Result<Option<Journal>, JournalError> {
             path,
             detail: error.to_string(),
         })
+}
+
+pub fn snapshot_db(data_subdir: &Path, data_dir: &Path) -> io::Result<()> {
+    let staging = staging_dir(data_dir);
+    fs::create_dir_all(&staging)?;
+    for name in lifecycle::DB_FILE_NAMES {
+        let source = data_subdir.join(name);
+        let target = staged_db_path(data_dir, name);
+        if source.is_file() {
+            fs::copy(source, target)?;
+        } else {
+            let _ = fs::remove_file(target);
+        }
+    }
+    fs::File::open(staging)?.sync_all()
+}
+
+pub fn retain_tree(app_dir: &Path) -> io::Result<()> {
+    let staged = staged_tree_path(app_dir);
+    let _ = fs::remove_dir_all(&staged);
+    fs::rename(app_dir, staged)?;
+    fs::File::open(app_dir.parent().expect("an app dir has a parent"))?.sync_all()
+}
+
+pub fn finalise_anchor(
+    data_subdir: &Path,
+    data_dir: &Path,
+    app_dir: &Path,
+    entry: &RegistryEntry,
+) -> io::Result<()> {
+    lifecycle::discard_db_snapshot(data_subdir);
+    lifecycle::discard_rollback_anchor(data_subdir);
+    let previous = lifecycle::previous_tree_path(app_dir);
+    let _ = fs::remove_dir_all(&previous);
+    fs::rename(staged_tree_path(app_dir), &previous)?;
+    for name in lifecycle::DB_FILE_NAMES {
+        let staged = staged_db_path(data_dir, name);
+        let public = lifecycle::db_snapshot_path(data_subdir, name);
+        if staged.is_file() {
+            fs::rename(staged, public)?;
+        }
+    }
+    lifecycle::write_rollback_anchor(
+        data_subdir,
+        &lifecycle::RollbackAnchor {
+            app_version: entry.app_version.clone(),
+            source_revision: entry.source_revision.clone(),
+            created_at: crate::registry::now_timestamp(),
+        },
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    fs::File::open(data_subdir)?.sync_all()?;
+    fs::File::open(app_dir.parent().expect("an app dir has a parent"))?.sync_all()
+}
+
+pub fn discard(data_dir: &Path) -> io::Result<()> {
+    let journal = journal_path(data_dir);
+    let _ = fs::remove_file(journal);
+    let staging = staging_dir(data_dir);
+    let _ = fs::remove_dir_all(staging);
+    fs::File::open(data_dir)?.sync_all()
+}
+
+pub fn discard_tree(app_dir: &Path) -> io::Result<()> {
+    let _ = fs::remove_dir_all(staged_tree_path(app_dir));
+    fs::File::open(app_dir.parent().expect("an app dir has a parent"))?.sync_all()
+}
+
+pub fn restore_outgoing(
+    data_subdir: &Path,
+    data_dir: &Path,
+    app_dir: &Path,
+    version: &str,
+) -> io::Result<()> {
+    for name in lifecycle::DB_FILE_NAMES {
+        let staged = staged_db_path(data_dir, name);
+        let live = data_subdir.join(name);
+        if staged.is_file() {
+            fs::copy(staged, live)?;
+        } else {
+            let _ = fs::remove_file(live);
+        }
+    }
+    let _ = fs::remove_dir_all(app_dir);
+    let staged_tree = staged_tree_path(app_dir);
+    if staged_tree.is_dir() {
+        fs::rename(staged_tree, app_dir)?;
+    }
+    let _ = lifecycle::discard_cache_stamp(data_subdir);
+    lifecycle::write_data_version(data_subdir, version)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    discard(data_dir)
 }

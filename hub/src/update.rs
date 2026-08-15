@@ -36,6 +36,7 @@ use crate::{
     registry::{self, RegistryEntry, RegistryError, Source, SourceKind},
     release,
     source::{self, Origin, SourceError},
+    update_transaction::{self, Journal, Phase, TransactionKind},
 };
 
 /// What `update <id>` does, decided from the registry's recorded `app_version`
@@ -128,6 +129,7 @@ pub fn update_decision(
 /// not a copy pass over it. A leftover `.previous` from an interrupted
 /// earlier update is replaced rather than appended to — there is only ever
 /// one generation to roll back to.
+#[allow(dead_code)] // Kept for the focused legacy-anchor tests during the protocol migration.
 pub fn retain_tree(app_dir: &Path) -> io::Result<()> {
     let previous = lifecycle::previous_tree_path(app_dir);
     if previous.is_dir() {
@@ -154,6 +156,7 @@ pub fn discard_tree(app_dir: &Path) {
 /// The temporary sibling used while a forced equal-version resync replaces an
 /// app tree. It is deliberately not the `.previous` rollback anchor: a resync
 /// must leave that anchor alone.
+#[allow(dead_code)]
 fn resync_aside_path(app_dir: &Path) -> PathBuf {
     let mut aside = app_dir.as_os_str().to_os_string();
     aside.push(".resync-aside");
@@ -163,6 +166,7 @@ fn resync_aside_path(app_dir: &Path) -> PathBuf {
 /// Move the current tree aside, copy its replacement, and put the current
 /// tree back if the copy fails. A stale aside can only be from an interrupted
 /// earlier resync, so the next resync clears it before creating its own.
+#[allow(dead_code)]
 fn resync_snapshot(source_root: &Path, app_dir: &Path) -> Result<(), UpdateError> {
     let aside = resync_aside_path(app_dir);
     remove_dir_if_present(&aside).map_err(|source| UpdateError::Io {
@@ -176,7 +180,10 @@ fn resync_snapshot(source_root: &Path, app_dir: &Path) -> Result<(), UpdateError
 
     if let Err(error) = install::snapshot(source_root, app_dir) {
         restore_resync_tree(app_dir)?;
-        return Err(UpdateError::Install(error));
+        return Err(UpdateError::Reverted {
+            detail: error.to_string(),
+            outcome: RevertOutcome::default(),
+        });
     }
 
     Ok(())
@@ -184,6 +191,7 @@ fn resync_snapshot(source_root: &Path, app_dir: &Path) -> Result<(), UpdateError
 
 /// Discard the newly copied tree and restore the pre-resync one. This is the
 /// undo for [`resync_snapshot`] when Composer cannot finish the replacement.
+#[allow(dead_code)]
 fn restore_resync_tree(app_dir: &Path) -> Result<(), UpdateError> {
     remove_dir_if_present(app_dir).map_err(|source| UpdateError::Io {
         path: app_dir.to_path_buf(),
@@ -196,6 +204,7 @@ fn restore_resync_tree(app_dir: &Path) -> Result<(), UpdateError> {
     })
 }
 
+#[allow(dead_code)]
 fn discard_resync_aside(app_dir: &Path) -> Result<(), UpdateError> {
     let aside = resync_aside_path(app_dir);
     remove_dir_if_present(&aside).map_err(|source| UpdateError::Io {
@@ -426,41 +435,36 @@ fn apply(
     hub_version: &str,
 ) -> Result<(), UpdateError> {
     let data_subdir = data_dir.join("data");
+    let mut transaction = Journal::prepared(TransactionKind::Apply, entry.clone());
+    update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
 
-    lifecycle::snapshot_db(&data_subdir).map_err(|source| UpdateError::Io {
+    update_transaction::snapshot_db(&data_subdir, data_dir).map_err(|source| UpdateError::Io {
         path: data_subdir.clone(),
         source,
     })?;
-    retain_tree(app_dir).map_err(|source| UpdateError::Io {
+    transaction.advance(Phase::SnapshotComplete);
+    update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
+    update_transaction::retain_tree(app_dir).map_err(|source| UpdateError::Io {
         path: app_dir.to_path_buf(),
         source,
     })?;
-
-    // The three anchor halves describe the same outgoing installation. Write
-    // the registry half before the first operation that can leave the other
-    // two behind, so an interruption never creates a mismatched anchor.
-    if let Err(error) = lifecycle::write_rollback_anchor(
-        &data_subdir,
-        &lifecycle::RollbackAnchor {
-            app_version: entry.app_version.clone(),
-            source_revision: entry.source_revision.clone(),
-            created_at: registry::now_timestamp(),
-        },
-    ) {
-        let outcome = revert(&data_subdir, app_dir, &entry.app_version);
-        return Err(UpdateError::Reverted {
-            detail: error.to_string(),
-            outcome,
-        });
-    }
+    transaction.advance(Phase::TreeRetained);
+    update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
 
     if let Err(error) = install::snapshot(&resolved.root, app_dir) {
-        let outcome = revert(&data_subdir, app_dir, &entry.app_version);
+        let _ = update_transaction::restore_outgoing(
+            &data_subdir,
+            data_dir,
+            app_dir,
+            &entry.app_version,
+        );
         return Err(UpdateError::Reverted {
             detail: error.to_string(),
-            outcome,
+            outcome: RevertOutcome::default(),
         });
     }
+    transaction.advance(Phase::ReplacementInstalled);
+    update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
 
     // The update commands are about to boot a container compiled from the
     // code that is no longer there — best-effort, matching `app_env`'s own
@@ -477,12 +481,19 @@ fn apply(
         LifecycleEvent::Update,
         &platform,
     ) {
-        let outcome = revert(&data_subdir, app_dir, &entry.app_version);
+        let _ = update_transaction::restore_outgoing(
+            &data_subdir,
+            data_dir,
+            app_dir,
+            &entry.app_version,
+        );
         return Err(UpdateError::Reverted {
             detail: error.to_string(),
-            outcome,
+            outcome: RevertOutcome::default(),
         });
     }
+    transaction.advance(Phase::LifecycleComplete);
+    update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
 
     // The event's success point already ran inside `prepare`; the complete
     // anchor already records the outgoing entry. Commit the registry entry,
@@ -504,16 +515,45 @@ fn apply(
             existing.updated_at = now;
         }
     }) {
-        let outcome = revert(&data_subdir, app_dir, &entry.app_version);
+        let _ = update_transaction::restore_outgoing(
+            &data_subdir,
+            data_dir,
+            app_dir,
+            &entry.app_version,
+        );
         return Err(UpdateError::Reverted {
             detail: error.to_string(),
-            outcome,
+            outcome: RevertOutcome::default(),
         });
     }
+    transaction.advance(Phase::RegistryCommitted);
+    update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
+    update_transaction::finalise_anchor(&data_subdir, data_dir, app_dir, entry).map_err(
+        |source| UpdateError::Io {
+            path: data_dir.to_path_buf(),
+            source,
+        },
+    )?;
+    transaction.advance(Phase::AnchorFinalised);
+    update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
+    update_transaction::discard(data_dir).map_err(|source| UpdateError::Io {
+        path: data_dir.to_path_buf(),
+        source,
+    })?;
 
     install::write_desktop_entry(paths, id, manifest, app_dir);
     println!("Updated {id} to {}.", manifest.app_version);
     Ok(())
+}
+
+fn transaction_error(error: update_transaction::JournalError) -> UpdateError {
+    match error {
+        update_transaction::JournalError::Io { path, source } => UpdateError::Io { path, source },
+        other => UpdateError::Io {
+            path: PathBuf::from("update transaction"),
+            source: io::Error::other(other.to_string()),
+        },
+    }
 }
 
 #[derive(Debug, Default)]
@@ -528,6 +568,7 @@ struct RevertFailure {
     detail: String,
 }
 
+#[allow(dead_code)]
 impl RevertOutcome {
     fn record(&mut self, step: &'static str, path: PathBuf, result: io::Result<()>) {
         if let Err(error) = result {
@@ -548,6 +589,7 @@ impl RevertOutcome {
 /// caller to report. A failed restore must not hide the attempts that follow:
 /// the user needs the full on-disk state before deciding whether to free disk
 /// space and retry `update` or use `rollback`.
+#[allow(dead_code)]
 fn revert(data_subdir: &Path, app_dir: &Path, outgoing_version: &str) -> RevertOutcome {
     let mut outcome = RevertOutcome::default();
     outcome.record(
@@ -593,6 +635,7 @@ fn revert(data_subdir: &Path, app_dir: &Path, outgoing_version: &str) -> RevertO
     outcome
 }
 
+#[allow(dead_code)]
 fn remove_dir_if_present(path: &Path) -> io::Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
@@ -601,6 +644,7 @@ fn remove_dir_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
+#[allow(dead_code)]
 fn remove_file_if_present(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -609,6 +653,7 @@ fn remove_file_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
+#[allow(dead_code)]
 fn lifecycle_error_io(error: LifecycleError) -> io::Error {
     io::Error::other(error.to_string())
 }
@@ -626,13 +671,20 @@ fn resync_only(
     resolved: &source::Resolved,
     app_dir: &Path,
 ) -> Result<(), UpdateError> {
-    // Never through `retain_tree`/`lifecycle::previous_tree_path`: that name
-    // is the rollback anchor's, and a resync must not rotate it (the plan's
-    // decision table). Its own aside is a rename, not deletion: a bad source
-    // copy must leave the serving tree usable.
-    resync_snapshot(&resolved.root, app_dir)?;
-
     let state_root = paths.create_app_data_dir(&entry.identifier)?;
+    let mut transaction = Journal::prepared(TransactionKind::ResyncOnly, entry.clone());
+    update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
+    // A resync uses the transaction sibling, never `.previous`: its existing
+    // public rollback anchor remains untouched until this attempt is known good.
+    update_transaction::retain_tree(app_dir).map_err(|source| UpdateError::Io {
+        path: app_dir.to_path_buf(),
+        source,
+    })?;
+    transaction.advance(Phase::TreeRetained);
+    update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
+    install::snapshot(&resolved.root, app_dir)?;
+    transaction.advance(Phase::ReplacementInstalled);
+    update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
     let environment = app_env::resolve(
         manifest,
         app_dir,
@@ -641,7 +693,12 @@ fn resync_only(
         app_env::Mode::Install,
     )?;
     if let Err(error) = toolchain.composer_install(app_dir, &environment.vars) {
-        restore_resync_tree(app_dir)?;
+        let _ = update_transaction::restore_outgoing(
+            &state_root.join("data"),
+            &state_root,
+            app_dir,
+            &entry.app_version,
+        );
         return Err(UpdateError::Php(error));
     }
 
@@ -650,14 +707,17 @@ fn resync_only(
     // launch reuse a container compiled from the tree just moved aside.
     let data_subdir = state_root.join("data");
     if let Err(error) = lifecycle::discard_cache_stamp(&data_subdir) {
-        restore_resync_tree(app_dir)?;
+        let _ = update_transaction::restore_outgoing(
+            &data_subdir,
+            &state_root,
+            app_dir,
+            &entry.app_version,
+        );
         return Err(UpdateError::Io {
             path: lifecycle::cache_stamp_path(&data_subdir),
             source: error,
         });
     }
-
-    discard_resync_aside(app_dir)?;
 
     let now = registry::now_timestamp();
     // Do not restore the aside if this write fails: the new tree and its
@@ -672,6 +732,18 @@ fn resync_only(
             existing.source = resolved.source.clone();
             existing.updated_at = now;
         }
+    })?;
+    transaction.advance(Phase::RegistryCommitted);
+    update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
+    update_transaction::discard_tree(app_dir).map_err(|source| UpdateError::Io {
+        path: app_dir.to_path_buf(),
+        source,
+    })?;
+    transaction.advance(Phase::AnchorFinalised);
+    update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
+    update_transaction::discard(&state_root).map_err(|source| UpdateError::Io {
+        path: state_root.clone(),
+        source,
     })?;
 
     println!("Resynced {} from {}.", entry.id, resolved.root.display());
@@ -723,6 +795,7 @@ pub enum UpdateError {
     },
     /// A failure from the tree swap onwards: the original error, with the
     /// installation already put back to what it was.
+    #[allow(dead_code)]
     Reverted {
         detail: String,
         outcome: RevertOutcome,
