@@ -1,27 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run the workspace's `cargo test` inside a private D-Bus session backed by an
-# ephemeral gnome-keyring-daemon, so the suite never touches the developer's
-# real login keyring. Its repository-owned bus configuration has no activation
-# service directories: the daemon below is the sole explicit Secret Service
-# provider, and the wrapper verifies its PID before Cargo can use it. The
-# keyring-backed modules arrive with plan 007 and some of their tests
-# deliberately exercise a *real* Secret Service; this wrapper is what gives
-# them one to talk to without any risk to the host. It is in place from plan
-# 001 on purpose — a test that reaches the login keyring once has already done
-# the damage, so the isolation must never be the thing added afterwards.
+# Run the explicit production-keyring smoke test inside a private D-Bus session
+# backed by an ephemeral gnome-keyring-daemon, so it never touches the
+# developer's real login keyring. Its repository-owned bus configuration has
+# no activation service directories: the daemon below is the sole explicit
+# Secret Service provider, and the wrapper verifies its PID before Cargo can
+# use it.
 #
-# All arguments are passed through to `cargo test`, so e.g.
-# `build/scripts/run-tests.sh --test keyring_health` still works.
+# All arguments are passed through to `cargo test`; Make supplies the one
+# ignored production-backend test that this harness exists to run.
 
 if ! command -v dbus-run-session >/dev/null; then
-  echo "run-tests.sh: 'dbus-run-session' not found on PATH — install 'dbus' (see README Prerequisites). It stands up the private bus the ephemeral Secret Service answers on for the tests; it is not a runtime dependency of the packaged app." >&2
+  echo "make keyring-integration: 'dbus-run-session' not found on PATH — install 'dbus' (see README Prerequisites). It stands up the private bus the ephemeral Secret Service answers on for this check; it is not a runtime dependency of the packaged app." >&2
   exit 1
 fi
 
 if ! command -v gnome-keyring-daemon >/dev/null; then
-  echo "run-tests.sh: 'gnome-keyring-daemon' not found on PATH — install 'gnome-keyring' (see README Prerequisites). It provides an ephemeral, throwaway Secret Service for the tests to run against; it is not a runtime dependency of the packaged app and is unrelated to the GNOME desktop." >&2
+  echo "make keyring-integration: 'gnome-keyring-daemon' not found on PATH — install 'gnome-keyring' (see README Prerequisites). It provides an ephemeral, throwaway Secret Service for this check; it is not a runtime dependency of the packaged app and is unrelated to the GNOME desktop." >&2
   exit 1
 fi
 
@@ -155,6 +151,24 @@ cd "$ROOT_DIR"
 dbus-run-session --config-file="$DBUS_CONFIG_FILE" -- bash -c '
   set -euo pipefail
 
+  startup_failure() {
+    echo "run-tests.sh: Secret Service startup failed: $1" >&2
+    exit 1
+  }
+
+  # `unix:runtime=yes` must resolve to the wrapper-owned directory, never to
+  # a socket in /tmp or on the developer session. Validate the listener before
+  # starting the provider, then expose it on request for external cleanup
+  # assertions.
+  bus_socket="${DBUS_SESSION_BUS_ADDRESS#unix:path=}"
+  bus_socket="${bus_socket%%,*}"
+  if [ -z "$bus_socket" ] || [[ "$bus_socket" != "$XDG_RUNTIME_DIR/"* ]] || [ ! -S "$bus_socket" ]; then
+    startup_failure "private D-Bus socket is not a socket below XDG_RUNTIME_DIR: ${DBUS_SESSION_BUS_ADDRESS:-unset}"
+  fi
+  if [ "${RUN_TESTS_RECORD_PATHS:-}" = "1" ]; then
+    echo "run-tests.sh: Secret Service bus: socket=$bus_socket" >&2
+  fi
+
   gnome-keyring-daemon --foreground --unlock --components=secrets <<< "" &
   daemon_pid=$!
 
@@ -163,11 +177,6 @@ dbus-run-session --config-file="$DBUS_CONFIG_FILE" -- bash -c '
     wait "$daemon_pid" 2>/dev/null || true
   }
   trap cleanup_daemon EXIT
-
-  startup_failure() {
-    echo "run-tests.sh: Secret Service startup failed: $1" >&2
-    exit 1
-  }
 
   waited=0
   while :; do

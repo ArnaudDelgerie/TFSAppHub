@@ -95,7 +95,7 @@ for building it.
   - **`gnome-keyring`** (the `gnome-keyring-daemon` binary) and **`dbus`**
     (`dbus-run-session`) — **test-only**, needed only for the explicit
     production-backend integration check. `make check` needs neither one and
-    never contacts a Secret Service. That integration check starts an
+    never contacts a Secret Service. `make keyring-integration` starts an
     *ephemeral*, throwaway provider, never your real login keyring. Neither is
     the GNOME desktop, and neither is a runtime dependency of the packaged hub.
 - **Or, a second door onto the exact same build: only Docker.**

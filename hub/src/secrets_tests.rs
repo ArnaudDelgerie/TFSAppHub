@@ -3,9 +3,9 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 use super::{
-    keys_for_window, new_fake_keyring_store, new_file_store_for_test, resolve_app_secret,
-    secret_key_allowed, secrets_delete, secrets_get, secrets_has, secrets_set, store_for_window,
-    APP_SECRET_ACCOUNT, PROBE_ACCOUNT,
+    is_keyring, keys_for_window, new_fake_keyring_store, new_file_store_for_test, new_store,
+    resolve_app_secret, secret_key_allowed, secrets_delete, secrets_get, secrets_has, secrets_set,
+    store_for_window, APP_SECRET_ACCOUNT, PROBE_ACCOUNT,
 };
 
 fn file_store(directory: &Path) -> super::SecretStore {
@@ -54,6 +54,30 @@ fn an_unreadable_store_file_reads_as_empty_rather_than_panicking() {
     fs::write(directory.path().join("secrets.json"), "{ not json").expect("a broken store");
 
     assert!(!secrets_has(&file_store(directory.path()), "openai"));
+}
+
+// --- the explicit production backend smoke test -------------------------
+
+#[test]
+#[ignore = "requires the private Secret Service from make keyring-integration"]
+fn production_keyring_round_trip() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let service = format!("test.tfsapp-hub.keyring-integration.{}", std::process::id());
+    let store = new_store(&service, directory.path());
+
+    assert!(
+        is_keyring(&store),
+        "the production store fell back to a file backend; make keyring-integration requires its private Secret Service"
+    );
+    assert_eq!(secrets_get(&store, "round-trip"), None);
+
+    secrets_set(&store, "round-trip", "ephemeral-value".to_string());
+    assert_eq!(
+        secrets_get(&store, "round-trip"),
+        Some("ephemeral-value".to_string())
+    );
+    assert!(secrets_delete(&store, "round-trip"));
+    assert_eq!(secrets_get(&store, "round-trip"), None);
 }
 
 // --- the key manifest ----------------------------------------------------

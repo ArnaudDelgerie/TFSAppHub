@@ -5,7 +5,7 @@
 #   make resources
 #   make check
 
-.PHONY: resources sidecar composer check build release
+.PHONY: resources sidecar composer check keyring-integration build release
 
 # Everything the hub ships that is not built from source. Both halves are
 # runtime prerequisites, not packaging ones: the hub installs and runs every
@@ -40,6 +40,12 @@ check:
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo test
 	shellcheck build/scripts/*.sh
+
+# The deliberately explicit production-backend smoke check. It alone starts
+# the repository-owned private D-Bus session and throwaway Secret Service; the
+# ordinary `check` target must never invoke this harness.
+keyring-integration:
+	build/scripts/run-tests.sh -p tfsapp-hub secrets::tests::production_keyring_round_trip -- --ignored --exact
 
 # The hub's own TFSAppHub_<version>_amd64.AppImage under
 # target/release/bundle/appimage/ (the workspace's shared target/, not
