@@ -112,6 +112,107 @@ fn failed_recovery_keeps_its_journal_for_a_later_retry() {
 }
 
 #[test]
+fn recovery_obeys_each_durable_phase_without_guessing() {
+    // These fixtures are the deterministic equivalent of stopping the process
+    // immediately after each journal write.  They deliberately construct only
+    // state the recorded phase permits recovery to undo.
+    for phase in [
+        Phase::Prepared,
+        Phase::SnapshotComplete,
+        Phase::TreeRetained,
+        Phase::ReplacementInstalled,
+        Phase::LifecycleComplete,
+        Phase::RegistryCommitted,
+        Phase::AnchorFinalised,
+    ] {
+        let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+        let mut journal = Journal::prepared(TransactionKind::Apply, entry.clone());
+
+        if phase != Phase::Prepared {
+            journal.database_members = snapshot_db(&data_dir.join("data"), &data_dir).unwrap();
+        }
+        if matches!(
+            phase,
+            Phase::SnapshotComplete
+                | Phase::TreeRetained
+                | Phase::ReplacementInstalled
+                | Phase::LifecycleComplete
+                | Phase::RegistryCommitted
+                | Phase::AnchorFinalised
+        ) {
+            journal.advance(Phase::SnapshotComplete);
+        }
+        if matches!(
+            phase,
+            Phase::TreeRetained
+                | Phase::ReplacementInstalled
+                | Phase::LifecycleComplete
+                | Phase::RegistryCommitted
+                | Phase::AnchorFinalised
+        ) {
+            retain_tree(&app_dir).unwrap();
+            fs::create_dir_all(app_dir.join("public")).unwrap();
+            fs::write(app_dir.join("public/version"), "new").unwrap();
+            journal.advance(Phase::TreeRetained);
+        }
+        if matches!(
+            phase,
+            Phase::ReplacementInstalled
+                | Phase::LifecycleComplete
+                | Phase::RegistryCommitted
+                | Phase::AnchorFinalised
+        ) {
+            journal.advance(Phase::ReplacementInstalled);
+        }
+        if matches!(
+            phase,
+            Phase::LifecycleComplete | Phase::RegistryCommitted | Phase::AnchorFinalised
+        ) {
+            fs::write(data_dir.join("data/app.db"), "new-db").unwrap();
+            lifecycle::write_data_version(&data_dir.join("data"), "0.7.0").unwrap();
+            journal.advance(Phase::LifecycleComplete);
+        }
+        if matches!(phase, Phase::RegistryCommitted | Phase::AnchorFinalised) {
+            registry::update(&paths, |registry| {
+                registry.get_mut("demo").unwrap().app_version = "0.7.0".into();
+            })
+            .unwrap();
+            journal.advance(Phase::RegistryCommitted);
+        }
+        if phase == Phase::AnchorFinalised {
+            journal.advance(Phase::AnchorFinalised);
+        }
+        write(&data_dir, &journal).unwrap();
+
+        let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+        assert!(outcome.is_complete(), "{phase:?}: {outcome:?}");
+        assert!(read(&data_dir).unwrap().is_none(), "{phase:?}");
+        if phase == Phase::AnchorFinalised {
+            assert_eq!(
+                fs::read_to_string(app_dir.join("public/version")).unwrap(),
+                "new"
+            );
+        } else if matches!(
+            phase,
+            Phase::TreeRetained
+                | Phase::ReplacementInstalled
+                | Phase::LifecycleComplete
+                | Phase::RegistryCommitted
+        ) {
+            assert_eq!(
+                fs::read_to_string(app_dir.join("public/version")).unwrap(),
+                "old"
+            );
+        }
+        assert_eq!(
+            registry::load(&paths).unwrap().get("demo").unwrap(),
+            &entry,
+            "{phase:?}"
+        );
+    }
+}
+
+#[test]
 fn journal_round_trip_tolerates_unknown_fields() {
     let dir = tempfile::tempdir().unwrap();
     let mut journal = Journal::prepared(TransactionKind::Apply, entry());
