@@ -116,7 +116,16 @@ pub fn acquire_activity(paths: &Paths, identifier: &str) -> Result<ActivityLease
         path: path.clone(),
         source,
     })? {
-        Some(file) => Ok(ActivityLease { _file: file }),
+        Some(file) => {
+            // A completed maintenance command leaves advisory text behind
+            // until the next exclusive owner overwrites it. Once activity
+            // holds this shared flock, that text cannot describe the current
+            // owner, so clear it before a later maintenance contender reads
+            // a stale operation name.
+            file.set_len(0)
+                .map_err(|source| GateError::Io { path, source })?;
+            Ok(ActivityLease { _file: file })
+        }
         None => match gate_decision(false, held_operation(&path)) {
             GateDecision::Busy { operation } => Err(GateError::Busy {
                 identifier: identifier.to_string(),
@@ -203,6 +212,22 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "old update").unwrap();
         assert!(acquire_maintenance(&paths, "dev.local.demo", "update").is_ok());
+    }
+
+    #[test]
+    fn an_activity_holder_clears_an_old_maintenance_record() {
+        let base = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted_at(base.path());
+        drop(acquire_maintenance(&paths, "dev.local.demo", "export").unwrap());
+        let _activity = acquire_activity(&paths, "dev.local.demo").unwrap();
+
+        assert!(matches!(
+            acquire_maintenance(&paths, "dev.local.demo", "import"),
+            Err(GateError::Busy {
+                operation: None,
+                ..
+            })
+        ));
     }
 
     #[test]
