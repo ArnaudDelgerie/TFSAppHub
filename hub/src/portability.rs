@@ -34,6 +34,7 @@ use crate::{
     cli::{EXIT_FAILED, EXIT_OK},
     install::{self, InstallError},
     lifecycle::{self, LifecycleEvent},
+    lifecycle_gate::{self, GateError},
     manifest::{self, ManifestError},
     paths::{Paths, PathsError},
     php::{self, PhpError},
@@ -197,6 +198,12 @@ pub fn export(id: &str, path: &str) -> i32 {
 /// Takes its `Paths` rather than resolving them, matching every other
 /// command's pipeline — what lets it run against a throwaway root in a test.
 fn run_export(paths: &Paths, id: &str, target: &Path) -> Result<(), PortabilityError> {
+    let installed = registry::load(paths)?;
+    let entry = installed
+        .get(id)
+        .ok_or_else(|| PortabilityError::NotInstalled { id: id.to_string() })?
+        .clone();
+    let _maintenance = lifecycle_gate::acquire_maintenance(paths, &entry.identifier, "export")?;
     let installed = registry::load(paths)?;
     let entry = installed
         .get(id)
@@ -399,6 +406,13 @@ fn run_import(
     force: bool,
     assume_yes: bool,
 ) -> Result<bool, PortabilityError> {
+    let installed = registry::load(paths)?;
+    let entry = installed
+        .get(id)
+        .ok_or_else(|| PortabilityError::NotInstalled { id: id.to_string() })?
+        .clone();
+
+    let _maintenance = lifecycle_gate::acquire_maintenance(paths, &entry.identifier, "import")?;
     let installed = registry::load(paths)?;
     let entry = installed
         .get(id)
@@ -714,6 +728,7 @@ pub enum PortabilityError {
     Paths(PathsError),
     Registry(RegistryError),
     Lifecycle(lifecycle::LifecycleError),
+    Gate(GateError),
     /// Reloading the installed manifest, or running its `pre-update`/
     /// `post-update` commands, to migrate an older archive forward.
     Install(InstallError),
@@ -770,6 +785,7 @@ impl fmt::Display for PortabilityError {
             Self::Paths(error) => write!(formatter, "{error}"),
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Lifecycle(error) => write!(formatter, "{error}"),
+            Self::Gate(error) => write!(formatter, "{error}"),
             Self::Install(error) => write!(formatter, "{error}"),
             Self::Manifest(error) => write!(formatter, "{error}"),
             Self::Php(error) => write!(formatter, "{error}"),
@@ -860,6 +876,7 @@ impl std::error::Error for PortabilityError {
             Self::Paths(error) => Some(error),
             Self::Registry(error) => Some(error),
             Self::Lifecycle(error) => Some(error),
+            Self::Gate(error) => Some(error),
             Self::Install(error) => Some(error),
             Self::Manifest(error) => Some(error),
             Self::Php(error) => Some(error),
@@ -884,6 +901,12 @@ impl From<RegistryError> for PortabilityError {
 impl From<lifecycle::LifecycleError> for PortabilityError {
     fn from(error: lifecycle::LifecycleError) -> Self {
         Self::Lifecycle(error)
+    }
+}
+
+impl From<GateError> for PortabilityError {
+    fn from(error: GateError) -> Self {
+        Self::Gate(error)
     }
 }
 

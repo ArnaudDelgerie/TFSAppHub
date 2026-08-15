@@ -1,6 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     os::unix::{
+        fs::OpenOptionsExt,
         io::{AsRawFd, RawFd},
         process::CommandExt,
     },
@@ -359,6 +360,10 @@ fn try_lock_file_with_mode(path: &Path, mode: libc::c_int) -> std::io::Result<Op
         .create(true)
         .write(true)
         .truncate(false)
+        // A retained lifecycle gate belongs to the hub process. Composer,
+        // hooks and run aliases must never keep it alive merely by inheriting
+        // an otherwise-unused descriptor across exec.
+        .custom_flags(libc::O_CLOEXEC)
         .open(path)?;
     let result = unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) };
     if result == 0 {

@@ -27,6 +27,7 @@ use crate::{
     cli::{EXIT_FAILED, EXIT_OK},
     install::{self, InstallError},
     lifecycle::{self, LifecycleDecisionError, LifecycleError, LifecycleEvent},
+    lifecycle_gate::{self, GateError},
     manifest::Manifest,
     paths::{Paths, PathsError},
     php::{self, PhpError},
@@ -283,6 +284,18 @@ fn update_into(
     assume_yes: bool,
     hub_version: &str,
 ) -> Result<bool, UpdateError> {
+    // The first lookup only discovers the stable identifier needed to name
+    // its gate. No mutable premise from it is trusted after the lease.
+    let installed = registry::load(paths)?;
+    let entry = installed
+        .get(id)
+        .ok_or_else(|| UpdateError::NotInstalled { id: id.to_string() })?
+        .clone();
+
+    let _maintenance = lifecycle_gate::acquire_maintenance(paths, &entry.identifier, "update")?;
+
+    // Another command could have completed between the discovery above and
+    // our acquisition. Re-read every stateful input while owning the gate.
     let installed = registry::load(paths)?;
     let entry = installed
         .get(id)
@@ -677,6 +690,7 @@ pub enum UpdateError {
     Php(PhpError),
     Platform(PlatformError),
     Lifecycle(LifecycleError),
+    Gate(GateError),
     Io {
         path: PathBuf,
         source: io::Error,
@@ -747,6 +761,7 @@ impl fmt::Display for UpdateError {
             Self::Php(error) => write!(formatter, "{error}"),
             Self::Platform(error) => write!(formatter, "{error}"),
             Self::Lifecycle(error) => write!(formatter, "{error}"),
+            Self::Gate(error) => write!(formatter, "{error}"),
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::NotInstalled { id } => write!(
                 formatter,
@@ -815,6 +830,7 @@ impl std::error::Error for UpdateError {
             Self::Php(error) => Some(error),
             Self::Platform(error) => Some(error),
             Self::Lifecycle(error) => Some(error),
+            Self::Gate(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -866,6 +882,12 @@ impl From<PlatformError> for UpdateError {
 impl From<LifecycleError> for UpdateError {
     fn from(error: LifecycleError) -> Self {
         Self::Lifecycle(error)
+    }
+}
+
+impl From<GateError> for UpdateError {
+    fn from(error: GateError) -> Self {
+        Self::Gate(error)
     }
 }
 

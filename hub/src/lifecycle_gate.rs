@@ -66,7 +66,6 @@ pub struct ActivityLease {
 /// A retained maintenance lease. The record is written only after exclusivity
 /// is acquired, so contenders can name this operation without trusting it for
 /// ownership.
-#[allow(dead_code)] // Maintenance callers arrive in plan 040 step 3.
 pub struct MaintenanceLease {
     _file: std::fs::File,
 }
@@ -128,7 +127,6 @@ pub fn acquire_activity(paths: &Paths, identifier: &str) -> Result<ActivityLease
     }
 }
 
-#[allow(dead_code)] // Maintenance callers arrive in plan 040 step 3.
 pub fn acquire_maintenance(
     paths: &Paths,
     identifier: &str,

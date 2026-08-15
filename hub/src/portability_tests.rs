@@ -5,7 +5,7 @@ use super::{
     ImportRefusal, Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE,
 };
 use crate::{
-    install, lifecycle,
+    install, lifecycle, lifecycle_gate,
     paths::Paths,
     registry::{self, Platform, RegistryEntry, Source, SourceKind, State},
 };
@@ -235,6 +235,22 @@ fn exporting_an_unregistered_id_refuses() {
         matches!(error, PortabilityError::NotInstalled { .. }),
         "{error}"
     );
+}
+
+#[test]
+fn a_held_maintenance_lease_refuses_export_before_it_creates_the_archive() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let target = base.path().join("backup.tar.gz");
+    let _held = lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "update")
+        .expect("the first maintenance command owns the gate");
+
+    let error = run_export(&paths, "demo", &target)
+        .expect_err("export must not overlap another maintenance command");
+
+    assert!(matches!(error, PortabilityError::Gate(_)), "{error}");
+    assert!(error.to_string().contains("update"), "{error}");
+    assert!(!target.exists(), "a refused export leaves no archive");
 }
 
 #[test]

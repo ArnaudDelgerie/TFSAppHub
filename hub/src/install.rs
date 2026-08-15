@@ -37,6 +37,7 @@ use crate::{
     cli::{EXIT_FAILED, EXIT_OK},
     desktop, hub_bin,
     lifecycle::{self, LifecycleDecisionError, LifecycleError, LifecycleEvent},
+    lifecycle_gate::{self, GateError},
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
     paths::{is_reserved_identifier, Paths, PathsError},
     php::{self, PhpError, Toolchain},
@@ -158,10 +159,10 @@ pub(crate) fn install_into(
 
     let id = resolve_id(id, manifest)?;
     check_identifier_allowed(&manifest.identifier)?;
-    // One read of the registry for both gates. The window between this read and
-    // the write at the end is real but narrow, and the write itself takes the
-    // lock — two racing installs cannot corrupt the file, at worst the second
-    // one's collision check was a moment stale.
+    // The source/manifest tells us which identifier to reserve. Everything
+    // mutable is deliberately checked only after this retained lease.
+    let _maintenance = lifecycle_gate::acquire_maintenance(paths, &manifest.identifier, "install")?;
+    // One read of the registry for all stateful gates, after the lease.
     let installed = registry::load(paths)?;
     check_id_free(&installed, paths, &id)?;
     check_identifier_free(&installed, &manifest.identifier)?;
@@ -913,6 +914,7 @@ pub enum InstallError {
     /// which would leave the app installed but undated, and so re-running its
     /// whole install event on the next one.
     Lifecycle(LifecycleError),
+    Gate(GateError),
     /// The derived or given `id` cannot name a directory or be typed as one
     /// word.
     UnusableId {
@@ -1006,6 +1008,7 @@ impl fmt::Display for InstallError {
             Self::Php(error) => write!(formatter, "{error}"),
             Self::Platform(error) => write!(formatter, "{error}"),
             Self::Lifecycle(error) => write!(formatter, "{error}"),
+            Self::Gate(error) => write!(formatter, "{error}"),
             Self::UnusableId { id, derived } => {
                 let source = match derived {
                     true => format!(
@@ -1158,6 +1161,7 @@ impl std::error::Error for InstallError {
             Self::Php(error) => Some(error),
             Self::Platform(error) => Some(error),
             Self::Lifecycle(error) => Some(error),
+            Self::Gate(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -1209,6 +1213,12 @@ impl From<PlatformError> for InstallError {
 impl From<LifecycleError> for InstallError {
     fn from(error: LifecycleError) -> Self {
         Self::Lifecycle(error)
+    }
+}
+
+impl From<GateError> for InstallError {
+    fn from(error: GateError) -> Self {
+        Self::Gate(error)
     }
 }
 

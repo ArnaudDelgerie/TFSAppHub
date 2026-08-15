@@ -6,6 +6,7 @@ use super::{
 };
 use crate::{
     lifecycle::{previous_tree_path, read_rollback_anchor},
+    lifecycle_gate,
     paths::Paths,
     registry::{self, Platform, RegistryEntry, Source, SourceKind, State},
 };
@@ -302,6 +303,24 @@ fn updating_an_unregistered_id_refuses() {
     let error =
         update(&paths, "demo", None, false, true, "0.1.0").expect_err("nothing is installed");
     assert!(matches!(error, UpdateError::NotInstalled { .. }), "{error}");
+}
+
+#[test]
+fn a_held_maintenance_lease_refuses_update_before_source_resolution() {
+    let (base, paths) = temp_paths();
+    let source = base.path().join("gone");
+    registry::update(&paths, |registry| {
+        registry.upsert(seeded_entry(&source.display().to_string()))
+    })
+    .expect("a seeded registry");
+    let _held = lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "import")
+        .expect("the first maintenance command owns the gate");
+
+    let error = update(&paths, "demo", None, false, true, "0.1.0")
+        .expect_err("update must refuse before reading the competing source");
+
+    assert!(matches!(error, UpdateError::Gate(_)), "{error}");
+    assert!(error.to_string().contains("import"), "{error}");
 }
 
 #[test]
