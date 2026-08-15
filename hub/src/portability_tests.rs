@@ -643,6 +643,56 @@ fn declining_the_overwrite_confirmation_touches_nothing() {
         fs::read(data_subdir.join("app.db")).expect("untouched"),
         b"existing"
     );
+    assert!(
+        lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "export").is_ok(),
+        "a declined confirmation releases its maintenance lease"
+    );
+}
+
+#[test]
+fn interleaved_forced_imports_cannot_overwrite_the_first_rescue_dump() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    fs::write(
+        data_subdir.join("app.db"),
+        b"first import's outgoing database",
+    )
+    .expect("an existing database");
+    let rescue = data_subdir.join("app.db.rescue-first-import");
+    fs::write(&rescue, b"first import's rescue dump").expect("the first rescue dump");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{DATA_DIR}/app.db"), b"second import's database"),
+        ],
+    );
+
+    // The held lease represents the first forced import after it has created
+    // its rescue dump. A second import must stop before it can copy or remove
+    // any database member.
+    let held = lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "import")
+        .expect("the first import owns the gate");
+    let error = run_import(&paths, "demo", &archive, true, true)
+        .expect_err("the interleaved import must refuse");
+
+    assert!(matches!(error, PortabilityError::Gate(_)), "{error}");
+    assert_eq!(
+        fs::read(&rescue).expect("the first rescue dump survives"),
+        b"first import's rescue dump"
+    );
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("the live database survives"),
+        b"first import's outgoing database"
+    );
+    drop(held);
+    assert!(
+        lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "export").is_ok(),
+        "the refusal must not retain a competing handle"
+    );
 }
 
 #[test]
