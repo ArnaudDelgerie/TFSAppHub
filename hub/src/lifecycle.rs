@@ -393,28 +393,69 @@ pub fn discard_db_snapshot(data_subdir: &Path) {
     }
 }
 
-/// `<data_subdir>/<name>.rescue-<YYYYMMDDTHHMMSSZ>` — where `rollback <id>`
-/// copies the *current* (post-update) database before overwriting it with the
-/// restored pre-update snapshot: a manual-recovery artefact at the new schema,
-/// never auto-restored — moving the data aside, not losing it. A same-second
-/// collision receives a numeric suffix, so every rescue remains recoverable.
-pub fn rescue_dump_path(data_subdir: &Path, name: &str) -> PathBuf {
+/// An I/O failure while atomically creating a rescue copy.
+#[derive(Debug)]
+pub struct RescueDumpError {
+    pub path: PathBuf,
+    pub source: io::Error,
+}
+
+/// The unreserved rescue filename pattern named before confirmation.
+pub fn rescue_dump_pattern(data_subdir: &Path, name: &str) -> PathBuf {
+    data_subdir.join(format!("{name}.rescue-<timestamp>[-N]"))
+}
+
+fn rescue_dump_base(data_subdir: &Path, name: &str) -> PathBuf {
     let format =
         time::format_description::parse_borrowed::<2>("[year][month][day]T[hour][minute][second]Z")
             .expect("the fixed rescue timestamp format is valid");
     let timestamp = time::OffsetDateTime::now_utc()
         .format(&format)
         .expect("UTC always fits the fixed rescue timestamp format");
-    let base = data_subdir.join(format!("{name}.rescue-{timestamp}"));
-    if !base.exists() {
-        return base;
-    }
+    data_subdir.join(format!("{name}.rescue-{timestamp}"))
+}
 
-    for suffix in 2_u32.. {
-        let candidate = data_subdir.join(format!("{name}.rescue-{timestamp}-{suffix}"));
-        if !candidate.exists() {
-            return candidate;
-        }
+/// Copy one current SQLite member to a newly-created rescue file. The
+/// exclusive create is the reservation: a concurrently claimed candidate is
+/// retried with its numeric suffix, never overwritten after an `exists` check.
+pub fn copy_rescue_dump(data_subdir: &Path, name: &str) -> Result<PathBuf, RescueDumpError> {
+    let source_path = data_subdir.join(name);
+    let base = rescue_dump_base(data_subdir, name);
+    copy_rescue_dump_at(&source_path, &base)
+}
+
+fn copy_rescue_dump_at(source_path: &Path, base: &Path) -> Result<PathBuf, RescueDumpError> {
+    for suffix in 1_u32.. {
+        let candidate = match suffix {
+            1 => base.to_path_buf(),
+            _ => base.with_file_name(format!(
+                "{}-{suffix}",
+                base.file_name().unwrap().to_string_lossy()
+            )),
+        };
+        let mut rescue = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(RescueDumpError {
+                    path: candidate,
+                    source,
+                })
+            }
+        };
+        let mut source = fs::File::open(source_path).map_err(|source| RescueDumpError {
+            path: source_path.to_path_buf(),
+            source,
+        })?;
+        io::copy(&mut source, &mut rescue).map_err(|source| RescueDumpError {
+            path: candidate.clone(),
+            source,
+        })?;
+        return Ok(candidate);
     }
     unreachable!("a u32 suffix range never ends")
 }

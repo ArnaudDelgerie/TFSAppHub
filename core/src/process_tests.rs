@@ -122,6 +122,28 @@ fn is_owner_live_false_again_after_lock_released() {
 // --- lock_file_exclusive -----------------------------------------------------
 
 #[test]
+fn shared_locks_coexist_but_exclude_an_exclusive_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lifecycle.lock");
+
+    let first = try_lock_file_shared(&path)
+        .unwrap()
+        .expect("first shared lock");
+    let second = try_lock_file_shared(&path)
+        .unwrap()
+        .expect("second shared lock");
+    assert!(try_lock_file(&path).unwrap().is_none());
+    drop(first);
+    assert!(try_lock_file(&path).unwrap().is_none());
+    drop(second);
+
+    let exclusive = try_lock_file(&path).unwrap().expect("exclusive lock");
+    assert!(try_lock_file_shared(&path).unwrap().is_none());
+    drop(exclusive);
+    assert!(try_lock_file_shared(&path).unwrap().is_some());
+}
+
+#[test]
 fn lock_file_exclusive_takes_a_free_lock_at_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("registry.lock");

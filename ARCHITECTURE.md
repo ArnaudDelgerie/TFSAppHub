@@ -275,6 +275,14 @@ the update event (`CONTRACT.md` §6), and the guarantee `install`'s own
 refusal defers: an update must never leave the app's database between two
 versions.
 
+Before trusting any mutable premise, `update` takes the installed app's
+exclusive lifecycle gate. The gate lives at
+`<OS data dir>/TFSApp/hub/locks/<identifier>.lifecycle.lock`, outside the
+removable app-data directory, and its retained file handle lasts through the
+prompt and every write. Once held, the registry is reloaded before the source,
+action and data-directory guards are acted on. This prevents a second update
+from removing the first update's `apps/<id>.previous` anchor.
+
 1. Load the registry entry, re-resolve its source (the recorded selector, or
    `--ref`'s), and validate it exactly as `install` does.
 2. Decide the action (`update_decision`) from the same `lifecycle_decision`
@@ -383,15 +391,15 @@ would leave the next launch on `LifecycleDecisionError::Downgrade`, which has
 no recovery path), not a window or `run` command holding the app (nothing to
 override, wait or stop it instead).
 
-**A forced import rescue-dumps before it overwrites.** The database it is
-about to replace is moved aside via `lifecycle::rescue_dump_path` — the same
-mechanism `rollback` uses for the database it cannot keep — and the path is
-printed before the confirmation prompt fires, so "wrong archive" costs a
-rename back, not a re-export from wherever the original came from. The rescue
-is named `app.db.rescue-<YYYYMMDDTHHMMSSZ>` (or with a numeric collision
-suffix), so a second forced import cannot replace the first rescue. Once the
-copy is safe, import removes each live `DB_FILE_NAMES` file before extraction:
-the database is literally moved aside, and an archive lacking a WAL cannot
+**A forced import atomically rescue-copies before it overwrites.** The database
+it is about to replace is copied by `lifecycle::copy_rescue_dump` — the same
+mechanism `rollback` uses for the database it cannot keep — to
+`app.db.rescue-<YYYYMMDDTHHMMSSZ>` (or a numeric collision suffix). The helper
+creates the selected target exclusively while it copies, retrying the next
+suffix on a collision; an announcement before confirmation therefore names the
+unreserved `app.db.rescue-<timestamp>[-N]` pattern, while outcomes name the
+actual committed path. Once the copies are safe, import removes each live
+`DB_FILE_NAMES` file before extraction, so an archive lacking a WAL cannot
 inherit one from the database it replaces.
 
 **A forced import also discards the rollback anchor, both halves.** The
@@ -849,13 +857,26 @@ step, and the fact that it has two apps' worth of this state to keep apart —
 above already use, so two different apps running commands at once costs
 nothing.
 
-### A third lock, and which question each of the three answers
+### A lifecycle gate beside the three activity locks
 
 | Lock | Answers | Read by |
 | --- | --- | --- |
+| `hub/locks/<identifier>.lifecycle.lock` | Is any installed lifecycle activity or maintenance operation retained for this identifier? | installed `open`, foreground `run`, and every installed maintenance pipeline |
 | `serving.lock` | Will handing this launch's argv to that process get you a window right now? | a launch's own hand-off probe |
 | `sidecar.pid.lock` (the liveness lock) | Does a process still own this data dir at all? | a launch's reap, and `run`'s own rule-3 concurrency probe |
 | `run.lock` | Is its launcher live, or did its child outlive it? | `run`'s rule 2, launch's rule-3-in-reverse refusal, and data-dir writers |
+
+The lifecycle gate is a non-blocking `flock` over a hub-root file, deliberately
+separate from the app data tree: `install` can reach it before that tree exists
+and `purge` keeps it while removing the tree. Activity holders use a shared
+lease; maintenance holders use an exclusive lease and record their operation
+name only after acquiring it. The record improves a busy error but is not
+authority — a stale record never blocks a free flock. A window keeps its shared
+handle in Tauri-managed state until process teardown, a foreground `run` keeps
+it through `child.wait()`, and maintenance keeps its exclusive handle through
+confirmation, Composer/hooks and every write. The descriptors are close-on-exec
+so a Composer or hook child cannot accidentally retain the gate. Different
+identifiers map to different files and proceed independently.
 
 Rule 3's "is a window live" probe deliberately reads the **liveness** lock,
 not the serving one: a process mid-teardown still owns the data dir, and a

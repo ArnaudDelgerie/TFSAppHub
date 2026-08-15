@@ -31,6 +31,11 @@ fn the_hub_root_sits_under_the_shared_vendor_folder() {
         paths.update_cache_lock_path(),
         base.path().join("TFSApp/hub/update_cache.lock")
     );
+    assert_eq!(
+        paths.lifecycle_gate_path("dev.local.demo").unwrap(),
+        base.path()
+            .join("TFSApp/hub/locks/dev.local.demo.lifecycle.lock")
+    );
 }
 
 #[test]
@@ -175,6 +180,19 @@ fn an_identifier_that_would_escape_the_vendor_dir_is_refused() {
             kind: "app identifier",
             ..
         }
+    ));
+}
+
+#[test]
+fn a_lifecycle_gate_path_for_a_traversing_identifier_is_refused() {
+    let (_base, paths) = temp_paths();
+
+    assert!(matches!(
+        paths.lifecycle_gate_path("../evil"),
+        Err(PathsError::UnsafeSegment {
+            kind: "app identifier",
+            ..
+        })
     ));
 }
 

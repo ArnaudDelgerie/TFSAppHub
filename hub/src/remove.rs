@@ -49,7 +49,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cli::{EXIT_FAILED, EXIT_OK},
     desktop::{self, RemovalOutcome},
-    lifecycle, manifest,
+    lifecycle,
+    lifecycle_gate::{self, GateError},
+    manifest,
     paths::{self, Paths, PathsError},
     prompt,
     registry::{self, Registry, RegistryError},
@@ -92,6 +94,12 @@ pub fn run(id: &str, purge: bool, assume_yes: bool) -> i32 {
 /// attempted at all — a removal that partly failed is reported zone by zone and
 /// still returns `Ok`.
 fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool, RemoveError> {
+    let installed = registry::load(paths)?;
+    let entry = installed
+        .get(id)
+        .ok_or_else(|| RemoveError::NotInstalled { id: id.to_string() })?;
+    let identifier = entry.identifier.clone();
+    let _maintenance = lifecycle_gate::acquire_maintenance(paths, &identifier, "remove")?;
     let installed = registry::load(paths)?;
     let entry = installed
         .get(id)
@@ -300,6 +308,8 @@ where
             identifier: identifier.to_string(),
         });
     }
+
+    let _maintenance = lifecycle_gate::acquire_maintenance(paths, identifier, "purge")?;
 
     // Refusal 1: a registry entry still claims this identifier. Purging
     // under a live install would delete data `remove <id> --purge` is the
@@ -778,6 +788,7 @@ fn delete_keyring_account(identifier: &str, account: &str) -> bool {
 pub enum RemoveError {
     Paths(PathsError),
     Registry(RegistryError),
+    Gate(GateError),
     /// `purge <identifier>` named a directory owned by the hub or desktop environment.
     ReservedIdentifier {
         identifier: String,
@@ -827,6 +838,7 @@ impl fmt::Display for RemoveError {
         match self {
             Self::Paths(error) => write!(formatter, "{error}"),
             Self::Registry(error) => write!(formatter, "{error}"),
+            Self::Gate(error) => write!(formatter, "{error}"),
             Self::ReservedIdentifier { identifier } => match identifier.as_str() {
                 "hub" => write!(
                     formatter,
@@ -910,6 +922,7 @@ impl std::error::Error for RemoveError {
         match self {
             Self::Paths(error) => Some(error),
             Self::Registry(error) => Some(error),
+            Self::Gate(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -925,6 +938,12 @@ impl From<PathsError> for RemoveError {
 impl From<RegistryError> for RemoveError {
     fn from(error: RegistryError) -> Self {
         Self::Registry(error)
+    }
+}
+
+impl From<GateError> for RemoveError {
+    fn from(error: GateError) -> Self {
+        Self::Gate(error)
     }
 }
 

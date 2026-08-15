@@ -20,6 +20,7 @@ mod identity;
 mod install;
 mod launch;
 mod lifecycle;
+mod lifecycle_gate;
 mod list;
 mod manifest;
 mod open;
@@ -264,6 +265,15 @@ fn prepare(source: &OpenChildSource, identity: &Identity) -> Launching {
     // host or recreated by hand gets tightened on its next use; a plain
     // `var/` for a dev session, which needs no such tightening — it is the
     // developer's own project directory (CONTRACT.md's dev section).
+    let activity = match &spec.source {
+        launch::Source::Installed { .. } => {
+            match lifecycle_gate::acquire_activity(&paths, &identity.identifier) {
+                Ok(lease) => Some(lease),
+                Err(error) => lifecycle::fatal_startup_error(&error.to_string()),
+            }
+        }
+        launch::Source::Live => None,
+    };
     let data_dir = match &spec.source {
         launch::Source::Installed { .. } => match paths.create_app_data_dir(&identity.identifier) {
             Ok(data_dir) => data_dir,
@@ -303,7 +313,12 @@ fn prepare(source: &OpenChildSource, identity: &Identity) -> Launching {
         ),
     };
 
-    Launching { paths, spec, locks }
+    Launching {
+        paths,
+        spec,
+        locks,
+        activity,
+    }
 }
 
 /// What the guards leave for the launch itself: where the app is, what it
@@ -313,6 +328,7 @@ struct Launching {
     paths: paths::Paths,
     spec: launch::LaunchSpec,
     locks: Option<lifecycle::LaunchLocks>,
+    activity: Option<lifecycle_gate::ActivityLease>,
 }
 
 /// Open the app installed as `id`, under `identity`.
@@ -336,7 +352,12 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
     // all of it has to happen in this window: they refuse through a blocking
     // native dialog, which deadlocks rather than appears once Tauri has claimed
     // GTK. See `lifecycle`'s module header.
-    let Launching { paths, spec, locks } = prepare(&source, &identity);
+    let Launching {
+        paths,
+        spec,
+        locks,
+        activity,
+    } = prepare(&source, &identity);
 
     // The app's `actions` groups, granted at runtime, before `Builder` — the
     // only window in which they can be: `add_capability` lives on `Context` and
@@ -454,6 +475,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
                     spec,
                     identity,
                     locks,
+                    activity,
                     app_origin,
                     splash_label,
                 );
@@ -487,6 +509,7 @@ fn serve(
     spec: launch::LaunchSpec,
     identity: Identity,
     locks: Option<lifecycle::LaunchLocks>,
+    activity: Option<lifecycle_gate::ActivityLease>,
     app_origin: window::AppOriginSlot,
     splash_label: String,
 ) {
@@ -497,7 +520,16 @@ fn serve(
     // app, and this process has nothing left to serve.
     let holds_launch_locks = locks.is_some();
     if !holds_launch_locks {
+        drop(activity);
         return;
+    }
+
+    // Retain the shared activity lease for the complete window lifetime, next
+    // to the liveness and serving locks it protects. Tauri owns managed state
+    // until this process exits, including paths where `serve` itself returns
+    // after reporting an error.
+    if let Some(activity) = activity {
+        app.manage(activity);
     }
 
     let (liveness_lock, serving_lock) = match locks {

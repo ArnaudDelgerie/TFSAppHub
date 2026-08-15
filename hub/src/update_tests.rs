@@ -6,6 +6,7 @@ use super::{
 };
 use crate::{
     lifecycle::{previous_tree_path, read_rollback_anchor},
+    lifecycle_gate,
     paths::Paths,
     registry::{self, Platform, RegistryEntry, Source, SourceKind, State},
 };
@@ -305,6 +306,61 @@ fn updating_an_unregistered_id_refuses() {
 }
 
 #[test]
+fn a_held_maintenance_lease_refuses_update_before_source_resolution() {
+    let (base, paths) = temp_paths();
+    let source = base.path().join("gone");
+    registry::update(&paths, |registry| {
+        registry.upsert(seeded_entry(&source.display().to_string()))
+    })
+    .expect("a seeded registry");
+    let _held = lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "import")
+        .expect("the first maintenance command owns the gate");
+
+    let error = update(&paths, "demo", None, false, true, "0.1.0")
+        .expect_err("update must refuse before reading the competing source");
+
+    assert!(matches!(error, UpdateError::Gate(_)), "{error}");
+    assert!(error.to_string().contains("import"), "{error}");
+}
+
+#[test]
+fn an_interleaved_update_cannot_replace_the_first_updates_previous_tree() {
+    let (base, paths) = temp_paths();
+    let source = base.path().join("gone");
+    registry::update(&paths, |registry| {
+        registry.upsert(seeded_entry(&source.display().to_string()))
+    })
+    .expect("a seeded registry");
+
+    // This is the precise window Audit 008 found: the first update has
+    // retained its outgoing tree, and a second update used to remove it
+    // before failing its own rename. Holding the first command's lease makes
+    // the second one refuse before it can reach `retain_tree`.
+    let app_dir = paths.app_dir("demo").expect("an app directory");
+    app_tree(
+        &previous_tree_path(&app_dir),
+        "first update's outgoing tree",
+    );
+    let held = lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "update")
+        .expect("the first update owns the gate");
+
+    let error = update(&paths, "demo", None, false, true, "0.1.0")
+        .expect_err("the interleaved update must refuse before source resolution");
+
+    assert!(matches!(error, UpdateError::Gate(_)), "{error}");
+    assert_eq!(
+        fs::read_to_string(previous_tree_path(&app_dir).join("marker"))
+            .expect("the first update's anchor survives"),
+        "first update's outgoing tree"
+    );
+    drop(held);
+    assert!(
+        lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "rollback").is_ok(),
+        "the refusal must not retain a competing handle"
+    );
+}
+
+#[test]
 fn a_source_that_no_longer_exists_is_refused_naming_the_recorded_location() {
     let (base, paths) = temp_paths();
     let gone = base.path().join("gone");
@@ -335,6 +391,10 @@ fn a_source_already_at_the_recorded_version_refuses_without_force() {
     let error = update(&paths, "demo", None, false, true, "0.1.0")
         .expect_err("an equal source refuses without --force");
     assert!(matches!(error, UpdateError::Equal { .. }), "{error}");
+    assert!(
+        lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "import").is_ok(),
+        "an early update refusal releases its maintenance lease"
+    );
 }
 
 #[test]

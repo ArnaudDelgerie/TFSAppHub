@@ -11,7 +11,7 @@
 //! would invite a "rollback forward" this plan does not define).
 //!
 //! The one thing it does not throw away is the database it is about to
-//! replace: [`lifecycle::rescue_dump_path`] carries it forward as a
+//! replace: [`lifecycle::copy_rescue_dump`] carries it forward as a
 //! manual-recovery artefact, named on screen, so "I rolled back too eagerly"
 //! never costs data that was never wrong.
 
@@ -21,6 +21,7 @@ use crate::{
     cli::{EXIT_FAILED, EXIT_OK},
     install::{self, InstallError},
     lifecycle::{self, Anchor, LifecycleError},
+    lifecycle_gate::{self, GateError},
     paths::{Paths, PathsError},
     prompt,
     registry::{self, RegistryEntry, RegistryError},
@@ -59,6 +60,14 @@ pub fn run(id: &str, assume_yes: bool) -> i32 {
 /// Takes its `Paths` rather than resolving them, matching `update`'s own
 /// pipeline — what lets it run against a throwaway root in a test.
 fn rollback(paths: &Paths, id: &str, assume_yes: bool) -> Result<bool, RollbackError> {
+    // Discover the identifier, then acquire before trusting any mutable
+    // registry or anchor state.
+    let installed = registry::load(paths)?;
+    let entry = installed
+        .get(id)
+        .ok_or_else(|| RollbackError::NotInstalled { id: id.to_string() })?
+        .clone();
+    let _maintenance = lifecycle_gate::acquire_maintenance(paths, &entry.identifier, "rollback")?;
     let installed = registry::load(paths)?;
     let entry = installed
         .get(id)
@@ -174,11 +183,11 @@ fn rescue_dump(data_subdir: &Path) -> Result<Option<std::path::PathBuf>, Rollbac
         if !source.is_file() {
             continue;
         }
-        let rescue = lifecycle::rescue_dump_path(data_subdir, name);
-        fs::copy(&source, &rescue).map_err(|error| RollbackError::Io {
-            path: rescue.clone(),
-            source: error,
-        })?;
+        let rescue =
+            lifecycle::copy_rescue_dump(data_subdir, name).map_err(|error| RollbackError::Io {
+                path: error.path,
+                source: error.source,
+            })?;
         if name == "app.db" {
             app_db_rescue = Some(rescue);
         }
@@ -204,6 +213,7 @@ pub enum RollbackError {
     Registry(RegistryError),
     Install(InstallError),
     Lifecycle(LifecycleError),
+    Gate(GateError),
     Io {
         path: std::path::PathBuf,
         source: std::io::Error,
@@ -227,6 +237,7 @@ impl fmt::Display for RollbackError {
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Install(error) => write!(formatter, "{error}"),
             Self::Lifecycle(error) => write!(formatter, "{error}"),
+            Self::Gate(error) => write!(formatter, "{error}"),
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::NotInstalled { id } => write!(
                 formatter,
@@ -250,6 +261,7 @@ impl std::error::Error for RollbackError {
             Self::Registry(error) => Some(error),
             Self::Install(error) => Some(error),
             Self::Lifecycle(error) => Some(error),
+            Self::Gate(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -277,6 +289,12 @@ impl From<InstallError> for RollbackError {
 impl From<LifecycleError> for RollbackError {
     fn from(error: LifecycleError) -> Self {
         Self::Lifecycle(error)
+    }
+}
+
+impl From<GateError> for RollbackError {
+    fn from(error: GateError) -> Self {
+        Self::Gate(error)
     }
 }
 

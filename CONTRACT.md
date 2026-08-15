@@ -815,12 +815,14 @@ is treated as a leftover from a failed export and must be removed by hand,
 never silently clobbered. A failed export best-effort removes only the temp it
 created itself.
 
-**A forced import moves the database aside before writing the archive.** Each
-database file being replaced is rescued as
+**A forced import rescues the database before writing the archive.** Each
+database file being replaced is copied atomically into a newly created rescue
+file named
 `<name>.rescue-<YYYYMMDDTHHMMSSZ>` (with a numeric suffix for a same-second
 collision); the primary database's `app.db.rescue-*` path is printed.
-Consecutive forced imports therefore never overwrite an earlier rescue. The
-live `app.db`, `app.db-wal` and
+The name is reserved with exclusive creation while the copy is made, so a
+pre-existing or simultaneous candidate advances to the next suffix and
+consecutive forced imports never overwrite an earlier rescue. The live `app.db`, `app.db-wal` and
 `app.db-shm` are removed after that rescue and before extraction, so an archive
 that carries only `app.db` cannot inherit a stale WAL from the data it
 replaced.
@@ -855,6 +857,20 @@ one — see §9.
 ```
 
 ### The guarantee
+
+**Installed-app lifecycle operations never overlap for one identifier.** The
+hub holds a shared activity lease from an installed `open` child's preflight
+until its window process exits, and throughout a foreground `run` command
+(including its `--replace` transition; `run --stop` holds it while it resolves
+and signals the run). It holds an exclusive maintenance lease from stateful
+preflight through confirmation and the final write for post-manifest
+`install`, `update`, `rollback`, `export`, `import`, `remove`, and `purge`.
+A competing operation fails immediately, naming the maintenance operation when
+one owns the lease; it never waits or begins a partial mutation. Different
+identifiers have independent leases. The existing window and `run.lock` probes
+remain compatibility guards for older hub processes, not substitutes for this
+no-overlap guarantee. A lease released by process death does not repair an
+interrupted mutation; crash recovery is deliberately outside this contract.
 
 **The commands of an event run once per install or update, in declared order,
 before the user first sees the app, with §3's environment.** Every one of them

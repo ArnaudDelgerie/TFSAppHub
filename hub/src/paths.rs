@@ -106,6 +106,11 @@ pub const UPDATE_CACHE_FILE: &str = "update_cache.json";
 /// itself.
 pub const UPDATE_CACHE_LOCK_FILE: &str = "update_cache.lock";
 
+/// The per-installed-app lifecycle gates. This belongs to the hub rather than
+/// an app data directory because `install` needs it before that directory
+/// exists and `purge` must retain it while removing the directory.
+pub const LIFECYCLE_LOCKS_DIR: &str = "locks";
+
 /// Every path the hub resolves, hanging off one base — the OS data dir.
 ///
 /// The base is a field rather than a call so the whole module is testable
@@ -228,6 +233,14 @@ impl Paths {
     /// `<OS data dir>/TFSApp/hub/update_cache.lock`.
     pub fn update_cache_lock_path(&self) -> PathBuf {
         self.hub_root().join(UPDATE_CACHE_LOCK_FILE)
+    }
+
+    /// `<OS data dir>/TFSApp/hub/locks/<identifier>.lifecycle.lock`.
+    pub fn lifecycle_gate_path(&self, identifier: &str) -> Result<PathBuf, PathsError> {
+        Ok(self.hub_root().join(LIFECYCLE_LOCKS_DIR).join(format!(
+            "{}.lifecycle.lock",
+            safe_segment("app identifier", identifier)?
+        )))
     }
 
     /// `<OS data dir>/TFSApp/hub/scratch/<pid>/` — this process's own

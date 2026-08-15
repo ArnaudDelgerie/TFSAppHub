@@ -34,6 +34,7 @@ use crate::{
     cli::{EXIT_FAILED, EXIT_OK},
     install::{self, InstallError},
     lifecycle::{self, LifecycleEvent},
+    lifecycle_gate::{self, GateError},
     manifest::{self, ManifestError},
     paths::{Paths, PathsError},
     php::{self, PhpError},
@@ -197,6 +198,12 @@ pub fn export(id: &str, path: &str) -> i32 {
 /// Takes its `Paths` rather than resolving them, matching every other
 /// command's pipeline — what lets it run against a throwaway root in a test.
 fn run_export(paths: &Paths, id: &str, target: &Path) -> Result<(), PortabilityError> {
+    let installed = registry::load(paths)?;
+    let entry = installed
+        .get(id)
+        .ok_or_else(|| PortabilityError::NotInstalled { id: id.to_string() })?
+        .clone();
+    let _maintenance = lifecycle_gate::acquire_maintenance(paths, &entry.identifier, "export")?;
     let installed = registry::load(paths)?;
     let entry = installed
         .get(id)
@@ -399,6 +406,13 @@ fn run_import(
     force: bool,
     assume_yes: bool,
 ) -> Result<bool, PortabilityError> {
+    let installed = registry::load(paths)?;
+    let entry = installed
+        .get(id)
+        .ok_or_else(|| PortabilityError::NotInstalled { id: id.to_string() })?
+        .clone();
+
+    let _maintenance = lifecycle_gate::acquire_maintenance(paths, &entry.identifier, "import")?;
     let installed = registry::load(paths)?;
     let entry = installed
         .get(id)
@@ -633,7 +647,7 @@ fn announce_overwrite(
     println!(
         "  its current database will be replaced — the database being replaced will be saved \
          to {}",
-        lifecycle::rescue_dump_path(data_subdir, "app.db").display()
+        lifecycle::rescue_dump_pattern(data_subdir, "app.db").display()
     );
     println!(
         "  its rollback anchor, if any, will be discarded — a rollback after this import would \
@@ -648,7 +662,7 @@ fn announce_overwrite(
 ///
 /// `rollback.rs`'s own `rescue_dump`, duplicated rather than shared: both are
 /// small, module-private pipeline steps over the same
-/// [`lifecycle::rescue_dump_path`], and the two commands' error types differ.
+/// [`lifecycle::copy_rescue_dump`], and the two commands' error types differ.
 fn rescue_dump(data_subdir: &Path) -> Result<Option<PathBuf>, PortabilityError> {
     let mut app_db_rescue = None;
     for name in lifecycle::DB_FILE_NAMES {
@@ -656,10 +670,11 @@ fn rescue_dump(data_subdir: &Path) -> Result<Option<PathBuf>, PortabilityError> 
         if !source.is_file() {
             continue;
         }
-        let rescue = lifecycle::rescue_dump_path(data_subdir, name);
-        fs::copy(&source, &rescue).map_err(|error| PortabilityError::Io {
-            path: rescue.clone(),
-            source: error,
+        let rescue = lifecycle::copy_rescue_dump(data_subdir, name).map_err(|error| {
+            PortabilityError::Io {
+                path: error.path,
+                source: error.source,
+            }
         })?;
         if name == "app.db" {
             app_db_rescue = Some(rescue);
@@ -714,6 +729,7 @@ pub enum PortabilityError {
     Paths(PathsError),
     Registry(RegistryError),
     Lifecycle(lifecycle::LifecycleError),
+    Gate(GateError),
     /// Reloading the installed manifest, or running its `pre-update`/
     /// `post-update` commands, to migrate an older archive forward.
     Install(InstallError),
@@ -770,6 +786,7 @@ impl fmt::Display for PortabilityError {
             Self::Paths(error) => write!(formatter, "{error}"),
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Lifecycle(error) => write!(formatter, "{error}"),
+            Self::Gate(error) => write!(formatter, "{error}"),
             Self::Install(error) => write!(formatter, "{error}"),
             Self::Manifest(error) => write!(formatter, "{error}"),
             Self::Php(error) => write!(formatter, "{error}"),
@@ -860,6 +877,7 @@ impl std::error::Error for PortabilityError {
             Self::Paths(error) => Some(error),
             Self::Registry(error) => Some(error),
             Self::Lifecycle(error) => Some(error),
+            Self::Gate(error) => Some(error),
             Self::Install(error) => Some(error),
             Self::Manifest(error) => Some(error),
             Self::Php(error) => Some(error),
@@ -884,6 +902,12 @@ impl From<RegistryError> for PortabilityError {
 impl From<lifecycle::LifecycleError> for PortabilityError {
     fn from(error: lifecycle::LifecycleError) -> Self {
         Self::Lifecycle(error)
+    }
+}
+
+impl From<GateError> for PortabilityError {
+    fn from(error: GateError) -> Self {
+        Self::Gate(error)
     }
 }
 

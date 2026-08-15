@@ -7,14 +7,14 @@ use std::{
 };
 
 use super::{
-    acquire_launch_locks, anchor_state, cache_stamp_path, data_dir_holder, db_snapshot_path,
-    decide_launch, dialog_is_warranted, discard_db_snapshot, discard_rollback_anchor,
-    lifecycle_decision, prepare_dev_launch, previous_tree_path, probe_run_lock, read_cache_stamp,
-    read_data_version, read_rollback_anchor, rescue_dump_path, restore_db_snapshot,
-    rollback_anchor_path, run_lock_held_decision, serving_lock_path, snapshot_db, veto_exit,
-    write_cache_stamp, write_data_version, write_rollback_anchor, Anchor, CacheStamp, CacheStatus,
-    LaunchDecision, LaunchLockError, LifecycleDecisionError, LifecycleError, LifecycleEvent,
-    RollbackAnchor, RunLockHeld, DB_FILE_NAMES,
+    acquire_launch_locks, anchor_state, cache_stamp_path, copy_rescue_dump_at, data_dir_holder,
+    db_snapshot_path, decide_launch, dialog_is_warranted, discard_db_snapshot,
+    discard_rollback_anchor, lifecycle_decision, prepare_dev_launch, previous_tree_path,
+    probe_run_lock, read_cache_stamp, read_data_version, read_rollback_anchor, rescue_dump_pattern,
+    restore_db_snapshot, rollback_anchor_path, run_lock_held_decision, serving_lock_path,
+    snapshot_db, veto_exit, write_cache_stamp, write_data_version, write_rollback_anchor, Anchor,
+    CacheStamp, CacheStatus, LaunchDecision, LaunchLockError, LifecycleDecisionError,
+    LifecycleError, LifecycleEvent, RollbackAnchor, RunLockHeld, DB_FILE_NAMES,
 };
 use crate::{registry::Platform, run::OrphanedRun};
 
@@ -719,27 +719,52 @@ fn discarding_an_absent_db_snapshot_is_not_an_error() {
 }
 
 #[test]
-fn consecutive_rescue_dumps_get_distinct_timestamped_names() {
+fn rescue_dumps_reserve_a_planted_candidate_and_preserve_both_byte_streams() {
     let data_subdir = tempfile::tempdir().expect("a temp data subdir");
-    let first = rescue_dump_path(data_subdir.path(), "app.db");
-    fs::write(&first, b"first rescue").expect("write the first rescue");
-    let second = rescue_dump_path(data_subdir.path(), "app.db");
-    fs::write(&second, b"second rescue").expect("write the second rescue");
+    let source = data_subdir.path().join("app.db");
+    let first = data_subdir.path().join("app.db.rescue-fixed");
+    fs::write(&source, b"first rescue").expect("write the source database");
+    fs::write(&first, b"existing rescue").expect("plant the first candidate");
+    let second = copy_rescue_dump_at(&source, &first).expect("reserve a suffix");
 
-    assert_ne!(first, second, "a later rescue must not overwrite the first");
-    for rescue in [&first, &second] {
-        let name = rescue.file_name().unwrap().to_string_lossy();
-        assert!(
-            name.starts_with("app.db.rescue-") && name.contains('T') && name.ends_with('Z')
-                || name.rsplit_once('-').is_some_and(|(stem, suffix)| {
-                    stem.starts_with("app.db.rescue-")
-                        && stem.contains('T')
-                        && suffix.parse::<u32>().is_ok()
-                }),
-            "{name} must retain the timestamped rescue pattern"
-        );
-        assert!(rescue.is_file(), "each rescue must remain on disk");
-    }
+    assert_eq!(second, data_subdir.path().join("app.db.rescue-fixed-2"));
+    assert_eq!(fs::read(&first).unwrap(), b"existing rescue");
+    assert_eq!(fs::read(&second).unwrap(), b"first rescue");
+}
+
+#[test]
+fn concurrent_rescue_dumps_reserve_distinct_paths_without_overwriting() {
+    use std::sync::{Arc, Barrier};
+
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let source = data_subdir.path().join("app.db");
+    let base = data_subdir.path().join("app.db.rescue-fixed");
+    fs::write(&source, b"database bytes").expect("write the source database");
+    let barrier = Arc::new(Barrier::new(2));
+    let first = std::thread::scope(|scope| {
+        let child_barrier = Arc::clone(&barrier);
+        let child_source = source.clone();
+        let child_base = base.clone();
+        let left = scope.spawn(move || {
+            child_barrier.wait();
+            copy_rescue_dump_at(&child_source, &child_base).expect("first concurrent copy")
+        });
+        barrier.wait();
+        let second = copy_rescue_dump_at(&source, &base).expect("second concurrent copy");
+        (left.join().unwrap(), second)
+    });
+    assert_ne!(first.0, first.1);
+    assert_eq!(fs::read(first.0).unwrap(), b"database bytes");
+    assert_eq!(fs::read(first.1).unwrap(), b"database bytes");
+}
+
+#[test]
+fn rescue_announcement_names_a_pattern_not_a_reserved_path() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    assert_eq!(
+        rescue_dump_pattern(data_subdir.path(), "app.db"),
+        data_subdir.path().join("app.db.rescue-<timestamp>[-N]")
+    );
 }
 
 // --- the rollback anchor's tree half: previous_tree_path -------------------
