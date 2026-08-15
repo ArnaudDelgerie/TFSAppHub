@@ -105,11 +105,31 @@ enum Backend {
     /// "keyring" without one — and without ever writing to a developer's real
     /// login keyring, which is what calling `new_store` in a test would do.
     #[cfg(test)]
-    FakeKeyring(Mutex<HashMap<String, String>>),
+    FakeKeyring {
+        service: String,
+        entries: FakeKeyring,
+    },
 }
 
 #[derive(Clone)]
 pub struct SecretStore(Arc<Backend>);
+
+/// A persistent, hub-owned keyring double for tests.  Callers can create
+/// several stores from one instance to model the production service/account
+/// namespace without changing the keyring crate's process-global builder.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct FakeKeyring(Arc<Mutex<HashMap<(String, String), String>>>);
+
+#[cfg(test)]
+impl FakeKeyring {
+    pub fn store(&self, service: &str) -> SecretStore {
+        SecretStore(Arc::new(Backend::FakeKeyring {
+            service: service.to_string(),
+            entries: self.clone(),
+        }))
+    }
+}
 
 /// One set/get/delete round trip against the real backend, run once at store
 /// creation rather than lazily on first use, so every request afterwards
@@ -148,7 +168,7 @@ pub fn is_keyring(store: &SecretStore) -> bool {
         Backend::Keyring { .. } => true,
         Backend::File { .. } => false,
         #[cfg(test)]
-        Backend::FakeKeyring(_) => true,
+        Backend::FakeKeyring { .. } => true,
     }
 }
 
@@ -212,10 +232,11 @@ pub fn secrets_has(store: &SecretStore, account: &str) -> bool {
             .is_ok(),
         Backend::File { path, .. } => read_file_map(path).contains_key(account),
         #[cfg(test)]
-        Backend::FakeKeyring(map) => map
+        Backend::FakeKeyring { service, entries } => entries
+            .0
             .lock()
             .expect("the secret store is not poisoned")
-            .contains_key(account),
+            .contains_key(&(service.clone(), account.to_string())),
     }
 }
 
@@ -224,10 +245,11 @@ pub fn secrets_get(store: &SecretStore, account: &str) -> Option<String> {
         Backend::Keyring { service } => Entry::new(service, account).ok()?.get_password().ok(),
         Backend::File { path, .. } => read_file_map(path).get(account).cloned(),
         #[cfg(test)]
-        Backend::FakeKeyring(map) => map
+        Backend::FakeKeyring { service, entries } => entries
+            .0
             .lock()
             .expect("the secret store is not poisoned")
-            .get(account)
+            .get(&(service.clone(), account.to_string()))
             .cloned(),
     }
 }
@@ -246,10 +268,12 @@ pub fn secrets_set(store: &SecretStore, account: &str, value: String) {
             write_file_map(path, &map);
         }
         #[cfg(test)]
-        Backend::FakeKeyring(map) => {
-            map.lock()
+        Backend::FakeKeyring { service, entries } => {
+            entries
+                .0
+                .lock()
                 .expect("the secret store is not poisoned")
-                .insert(account.to_string(), value);
+                .insert((service.clone(), account.to_string()), value);
         }
     }
 }
@@ -269,10 +293,11 @@ pub fn secrets_delete(store: &SecretStore, account: &str) -> bool {
             existed
         }
         #[cfg(test)]
-        Backend::FakeKeyring(map) => map
+        Backend::FakeKeyring { service, entries } => entries
+            .0
             .lock()
             .expect("the secret store is not poisoned")
-            .remove(account)
+            .remove(&(service.clone(), account.to_string()))
             .is_some(),
     }
 }
@@ -429,7 +454,12 @@ pub fn secret_list(window: tauri::Window) -> Result<Vec<SecretListEntry>, &'stat
 
 #[cfg(test)]
 pub fn new_fake_keyring_store() -> SecretStore {
-    SecretStore(Arc::new(Backend::FakeKeyring(Mutex::new(HashMap::new()))))
+    new_fake_keyring().store("test.tfsapp-hub")
+}
+
+#[cfg(test)]
+pub fn new_fake_keyring() -> FakeKeyring {
+    FakeKeyring::default()
 }
 
 /// A real `File`-backend store, bypassing [`new_store`]'s D-Bus probe, so a test

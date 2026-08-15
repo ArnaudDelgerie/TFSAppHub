@@ -68,6 +68,7 @@ start").
 ```sh
 make resources # fetch the pinned FrankenPHP and composer.phar into hub/resources (once)
 make check     # cargo fmt --check, clippy -D warnings, unit tests, shellcheck
+make keyring-integration # explicit production Secret Service smoke; needs dbus + gnome-keyring
 make build     # the hub's own AppImage, target/release/bundle/appimage/
 ```
 
@@ -93,10 +94,11 @@ for building it.
     **shellcheck** — needed for `make check`. A missing Rust component fails
     with rustup's own `rustup component add …` message.
   - **`gnome-keyring`** (the `gnome-keyring-daemon` binary) and **`dbus`**
-    (`dbus-run-session`) — **test-only**, needed for `make check`. They stand
-    up an *ephemeral*, throwaway Secret Service the test suite runs against,
-    so it never touches your real login keyring. Neither is the GNOME
-    desktop, and neither is a runtime dependency of the packaged hub.
+    (`dbus-run-session`) — **test-only**, needed only for the explicit
+    production-backend integration check. `make check` needs neither one and
+    never contacts a Secret Service. `make keyring-integration` starts an
+    *ephemeral*, throwaway provider, never your real login keyring. Neither is
+    the GNOME desktop, and neither is a runtime dependency of the packaged hub.
 - **Or, a second door onto the exact same build: only Docker.**
   `cd build && docker compose run --rm build` installs everything above
   inside a container and runs `make build` there — nothing in the recipe

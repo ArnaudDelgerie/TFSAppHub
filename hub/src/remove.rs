@@ -154,6 +154,18 @@ fn busy_holder(data_dir: &Path, identifier: &str) -> io::Result<Option<lifecycle
 /// module's entry points — `remove <id> [--purge]` today, and (plan 023 step
 /// 3) `purge <identifier>`'s orphan subject.
 fn execute(paths: &Paths, plan: &RemovalPlan, purge: bool) -> Result<(), RemoveError> {
+    execute_with_keyring(paths, plan, purge, delete_keyring_account)
+}
+
+fn execute_with_keyring<F>(
+    paths: &Paths,
+    plan: &RemovalPlan,
+    purge: bool,
+    delete_keyring_account: F,
+) -> Result<(), RemoveError>
+where
+    F: Fn(&str, &str) -> bool,
+{
     if let Some(id) = &plan.id {
         // The entry goes first, under the registry's own lock. An app whose
         // files are gone but which `list` still shows is the worse of the two
@@ -270,6 +282,18 @@ fn purge_identifier(
     identifier: &str,
     assume_yes: bool,
 ) -> Result<bool, RemoveError> {
+    purge_identifier_with_keyring(paths, identifier, assume_yes, delete_keyring_account)
+}
+
+fn purge_identifier_with_keyring<F>(
+    paths: &Paths,
+    identifier: &str,
+    assume_yes: bool,
+    delete_keyring_account: F,
+) -> Result<bool, RemoveError>
+where
+    F: Fn(&str, &str) -> bool,
+{
     // Refusal 0: these names identify infrastructure, never orphaned app data.
     if paths::is_reserved_identifier(identifier) {
         return Err(RemoveError::ReservedIdentifier {
@@ -351,7 +375,7 @@ fn purge_identifier(
         return Ok(false);
     }
 
-    execute(paths, &removal_plan, true)?;
+    execute_with_keyring(paths, &removal_plan, true, delete_keyring_account)?;
     Ok(true)
 }
 

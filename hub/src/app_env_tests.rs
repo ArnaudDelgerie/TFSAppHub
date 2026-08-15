@@ -4,8 +4,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{resolve, Mode};
-use crate::{lifecycle::CacheStamp, manifest, paths::Paths, registry::Platform};
+use super::{resolve, resolve_with_secret_store_for_test, Mode};
+use crate::{
+    lifecycle::CacheStamp,
+    manifest,
+    paths::Paths,
+    registry::Platform,
+    secrets::{new_fake_keyring, secrets_get, secrets_set},
+};
 
 /// A stamp for tests that only need `Mode::Launch` to resolve at all, not to
 /// care whether it matches — this file's cache-reuse behaviour itself is
@@ -22,24 +28,7 @@ fn any_cache_stamp() -> CacheStamp {
     }
 }
 
-/// One `identifier` per test, named after the test.
-///
-/// A tempdir isolates everything here **except** the keyring, because the
-/// identifier *is* the Secret Service name and that namespace belongs to the
-/// login session, not to the test (see `secrets.rs` on why it is a namespace and
-/// not a boundary). Two tests sharing an identifier therefore share one
-/// `app-secret` account, and `cargo test`'s threads turn that into a race:
-/// `remove_tests`' purge deletes accounts under its identifier, which used to be
-/// this one — so a resolve here could have its own entry deleted between the
-/// write and the read-back, fall through to the file, and come back with a
-/// different secret than the resolve before it.
-///
-/// Named after the test rather than made unique per *run* (a pid, a counter):
-/// both isolate, but only this one leaves a bounded set of accounts behind.
-/// `make check` stands up a throwaway Secret Service, so nothing accumulates
-/// there — a bare `cargo test` writes to the developer's real keyring, and
-/// growing it by five entries per run would be a poor trade for the same
-/// isolation.
+/// One identifier per test, named after the test.
 fn identifier_for(test: &str) -> String {
     format!("dev.local.demo-env-{test}")
 }
@@ -459,12 +448,14 @@ fn the_dev_secrets_store_service_carries_the_prefix() {
     let prefixed = format!("dev.{bare_identifier}");
     let state_root = project.path().join("var");
 
-    let environment = resolve(
+    let keyring = new_fake_keyring();
+    let environment = resolve_with_secret_store_for_test(
         &manifest_for(&bare_identifier, ""),
         project.path(),
         &prefixed,
         &state_root,
         Mode::Dev,
+        keyring.store(&prefixed),
     )
     .expect("the dev environment resolves");
 
@@ -472,10 +463,10 @@ fn the_dev_secrets_store_service_carries_the_prefix() {
     // secrets must never resolve to the same keyring entry — the trap the
     // station's own `dev_secrets_service` already solved, carried over here as
     // the whole runtime identity rather than a service string built ad hoc.
-    crate::secrets::secrets_set(&environment.secret_store, "probe", "dev-value".to_string());
-    let installed_store = crate::secrets::new_store(&bare_identifier, &state_root.join("data"));
+    secrets_set(&environment.secret_store, "probe", "dev-value".to_string());
+    let installed_store = keyring.store(&bare_identifier);
     assert_ne!(
-        crate::secrets::secrets_get(&installed_store, "probe").as_deref(),
+        secrets_get(&installed_store, "probe").as_deref(),
         Some("dev-value"),
         "a dev session's secret must not be visible under the installed app's own service"
     );
