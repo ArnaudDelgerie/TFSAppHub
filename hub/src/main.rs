@@ -101,6 +101,24 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         return EXIT_UNIMPLEMENTED;
     }
 
+    if let Some(id) = interrupted_app_id(&command) {
+        if let Ok(paths) = paths::Paths::resolve() {
+            match update::repair_required(&paths, id) {
+                Ok(true) => {
+                    eprintln!(
+                        "tfsapp-hub: {id} has an interrupted update; run `tfsapp-hub repair {id} --yes` first."
+                    );
+                    return cli::EXIT_FAILED;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("tfsapp-hub: cannot inspect the update journal for {id}: {error}");
+                    return cli::EXIT_FAILED;
+                }
+            }
+        }
+    }
+
     // Reconciliation (plan 020, step 5): a hub self-update can move PHP out
     // from under an already-installed app, and this is where that gets
     // noticed — once, on the first `Level::App` command that runs after it,
@@ -182,6 +200,7 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             assume_yes,
             &context.package_info().version.to_string(),
         ),
+        Command::Repair { id, assume_yes } => update::repair(&id, assume_yes),
         Command::Rollback { id, assume_yes } => rollback::run(&id, assume_yes),
         Command::Export { id, path } => portability::export(&id, &path),
         Command::Import {
@@ -231,6 +250,25 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             );
             EXIT_OK
         }
+    }
+}
+
+fn interrupted_app_id(command: &Command) -> Option<&str> {
+    match command {
+        Command::Open { id }
+        | Command::Update { id, .. }
+        | Command::Rollback { id, .. }
+        | Command::Remove { id, .. }
+        | Command::Export { id, .. }
+        | Command::Import { id, .. } => Some(id),
+        Command::Run(RunInvocation::List { id })
+        | Command::Run(RunInvocation::Stop { id })
+        | Command::Run(RunInvocation::Start { id, .. }) => Some(id),
+        Command::OpenChild {
+            source: OpenChildSource::Id(id),
+            ..
+        } => Some(id),
+        _ => None,
     }
 }
 

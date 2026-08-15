@@ -896,6 +896,86 @@ fn resync_only(
     Ok(())
 }
 
+/// Explicitly recover an update that was interrupted after its journal became
+/// durable.  Normal commands deliberately never call this: choosing to put
+/// the old version back is a user-visible decision.
+pub fn repair(id: &str, assume_yes: bool) -> i32 {
+    let paths = match Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    match repair_at(&paths, id, assume_yes) {
+        Ok(true) => EXIT_OK,
+        Ok(false) => EXIT_FAILED,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            EXIT_FAILED
+        }
+    }
+}
+
+fn repair_at(paths: &Paths, id: &str, assume_yes: bool) -> Result<bool, UpdateError> {
+    let installed = registry::load(paths)?;
+    let entry = installed
+        .get(id)
+        .ok_or_else(|| UpdateError::NotInstalled { id: id.to_string() })?
+        .clone();
+    let _maintenance = lifecycle_gate::acquire_maintenance(paths, &entry.identifier, "repair")?;
+    let installed = registry::load(paths)?;
+    let entry = installed
+        .get(id)
+        .ok_or_else(|| UpdateError::NotInstalled { id: id.to_string() })?
+        .clone();
+    let data_dir = paths.app_data_dir(&entry.identifier)?;
+    let journal = update_transaction::read(&data_dir)
+        .map_err(transaction_error)?
+        .ok_or_else(|| UpdateError::NoJournal { id: id.to_string() })?;
+    if journal.outgoing.identifier != entry.identifier || journal.outgoing.id != entry.id {
+        return Err(UpdateError::JournalMismatch {
+            path: update_transaction::journal_path(&data_dir),
+        });
+    }
+    let app_dir = paths.app_dir(id)?;
+    println!(
+        "Repairing {id}: this restores the interrupted {} attempt to {}.",
+        match journal.kind {
+            TransactionKind::Apply => "update",
+            TransactionKind::ResyncOnly => "re-sync",
+        },
+        journal.outgoing.app_version
+    );
+    if !prompt::confirmed(assume_yes) {
+        println!("Aborted — nothing was changed.");
+        return Ok(false);
+    }
+    let outcome = recover_transaction(paths, &data_dir, &app_dir, &journal);
+    if !outcome.is_complete() {
+        return Err(UpdateError::Reverted {
+            detail: "repair could not restore every outgoing path.".into(),
+            outcome,
+        });
+    }
+    println!("Repaired {id} to {}.", journal.outgoing.app_version);
+    Ok(true)
+}
+
+/// A cheap, shared fence for ordinary commands. The journal is checked before
+/// command-specific filesystem diagnostics can mistake an interrupted swap
+/// for a missing installation.
+pub(crate) fn repair_required(paths: &Paths, id: &str) -> Result<bool, UpdateError> {
+    let installed = registry::load(paths)?;
+    let Some(entry) = installed.get(id) else {
+        return Ok(false);
+    };
+    let data_dir = paths.app_data_dir(&entry.identifier)?;
+    Ok(update_transaction::read(&data_dir)
+        .map_err(transaction_error)?
+        .is_some())
+}
+
 /// Everything that can stop an update, in one type so the command has one
 /// place to print from.
 #[derive(Debug)]
@@ -922,6 +1002,12 @@ pub enum UpdateError {
     /// always carries one), kept so the type is total.
     NoRecord {
         id: String,
+    },
+    NoJournal {
+        id: String,
+    },
+    JournalMismatch {
+        path: PathBuf,
     },
     /// The source is exactly what is already installed.
     Equal {
@@ -990,6 +1076,12 @@ impl fmt::Display for UpdateError {
                 formatter,
                 "{id} has no recorded version to update from — this should not happen for \
                  an installed app. Reinstall it."
+            ),
+            Self::NoJournal { id } => write!(formatter, "{id} has nothing to repair."),
+            Self::JournalMismatch { path } => write!(
+                formatter,
+                "{} does not describe this installed app — refusing to repair it.",
+                path.display()
             ),
             Self::Equal { id, version } => write!(
                 formatter,
