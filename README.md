@@ -68,6 +68,7 @@ start").
 ```sh
 make resources # fetch the pinned FrankenPHP and composer.phar into hub/resources (once)
 make check     # cargo fmt --check, clippy -D warnings, unit tests, shellcheck
+make keyring-integration # explicit production Secret Service smoke; needs dbus + gnome-keyring
 make build     # the hub's own AppImage, target/release/bundle/appimage/
 ```
 
