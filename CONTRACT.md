@@ -211,7 +211,8 @@ suffix would be destroyed by another app's update.
 | `commands` | object | Lifecycle commands the hub runs around an install or an update — §6. |
 | `run` | object | Named `bin/console` aliases a user can run directly. |
 | `actions` | object | Which native capabilities the app's own code may reach, and over which transport — §7. `actions.picker` is IPC-only: `{ "ipc": true }`. |
-| `async_worker` | boolean | Declares that the app has work to consume off the request cycle — see "Declaring off-window work" below. |
+| `workers` | array of objects | Declares one or more background consumers, each an ordered list of Messenger transports plus an optional copy count — see "Declaring off-window work" below. |
+| `async_worker` | boolean | Sugar for a single worker consuming `async`; refused together with `workers` — see "Declaring off-window work" below. |
 
 A minimal manifest is four lines:
 
@@ -286,14 +287,50 @@ the same version of the app.
 
 ### Declaring off-window work
 
-`async_worker` declares that this app has work that does not belong on the
-request cycle — a Messenger transport to consume. Declaring it gets the app a
-real transport it can dispatch to, and a worker consuming it; not declaring it
-gets `sync://`, where handlers run inline. Either way the app's own code is the
-same code, which is the point.
+`workers` declares one or more background consumers, each an ordered,
+non-empty list of Messenger transport names plus an optional `count` (a
+number of identical copies, default `1`, capped at `4`). Declaring at least
+one worker gets the app real Messenger transports it can dispatch to; declaring
+none gets `sync://`, where handlers run inline. Either way the app's own code
+is the same code, which is the point.
 
-Two things about this key are deliberate and will not change even as its shape
-does.
+```json
+{
+  "workers": [
+    { "transports": ["courant", "planifie", "fond"] },
+    { "transports": ["urgent"] }
+  ]
+}
+```
+
+**A transport list's order is its priority, and there is no separate priority
+key.** `messenger:consume a b c` is Symfony's own mechanism — a worker
+rescans from the first transport after handling a single envelope — so a long
+queued run never starves short interactive work on the same consumer. An app
+that wants several transports to interleave in a given order declares them in
+that order on one worker; several *workers* are for latency, letting one
+transport's handlers run while another's are busy, never for throughput on one
+transport and never for routing — the manifest declares transports and their
+order, the app's own `framework.messenger.routing` decides what lands where.
+
+`count` is copies of one declaration, default `1`. `DATABASE_URL` is always
+SQLite, which serializes writers regardless, so extra copies pay off only for
+handlers that spend time outside SQLite. A `count` above `4` falls back to
+`4`, and a declaration naming a `scheduler_*` transport falls back to `count:
+1` regardless of what was asked — a Scheduler transport consumed twice fires
+every task twice — both with a printed reason, per the standing
+fall-back-and-say-so rule. Naming the same transport twice, within one
+declaration or across several, is refused rather than falling back: two
+consumers on one transport is what `count` spells.
+
+`async_worker: true` is kept as sugar for exactly one declaration consuming
+`async`, with the DSN it always had — see §3 — so an already-installed app
+migrates to `workers` at its own pace rather than under it. A manifest
+spelling both keys is refused: two spellings of one thing, where guessing
+which wins is worse than asking the author to pick one.
+
+Two things about this declaration are deliberate and will not change even as
+its shape does.
 
 **Declaration is not consent.** The manifest says *this app has off-window
 work*. Whether that work is allowed to continue once the window is closed — a
@@ -311,11 +348,12 @@ because the window will be closed is entitled to say so, and can only say it if
 the environment tells the truth about the machine rather than echoing the
 manifest back.
 
-The boolean is the shape accepted today, and it is known to be too narrow: it
-hardcodes one transport, while an app using Symfony Scheduler consumes
-`scheduler_<name>` and often several transports at once. The replacement is a
-list, and it is owned by the background-worker plan rather than by this
-document. What that plan may not change is the two paragraphs above.
+The list above is plan 045's landed replacement for a boolean that hardcoded
+one transport, an app using Symfony Scheduler having always needed
+`scheduler_<name>` and often several transports at once. `async_worker`
+remains, unchanged in meaning, as the one-line spelling for the common case.
+The two paragraphs above are the ones a future change to this shape may not
+touch.
 
 ### `run`
 
@@ -388,11 +426,12 @@ console command. An app cannot tell them apart, and that is deliberate.
 | `APP_LOG_DIR` | a writable log directory | Symfony |
 | `APP_SESSION_DIR` | a writable session directory, this app's own | Symfony |
 | `DATABASE_URL` | `sqlite:///<app data>/data/app.db` | Doctrine, if the app uses it |
-| `MESSENGER_TRANSPORT_DSN` | a `doctrine://` transport when `async_worker` is declared, `sync://` otherwise | Symfony Messenger |
+| `MESSENGER_TRANSPORT_DSN` | `doctrine://default` when `workers` is declared, `doctrine://default?queue_name=async` when only the legacy `async_worker: true` is, `sync://` otherwise | Symfony Messenger |
 | `MERCURE_URL` | `<APP_ORIGIN>/.well-known/mercure` | Symfony, publishing |
 | `MERCURE_PUBLIC_URL` | identical to `MERCURE_URL` — same origin, loopback | the browser, subscribing |
 | `MERCURE_JWT_SECRET` | fresh random value every launch, never persisted | Symfony and the hub |
 | `TFS_ASYNC_WORKER` | `"1"` / `"0"` — see "Capabilities are reported, not assumed" | the app, to tell its user |
+| `TFS_WORKER_TRANSPORTS` | the transports actually consumed after fallbacks, in declaration order, deduplicated, comma-separated, empty when none | the app, to tell its user |
 | `TFS_KEYRING_AVAILABLE` | `"1"` when the OS keyring answered, `"0"` when secrets fell back to a file — §5 | the app, to tell its user |
 | `PHP_BINARY` | the interpreter actually running this app | any PHP tool spawning a PHP subprocess |
 | `PATH` | prefixed so that `php` resolves to that same interpreter | the same |
@@ -484,15 +523,18 @@ keyring or has fallen back to a file (§5). It reports what the probe actually
 picked, not whether a keyring is installed: a keyring that is present but locked
 has already fallen back, and an app is entitled to warn on that basis.
 
-`TFS_ASYNC_WORKER` says whether a worker is consuming the app's transports.
-Today the answer is exact and its scope is the window's lifetime: declaring
-`async_worker` gets a worker for as long as the app is open, and closing the
-window ends it. The rule that binds any future change: this variable mirrors
-**what is actually running**, never what the manifest asked for. The day a host
-can be asked to narrow the declaration — or to extend it past the window — the
-narrowing has to reach the app here, or an app ships a task due at 8 a.m., is
-silently narrowed, and neither its author nor its user ever learns it does not
-fire.
+`TFS_ASYNC_WORKER` says whether at least one worker is consuming any of the
+app's transports. Today the answer is exact and its scope is the window's
+lifetime: declaring `workers` (or the legacy `async_worker`) gets one or more
+workers for as long as the app is open, and closing the window ends all of
+them. `TFS_WORKER_TRANSPORTS` names which transports specifically, so an app
+with several declarations can tell a still-running one apart from one that
+gave up (§6's supervisor). The rule that binds any future change to either
+variable: they mirror **what is actually running**, never what the manifest
+asked for. The day a host can be asked to narrow the declaration — or to
+extend it past the window — the narrowing has to reach the app here, or an app
+ships a task due at 8 a.m., is silently narrowed, and neither its author nor
+its user ever learns it does not fire.
 
 ---
 
@@ -636,7 +678,7 @@ Two seconds is not a budget to design against. It is generous for a loopback
 request against a local SQLite database and deliberately short of the host's own
 kill deadline, so the ordinary close is clean. **An app that needs to finish
 something longer than a request must not do it in a request**: that is what §2's
-`async_worker` and §6's `run` are for. Work still running in a stream or a
+`workers` and §6's `run` are for. Work still running in a stream or a
 long-poll when the user closes the window is work that will be cut off.
 
 ## 5. The app's own state, and what it is isolated from

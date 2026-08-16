@@ -633,7 +633,7 @@ Each app pays its own FrankenPHP startup. That is the cost, and it is accepted.
 2. The **splash window is created first**, before the sidecar is spawned and long
    before `/healthz` answers.
 3. The Caddyfile is written into the app's data directory, then
-   `messenger:setup-transports` runs, then the server, then the worker.
+   `messenger:setup-transports` runs, then the server, then every worker.
 4. `/healthz` is polled every 250 ms for up to 60 seconds. If the server process
    dies before answering, the wait aborts immediately instead of burning the
    timeout.
@@ -786,7 +786,7 @@ backend already dying instead of starting a fresh one.
 
 **Teardown runs in one order, and every step of it is load-bearing**: the
 serving claim is released, then this process's webview windows are *destroyed*,
-then the worker is stopped, then the server, and only then does the process
+then every worker is stopped, then the server, and only then does the process
 exit. The middle step is the one that is not obvious. Closing the last window
 hides it rather than closing it, so the user's click lands while the work
 happens off the GTK main thread — and a hidden webview still holds its
@@ -801,8 +801,11 @@ For clients this process does not own — a browser opened on the app's port, a
 ours. The `SIGTERM`-then-`SIGKILL` escalation is what remains for something
 genuinely stuck: an exception path, not the ordinary one.
 
-The worker's pid is the second line of that pid file, which is what lets the
-next launch reap it if this process never gets the chance. Children are killed
+The pid file is the server's pid, then one line per live worker — plan 045's
+shape, one slot per declared consumer, written through a single shared table
+so no slot's supervisor can overwrite a sibling's line by rewriting the file
+from its own knowledge alone. That shape is what lets the next launch reap
+every one of them if this process never gets the chance. Children are killed
 as a process group, so nothing survives a window closing — and a process that
 has exited but has not yet been reaped is treated as gone rather than as
 running, which is what lets the escalation stay an exception instead of firing
@@ -820,15 +823,19 @@ declared command" below for what it answers and how a launch reads it.
 
 ### Worker supervision
 
-An app that declares off-window work gets a consumer on its queue, recycled on
-its own time and memory limits, respawned with an exponential backoff, and given
-up on after five consecutive failed starts with the user told once.
+An app that declares off-window work gets one consumer per declared worker
+(§2's `count`, flattened into one slot each), each recycled on its own time and
+memory limits, respawned with an exponential backoff, and given up on after
+five consecutive failed starts on that slot alone — a crash-looping consumer
+does not make a healthy sibling give up. The user is told at most once per
+launch, even if more than one slot gives up, and the message names the
+transports whose consumption stopped.
 
 Those constants are the app's guarantee rather than the host's, which is why
 they are not tuned here: a host that supervised differently would make the same
 manifest mean two different things.
 
-The worker belongs to the **sidecar's** lifetime, not the window's. A second
+Every worker belongs to the **sidecar's** lifetime, not the window's. A second
 `open` of the same app cannot spawn a second consumer, because it never gets
 past the serving lock.
 

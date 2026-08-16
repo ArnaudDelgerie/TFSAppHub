@@ -289,6 +289,248 @@ fn async_worker_of_the_wrong_type_is_a_parse_error_not_a_silent_false() {
     );
 }
 
+// --- workers, and async_worker's desugaring into it ------------------------
+
+#[test]
+fn workers_is_parsed_in_declared_order() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "workers": [
+            { "transports": ["courant", "planifie", "fond"] },
+            { "transports": ["scheduler_default"] }
+        ]"#,
+    );
+
+    let manifest = parse_ok(&contents).manifest;
+
+    assert_eq!(manifest.workers.len(), 2);
+    assert_eq!(
+        manifest.workers[0].transports,
+        ["courant", "planifie", "fond"]
+    );
+    // Absent `count` is the default of one.
+    assert_eq!(manifest.workers[0].count, 1);
+    assert_eq!(manifest.workers[1].transports, ["scheduler_default"]);
+}
+
+#[test]
+fn a_declared_count_is_read() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "workers": [
+            { "transports": ["fond"], "count": 3 }
+        ]"#,
+    );
+
+    assert_eq!(parse_ok(&contents).manifest.workers[0].count, 3);
+}
+
+#[test]
+fn async_worker_true_desugars_to_one_declaration_consuming_async() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "async_worker": true"#,
+    );
+
+    let manifest = parse_ok(&contents).manifest;
+
+    assert!(manifest.async_worker);
+    assert_eq!(manifest.workers.len(), 1);
+    assert_eq!(manifest.workers[0].transports, ["async"]);
+    assert_eq!(manifest.workers[0].count, 1);
+}
+
+#[test]
+fn async_worker_absent_desugars_to_no_workers() {
+    assert!(parse_ok(MINIMAL).manifest.workers.is_empty());
+}
+
+#[test]
+fn spelling_both_async_worker_and_workers_is_refused() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "async_worker": false, "workers": [{"transports": ["a"]}]"#,
+    );
+
+    let error = parse_err(&contents);
+
+    assert!(matches!(
+        error,
+        ManifestError::ConflictingWorkerDeclaration { .. }
+    ));
+    let message = error.to_string();
+    assert!(message.contains("\"async_worker\""), "{message}");
+    assert!(message.contains("\"workers\""), "{message}");
+}
+
+#[test]
+fn workers_must_be_an_array() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "workers": {"transports": ["a"]}"#,
+    );
+
+    let error = parse_err(&contents);
+
+    assert!(matches!(error, ManifestError::WorkersInvalid { .. }));
+    let message = error.to_string();
+    assert!(message.contains("must be an array"), "{message}");
+    assert!(message.contains("found an object"), "{message}");
+}
+
+#[test]
+fn a_worker_declaration_must_be_an_object() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "workers": ["not-an-object"]"#,
+    );
+
+    let error = parse_err(&contents);
+
+    let message = error.to_string();
+    assert!(message.contains("workers[0]"), "{message}");
+    assert!(message.contains("must be an object"), "{message}");
+}
+
+#[test]
+fn transports_must_be_a_non_empty_array() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "workers": [{"transports": []}]"#,
+    );
+
+    let error = parse_err(&contents);
+
+    let message = error.to_string();
+    assert!(message.contains("workers[0].transports"), "{message}");
+    assert!(message.contains("non-empty array"), "{message}");
+}
+
+#[test]
+fn a_transport_name_must_be_a_non_empty_string() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "workers": [{"transports": ["  "]}]"#,
+    );
+
+    let error = parse_err(&contents);
+
+    let message = error.to_string();
+    assert!(message.contains("workers[0].transports[0]"), "{message}");
+    assert!(message.contains("non-empty string"), "{message}");
+}
+
+#[test]
+fn count_must_be_a_positive_integer() {
+    for bad_count in ["0", "-1", "\"3\"", "2.5"] {
+        let contents = MINIMAL.replace(
+            r#""app_version": "0.6.0""#,
+            &format!(
+                r#""app_version": "0.6.0", "workers": [{{"transports": ["a"], "count": {bad_count}}}]"#
+            ),
+        );
+
+        let error = parse_err(&contents);
+
+        let message = error.to_string();
+        assert!(
+            message.contains("workers[0].count"),
+            "count {bad_count}: {message}"
+        );
+        assert!(
+            message.contains("positive integer"),
+            "count {bad_count}: {message}"
+        );
+    }
+}
+
+#[test]
+fn a_transport_repeated_across_declarations_is_refused() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "workers": [
+            { "transports": ["courant"] },
+            { "transports": ["courant"] }
+        ]"#,
+    );
+
+    let error = parse_err(&contents);
+
+    assert!(matches!(
+        error,
+        ManifestError::DuplicateWorkerTransport { ref transport, .. } if transport == "courant"
+    ));
+    assert!(error.to_string().contains("\"courant\""), "{error}");
+}
+
+#[test]
+fn a_transport_repeated_within_one_declaration_is_refused() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "workers": [
+            { "transports": ["courant", "courant"] }
+        ]"#,
+    );
+
+    assert!(matches!(
+        parse_err(&contents),
+        ManifestError::DuplicateWorkerTransport { .. }
+    ));
+}
+
+#[test]
+fn a_count_above_the_cap_falls_back_to_the_cap_and_says_so() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "workers": [{"transports": ["fond"], "count": 9}]"#,
+    );
+
+    let loaded = parse_ok(&contents);
+
+    assert_eq!(loaded.manifest.workers[0].count, super::WORKER_COUNT_CAP);
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+    assert!(
+        loaded.warnings[0].contains("workers[0].count"),
+        "{}",
+        loaded.warnings[0]
+    );
+    assert!(loaded.warnings[0].contains('9'), "{}", loaded.warnings[0]);
+}
+
+#[test]
+fn a_scheduler_transport_asked_for_more_than_once_falls_back_to_one_and_says_so() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "workers": [{"transports": ["scheduler_default"], "count": 2}]"#,
+    );
+
+    let loaded = parse_ok(&contents);
+
+    assert_eq!(loaded.manifest.workers[0].count, 1);
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+    assert!(
+        loaded.warnings[0].contains("scheduler"),
+        "{}",
+        loaded.warnings[0]
+    );
+}
+
+#[test]
+fn both_fallbacks_can_fire_together_and_each_is_reported() {
+    // A scheduler transport asked for above the cap: the cap fallback fires
+    // first (9 -> 4), then the scheduler fallback fires on the post-cap
+    // count (4 -> 1) — two warnings, not a silent clamp straight to one.
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "workers": [{"transports": ["scheduler_default"], "count": 9}]"#,
+    );
+
+    let loaded = parse_ok(&contents);
+
+    assert_eq!(loaded.manifest.workers[0].count, 1);
+    assert_eq!(loaded.warnings.len(), 2, "{:?}", loaded.warnings);
+}
+
 // --- reading from disk ----------------------------------------------------
 
 #[test]

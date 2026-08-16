@@ -14,11 +14,12 @@
 //! would be indistinguishable from a current one.
 //!
 //! **Order is load-bearing and is the station's.** `messenger:setup-transports`
-//! runs first, before anything is spawned, so an app that declares
-//! `async_worker` without the Doctrine Messenger bridge fails with no sidecar to
-//! tear down. Then the server. Then the worker, whose pid becomes the second
-//! line of `sidecar.pid` (§6) so the next launch can reap it if this process
-//! never gets to.
+//! runs first, before anything is spawned, so an app that declares a worker
+//! without the Doctrine Messenger bridge fails with no sidecar to tear down.
+//! Then the server. Then every worker (plan 045: one slot per declaration,
+//! flattened by its copy count), each pid becoming its own line of
+//! `sidecar.pid` after the server's (§6) so the next launch can reap all of
+//! them if this process never gets to.
 
 use std::{
     fs,
@@ -49,9 +50,11 @@ const CADDYFILE: &str = include_str!("../Caddyfile.desktop");
 /// arrangement the station relies on.
 pub struct Sidecar {
     pub server: Option<Child>,
-    /// The Messenger worker, when the app declares `async_worker`. Behind a lock
-    /// because the supervisor thread replaces it on every recycle.
-    pub worker: Arc<Mutex<Option<Child>>>,
+    /// One slot per declared worker (plan 045 step 4), flattened from
+    /// `manifest.workers` by each declaration's copy count. Each slot is
+    /// behind its own lock because its own supervisor thread replaces it on
+    /// every recycle, independently of its siblings.
+    pub workers: Vec<Arc<Mutex<Option<Child>>>>,
     /// Tells the supervisor to stop respawning. Set **first** in [`Sidecar::stop`],
     /// before the worker is killed, so the supervisor can never race a teardown
     /// with a respawn.
@@ -79,9 +82,9 @@ pub struct Sidecar {
 impl Sidecar {
     /// Stop everything, in the one order that leaves nothing behind.
     ///
-    /// Worker before server: the worker talks to the app's database through the
-    /// same files the server holds open, and stopping the server first would
-    /// leave a consumer running against a backend that has gone.
+    /// Every worker before the server: a worker talks to the app's database
+    /// through the same files the server holds open, and stopping the server
+    /// first would leave a consumer running against a backend that has gone.
     ///
     /// **It assumes this process's webview windows are already gone** — an
     /// ordering constraint `lifecycle::stop_sidecar_and_exit` owns and this
@@ -102,12 +105,14 @@ impl Sidecar {
         // shutdown only afterwards respawns the worker we just stopped.
         self.shutting_down.store(true, Ordering::SeqCst);
 
-        if let Ok(mut worker) = self.worker.lock() {
-            if let Some(mut child) = worker.take() {
-                if worker_needs_termination(&mut child) {
-                    println!("Stopping the Messenger worker pid {}", child.id());
-                    tfsapp_core::process::terminate(child.id());
-                    let _ = child.wait();
+        for worker in &self.workers {
+            if let Ok(mut worker) = worker.lock() {
+                if let Some(mut child) = worker.take() {
+                    if worker_needs_termination(&mut child) {
+                        println!("Stopping the Messenger worker pid {}", child.id());
+                        tfsapp_core::process::terminate(child.id());
+                        let _ = child.wait();
+                    }
                 }
             }
         }
@@ -182,15 +187,17 @@ pub fn start(
     serving: Option<fs::File>,
     app: &tauri::AppHandle,
 ) -> Result<(Sidecar, String), Box<dyn std::error::Error>> {
-    let async_worker = manifest.async_worker;
+    // One slot per declared worker, flattened from the manifest's
+    // declarations by their copy count (plan 045 step 4).
+    let worker_slots = worker::flatten_worker_slots(&manifest.workers);
     let actions = &manifest.actions;
     let url = format!("http://127.0.0.1:{}", environment.port);
     let pid_file = environment.data_dir.join("sidecar.pid");
 
-    // First, and before anything is spawned: an app declaring `async_worker`
+    // First, and before anything is spawned: an app declaring a worker
     // without the Doctrine Messenger bridge has to fail here, with nothing yet
     // to tear down.
-    if async_worker {
+    if !worker_slots.is_empty() {
         worker::setup_transports(toolchain, app_dir, &environment.vars, &environment.log_dir)?;
     }
 
@@ -265,7 +272,10 @@ pub fn start(
     // `Sidecar::stop` reaps both the server and any worker already adopted.
     let sidecar = Sidecar {
         server: Some(server),
-        worker: Arc::new(Mutex::new(None)),
+        workers: worker_slots
+            .iter()
+            .map(|_| Arc::new(Mutex::new(None)))
+            .collect(),
         shutting_down: Arc::new(AtomicBool::new(false)),
         pid_file,
         lock,
@@ -282,39 +292,57 @@ pub fn start(
     // while reaping the server it has owned since `spawn()` returned.
     fs::write(&sidecar.pid_file, format!("{server_pid}\n"))?;
 
-    // Only the worker is gated on `async_worker`. The Mercure hub is always
+    // Only the workers are gated on a declaration. The Mercure hub is always
     // mounted: it is a Caddy directive, not a process, and costs nothing at
     // rest — which is what lets an app use it without declaring anything.
-    if async_worker {
-        let child =
-            worker::spawn_worker(&toolchain.frankenphp, app_dir, &envs, &environment.log_dir)
-                .map_err(|error| format!("Cannot start the Messenger worker: {error}"))?;
-        let worker_spawned_at = Instant::now();
-
-        // Adopt before the fallible pid-file rewrite. From this point a failed
-        // write drops `sidecar`, which owns and stops this worker too.
-        let worker_pid = child.id();
-        *sidecar
-            .worker
-            .lock()
-            .expect("the worker slot is uncontended before its supervisor starts") = Some(child);
-
-        // Both pids, server first, worker second — the order CONTRACT.md §6
-        // fixes, and the order the next launch's reap reads them back in.
-        fs::write(&sidecar.pid_file, format!("{server_pid}\n{worker_pid}\n"))?;
-
-        worker::spawn_worker_supervisor(worker::WorkerSupervisorConfig {
-            worker: Arc::clone(&sidecar.worker),
-            shutting_down: Arc::clone(&sidecar.shutting_down),
-            frankenphp: toolchain.frankenphp.clone(),
-            app_dir: app_dir.to_path_buf(),
-            envs: envs.clone(),
-            pid_file: sidecar.pid_file.clone(),
+    if !worker_slots.is_empty() {
+        // Shared across every slot: the table so no supervisor's rewrite can
+        // erase a sibling's pid, the latch so a launch with several workers
+        // still shows the give-up dialog at most once.
+        let pid_table = Arc::new(worker::WorkerPidTable::new(
             server_pid,
-            log_dir: environment.log_dir.clone(),
-            worker_spawned_at,
-            app: app.clone(),
-        });
+            sidecar.pid_file.clone(),
+            worker_slots.len(),
+        ));
+        let dialog_shown = Arc::new(AtomicBool::new(false));
+
+        for (slot, transports) in worker_slots.into_iter().enumerate() {
+            let child = worker::spawn_worker(
+                &toolchain.frankenphp,
+                app_dir,
+                &envs,
+                &environment.log_dir,
+                &transports,
+            )
+            .map_err(|error| format!("Cannot start the Messenger worker: {error}"))?;
+            let worker_spawned_at = Instant::now();
+
+            // Adopt before the fallible pid-table rewrite. From this point a
+            // failed write drops `sidecar`, which owns and stops every worker
+            // already adopted, this one included.
+            let worker_pid = child.id();
+            *sidecar.workers[slot]
+                .lock()
+                .expect("the worker slot is uncontended before its supervisor starts") =
+                Some(child);
+
+            pid_table.set(slot, Some(worker_pid))?;
+
+            worker::spawn_worker_supervisor(worker::WorkerSupervisorConfig {
+                worker: Arc::clone(&sidecar.workers[slot]),
+                shutting_down: Arc::clone(&sidecar.shutting_down),
+                frankenphp: toolchain.frankenphp.clone(),
+                app_dir: app_dir.to_path_buf(),
+                envs: envs.clone(),
+                transports,
+                pid_table: Arc::clone(&pid_table),
+                slot,
+                log_dir: environment.log_dir.clone(),
+                worker_spawned_at,
+                app: app.clone(),
+                dialog_shown: Arc::clone(&dialog_shown),
+            });
+        }
     }
 
     Ok((sidecar, url))

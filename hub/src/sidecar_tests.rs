@@ -19,7 +19,7 @@ fn dropping_a_sidecar_reaps_its_server_and_removes_its_pid_file() {
 
     let sidecar = Sidecar {
         server: Some(server),
-        worker: Arc::new(Mutex::new(None)),
+        workers: vec![],
         shutting_down: Arc::new(AtomicBool::new(false)),
         pid_file: pid_file.clone(),
         lock: None,
@@ -35,6 +35,53 @@ fn dropping_a_sidecar_reaps_its_server_and_removes_its_pid_file() {
     assert!(
         !pid_file.exists(),
         "dropping Sidecar must remove its pid file"
+    );
+}
+
+#[test]
+fn dropping_a_sidecar_reaps_every_worker_slot() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    let pid_file = data_dir.path().join("sidecar.pid");
+
+    let spawn_sleeper = || {
+        let mut command = Command::new("sleep");
+        command.arg("60");
+        tfsapp_core::process::set_own_process_group(&mut command);
+        command.spawn().expect("a throwaway process")
+    };
+
+    let server = spawn_sleeper();
+    let server_pid = server.id();
+    let worker_a = spawn_sleeper();
+    let worker_a_pid = worker_a.id();
+    let worker_b = spawn_sleeper();
+    let worker_b_pid = worker_b.id();
+
+    let sidecar = Sidecar {
+        server: Some(server),
+        workers: vec![
+            Arc::new(Mutex::new(Some(worker_a))),
+            Arc::new(Mutex::new(Some(worker_b))),
+        ],
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        pid_file: pid_file.clone(),
+        lock: None,
+        serving: None,
+    };
+
+    drop(sidecar);
+
+    assert!(
+        !tfsapp_core::process::process_exists(server_pid),
+        "dropping Sidecar must reap its server"
+    );
+    assert!(
+        !tfsapp_core::process::process_exists(worker_a_pid),
+        "dropping Sidecar must reap every worker slot"
+    );
+    assert!(
+        !tfsapp_core::process::process_exists(worker_b_pid),
+        "dropping Sidecar must reap every worker slot"
     );
 }
 

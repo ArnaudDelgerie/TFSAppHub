@@ -111,6 +111,9 @@ fn every_variable_the_contract_lists_is_injected() {
     ] {
         assert!(!value(&environment.vars, key).is_empty(), "{key} is empty");
     }
+    // Empty is the correct value with no workers declared — CONTRACT.md §3
+    // still lists it, so `value` panicking on an absent key is the check.
+    assert_eq!(value(&environment.vars, "TFS_WORKER_TRANSPORTS"), "");
 
     // Conditional on a bridge *running*, and an install starts none. Present
     // but dead would be worse than absent: an app would connect to nothing.
@@ -187,6 +190,7 @@ fn the_async_worker_toggle_reaches_both_the_transport_and_the_app() {
     .expect("it resolves");
     assert_eq!(value(&off.vars, "MESSENGER_TRANSPORT_DSN"), "sync://");
     assert_eq!(value(&off.vars, "TFS_ASYNC_WORKER"), "0");
+    assert_eq!(value(&off.vars, "TFS_WORKER_TRANSPORTS"), "");
 
     let on = resolve(
         &manifest_for(&identifier, r#", "async_worker": true"#),
@@ -201,6 +205,79 @@ fn the_async_worker_toggle_reaches_both_the_transport_and_the_app() {
         "doctrine://default?queue_name=async"
     );
     assert_eq!(value(&on.vars, "TFS_ASYNC_WORKER"), "1");
+    assert_eq!(value(&on.vars, "TFS_WORKER_TRANSPORTS"), "async");
+}
+
+#[test]
+fn declared_workers_get_the_bare_dsn_and_the_union_of_transports_in_order() {
+    // `async_worker: true` keeps its DSN byte for byte (rows already queued
+    // under `queue_name='async'`); a manifest that spells `workers` gets the
+    // bare DSN so each transport's own `queue_name` reaches Doctrine instead
+    // of being overridden by `Connection::buildConfiguration()`'s left-hand
+    // merge — plan 045's design decision.
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("declared-workers");
+    let state_root = state_root(&paths, &identifier);
+
+    let manifest = manifest_for(
+        &identifier,
+        r#", "workers": [{"transports": ["courant", "planifie"]}, {"transports": ["fond"]}]"#,
+    );
+
+    let environment = resolve(
+        &manifest,
+        Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
+        Mode::Install,
+    )
+    .expect("it resolves");
+
+    assert_eq!(
+        value(&environment.vars, "MESSENGER_TRANSPORT_DSN"),
+        "doctrine://default"
+    );
+    assert_eq!(value(&environment.vars, "TFS_ASYNC_WORKER"), "1");
+    assert_eq!(
+        value(&environment.vars, "TFS_WORKER_TRANSPORTS"),
+        "courant,planifie,fond"
+    );
+}
+
+#[test]
+fn a_manifest_whose_fallback_fired_still_gets_the_transport_it_actually_runs() {
+    // `resolve` reads `manifest.workers` as `parse` left it — already mutated
+    // by `apply_worker_fallbacks` — so a clamped count must not hide the
+    // transport that is genuinely still being consumed.
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("fallback-transports");
+    let state_root = state_root(&paths, &identifier);
+
+    let manifest = manifest_for(
+        &identifier,
+        r#", "workers": [{"transports": ["scheduler_default"], "count": 3}]"#,
+    );
+
+    let environment = resolve(
+        &manifest,
+        Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
+        Mode::Install,
+    )
+    .expect("it resolves");
+
+    assert_eq!(
+        value(&environment.vars, "MESSENGER_TRANSPORT_DSN"),
+        "doctrine://default"
+    );
+    assert_eq!(value(&environment.vars, "TFS_ASYNC_WORKER"), "1");
+    assert_eq!(
+        value(&environment.vars, "TFS_WORKER_TRANSPORTS"),
+        "scheduler_default"
+    );
 }
 
 #[test]

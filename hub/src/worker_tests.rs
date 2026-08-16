@@ -1,4 +1,5 @@
 use std::{
+    fs,
     process::Command,
     sync::{atomic::AtomicBool, Arc, Mutex},
     thread,
@@ -6,9 +7,150 @@ use std::{
 };
 
 use super::{
-    arbitrate_respawn, sleep_backoff_or_shutdown, supervisor_decision, RespawnArbitration,
-    SupervisorDecision, WORKER_MIN_HEALTHY_UPTIME,
+    arbitrate_respawn, claim_dialog, consume_args, flatten_worker_slots, sleep_backoff_or_shutdown,
+    supervisor_decision, RespawnArbitration, SupervisorDecision, WorkerPidTable,
+    WORKER_MIN_HEALTHY_UPTIME,
 };
+use crate::manifest::WorkerDeclaration;
+
+// --- messenger:consume argument vector (plan 045) ---------------------------
+
+#[test]
+fn one_transport_is_appended_after_messenger_consume() {
+    assert_eq!(
+        consume_args(&["async".to_string()]),
+        vec![
+            "php-cli",
+            "bin/console",
+            "messenger:consume",
+            "async",
+            "--time-limit=3600",
+            "--memory-limit=256M",
+        ]
+    );
+}
+
+#[test]
+fn several_transports_are_appended_in_declared_order() {
+    // Order is the priority: `Worker::run()` rescans from the first transport
+    // after every envelope, so declaration order is what keeps a long queued
+    // run from starving short interactive work on the same consumer.
+    assert_eq!(
+        consume_args(&[
+            "courant".to_string(),
+            "planifie".to_string(),
+            "fond".to_string(),
+        ]),
+        vec![
+            "php-cli",
+            "bin/console",
+            "messenger:consume",
+            "courant",
+            "planifie",
+            "fond",
+            "--time-limit=3600",
+            "--memory-limit=256M",
+        ]
+    );
+}
+
+// --- flattening declarations into slots (plan 045 step 4) -------------------
+
+#[test]
+fn flattening_expands_each_declaration_by_its_count() {
+    let workers = vec![
+        WorkerDeclaration {
+            transports: vec!["courant".to_string()],
+            count: 2,
+        },
+        WorkerDeclaration {
+            transports: vec!["fond".to_string()],
+            count: 1,
+        },
+    ];
+
+    assert_eq!(
+        flatten_worker_slots(&workers),
+        vec![
+            vec!["courant".to_string()],
+            vec!["courant".to_string()],
+            vec!["fond".to_string()],
+        ]
+    );
+}
+
+#[test]
+fn flattening_no_declarations_is_no_slots() {
+    assert!(flatten_worker_slots(&[]).is_empty());
+}
+
+// --- the shared pid table -----------------------------------------------------
+
+#[test]
+fn the_pid_table_writes_the_server_then_every_live_worker_in_slot_order() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let pid_file = dir.path().join("sidecar.pid");
+    let table = WorkerPidTable::new(100, pid_file.clone(), 3);
+
+    // Set out of slot order: the file must still read back in slot order.
+    table.set(0, Some(201)).expect("write slot 0");
+    table.set(2, Some(203)).expect("write slot 2");
+    table.set(1, Some(202)).expect("write slot 1");
+
+    assert_eq!(
+        fs::read_to_string(&pid_file).expect("read the pid file"),
+        "100\n201\n202\n203\n"
+    );
+}
+
+#[test]
+fn respawning_a_middle_slot_leaves_its_siblings_pids_untouched() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let pid_file = dir.path().join("sidecar.pid");
+    let table = WorkerPidTable::new(100, pid_file.clone(), 3);
+    table.set(0, Some(201)).expect("write slot 0");
+    table.set(1, Some(202)).expect("write slot 1");
+    table.set(2, Some(203)).expect("write slot 2");
+
+    table.set(1, Some(9202)).expect("respawn slot 1");
+
+    assert_eq!(
+        fs::read_to_string(&pid_file).expect("read the pid file"),
+        "100\n201\n9202\n203\n"
+    );
+}
+
+#[test]
+fn giving_up_on_one_slot_clears_only_that_pid() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let pid_file = dir.path().join("sidecar.pid");
+    let table = WorkerPidTable::new(100, pid_file.clone(), 3);
+    table.set(0, Some(201)).expect("write slot 0");
+    table.set(1, Some(202)).expect("write slot 1");
+    table.set(2, Some(203)).expect("write slot 2");
+
+    table.set(1, None).expect("give up on slot 1");
+
+    assert_eq!(
+        fs::read_to_string(&pid_file).expect("read the pid file"),
+        "100\n201\n203\n"
+    );
+}
+
+// --- the give-up dialog latch -------------------------------------------------
+
+#[test]
+fn the_dialog_latch_admits_only_the_first_claim() {
+    let dialog_shown = AtomicBool::new(false);
+    assert!(
+        claim_dialog(&dialog_shown),
+        "the first give-up must claim the dialog"
+    );
+    assert!(
+        !claim_dialog(&dialog_shown),
+        "a second give-up must not claim it again"
+    );
+}
 
 // The station's own table, ported unchanged. The policy is the app's guarantee
 // (CONTRACT.md §2/§6) rather than the host's, so the two hosts have to decide

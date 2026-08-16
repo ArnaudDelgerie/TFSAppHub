@@ -54,10 +54,17 @@ pub const KNOWN_KEYS: &[&str] = &[
     "splash_text",
     "commands",
     "async_worker",
+    "workers",
     "actions",
     "releases_repo",
     "run",
 ];
+
+/// Cap on a `workers[]` declaration's `count` (the contract's
+/// fall-back-and-say-so rule, CONTRACT.md §2). `DATABASE_URL` is always
+/// SQLite, which serializes writers regardless of how many consumers are
+/// running, so a count above this buys nothing and only adds contention.
+pub const WORKER_COUNT_CAP: u8 = 4;
 
 /// The four fields with no sane default: an app that declares none of them has
 /// no identity, and every downstream key — data dir, keyring namespace, window
@@ -122,14 +129,42 @@ pub struct Manifest {
     pub actions: ActionsConfig,
     /// Opts into a supervised Messenger worker and a `doctrine://` transport.
     /// Absent is `false`, and a non-boolean is a parse error rather than a
-    /// silent `false` — see this module's header.
+    /// silent `false` — see this module's header. Sugar for a single
+    /// declaration consuming `async`, desugared into `workers` by [`parse`];
+    /// a manifest may spell this key or `workers`, never both.
     #[serde(default)]
     pub async_worker: bool,
+    /// One or more supervised consumers, each an ordered, non-empty transport
+    /// list plus an optional copy count (CONTRACT.md §2, plan 045). The order
+    /// of a declaration's transports is its priority: `messenger:consume`
+    /// rescans from the first transport after every envelope, so a long
+    /// queued run cannot starve short interactive work on the same consumer.
+    /// Empty means no consumer declared, the same as `async_worker` absent —
+    /// [`parse`] desugars `async_worker: true` into this field, so downstream
+    /// code reads `workers` alone once a manifest has loaded.
+    #[serde(default)]
+    pub workers: Vec<WorkerDeclaration>,
     /// A legacy key accepted but never read (CONTRACT.md §2's "Keys this
     /// contract does not define"). `publish` uses `--repo` or the project's
     /// git remote; install and update never let a source steer its own fetch.
     #[serde(default)]
     pub releases_repo: Option<String>,
+}
+
+/// One declared worker: an ordered, non-empty transport list plus how many
+/// copies to run — CONTRACT.md §2, plan 045. `count` above
+/// [`WORKER_COUNT_CAP`] and a `scheduler_*` transport asked for more than
+/// once both fall back rather than refuse or silently clamp; see
+/// [`apply_worker_fallbacks`].
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct WorkerDeclaration {
+    pub transports: Vec<String>,
+    #[serde(default = "default_worker_count")]
+    pub count: u8,
+}
+
+fn default_worker_count() -> u8 {
+    1
 }
 
 /// The four launch-time lifecycle command lists (CONTRACT.md §2/§6):
@@ -313,6 +348,19 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
         }
     }
 
+    // Two spellings of one thing: guessing which wins is worse than a
+    // refusal, so a manifest declaring both is rejected outright rather than
+    // desugared one way or the other.
+    if object.contains_key("async_worker") && object.contains_key("workers") {
+        return Err(ManifestError::ConflictingWorkerDeclaration {
+            path: path.to_path_buf(),
+        });
+    }
+
+    if let Some(value) = object.get("workers") {
+        validate_workers_shape(path, value)?;
+    }
+
     // Unlike a new top-level key, `actions.picker.bridge` cannot be safely
     // ignored: this group has no bridge transport, so accepting it would make
     // a future-looking manifest appear to grant something it never can.
@@ -330,7 +378,7 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
         });
     }
 
-    let warnings = object
+    let mut warnings: Vec<String> = object
         .keys()
         .filter(|key| !KNOWN_KEYS.contains(&key.as_str()))
         .map(|key| {
@@ -342,12 +390,152 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
         })
         .collect();
 
-    let manifest = serde_json::from_value(value).map_err(|error| ManifestError::Invalid {
-        path: path.to_path_buf(),
-        detail: error.to_string(),
-    })?;
+    let mut manifest: Manifest =
+        serde_json::from_value(value).map_err(|error| ManifestError::Invalid {
+            path: path.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+
+    if let Some(transport) = duplicate_worker_transport(&manifest.workers) {
+        return Err(ManifestError::DuplicateWorkerTransport {
+            path: path.to_path_buf(),
+            transport,
+        });
+    }
+
+    // The sugar this key has always been: one declaration, one transport,
+    // the same shape `workers` would spell by hand. Only reachable when
+    // `workers` itself is absent — the both-keys check above already refused
+    // the alternative.
+    if manifest.async_worker && manifest.workers.is_empty() {
+        manifest.workers = vec![WorkerDeclaration {
+            transports: vec!["async".to_string()],
+            count: 1,
+        }];
+    }
+
+    warnings.extend(apply_worker_fallbacks(&mut manifest.workers));
 
     Ok(Loaded { manifest, warnings })
+}
+
+/// The type checks `serde`'s own error cannot name a field for (this
+/// module's header): `workers` must be an array, each element an object,
+/// `transports` a non-empty array of non-empty strings, `count` — when
+/// present — a positive integer.
+fn validate_workers_shape(path: &Path, value: &serde_json::Value) -> Result<(), ManifestError> {
+    let invalid = |detail: String| ManifestError::WorkersInvalid {
+        path: path.to_path_buf(),
+        detail,
+    };
+
+    let declarations = value.as_array().ok_or_else(|| {
+        invalid(format!(
+            "\"workers\" must be an array, found {}",
+            json_type(value)
+        ))
+    })?;
+
+    for (index, declaration) in declarations.iter().enumerate() {
+        let object = declaration.as_object().ok_or_else(|| {
+            invalid(format!(
+                "workers[{index}] must be an object, found {}",
+                json_type(declaration)
+            ))
+        })?;
+
+        let transports = object
+            .get("transports")
+            .ok_or_else(|| invalid(format!("workers[{index}].transports is required")))?;
+        let transports = transports
+            .as_array()
+            .filter(|array| !array.is_empty())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "workers[{index}].transports must be a non-empty array of non-empty \
+                     strings, found {}",
+                    json_type(transports)
+                ))
+            })?;
+        for (transport_index, transport) in transports.iter().enumerate() {
+            let is_non_empty_string = transport
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty());
+            if !is_non_empty_string {
+                return Err(invalid(format!(
+                    "workers[{index}].transports[{transport_index}] must be a non-empty \
+                     string, found {}",
+                    json_type(transport)
+                )));
+            }
+        }
+
+        if let Some(count) = object.get("count") {
+            let is_positive_integer = count
+                .as_u64()
+                .is_some_and(|n| (1..=u8::MAX as u64).contains(&n));
+            if !is_positive_integer {
+                return Err(invalid(format!(
+                    "workers[{index}].count must be a positive integer, found {}",
+                    json_type(count)
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The first transport spelled by more than one declaration, if any — a
+/// consumer is what `count` spells, so this is refused rather than
+/// fallen back on, unlike the two cases below.
+fn duplicate_worker_transport(workers: &[WorkerDeclaration]) -> Option<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for declaration in workers {
+        for transport in &declaration.transports {
+            if !seen.insert(transport.as_str()) {
+                return Some(transport.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Apply CONTRACT.md's fall-back-and-say-so rule to every declaration,
+/// in place, and return one printable reason per fallback that fired.
+///
+/// A `count` above [`WORKER_COUNT_CAP`] falls back to the cap: `DATABASE_URL`
+/// is always SQLite, which serializes writers regardless, so a count above it
+/// only adds contention. A declaration naming a `scheduler_*` transport falls
+/// back to `count: 1` whatever it asked for: a Scheduler transport consumed
+/// by more than one worker at once fires every due task more than once.
+fn apply_worker_fallbacks(workers: &mut [WorkerDeclaration]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (index, declaration) in workers.iter_mut().enumerate() {
+        if declaration.count > WORKER_COUNT_CAP {
+            warnings.push(format!(
+                "workers[{index}].count {} exceeds the cap of {WORKER_COUNT_CAP}; using \
+                 {WORKER_COUNT_CAP} instead (CONTRACT.md §2).",
+                declaration.count
+            ));
+            declaration.count = WORKER_COUNT_CAP;
+        }
+        if declaration.count > 1
+            && declaration
+                .transports
+                .iter()
+                .any(|transport| transport.starts_with("scheduler_"))
+        {
+            warnings.push(format!(
+                "workers[{index}] consumes a scheduler transport with count {}; a Scheduler \
+                 transport consumed more than once fires every due task more than once, so \
+                 count is set to 1 instead (CONTRACT.md §2).",
+                declaration.count
+            ));
+            declaration.count = 1;
+        }
+    }
+    warnings
 }
 
 /// What a JSON value is, in words an error message can use.
@@ -390,6 +578,17 @@ pub enum ManifestError {
         group: &'static str,
         transport: &'static str,
     },
+    ConflictingWorkerDeclaration {
+        path: PathBuf,
+    },
+    WorkersInvalid {
+        path: PathBuf,
+        detail: String,
+    },
+    DuplicateWorkerTransport {
+        path: PathBuf,
+        transport: String,
+    },
     Invalid {
         path: PathBuf,
         detail: String,
@@ -431,6 +630,24 @@ impl fmt::Display for ManifestError {
             } => write!(
                 formatter,
                 "\"actions.{group}.{transport}\" in {} is not supported: actions.{group} has no {transport} transport (CONTRACT.md §7).",
+                path.display()
+            ),
+            Self::ConflictingWorkerDeclaration { path } => write!(
+                formatter,
+                "{} declares both \"async_worker\" and \"workers\" — spell one, not both \
+                 (CONTRACT.md §2).",
+                path.display()
+            ),
+            Self::WorkersInvalid { path, detail } => write!(
+                formatter,
+                "\"workers\" in {} is invalid: {detail} (CONTRACT.md §2).",
+                path.display()
+            ),
+            Self::DuplicateWorkerTransport { path, transport } => write!(
+                formatter,
+                "\"workers\" in {} declares transport \"{transport}\" more than once — two \
+                 consumers on one transport is what \"count\" spells, not two declarations \
+                 (CONTRACT.md §2).",
                 path.display()
             ),
             Self::Invalid { path, detail } => {
