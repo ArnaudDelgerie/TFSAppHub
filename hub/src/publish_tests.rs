@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::ffi::OsStrExt,
     os::unix::fs::{symlink, PermissionsExt},
     path::{Path, PathBuf},
@@ -110,10 +110,16 @@ case "$3" in
   cat-file)
     while IFS= read -r object; do
       case "$object" in
-        a*) printf '%s blob 1\nx\n' "$object" ;;
+        a*) value='# Changelog
+
+## 1.2.0
+
+Added the frobnicator.
+Fixed the widget.
+'; printf '%s blob %s\n%s\n' "$object" "${#value}" "$value" ;;
         b*) printf '%s blob 12\nsrc/main.php\n' "$object" ;;
         c*) printf '%s blob 6\n<?php\n\n' "$object" ;;
-        d*) printf '%s blob 2\n{}\n' "$object" ;;
+        d*) value='{"product_name":"Demo App","identifier":"dev.local.demo","project_name":"demo","app_version":"1.2.0"}'; printf '%s blob %s\n%s\n' "$object" "${#value}" "$value" ;;
       esac
     done
     exit 0
@@ -187,12 +193,17 @@ fn a_stale_releases_repo_in_the_manifest_is_ignored() {
 }
 
 #[test]
-fn a_missing_manifest_is_refused_before_git_is_ever_called() {
+fn a_missing_pinned_manifest_is_refused() {
     let project = tempfile::tempdir().expect("a temp project dir");
     fs::create_dir_all(project.path()).expect("a project root");
 
-    let error =
-        run_local_gates(project.path(), Some("owner/repo"), &git_never_called()).unwrap_err();
+    let body = GIT_CLEAN_AND_PUSHED.replace(
+        "    printf '100644 blob dddddddddddddddddddddddddddddddddddddddd\\ttfsapp.config.json\\0'\n",
+        "",
+    );
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(scripts.path(), "git", &body));
+    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
     assert!(matches!(error, PublishError::Manifest(_)), "{error}");
 }
 
@@ -202,8 +213,11 @@ fn a_non_semver_app_version_is_refused_naming_the_value_and_the_field() {
     write_manifest(project.path(), "v1.2", "");
     write_changelog(project.path(), CHANGELOG);
 
-    let error =
-        run_local_gates(project.path(), Some("owner/repo"), &git_never_called()).unwrap_err();
+    let body =
+        GIT_CLEAN_AND_PUSHED.replace("\"app_version\":\"1.2.0\"", "\"app_version\":\"v1.2\"");
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(scripts.path(), "git", &body));
+    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
     match &error {
         PublishError::UnusableVersion { version, .. } => assert_eq!(version, "v1.2"),
         other => panic!("expected UnusableVersion, got {other}"),
@@ -302,7 +316,11 @@ fn a_missing_changelog_file_is_refused() {
     write_manifest(project.path(), "1.2.0", "");
 
     let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
-    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+    let body = GIT_CLEAN_AND_PUSHED.replace(
+        "    printf '100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\tCHANGELOG.md\\0'\n",
+        "",
+    );
+    let git = Git::at(write_fake(scripts.path(), "git", &body));
 
     let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
     assert!(
@@ -318,7 +336,9 @@ fn a_changelog_with_no_matching_heading_is_refused() {
     write_changelog(project.path(), CHANGELOG);
 
     let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
-    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+    let body =
+        GIT_CLEAN_AND_PUSHED.replace("\"app_version\":\"1.2.0\"", "\"app_version\":\"1.3.0\"");
+    let git = Git::at(write_fake(scripts.path(), "git", &body));
 
     let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
     match &error {
@@ -377,7 +397,11 @@ fn ipc_on_and_undeclinable_in_a_test_refuses_the_gate() {
     write_changelog(project.path(), CHANGELOG);
 
     let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
-    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+    let body = GIT_CLEAN_AND_PUSHED.replace(
+        "\"app_version\":\"1.2.0\"}",
+        "\"app_version\":\"1.2.0\",\"actions\":{\"secrets\":{\"ipc\":true}}}",
+    );
+    let git = Git::at(write_fake(scripts.path(), "git", &body));
 
     let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
     assert!(matches!(error, PublishError::IpcNotConfirmed), "{error}");
@@ -795,6 +819,77 @@ fn publish_runs_the_whole_pipeline_and_leaves_no_scratch_behind() {
 }
 
 #[test]
+fn publish_uses_pinned_metadata_notes_and_bytes_after_the_worktree_changes() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    publishable_project(project.path(), "1.2.0");
+
+    let git_body = GIT_CLEAN_AND_PUSHED.replace(
+        "  ls-tree)\n",
+        "  ls-tree)\n    printf '%s' '{\"product_name\":\"Changed\",\"identifier\":\"dev.local.changed\",\"project_name\":\"changed\",\"app_version\":\"9.9.9\"}' > \"$2/tfsapp.config.json\"\n    printf '%s' '## 9.9.9\\n\\nChanged notes.\\n' > \"$2/CHANGELOG.md\"\n    printf '%s' '<?php changed\\n' > \"$2/src/main.php\"\n",
+    );
+    let git_scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(git_scripts.path(), "git", &git_body));
+    let gh_scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
+    let gh = Gh::at(write_fake(
+        gh_scripts.path(),
+        "gh",
+        r#"
+case "$1" in
+  --version) exit 0 ;;
+esac
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "release view") echo 'release not found' 1>&2; exit 1 ;;
+  "release create")
+    previous=''
+    for argument in "$@"; do
+      if [ "$previous" = notes ]; then
+        cp "$argument" "$(dirname "$0")/published-notes.md"
+        previous=''
+      fi
+      case "$argument" in
+        --notes-file) previous=notes ;;
+        *.tar.gz) cp "$argument" "$(dirname "$0")/published.tar.gz" ;;
+      esac
+    done
+    echo "https://github.com/owner/repo/releases/tag/v1.2.0"
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+    ));
+    let (_base, paths) = temp_paths();
+
+    assert!(publish(&paths, project.path(), None, true, &git, &gh).expect("a pinned publish"));
+    assert!(argv_log(gh_scripts.path()).contains("release create v1.2.0"));
+    assert!(argv_log(gh_scripts.path()).contains("--target deadbeefcafe1234"));
+    assert_eq!(
+        fs::read_to_string(gh_scripts.path().join("published-notes.md")).expect("copied notes"),
+        "Added the frobnicator.\nFixed the widget."
+    );
+
+    let file = fs::File::open(gh_scripts.path().join("published.tar.gz")).expect("copied archive");
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let mut contents = BTreeMap::new();
+    for entry in archive.entries().expect("archive entries") {
+        let mut entry = entry.expect("readable entry");
+        let path = entry.path().expect("entry path").into_owned();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).expect("entry bytes");
+        contents.insert(path, bytes);
+    }
+    assert_eq!(
+        contents[&PathBuf::from("demo-1.2.0/tfsapp.config.json")],
+        b"{\"product_name\":\"Demo App\",\"identifier\":\"dev.local.demo\",\"project_name\":\"demo\",\"app_version\":\"1.2.0\"}"
+    );
+    assert_eq!(
+        contents[&PathBuf::from("demo-1.2.0/src/main.php")],
+        b"<?php\n"
+    );
+}
+
+#[test]
 fn a_local_gate_failure_never_reaches_gh_and_leaves_no_scratch_behind() {
     let project = tempfile::tempdir().expect("a temp project dir");
     write_manifest(project.path(), "1.2.0", "");
@@ -803,7 +898,11 @@ fn a_local_gate_failure_never_reaches_gh_and_leaves_no_scratch_behind() {
     write_source_files(project.path());
 
     let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
-    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+    let body = GIT_CLEAN_AND_PUSHED.replace(
+        "    printf '100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\tCHANGELOG.md\\0'\n",
+        "",
+    );
+    let git = Git::at(write_fake(scripts.path(), "git", &body));
     let (_base, paths) = temp_paths();
 
     let error = publish(

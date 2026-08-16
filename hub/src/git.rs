@@ -429,7 +429,7 @@ impl BlobReader {
         let returned = fields.next();
         let kind = fields.next();
         let size = fields.next();
-        if returned.is_none()
+        if returned != Some(object.as_bytes())
             || kind != Some(b"blob".as_slice())
             || size.is_none()
             || fields.next().is_some()
