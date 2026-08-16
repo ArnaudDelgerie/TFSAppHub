@@ -366,7 +366,7 @@ fn write_locked(paths: &Paths, registry: &Registry) -> Result<(), RegistryError>
     write_bytes_locked(paths, &json)
 }
 
-/// The write half both [`write_locked`] and [`restore_from`] share: temp
+/// The write half both [`write_locked`] and [`restore_for_rollback`] share: temp
 /// file, `fsync`, rename, directory `fsync` — the caller must already hold
 /// the lock. Factored out because a rollback restore writes bytes read
 /// verbatim from an anchor snapshot rather than a freshly serialised
@@ -427,50 +427,64 @@ pub fn snapshot_to(paths: &Paths, destination: &std::path::Path) -> Result<(), R
     })
 }
 
-/// Restore `registry.json` from `source`, under the exclusive lock — the
-/// rollback anchor's registry half restored (`hub_rollback.rs`, this plan's
-/// step 7), the exact inverse of [`snapshot_to`]. Copies `source`'s bytes
-/// verbatim rather than reading them through a [`Registry`] and
-/// re-serialising: the restored file ends up byte-identical to the snapshot,
-/// not merely equivalent under it.
-pub fn restore_from(paths: &Paths, source: &std::path::Path) -> Result<(), RegistryError> {
+/// What [`restore_for_rollback`] wrote while holding the registry lock.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RollbackRestoreOutcome {
+    /// The live app entries still matched the anchor, so its bytes were copied
+    /// verbatim.
+    RestoredBytes,
+    /// App entries had changed after the anchor. The returned registry is the
+    /// locked live state whose entries were retained.
+    Merged { live: Registry },
+}
+
+/// Restore the rollback anchor without losing an app operation that races the
+/// command.
+///
+/// The snapshot is parsed before the lock, so a malformed anchor still fails
+/// before the caller consumes its binary half. The authoritative comparison,
+/// however, happens only after taking the exclusive lock: it reads the live
+/// registry, selects the byte-copy or merge branch, and writes that selection
+/// before releasing the lock. An app install, removal, or update therefore
+/// cannot land between deciding which branch to use and writing it.
+pub fn restore_for_rollback(
+    paths: &Paths,
+    source: &std::path::Path,
+) -> Result<RollbackRestoreOutcome, RegistryError> {
     let bytes = fs::read(source).map_err(|read_error| RegistryError::Io {
         path: source.to_path_buf(),
         source: read_error,
     })?;
-    let _lock = lock(paths)?;
-    write_bytes_locked(paths, &bytes)
-}
+    let snapshot = parse_registry(source, &bytes)?;
 
-/// Read a registry snapshot without changing the live registry.
-pub fn load_from(source: &std::path::Path) -> Result<Registry, RegistryError> {
-    let contents = fs::read_to_string(source).map_err(|source_error| RegistryError::Io {
-        path: source.to_path_buf(),
-        source: source_error,
-    })?;
-    serde_json::from_str(&contents).map_err(|error| RegistryError::Malformed {
-        path: source.to_path_buf(),
-        detail: error.to_string(),
-    })
-}
-
-/// Keep the live app entries, but restore the hub-level stamp from `source`.
-///
-/// The operation holds the same exclusive lock as [`restore_from`], including
-/// while it reads the live registry and writes the merged result. It returns
-/// the live registry that won, so callers can report the entries they kept.
-pub fn restore_hub_stamp_from(
-    paths: &Paths,
-    source: &std::path::Path,
-) -> Result<Registry, RegistryError> {
-    let snapshot = load_from(source)?;
     let _lock = lock(paths)?;
     let mut live = load(paths)?;
+    if live.app_entries_match(&snapshot) {
+        write_bytes_locked(paths, &bytes)?;
+        return Ok(RollbackRestoreOutcome::RestoredBytes);
+    }
+
     let kept = live.clone();
     live.hub_version = snapshot.hub_version;
     live.platform = snapshot.platform;
     write_locked(paths, &live)?;
-    Ok(kept)
+    Ok(RollbackRestoreOutcome::Merged { live: kept })
+}
+
+/// Read a registry snapshot without changing the live registry.
+pub fn load_from(source: &std::path::Path) -> Result<Registry, RegistryError> {
+    let bytes = fs::read(source).map_err(|source_error| RegistryError::Io {
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    parse_registry(source, &bytes)
+}
+
+fn parse_registry(source: &std::path::Path, bytes: &[u8]) -> Result<Registry, RegistryError> {
+    serde_json::from_slice(bytes).map_err(|error| RegistryError::Malformed {
+        path: source.to_path_buf(),
+        detail: error.to_string(),
+    })
 }
 
 /// RFC 3339 in UTC, for `installed_at` / `updated_at`.

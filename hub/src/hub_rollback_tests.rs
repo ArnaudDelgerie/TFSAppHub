@@ -125,7 +125,7 @@ fn the_whole_flow_restores_the_binary_and_a_byte_identical_registry_and_consumes
 
     let outcome = rollback(&paths, Some(appimage_path.to_str().unwrap()), true)
         .expect("the rollback succeeds");
-    assert!(outcome);
+    assert!(outcome.completed);
 
     // The stable copy and $APPIMAGE both carry the restored bytes.
     assert_eq!(
@@ -138,7 +138,7 @@ fn the_whole_flow_restores_the_binary_and_a_byte_identical_registry_and_consumes
     );
 
     // registry.json is byte-identical to the snapshot, not merely equivalent
-    // under it — restore_from copies bytes, it does not re-serialise.
+    // under it — the atomic restore copies bytes, it does not re-serialise.
     assert_eq!(
         fs::read(paths.registry_path()).expect("registry.json exists"),
         snapshot.as_bytes()
@@ -173,6 +173,37 @@ fn an_app_installed_since_update_stays_registered_when_rolling_back() {
             .map(|entry| entry.id.as_str())
             .collect::<Vec<_>>(),
         ["first", "second"]
+    );
+}
+
+#[test]
+fn an_app_installed_after_the_old_pre_read_point_survives_and_is_reported() {
+    let (_base, paths) = temp_paths();
+    let snapshot = registry_body("0.1.0", vec![app("first", "1.0.0")]);
+    seed_anchor(&paths, b"hub v1", &snapshot);
+    seed_live_registry(&paths, "0.2.0", vec![app("first", "1.0.0")]);
+
+    // This callback is after the old implementation's stale live-registry
+    // read, but before the new implementation takes the lock for its restore.
+    // An install committed here used to be overwritten by the byte-copy path.
+    let outcome = rollback_after_binary(&paths, None, true, |paths| {
+        registry::update(paths, |stored| stored.upsert(app("second", "1.0.0")))
+            .expect("the concurrent install commits");
+    })
+    .expect("the rollback succeeds");
+
+    assert!(outcome.completed);
+    assert_eq!(
+        outcome.kept_entries,
+        ["second (installed since update)"],
+        "the report is based on the state retained under the lock"
+    );
+    assert!(
+        registry::load(&paths)
+            .expect("the merged registry reads")
+            .get("second")
+            .is_some(),
+        "the interleaved install remains registered"
     );
 }
 
@@ -248,7 +279,7 @@ fn appimage_already_the_stable_copy_needs_no_second_swap() {
 
     let outcome =
         rollback(&paths, Some(stable_path.to_str().unwrap()), true).expect("the rollback succeeds");
-    assert!(outcome);
+    assert!(outcome.completed);
 
     assert_eq!(
         fs::read(&stable_path).expect("the stable copy exists"),
@@ -263,7 +294,7 @@ fn an_unset_appimage_is_not_a_reason_to_refuse() {
     seed_anchor(&paths, b"hub v1 bytes", &snapshot);
 
     let outcome = rollback(&paths, None, true).expect("a stable-copy-only rollback succeeds");
-    assert!(outcome);
+    assert!(outcome.completed);
 
     assert_eq!(
         fs::read(paths.hub_executable_path()).expect("the stable copy exists"),
@@ -283,7 +314,7 @@ fn a_deleted_appimage_download_is_noted_not_a_failure() {
 
     let outcome = rollback(&paths, Some(appimage_path.to_str().unwrap()), true)
         .expect("a missing download does not fail the rollback");
-    assert!(outcome);
+    assert!(outcome.completed);
 
     assert_eq!(
         fs::read(paths.hub_executable_path()).expect("the stable copy exists"),

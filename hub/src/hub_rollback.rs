@@ -10,7 +10,8 @@
 //!
 //! The anchor is consumed as soon as both halves are safely back: the binary
 //! half by the very rename that restores it, the registry half by deleting
-//! the snapshot once [`registry::restore_from`] has copied it back. `$APPIMAGE`
+//! the snapshot once [`registry::restore_for_rollback`] has copied or merged it
+//! back. `$APPIMAGE`
 //! is swapped after that, exactly as `hub_update::run`'s own step 9 comes
 //! after its anchor-consuming step 8 — a failure there is a named partial
 //! failure with its own message, not a reason to leave the anchor in place
@@ -43,10 +44,10 @@ pub fn run(assume_yes: bool) -> i32 {
     let appimage_env = std::env::var("APPIMAGE").ok();
 
     match rollback(&paths, appimage_env.as_deref(), assume_yes) {
-        Ok(true) => EXIT_OK,
+        Ok(outcome) if outcome.completed => EXIT_OK,
         // Declining is not a failure of the command, but nothing changed
         // either — a script reading 0 would conclude it did.
-        Ok(false) => EXIT_FAILED,
+        Ok(_) => EXIT_FAILED,
         Err(error) => {
             eprintln!("tfsapp-hub: {error}");
             EXIT_FAILED
@@ -56,13 +57,13 @@ pub fn run(assume_yes: bool) -> i32 {
 
 /// [`run`]'s pipeline, minus resolving `Paths`/`$APPIMAGE` — the seam
 /// `hub_rollback_tests.rs` uses to run a whole `--rollback` against a
-/// throwaway root, matching `hub_update::update`'s own shape. `false` means
-/// the user declined.
+/// throwaway root, matching `hub_update::update`'s own shape. Its outcome
+/// records whether the user declined and which entries the locked merge kept.
 fn rollback(
     paths: &Paths,
     appimage_env: Option<&str>,
     assume_yes: bool,
-) -> Result<bool, HubRollbackError> {
+) -> Result<RollbackResult, HubRollbackError> {
     rollback_after_binary(paths, appimage_env, assume_yes, |_| {})
 }
 
@@ -74,7 +75,7 @@ fn rollback_after_binary(
     appimage_env: Option<&str>,
     assume_yes: bool,
     after_binary: impl FnOnce(&Paths),
-) -> Result<bool, HubRollbackError> {
+) -> Result<RollbackResult, HubRollbackError> {
     let anchor_binary = hub_bin::anchor_path(paths);
     let anchor_registry = hub_bin::anchor_registry_path(paths);
 
@@ -86,18 +87,16 @@ fn rollback_after_binary(
 
     // The snapshot was written by the hub being restored to, before the
     // update that replaced it — its own `hub_version` is the version this
-    // rollback is restoring, read here so both the prompt and the final
-    // report can name it without re-parsing the file `restore_from` is about
-    // to overwrite.
+    // rollback is restoring. This read validates the anchor before the binary
+    // rename and provides the prompt's version; it never decides what live app
+    // state will be written back.
     let snapshot = registry::load_from(&anchor_registry).map_err(HubRollbackError::Registry)?;
     let restoring_to = snapshot.hub_version.clone();
-    let live = registry::load(paths).map_err(HubRollbackError::Registry)?;
-    let kept_entries = kept_entries(&live, &snapshot);
 
     announce(restoring_to.as_deref());
     if !prompt::confirmed(assume_yes) {
         println!("Aborted — nothing was changed.");
-        return Ok(false);
+        return Ok(RollbackResult::declined());
     }
 
     let stable_path = paths.hub_executable_path();
@@ -108,21 +107,16 @@ fn rollback_after_binary(
 
     after_binary(paths);
 
-    if live.app_entries_match(&snapshot) {
-        registry::restore_from(paths, &anchor_registry).map_err(|source| {
+    let kept_entries =
+        match registry::restore_for_rollback(paths, &anchor_registry).map_err(|source| {
             HubRollbackError::RegistryRestoreFailed {
                 snapshot_path: anchor_registry.clone(),
                 source,
             }
-        })?;
-    } else {
-        registry::restore_hub_stamp_from(paths, &anchor_registry).map_err(|source| {
-            HubRollbackError::RegistryRestoreFailed {
-                snapshot_path: anchor_registry.clone(),
-                source,
-            }
-        })?;
-    }
+        })? {
+            registry::RollbackRestoreOutcome::RestoredBytes => Vec::new(),
+            registry::RollbackRestoreOutcome::Merged { live } => kept_entries(&live, &snapshot),
+        };
 
     // Both halves are safely back — the anchor is consumed here, before the
     // $APPIMAGE swap below, which is best-effort from this point on and not
@@ -136,7 +130,25 @@ fn rollback_after_binary(
         missing_appimage.as_deref(),
         &kept_entries,
     );
-    Ok(true)
+    Ok(RollbackResult {
+        completed: true,
+        kept_entries,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+struct RollbackResult {
+    completed: bool,
+    kept_entries: Vec<String>,
+}
+
+impl RollbackResult {
+    fn declined() -> Self {
+        Self {
+            completed: false,
+            kept_entries: Vec::new(),
+        }
+    }
 }
 
 /// Overwrite `$APPIMAGE` with the just-restored stable copy — unless it names
