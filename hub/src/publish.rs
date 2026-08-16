@@ -11,7 +11,10 @@
 
 use std::{
     collections::BTreeSet,
+    ffi::OsString,
     fmt, fs, io,
+    io::{Read, Seek, SeekFrom, Write},
+    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
 };
 
@@ -19,7 +22,7 @@ use crate::{
     archive,
     cli::{EXIT_FAILED, EXIT_OK},
     gh::{Gh, GhError},
-    git::{Commit, Git, GitError},
+    git::{BlobReader, Commit, Git, GitError, TreeEntry},
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
     paths::Paths,
     prompt,
@@ -96,19 +99,31 @@ pub struct Assets {
     pub sha256: String,
 }
 
+/// A bounded source of pinned Git blobs.  It intentionally exposes copying,
+/// not whole-blob reads: the archive consumes one object at a time.
+pub(crate) trait BlobSource {
+    fn copy_blob(&mut self, object: &str, destination: &mut dyn Write) -> Result<u64, GitError>;
+}
+
+impl BlobSource for BlobReader {
+    fn copy_blob(&mut self, object: &str, destination: &mut dyn Write) -> Result<u64, GitError> {
+        BlobReader::copy_blob(self, object, destination)
+    }
+}
+
 /// Build `<project_name>-<app_version>.tar.gz` and its `SHA256SUMS.txt` into
-/// `destination`, from the explicit Git-tracked paths under `project_path`.
+/// `destination`, from explicit entries and blobs in one pinned Git tree.
 ///
 /// The list is filtered with [`source::EXCLUDED_FROM_HASH`] before reaching
 /// here, which is what buys the property this step exists for: `tree_hash` of
 /// the archive, once extracted, equals `tree_hash` of the tracked tree minus
 /// those standing exclusions. A symlink whose target would resolve outside the
-/// extracted tree is refused before a byte of the archive is written, with the
-/// exact lexical rule `archive::extract` applies at the other end
+/// extracted tree is refused before anything is uploaded, with the exact
+/// lexical rule `archive::extract` applies at the other end
 /// (`archive::link_target_escapes`).
 pub fn build_archive(
-    project_path: &Path,
-    tracked_paths: &[PathBuf],
+    entries: &[TreeEntry],
+    blobs: &mut impl BlobSource,
     project_name: &str,
     app_version: &str,
     destination: &Path,
@@ -135,48 +150,16 @@ pub fn build_archive(
     // warning), and following one here would silently swap the byte content
     // of a symlink `source::tree_hash` never reads for the content of
     // whatever it points at.
-    builder.follow_symlinks(false);
-
     let archive_root = PathBuf::from(&prefix);
-    builder
-        .append_dir(&archive_root, project_path)
-        .map_err(|source| PublishError::Io {
-            path: project_path.to_path_buf(),
-            source,
-        })?;
+    append_directory(&mut builder, &archive_root)?;
 
-    for (relative_path, is_directory) in archive_paths(tracked_paths) {
-        let source_path = project_path.join(&relative_path);
+    for (relative_path, entry) in archive_paths(entries) {
         let archive_path = archive_root.join(&relative_path);
-        if is_directory {
-            builder
-                .append_dir(&archive_path, &source_path)
-                .map_err(|source| PublishError::Io {
-                    path: source_path,
-                    source,
-                })?;
+        if let Some(entry) = entry {
+            append_blob_entry(&mut builder, &archive_path, entry, blobs)?;
             continue;
         }
-
-        let metadata = fs::symlink_metadata(&source_path).map_err(|source| PublishError::Io {
-            path: source_path.clone(),
-            source,
-        })?;
-        if metadata.is_symlink() {
-            let target = fs::read_link(&source_path).map_err(|source| PublishError::Io {
-                path: source_path.clone(),
-                source,
-            })?;
-            if archive::link_target_escapes(&archive_path, &target) {
-                return Err(PublishError::EscapingSymlink { path: source_path });
-            }
-        }
-        builder
-            .append_path_with_name(&source_path, &archive_path)
-            .map_err(|source| PublishError::Io {
-                path: source_path,
-                source,
-            })?;
+        append_directory(&mut builder, &archive_path)?;
     }
 
     let encoder = builder.into_inner().map_err(|source| PublishError::Io {
@@ -216,8 +199,12 @@ pub fn build_archive(
 /// Sorted archive entries derived from Git's tracked files: every parent
 /// directory once, before files below it. Git does not track empty directories,
 /// so deriving them loses nothing.
-fn archive_paths(tracked_paths: &[PathBuf]) -> Vec<(PathBuf, bool)> {
-    let files: BTreeSet<PathBuf> = tracked_paths.iter().cloned().collect();
+fn archive_paths(entries: &[TreeEntry]) -> Vec<(PathBuf, Option<&TreeEntry>)> {
+    let files: BTreeSet<PathBuf> = entries
+        .iter()
+        .filter(|entry| !excluded_from_archive(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect();
     let mut directories = BTreeSet::new();
     for path in &files {
         let mut parent = path.parent();
@@ -232,17 +219,97 @@ fn archive_paths(tracked_paths: &[PathBuf]) -> Vec<(PathBuf, bool)> {
 
     let mut entries: Vec<_> = directories
         .into_iter()
-        .map(|path| (path, true))
-        .chain(files.into_iter().map(|path| (path, false)))
+        .map(|path| (path, None))
+        .chain(files.into_iter().map(|path| {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .expect("every archive path came from a tree entry");
+            (path, Some(entry))
+        }))
         .collect();
-    entries.sort_by(
-        |(left_path, left_is_directory), (right_path, right_is_directory)| {
-            left_path
-                .cmp(right_path)
-                .then_with(|| right_is_directory.cmp(left_is_directory))
-        },
-    );
+    entries.sort_by(|(left_path, left_entry), (right_path, right_entry)| {
+        left_path
+            .cmp(right_path)
+            .then_with(|| right_entry.is_none().cmp(&left_entry.is_none()))
+    });
     entries
+}
+
+fn append_directory<W: Write>(
+    builder: &mut tar::Builder<W>,
+    path: &Path,
+) -> Result<(), PublishError> {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_mode(0o755);
+    header.set_size(0);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, io::empty())
+        .map_err(|source| PublishError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn append_blob_entry<W: Write>(
+    builder: &mut tar::Builder<W>,
+    archive_path: &Path,
+    entry: &TreeEntry,
+    blobs: &mut impl BlobSource,
+) -> Result<(), PublishError> {
+    let mut blob = tempfile::tempfile().map_err(|source| PublishError::Io {
+        path: archive_path.to_path_buf(),
+        source,
+    })?;
+    let size = blobs.copy_blob(&entry.object_id, &mut blob)?;
+    blob.seek(SeekFrom::Start(0))
+        .map_err(|source| PublishError::Io {
+            path: archive_path.to_path_buf(),
+            source,
+        })?;
+
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(if entry.is_executable() { 0o755 } else { 0o644 });
+    if entry.is_symlink() {
+        let mut target = Vec::new();
+        blob.read_to_end(&mut target)
+            .map_err(|source| PublishError::Io {
+                path: archive_path.to_path_buf(),
+                source,
+            })?;
+        let target = PathBuf::from(OsString::from_vec(target));
+        if archive::link_target_escapes(archive_path, &target) {
+            return Err(PublishError::EscapingSymlink {
+                path: entry.path.clone(),
+            });
+        }
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header
+            .set_link_name(target)
+            .map_err(|source| PublishError::Io {
+                path: archive_path.to_path_buf(),
+                source,
+            })?;
+        header.set_cksum();
+        return builder
+            .append_data(&mut header, archive_path, io::empty())
+            .map_err(|source| PublishError::Io {
+                path: archive_path.to_path_buf(),
+                source,
+            });
+    }
+
+    header.set_size(size);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, archive_path, blob)
+        .map_err(|source| PublishError::Io {
+            path: archive_path.to_path_buf(),
+            source,
+        })
 }
 
 /// Whether a Git-tracked path is still excluded from the archive because a
@@ -321,10 +388,11 @@ fn publish_into(
     gh: &Gh,
 ) -> Result<bool, PublishError> {
     let gates = run_local_gates(project_path, repo, git)?;
-    let tracked_paths: Vec<_> = git
-        .ls_files(project_path)?
+    let snapshot = git.snapshot(project_path, repo)?;
+    let entries: Vec<_> = git
+        .tree_entries(project_path, &snapshot)?
         .into_iter()
-        .filter(|path| !excluded_from_archive(path))
+        .filter(|entry| !excluded_from_archive(&entry.path))
         .collect();
     let manifest = &gates.loaded.manifest;
     let tag = format!("v{}", manifest.app_version);
@@ -333,9 +401,10 @@ fn publish_into(
     gh.ensure_authenticated()?;
     gh.ensure_no_existing_release(&gates.commit.repo, &tag)?;
 
+    let mut blobs = git.blob_reader(project_path)?;
     let assets = build_archive(
-        project_path,
-        &tracked_paths,
+        &entries,
+        &mut blobs,
         &manifest.project_name,
         &manifest.app_version,
         scratch,

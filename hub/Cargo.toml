@@ -63,12 +63,14 @@ serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
 semver.workspace = true
+# Each pinned Git blob is spooled individually before it is written to the
+# tar stream; this keeps a publication from buffering the source archive.
+tempfile.workspace = true
 
 [dev-dependencies]
 # Throwaway data-dir roots for the state layer's tests (plan 004): every one of
 # them resolves its paths against a temp dir it owns, so the suite never reads
 # or writes the developer's real `~/.local/share/TFSApp/`.
-tempfile.workspace = true
 # tauri's MockRuntime (test-only feature), so `secrets_tests.rs` can stand up two
 # real apps with two real windows and prove that resolving a secret store from
 # the calling window reaches that app's store and no other — the one regression

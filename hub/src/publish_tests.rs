@@ -1,5 +1,8 @@
 use std::{
+    collections::BTreeMap,
     fs,
+    io::Write,
+    os::unix::ffi::OsStrExt,
     os::unix::fs::{symlink, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
@@ -7,12 +10,12 @@ use std::{
 
 use super::{
     build_archive, changelog_section, excluded_from_archive, is_owner_repo_shape, publish,
-    run_local_gates, PublishError,
+    run_local_gates, BlobSource, PublishError,
 };
 use crate::{
     archive,
     gh::{Gh, GhError},
-    git::{Git, GitError},
+    git::{Git, GitError, TreeEntry},
     paths::Paths,
     release, source,
 };
@@ -79,6 +82,7 @@ case "$3" in
   rev-parse)
     case "$4" in
       --show-toplevel) echo "/repo"; exit 0 ;;
+      --show-prefix) printf ''; exit 0 ;;
       HEAD) echo "deadbeefcafe1234"; exit 0 ;;
     esac
     ;;
@@ -94,6 +98,25 @@ case "$3" in
     ;;
   remote)
     [ "$4" = "get-url" ] && { echo "https://github.com/owner/repo"; exit 0; }
+    ;;
+  merge-base) exit 0 ;;
+  ls-tree)
+    printf '100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tCHANGELOG.md\0'
+    printf '120000 blob bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tlink-to-main\0'
+    printf '100644 blob cccccccccccccccccccccccccccccccccccccccc\tsrc/main.php\0'
+    printf '100644 blob dddddddddddddddddddddddddddddddddddddddd\ttfsapp.config.json\0'
+    exit 0
+    ;;
+  cat-file)
+    while IFS= read -r object; do
+      case "$object" in
+        a*) printf '%s blob 1\nx\n' "$object" ;;
+        b*) printf '%s blob 12\nsrc/main.php\n' "$object" ;;
+        c*) printf '%s blob 6\n<?php\n\n' "$object" ;;
+        d*) printf '%s blob 2\n{}\n' "$object" ;;
+      esac
+    done
+    exit 0
     ;;
 esac
 exit 1
@@ -403,6 +426,55 @@ fn tracked_source_paths() -> Vec<PathBuf> {
     ])
 }
 
+struct TestBlobs(BTreeMap<String, Vec<u8>>);
+
+impl BlobSource for TestBlobs {
+    fn copy_blob(&mut self, object: &str, destination: &mut dyn Write) -> Result<u64, GitError> {
+        let bytes = self.0.get(object).ok_or_else(|| GitError::MissingObject {
+            object: object.to_string(),
+        })?;
+        destination
+            .write_all(bytes)
+            .expect("a writable archive blob");
+        Ok(bytes.len() as u64)
+    }
+}
+
+fn tree_from_paths(root: &Path, paths: &[PathBuf]) -> (Vec<TreeEntry>, TestBlobs) {
+    let mut blobs = BTreeMap::new();
+    let entries = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let source = root.join(path);
+            let metadata = fs::symlink_metadata(&source).expect("tracked source metadata");
+            let bytes = if metadata.file_type().is_symlink() {
+                fs::read_link(&source)
+                    .expect("a readable symlink")
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec()
+            } else {
+                fs::read(&source).expect("a readable source blob")
+            };
+            let object_id = format!("test-{index}");
+            blobs.insert(object_id.clone(), bytes);
+            TreeEntry {
+                path: path.clone(),
+                mode: if metadata.file_type().is_symlink() {
+                    0o120000
+                } else if metadata.permissions().mode() & 0o111 != 0 {
+                    0o100755
+                } else {
+                    0o100644
+                },
+                object_id,
+            }
+        })
+        .collect();
+    (entries, TestBlobs(blobs))
+}
+
 #[test]
 fn the_archive_extracts_to_a_tree_hashing_the_same_as_the_source() {
     let project = tempfile::tempdir().expect("a temp project dir");
@@ -410,15 +482,10 @@ fn the_archive_extracts_to_a_tree_hashing_the_same_as_the_source() {
     write_source_files(project.path());
     let scratch = tempfile::tempdir().expect("a temp scratch dir");
     let tracked_paths = tracked_source_paths();
+    let (entries, mut blobs) = tree_from_paths(project.path(), &tracked_paths);
 
-    let assets = build_archive(
-        project.path(),
-        &tracked_paths,
-        "demo",
-        "1.2.0",
-        scratch.path(),
-    )
-    .expect("the archive to build");
+    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+        .expect("the archive to build");
     assert_eq!(assets.archive_name, "demo-1.2.0.tar.gz");
     assert!(assets.archive_path.is_file());
     assert!(assets.sums_path.is_file());
@@ -444,6 +511,69 @@ fn the_archive_extracts_to_a_tree_hashing_the_same_as_the_source() {
 }
 
 #[test]
+fn the_archive_uses_the_captured_blobs_even_if_the_worktree_changes_afterwards() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    write_manifest(project.path(), "1.2.0", "");
+    write_source_files(project.path());
+    let executable = project.path().join("src/main.php");
+    let mut permissions = fs::metadata(&executable)
+        .expect("source metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&executable, permissions).expect("an executable source file");
+    let binary = project.path().join("binary.dat");
+    fs::write(&binary, [0, 0xff, b'\n']).expect("a binary source file");
+    let mut tracked_paths = tracked_source_paths();
+    tracked_paths.push(PathBuf::from("binary.dat"));
+    let (entries, mut blobs) = tree_from_paths(project.path(), &tracked_paths);
+
+    fs::write(&executable, "mutated after the snapshot\n").expect("a later worktree change");
+    fs::write(&binary, "mutated binary\n").expect("a later binary change");
+    fs::remove_file(project.path().join("link-to-main")).expect("a later worktree removal");
+
+    let scratch = tempfile::tempdir().expect("a temp scratch dir");
+    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+        .expect("the pinned archive to build");
+    let root = archive::extract(&assets.archive_path, &scratch.path().join("extracted"))
+        .expect("the archive to extract");
+
+    assert_eq!(
+        fs::read_to_string(root.join("src/main.php")).unwrap(),
+        "<?php\n"
+    );
+    assert_eq!(fs::read(root.join("binary.dat")).unwrap(), [0, 0xff, b'\n']);
+    assert!(root.join("link-to-main").is_symlink());
+    assert_eq!(
+        fs::metadata(root.join("src/main.php"))
+            .expect("extracted metadata")
+            .permissions()
+            .mode()
+            & 0o111,
+        0o111
+    );
+}
+
+#[test]
+fn archive_exclusions_are_applied_before_a_blob_is_requested() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    write_manifest(project.path(), "1.2.0", "");
+    write_source_files(project.path());
+    let (mut entries, mut blobs) = tree_from_paths(project.path(), &tracked_source_paths());
+    entries.push(TreeEntry {
+        path: PathBuf::from("vendor/never-read.php"),
+        mode: 0o100644,
+        object_id: "missing-excluded-object".to_string(),
+    });
+
+    let scratch = tempfile::tempdir().expect("a temp scratch dir");
+    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+        .expect("an excluded blob must not be requested");
+    let root = archive::extract(&assets.archive_path, &scratch.path().join("extracted"))
+        .expect("the archive to extract");
+    assert!(!root.join("vendor").exists());
+}
+
+#[test]
 fn ignored_files_on_disk_are_not_written_to_the_archive() {
     let project = tempfile::tempdir().expect("a temp project dir");
     write_manifest(project.path(), "1.2.0", "");
@@ -461,15 +591,10 @@ fn ignored_files_on_disk_are_not_written_to_the_archive() {
     fs::write(cache.join("test-results"), "cache").expect("a PHPUnit cache entry");
     let scratch = tempfile::tempdir().expect("a temp scratch dir");
     let tracked_paths = tracked_source_paths();
+    let (entries, mut blobs) = tree_from_paths(project.path(), &tracked_paths);
 
-    let assets = build_archive(
-        project.path(),
-        &tracked_paths,
-        "demo",
-        "1.2.0",
-        scratch.path(),
-    )
-    .expect("the archive to build");
+    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+        .expect("the archive to build");
     let root = archive::extract(&assets.archive_path, &scratch.path().join("extracted"))
         .expect("the archive to extract");
 
@@ -532,7 +657,8 @@ fn a_real_repository_archive_contains_exactly_its_tracked_paths() {
         .filter(|path| !excluded_from_archive(path))
         .collect();
     let scratch = tempfile::tempdir().expect("a temp scratch dir");
-    let assets = build_archive(root, &archive_paths, "demo", "1.2.0", scratch.path())
+    let (entries, mut blobs) = tree_from_paths(root, &archive_paths);
+    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
         .expect("the archive to build");
 
     let file = fs::File::open(&assets.archive_path).expect("a readable archive");
@@ -569,15 +695,10 @@ fn the_sums_file_verifies_against_the_archive_it_names() {
     write_source_files(project.path());
     let scratch = tempfile::tempdir().expect("a temp scratch dir");
     let tracked_paths = tracked_source_paths();
+    let (entries, mut blobs) = tree_from_paths(project.path(), &tracked_paths);
 
-    let assets = build_archive(
-        project.path(),
-        &tracked_paths,
-        "demo",
-        "1.2.0",
-        scratch.path(),
-    )
-    .expect("the archive to build");
+    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+        .expect("the archive to build");
 
     let sums_body = fs::read_to_string(&assets.sums_path).expect("a readable sums file");
     assert_eq!(
@@ -606,18 +727,12 @@ fn an_escaping_symlink_is_refused_before_anything_is_uploaded() {
     let scratch = tempfile::tempdir().expect("a temp scratch dir");
     let mut tracked_paths = tracked_source_paths();
     tracked_paths.push(PathBuf::from("evil"));
+    let (entries, mut blobs) = tree_from_paths(project.path(), &tracked_paths);
 
-    let error = build_archive(
-        project.path(),
-        &tracked_paths,
-        "demo",
-        "1.2.0",
-        scratch.path(),
-    )
-    .unwrap_err();
+    let error = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path()).unwrap_err();
     match &error {
         PublishError::EscapingSymlink { path } => {
-            assert_eq!(path, &project.path().join("evil"));
+            assert_eq!(path, &PathBuf::from("evil"));
         }
         other => panic!("expected EscapingSymlink, got {other}"),
     }
@@ -847,8 +962,19 @@ fn an_escaping_symlink_refuses_after_every_gh_gate_and_still_leaves_no_scratch_b
     symlink("../../outside", project.path().join("evil")).expect("an escaping symlink");
 
     let git_scripts = tempfile::tempdir().expect("a temp dir for the fake git");
-    let git_body =
-        GIT_CLEAN_AND_PUSHED.replace("tfsapp.config.json\\0'", "tfsapp.config.json\\0evil\\0'");
+    let git_body = GIT_CLEAN_AND_PUSHED
+        .replace(
+            "CHANGELOG.md\\0link-to-main\\0src/main.php\\0tfsapp.config.json\\0'",
+            "CHANGELOG.md\\0link-to-main\\0src/main.php\\0tfsapp.config.json\\0evil\\0'",
+        )
+        .replace(
+            "    exit 0\n    ;;\n  cat-file)",
+            "    printf '120000 blob eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\tevil\\0'\n    exit 0\n    ;;\n  cat-file)",
+        )
+        .replace(
+            "        d*) printf '%s blob 2\\n{}\\n' \"$object\" ;;",
+            "        d*) printf '%s blob 2\\n{}\\n' \"$object\" ;;\n        e*) printf '%s blob 13\\n../../outside\\n' \"$object\" ;;",
+        );
     let git = Git::at(write_fake(git_scripts.path(), "git", &git_body));
     let gh_scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
     let gh = Gh::at(write_fake(gh_scripts.path(), "gh", GH_EVERY_GATE_PASSES));

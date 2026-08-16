@@ -396,8 +396,8 @@ impl BlobReader {
     pub fn copy_blob(
         &mut self,
         object: &str,
-        destination: &mut impl Write,
-    ) -> Result<(), GitError> {
+        destination: &mut (impl Write + ?Sized),
+    ) -> Result<u64, GitError> {
         self.stdin
             .write_all(object.as_bytes())
             .and_then(|()| self.stdin.write_all(b"\n"))
@@ -466,7 +466,7 @@ impl BlobReader {
                 detail: format!("blob response for {object} has no trailing newline"),
             });
         }
-        Ok(())
+        Ok(size)
     }
 }
 
