@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{parse_branch_line, parse_ls_files, parse_status, Git, GitError};
+use super::{parse_branch_line, parse_ls_files, parse_ls_tree, parse_status, Git, GitError};
 
 /// A fake `git` at `dir/git`, logging its own argv (space-joined) to
 /// `dir/argv.log` before dispatching — see `gh_tests.rs`'s own copy of this
@@ -320,4 +320,109 @@ exit 1
         vec![PathBuf::from("src/main.php"), PathBuf::from("a file.php")]
     );
     assert!(argv_log(scripts.path()).contains("-C /repo/app ls-files -z"));
+}
+
+#[test]
+fn parse_ls_tree_keeps_paths_modes_and_object_order_under_a_nested_prefix() {
+    let sha_a = b"0123456789012345678901234567890123456789";
+    let sha_b = b"abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    let mut output = Vec::new();
+    output.extend_from_slice(b"100755 blob ");
+    output.extend_from_slice(sha_a);
+    output.extend_from_slice(b"\tapps/demo/bin/run\0");
+    output.extend_from_slice(b"120000 blob ");
+    output.extend_from_slice(sha_b);
+    output.extend_from_slice(b"\tapps/demo/a\nlink\0");
+
+    let entries = parse_ls_tree(&output, Path::new("apps/demo/")).expect("a valid pinned tree");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].path, PathBuf::from("bin/run"));
+    assert_eq!(entries[0].mode, 0o100755);
+    assert!(entries[0].is_executable());
+    assert_eq!(entries[1].path, PathBuf::from("a\nlink"));
+    assert!(entries[1].is_symlink());
+    assert_eq!(
+        entries[1].object_id,
+        "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+    );
+}
+
+#[test]
+fn parse_ls_tree_refuses_malformed_records_and_gitlinks() {
+    let malformed = parse_ls_tree(b"100644 blob no-tab\0", Path::new(""))
+        .expect_err("a tab separates the path");
+    assert!(matches!(malformed, GitError::MalformedTree { .. }));
+
+    let gitlink = parse_ls_tree(
+        b"160000 commit 0123456789012345678901234567890123456789\tvendor/dependency\0",
+        Path::new(""),
+    )
+    .expect_err("submodules have no V0.1 archive representation");
+    assert!(matches!(gitlink, GitError::UnsupportedTreeEntry { .. }));
+}
+
+#[test]
+fn snapshot_pins_the_upstream_sha_and_discovers_a_nested_project_prefix() {
+    let scripts = tempfile::tempdir().expect("a temp dir");
+    let git = Git::at(write_fake_git(
+        scripts.path(),
+        r#"
+case "$3" in
+  rev-parse)
+    case "$4" in
+      --show-toplevel) echo "/repo" ;;
+      --show-prefix) printf 'apps/demo/\n' ;;
+      HEAD) echo "abc123deadbeef" ;;
+    esac
+    exit 0 ;;
+  status) printf '## main...origin/main\n'; exit 0 ;;
+  merge-base) exit 0 ;;
+  remote) echo 'https://github.com/ArnaudDelgerie/TFSAppDemo'; exit 0 ;;
+esac
+exit 1
+"#,
+    ));
+
+    let snapshot = git
+        .snapshot(Path::new("/repo/apps/demo"), None)
+        .expect("a clean upstream commit");
+    assert_eq!(snapshot.commit.sha, "abc123deadbeef");
+    assert_eq!(snapshot.project_prefix, PathBuf::from("apps/demo/"));
+    assert!(
+        argv_log(scripts.path()).contains("merge-base --is-ancestor abc123deadbeef origin/main")
+    );
+}
+
+#[test]
+fn one_batch_child_streams_each_blob_and_refuses_missing_or_malformed_responses() {
+    let scripts = tempfile::tempdir().expect("a temp dir");
+    let git = Git::at(write_fake_git(
+        scripts.path(),
+        r#"
+case "$3" in
+  cat-file)
+    while IFS= read -r object; do
+      case "$object" in
+        good) printf 'good blob 4\n\377\000ok\n' ;;
+        missing) printf 'missing missing\n' ;;
+        bad) printf 'bad tree 1\nx\n' ;;
+      esac
+    done
+    exit 0 ;;
+esac
+exit 1
+"#,
+    ));
+    let mut reader = git.blob_reader(Path::new("/repo")).expect("batch child");
+    let mut bytes = Vec::new();
+    reader.copy_blob("good", &mut bytes).expect("streamed blob");
+    assert_eq!(bytes, b"\xff\0ok");
+    assert!(matches!(
+        reader.copy_blob("missing", &mut Vec::new()),
+        Err(GitError::MissingObject { .. })
+    ));
+    assert!(matches!(
+        reader.copy_blob("bad", &mut Vec::new()),
+        Err(GitError::MalformedBatch { .. })
+    ));
 }
