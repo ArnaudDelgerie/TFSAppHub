@@ -1076,13 +1076,18 @@ anchor remains: `tfsapp-hub --rollback` repairs that state.
 — both anchor halves present — is checked before anything else, including the
 confirmation prompt, so a half-written anchor from an interrupted `--update`
 reads as "nothing to roll back to" rather than a network problem. It restores
-the previous binary first. The registry restore is a merge: when the live app
-entries match the snapshot it copies the snapshot byte-for-byte; when they
-differ, live app entries follow the installed trees while only `hub_version`
-and the platform stamp return from the snapshot. Thus app installs, removals
-and updates made since the hub update remain coherent, and the report names
-the entries whose recorded state was kept. This supersedes plan 020's
-historical claim that a rollback always restores the whole registry exactly.
+the previous binary first. Only then does one registry operation take the
+exclusive registry lock, read the live entries, compare them with the snapshot,
+and write the selected result before releasing that lock. It is deliberately
+not held through the confirmation prompt or binary swap, so ordinary app
+commands never wait on a person or unrelated filesystem work. The registry
+restore is a merge: when the entries read under that lock match the snapshot it
+copies the snapshot byte-for-byte; when they differ, those locked live entries
+follow the installed trees while only `hub_version` and the platform stamp
+return from the snapshot. Thus app installs, removals and updates made since
+the hub update remain coherent, and the report names the entries whose recorded
+state was kept. This supersedes plan 020's historical claim that a rollback
+always restores the whole registry exactly.
 
 Once the registry is safely back, `$APPIMAGE` is restored — skipped when it
 already names the stable copy, and noted rather than failed when the user's

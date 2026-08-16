@@ -57,8 +57,8 @@ pub fn run(assume_yes: bool) -> i32 {
 
 /// [`run`]'s pipeline, minus resolving `Paths`/`$APPIMAGE` — the seam
 /// `hub_rollback_tests.rs` uses to run a whole `--rollback` against a
-/// throwaway root, matching `hub_update::update`'s own shape. `false` means
-/// the user declined.
+/// throwaway root, matching `hub_update::update`'s own shape. Its outcome
+/// records whether the user declined and which entries the locked merge kept.
 fn rollback(
     paths: &Paths,
     appimage_env: Option<&str>,
