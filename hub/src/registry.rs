@@ -366,7 +366,7 @@ fn write_locked(paths: &Paths, registry: &Registry) -> Result<(), RegistryError>
     write_bytes_locked(paths, &json)
 }
 
-/// The write half both [`write_locked`] and [`restore_from`] share: temp
+/// The write half both [`write_locked`] and [`restore_for_rollback`] share: temp
 /// file, `fsync`, rename, directory `fsync` — the caller must already hold
 /// the lock. Factored out because a rollback restore writes bytes read
 /// verbatim from an anchor snapshot rather than a freshly serialised
@@ -429,10 +429,6 @@ pub fn snapshot_to(paths: &Paths, destination: &std::path::Path) -> Result<(), R
 
 /// What [`restore_for_rollback`] wrote while holding the registry lock.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "the command adopts this primitive in the next atomic plan step"
-)]
 pub enum RollbackRestoreOutcome {
     /// The live app entries still matched the anchor, so its bytes were copied
     /// verbatim.
@@ -451,10 +447,6 @@ pub enum RollbackRestoreOutcome {
 /// registry, selects the byte-copy or merge branch, and writes that selection
 /// before releasing the lock. An app install, removal, or update therefore
 /// cannot land between deciding which branch to use and writing it.
-#[allow(
-    dead_code,
-    reason = "the command adopts this primitive in the next atomic plan step"
-)]
 pub fn restore_for_rollback(
     paths: &Paths,
     source: &std::path::Path,
@@ -479,19 +471,6 @@ pub fn restore_for_rollback(
     Ok(RollbackRestoreOutcome::Merged { live: kept })
 }
 
-/// Restore an anchor verbatim under the registry lock.
-///
-/// Kept temporarily for the command's existing call site; the rollback path
-/// moves to [`restore_for_rollback`] in the following integration step.
-pub fn restore_from(paths: &Paths, source: &std::path::Path) -> Result<(), RegistryError> {
-    let bytes = fs::read(source).map_err(|read_error| RegistryError::Io {
-        path: source.to_path_buf(),
-        source: read_error,
-    })?;
-    let _lock = lock(paths)?;
-    write_bytes_locked(paths, &bytes)
-}
-
 /// Read a registry snapshot without changing the live registry.
 pub fn load_from(source: &std::path::Path) -> Result<Registry, RegistryError> {
     let bytes = fs::read(source).map_err(|source_error| RegistryError::Io {
@@ -506,24 +485,6 @@ fn parse_registry(source: &std::path::Path, bytes: &[u8]) -> Result<Registry, Re
         path: source.to_path_buf(),
         detail: error.to_string(),
     })
-}
-
-/// Keep the live app entries, but restore the hub-level stamp from `source`.
-///
-/// Kept temporarily for the command's existing call site; the rollback path
-/// moves to [`restore_for_rollback`] in the following integration step.
-pub fn restore_hub_stamp_from(
-    paths: &Paths,
-    source: &std::path::Path,
-) -> Result<Registry, RegistryError> {
-    let snapshot = load_from(source)?;
-    let _lock = lock(paths)?;
-    let mut live = load(paths)?;
-    let kept = live.clone();
-    live.hub_version = snapshot.hub_version;
-    live.platform = snapshot.platform;
-    write_locked(paths, &live)?;
-    Ok(kept)
 }
 
 /// RFC 3339 in UTC, for `installed_at` / `updated_at`.
