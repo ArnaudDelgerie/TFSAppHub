@@ -1192,8 +1192,8 @@ fn an_escaping_symlink_refuses_after_every_gh_gate_and_still_leaves_no_scratch_b
             "    printf '120000 blob eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\tevil\\0'\n    exit 0\n    ;;\n  cat-file)",
         )
         .replace(
-            "        d*) printf '%s blob 2\\n{}\\n' \"$object\" ;;",
-            "        d*) printf '%s blob 2\\n{}\\n' \"$object\" ;;\n        e*) printf '%s blob 13\\n../../outside\\n' \"$object\" ;;",
+            "        d*) value='{\"product_name\":\"Demo App\",\"identifier\":\"dev.local.demo\",\"project_name\":\"demo\",\"app_version\":\"1.2.0\"}'; printf '%s blob %s\\n%s\\n' \"$object\" \"${#value}\" \"$value\" ;;",
+            "        d*) value='{\"product_name\":\"Demo App\",\"identifier\":\"dev.local.demo\",\"project_name\":\"demo\",\"app_version\":\"1.2.0\"}'; printf '%s blob %s\\n%s\\n' \"$object\" \"${#value}\" \"$value\" ;;\n        e*) printf '%s blob 13\\n../../outside\\n' \"$object\" ;;",
         );
     let git = Git::at(write_fake(git_scripts.path(), "git", &git_body));
     let gh_scripts = tempfile::tempdir().expect("a temp dir for the fake gh");
