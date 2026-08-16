@@ -81,6 +81,51 @@ fn cleanup_previous_sidecar_waits_for_a_lock_released_mid_flight_then_reaps() {
     assert!(!pid_file.exists(), "a reaped pid file is removed");
 }
 
+#[test]
+fn cleanup_previous_sidecar_reaps_a_stale_server_and_every_stale_worker() {
+    // Plan 045 step 4's regression: a stale sidecar.pid holding a server and
+    // three workers must get all four reaped by the next launch. Nothing
+    // about this function changes for it — the per-line loop above already
+    // covers N workers — and this test is what keeps that true.
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("sidecar.pid");
+
+    let server = spawn_child_with_identifier("test-identifier");
+    let worker_a = spawn_child_with_identifier("test-identifier");
+    let worker_b = spawn_child_with_identifier("test-identifier");
+    let worker_c = spawn_child_with_identifier("test-identifier");
+    let pids = [server.id(), worker_a.id(), worker_b.id(), worker_c.id()];
+
+    fs::write(
+        &pid_file,
+        pids.iter()
+            .map(|pid| format!("{pid}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+
+    let reapers: Vec<_> = [server, worker_a, worker_b, worker_c]
+        .into_iter()
+        .map(|mut child| {
+            thread::spawn(move || {
+                let _ = child.wait();
+            })
+        })
+        .collect();
+
+    let lock = cleanup_previous_sidecar(&pid_file, "test-identifier", Duration::ZERO);
+    assert!(lock.is_some());
+
+    for reaper in reapers {
+        reaper.join().unwrap();
+    }
+
+    for pid in pids {
+        assert!(!process_exists(pid), "pid {pid} must have been reaped");
+    }
+    assert!(!pid_file.exists(), "a reaped pid file is removed");
+}
+
 // --- lock_path -------------------------------------------------------------
 
 #[test]

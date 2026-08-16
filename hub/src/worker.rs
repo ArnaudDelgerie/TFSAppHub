@@ -17,14 +17,15 @@
 //!   `php::Toolchain`, which is what keeps every line of an app's PHP on the
 //!   bundled interpreter (see `php.rs`'s header on `PHP_BINARY`).
 //!
-//! **The worker belongs to the sidecar's lifetime, not the window's.** A second
-//! `open` of the same app attaches a window to the sidecar already running and
-//! must not spawn a second consumer — which falls out of the process model:
-//! the serving lock sends that second `open` down the hand-off path, and the
-//! hand-off — not a lock — prevents the second worker. Teardown stops the
-//! worker before the server, and the worker's pid is the second line of
-//! `sidecar.pid` (CONTRACT.md §6), which is what lets the next launch reap it if
-//! this process dies without tearing anything down.
+//! **Every worker belongs to the sidecar's lifetime, not the window's.** A
+//! second `open` of the same app attaches a window to the sidecar already
+//! running and must not spawn a second set of consumers — which falls out of
+//! the process model: the serving lock sends that second `open` down the
+//! hand-off path, and the hand-off — not a lock — prevents it. Teardown stops
+//! every worker before the server, and each worker's pid is one of the lines
+//! after the server's in `sidecar.pid` (CONTRACT.md §6, plan 045), which is
+//! what lets the next launch reap all of them if this process dies without
+//! tearing anything down.
 
 use std::{
     fs,
@@ -115,6 +116,20 @@ pub fn spawn_worker(
     command.spawn()
 }
 
+/// Flatten `workers` into one entry per copy — a declaration with `count: 3`
+/// becomes three identical slots — in declaration order, each copy's
+/// transports before the next declaration's first (plan 045 step 4). A pure
+/// function so the slot list a launch will spawn is assertable without
+/// spawning anything.
+pub fn flatten_worker_slots(workers: &[crate::manifest::WorkerDeclaration]) -> Vec<Vec<String>> {
+    workers
+        .iter()
+        .flat_map(|declaration| {
+            std::iter::repeat_n(declaration.transports.clone(), declaration.count as usize)
+        })
+        .collect()
+}
+
 /// A worker that lived at least this long is judged healthy: its exit is a
 /// recycle (a time or memory limit reached, or a clean `SIGTERM`) rather than a
 /// failed start, and it resets the failure count.
@@ -183,6 +198,42 @@ pub fn sleep_backoff_or_shutdown(delay: Duration, shutting_down: &AtomicBool) ->
     }
 }
 
+/// The shared record behind every `sidecar.pid` write once a launch has more
+/// than one worker slot (plan 045 step 4).
+///
+/// A supervisor that rewrote the file from its own knowledge alone would
+/// erase its siblings' pids the moment it recycled or gave up, and the next
+/// launch would not reap them — so every write instead goes through this
+/// table, which holds every slot's current pid and always rewrites the whole
+/// file: the server pid, then one line per still-live worker, in slot order.
+pub struct WorkerPidTable {
+    server_pid: u32,
+    pid_file: PathBuf,
+    pids: Mutex<Vec<Option<u32>>>,
+}
+
+impl WorkerPidTable {
+    pub fn new(server_pid: u32, pid_file: PathBuf, slots: usize) -> Self {
+        Self {
+            server_pid,
+            pid_file,
+            pids: Mutex::new(vec![None; slots]),
+        }
+    }
+
+    /// Record `slot`'s pid (or clear it, with `None`, on a give-up) and
+    /// rewrite the file whole.
+    pub fn set(&self, slot: usize, pid: Option<u32>) -> std::io::Result<()> {
+        let mut pids = self.pids.lock().expect("worker pid table mutex");
+        pids[slot] = pid;
+        let mut contents = format!("{}\n", self.server_pid);
+        for pid in pids.iter().flatten() {
+            contents.push_str(&format!("{pid}\n"));
+        }
+        fs::write(&self.pid_file, contents)
+    }
+}
+
 /// Everything the supervisor loop needs, grouped so its call site builds one
 /// named-field value rather than a positional list where two swapped `PathBuf`s
 /// would compile in silence. Every field is owned: they all cross a
@@ -194,11 +245,16 @@ pub struct WorkerSupervisorConfig {
     pub app_dir: PathBuf,
     pub envs: Vec<(&'static str, String)>,
     pub transports: Vec<String>,
-    pub pid_file: PathBuf,
-    pub server_pid: u32,
+    /// The shared table behind this slot's `sidecar.pid` line, and this
+    /// slot's index into it.
+    pub pid_table: Arc<WorkerPidTable>,
+    pub slot: usize,
     pub log_dir: PathBuf,
     pub worker_spawned_at: Instant,
     pub app: tauri::AppHandle,
+    /// Shared across every slot's supervisor so at most one give-up ever
+    /// shows the "background processing unavailable" dialog for one launch.
+    pub dialog_shown: Arc<AtomicBool>,
 }
 
 /// The result of offering a freshly spawned worker to the shared sidecar slot.
@@ -252,11 +308,12 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
         app_dir,
         envs,
         transports,
-        pid_file,
-        server_pid,
+        pid_table,
+        slot,
         log_dir,
         worker_spawned_at,
         app,
+        dialog_shown,
     } = config;
     let sidecar_log = log_dir.join("sidecar.log");
 
@@ -323,10 +380,12 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
                         );
                         eprintln!("{line}");
                         log::append_log(&sidecar_log, &line);
-                        // No worker left for the next launch to reap; only the
-                        // server pid still means anything.
-                        let _ = fs::write(&pid_file, format!("{server_pid}\n"));
-                        gave_up_dialog(&app, &sidecar_log);
+                        // Only this slot's pid leaves the table; a sibling
+                        // still running keeps its own line.
+                        let _ = pid_table.set(slot, None);
+                        if claim_dialog(&dialog_shown) {
+                            gave_up_dialog(&app, &sidecar_log, &transports);
+                        }
                         return;
                     }
                     SupervisorDecision::RestartAfter {
@@ -357,12 +416,12 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
                             // The child is in the slot before this durable
                             // record exists, so teardown can always take it.
                             // If shutdown begins just after the arbitration,
-                            // its own cleanup removes this file; the final
-                            // check below also covers teardown deleting it
-                            // between this write and that cleanup.
-                            let _ = fs::write(&pid_file, format!("{server_pid}\n{worker_pid}\n"));
+                            // clearing this slot again below covers the race
+                            // where this write lands after teardown already
+                            // read the table for its own last rewrite.
+                            let _ = pid_table.set(slot, Some(worker_pid));
                             if shutting_down.load(Ordering::SeqCst) {
-                                let _ = fs::remove_file(&pid_file);
+                                let _ = pid_table.set(slot, None);
                                 return;
                             }
 
@@ -401,20 +460,34 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
     });
 }
 
-/// Tell the user once that background processing has stopped.
+/// Claim the right to show the give-up dialog: `true` for the first slot to
+/// call this on a given `dialog_shown`, `false` for every one after it. A
+/// launch with several workers can only give up on more than one, and the
+/// user is told once, not once per slot — kept as its own pure-ish function
+/// (its only side effect is the flag itself) so the latch is testable without
+/// a `tauri::AppHandle`.
+fn claim_dialog(dialog_shown: &AtomicBool) -> bool {
+    dialog_shown
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+/// Tell the user once that background processing has stopped, naming the
+/// transports the give-up leaves unconsumed.
 ///
 /// Non-blocking, unlike a startup failure's dialog: the server is still healthy
 /// and the window still usable, so nothing here should block either this thread
 /// or the user's work. Relaunching is the only retry, which is what the message
 /// has to convey without saying "restart" as if it were a bug report.
-fn gave_up_dialog(app: &tauri::AppHandle, sidecar_log: &Path) {
+fn gave_up_dialog(app: &tauri::AppHandle, sidecar_log: &Path, transports: &[String]) {
     use tauri_plugin_dialog::DialogExt;
 
     app.dialog()
         .message(format!(
-            "The background worker could not stay running and has been stopped for this \
-             session. The app itself is unaffected, but jobs that rely on it will not \
+            "The background worker consuming {} could not stay running and has been stopped \
+             for this session. The app itself is unaffected, but jobs that rely on it will not \
              complete until you open it again. See {} for details.",
+            transports.join(", "),
             sidecar_log.display()
         ))
         .title("Background processing unavailable")
