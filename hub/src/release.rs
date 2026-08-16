@@ -16,7 +16,8 @@
 //! **[`resolve_assets`] cannot ask for the full
 //! `<project_name>-<app_version>.tar.gz` name.** `project_name` lives in the
 //! manifest inside the archive, but the tag already supplies the other half:
-//! before extraction this module refuses anything but `v<canonical-semver>`
+//! before extraction this module refuses anything but `vMAJOR.MINOR.PATCH`
+//! (the transport `v` followed by a canonical app version)
 //! and an archive ending in `-<version>.tar.gz`. [`source::resolve_release`]
 //! confirms the remaining project-name half against the extracted manifest.
 //! Together those checks implement plan 018's release identity rule: a

@@ -374,7 +374,7 @@ fn an_app_version_nothing_can_compare_is_refused_at_install() {
     assert!(error.to_string().contains("app_version"), "{error}");
 
     manifest_at(root.path(), "1.2.3");
-    validate(root.path()).expect("1.2.3 is canonical semver");
+    validate(root.path()).expect("1.2.3 is a canonical app version");
 }
 
 #[test]
