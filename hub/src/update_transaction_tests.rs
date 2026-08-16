@@ -204,9 +204,23 @@ fn recovery_obeys_each_durable_phase_without_guessing() {
                 "old"
             );
         }
+        // `AnchorFinalised` is the one phase recovery must not reverse: the
+        // registry write already committed and the anchor step means the
+        // update is done, so `recover_transaction` only discards the journal
+        // (update.rs's early `AnchorFinalised` branch) and rightly leaves the
+        // new version in place — matching `public/version` staying "new"
+        // above rather than reverting to the pre-update `entry`.
+        let expected_entry = if phase == Phase::AnchorFinalised {
+            RegistryEntry {
+                app_version: "0.7.0".into(),
+                ..entry.clone()
+            }
+        } else {
+            entry.clone()
+        };
         assert_eq!(
             registry::load(&paths).unwrap().get("demo").unwrap(),
-            &entry,
+            &expected_entry,
             "{phase:?}"
         );
     }
