@@ -138,10 +138,12 @@ A release is, on the app's own forge repository:
 
 - a tag `v<app_version>` — `--ref` selects a release this way, never a branch
   or a commit;
-- an asset named `<project_name>-<app_version>.tar.gz`, holding the Git-tracked
-  source tree at that commit: no `vendor/`, `var/`, `node_modules/` or `.git/`,
-  built frontend assets committed like any other tracked file — the same tree a
-  local install would copy, so no step of the pipeline gets a remote special
+- an asset named `<project_name>-<app_version>.tar.gz`, holding the permitted
+  Git-tracked source tree at that commit: no `vendor/`, `var/`, `node_modules/`
+  or `.git/`, built frontend assets committed like any other tracked file. When
+  the hub publishes it, the archive's paths, bytes, executable and symlink
+  modes, manifest and changelog all come from that one pushed commit — never a
+  later working-tree state — so no step of the pipeline gets a remote special
   case;
 - a `SHA256SUMS.txt` beside it, one `<sha256>  <filename>` line naming the
   archive, checked before a single byte of it reaches the app root;

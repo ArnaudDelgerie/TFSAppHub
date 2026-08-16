@@ -713,6 +713,111 @@ fn a_real_repository_archive_contains_exactly_its_tracked_paths() {
 }
 
 #[test]
+fn a_real_pinned_repository_ignores_later_tracked_changes_and_ignored_secrets() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let remote = tempfile::tempdir().expect("a bare remote");
+    let root = project.path();
+    write_manifest(root, "1.2.0", "");
+    write_changelog(root, CHANGELOG);
+    fs::create_dir_all(root.join("src")).expect("a source dir");
+    let executable = root.join("src/main.php");
+    fs::write(&executable, "<?php echo 'pinned';\n").expect("an executable source file");
+    let mut permissions = fs::metadata(&executable)
+        .expect("source metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&executable, permissions).expect("a source executable bit");
+    fs::write(root.join(".gitignore"), ".env.local\n").expect("a gitignore");
+
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .current_dir(remote.path())
+            .status()
+            .expect("git to run")
+            .success(),
+        "bare remote setup must succeed"
+    );
+    for arguments in [
+        Vec::from(["init", "--quiet"]),
+        Vec::from(["config", "user.email", "test.invalid"]),
+        Vec::from(["config", "user.name", "TFSApp test"]),
+        Vec::from(["add", "."]),
+        Vec::from(["commit", "--quiet", "-m", "pinned source"]),
+    ] {
+        assert!(
+            Command::new("git")
+                .args(arguments)
+                .current_dir(root)
+                .status()
+                .expect("git to run")
+                .success(),
+            "project setup must succeed"
+        );
+    }
+    assert!(
+        Command::new("git")
+            .args(["remote", "add", "origin"])
+            .arg(remote.path())
+            .current_dir(root)
+            .status()
+            .expect("git to run")
+            .success(),
+        "remote setup must succeed"
+    );
+    assert!(
+        Command::new("git")
+            .args(["push", "--set-upstream", "origin", "HEAD"])
+            .current_dir(root)
+            .status()
+            .expect("git to run")
+            .success(),
+        "push must succeed"
+    );
+
+    let git = Git::new();
+    let snapshot = git
+        .snapshot(root, Some("owner/repo"))
+        .expect("a clean pushed snapshot");
+    let entries = git.tree_entries(root, &snapshot).expect("the pinned tree");
+
+    fs::write(&executable, "<?php echo 'changed';\n").expect("a later tracked change");
+    fs::write(root.join("tfsapp.config.json"), "{}").expect("a later manifest change");
+    fs::write(root.join("CHANGELOG.md"), "## 9.9.9\n").expect("a later changelog change");
+    fs::write(root.join(".env.local"), "APP_SECRET=not-published").expect("an ignored secret");
+
+    let scratch = tempfile::tempdir().expect("a temp scratch dir");
+    let mut blobs = git.blob_reader(root).expect("a pinned blob reader");
+    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+        .expect("an archive from the pinned commit");
+    let extracted = archive::extract(&assets.archive_path, &scratch.path().join("extracted"))
+        .expect("the archive to extract");
+
+    assert_eq!(
+        fs::read_to_string(extracted.join("src/main.php")).expect("pinned executable"),
+        "<?php echo 'pinned';\n"
+    );
+    assert_eq!(
+        fs::metadata(extracted.join("src/main.php"))
+            .expect("extracted metadata")
+            .permissions()
+            .mode()
+            & 0o111,
+        0o111
+    );
+    assert!(
+        !extracted.join(".env.local").exists(),
+        "an ignored secret must not be archived"
+    );
+    assert!(fs::read_to_string(extracted.join("tfsapp.config.json"))
+        .expect("pinned manifest")
+        .contains("\"app_version\": \"1.2.0\""));
+    assert!(fs::read_to_string(extracted.join("CHANGELOG.md"))
+        .expect("pinned changelog")
+        .contains("## 1.2.0"));
+}
+
+#[test]
 fn the_sums_file_verifies_against_the_archive_it_names() {
     let project = tempfile::tempdir().expect("a temp project dir");
     write_manifest(project.path(), "1.2.0", "");

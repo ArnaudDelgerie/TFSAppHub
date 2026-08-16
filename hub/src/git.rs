@@ -276,8 +276,10 @@ impl Git {
         command
             .arg("-C")
             .arg(project)
-            .args(["ls-tree", "-r", "-z", &snapshot.commit.sha, "--"])
-            .arg(&snapshot.project_prefix);
+            .args(["ls-tree", "-r", "-z", &snapshot.commit.sha, "--"]);
+        if !snapshot.project_prefix.as_os_str().is_empty() {
+            command.arg(&snapshot.project_prefix);
+        }
         let output =
             spawn_with_retry(&mut command).map_err(|source| GitError::NotInstalled { source })?;
         if !output.status.success() {
