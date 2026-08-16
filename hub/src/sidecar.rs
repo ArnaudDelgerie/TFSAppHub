@@ -182,15 +182,17 @@ pub fn start(
     serving: Option<fs::File>,
     app: &tauri::AppHandle,
 ) -> Result<(Sidecar, String), Box<dyn std::error::Error>> {
-    let async_worker = manifest.async_worker;
+    // Only the first declaration is spawned for now (plan 045 step 3); step 4
+    // fans this out into one slot per worker.
+    let declared_worker = manifest.workers.first();
     let actions = &manifest.actions;
     let url = format!("http://127.0.0.1:{}", environment.port);
     let pid_file = environment.data_dir.join("sidecar.pid");
 
-    // First, and before anything is spawned: an app declaring `async_worker`
+    // First, and before anything is spawned: an app declaring a worker
     // without the Doctrine Messenger bridge has to fail here, with nothing yet
     // to tear down.
-    if async_worker {
+    if declared_worker.is_some() {
         worker::setup_transports(toolchain, app_dir, &environment.vars, &environment.log_dir)?;
     }
 
@@ -282,13 +284,18 @@ pub fn start(
     // while reaping the server it has owned since `spawn()` returned.
     fs::write(&sidecar.pid_file, format!("{server_pid}\n"))?;
 
-    // Only the worker is gated on `async_worker`. The Mercure hub is always
+    // Only the worker is gated on a declaration. The Mercure hub is always
     // mounted: it is a Caddy directive, not a process, and costs nothing at
     // rest — which is what lets an app use it without declaring anything.
-    if async_worker {
-        let child =
-            worker::spawn_worker(&toolchain.frankenphp, app_dir, &envs, &environment.log_dir)
-                .map_err(|error| format!("Cannot start the Messenger worker: {error}"))?;
+    if let Some(declaration) = declared_worker {
+        let child = worker::spawn_worker(
+            &toolchain.frankenphp,
+            app_dir,
+            &envs,
+            &environment.log_dir,
+            &declaration.transports,
+        )
+        .map_err(|error| format!("Cannot start the Messenger worker: {error}"))?;
         let worker_spawned_at = Instant::now();
 
         // Adopt before the fallible pid-file rewrite. From this point a failed
@@ -309,6 +316,7 @@ pub fn start(
             frankenphp: toolchain.frankenphp.clone(),
             app_dir: app_dir.to_path_buf(),
             envs: envs.clone(),
+            transports: declaration.transports.clone(),
             pid_file: sidecar.pid_file.clone(),
             server_pid,
             log_dir: environment.log_dir.clone(),

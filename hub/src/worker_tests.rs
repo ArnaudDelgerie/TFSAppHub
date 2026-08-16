@@ -6,9 +6,50 @@ use std::{
 };
 
 use super::{
-    arbitrate_respawn, sleep_backoff_or_shutdown, supervisor_decision, RespawnArbitration,
-    SupervisorDecision, WORKER_MIN_HEALTHY_UPTIME,
+    arbitrate_respawn, consume_args, sleep_backoff_or_shutdown, supervisor_decision,
+    RespawnArbitration, SupervisorDecision, WORKER_MIN_HEALTHY_UPTIME,
 };
+
+// --- messenger:consume argument vector (plan 045) ---------------------------
+
+#[test]
+fn one_transport_is_appended_after_messenger_consume() {
+    assert_eq!(
+        consume_args(&["async".to_string()]),
+        vec![
+            "php-cli",
+            "bin/console",
+            "messenger:consume",
+            "async",
+            "--time-limit=3600",
+            "--memory-limit=256M",
+        ]
+    );
+}
+
+#[test]
+fn several_transports_are_appended_in_declared_order() {
+    // Order is the priority: `Worker::run()` rescans from the first transport
+    // after every envelope, so declaration order is what keeps a long queued
+    // run from starving short interactive work on the same consumer.
+    assert_eq!(
+        consume_args(&[
+            "courant".to_string(),
+            "planifie".to_string(),
+            "fond".to_string(),
+        ]),
+        vec![
+            "php-cli",
+            "bin/console",
+            "messenger:consume",
+            "courant",
+            "planifie",
+            "fond",
+            "--time-limit=3600",
+            "--memory-limit=256M",
+        ]
+    );
+}
 
 // The station's own table, ported unchanged. The policy is the app's guarantee
 // (CONTRACT.md §2/§6) rather than the host's, so the two hosts have to decide

@@ -64,7 +64,26 @@ pub fn setup_transports(
     )
 }
 
-/// Spawn one Messenger worker.
+/// The `messenger:consume` argument vector for one declaration's transports,
+/// in the order the manifest gave them (plan 045). Order is Symfony's own
+/// priority mechanism — `Worker::run()` rescans from the first transport
+/// after every envelope (`vendor/symfony/messenger/Worker.php`) — so a long
+/// queued run cannot starve short interactive work on the same consumer, and
+/// the hub itself never routes a message. A pure function so the vector is
+/// testable without spawning anything.
+fn consume_args(transports: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "php-cli".to_string(),
+        "bin/console".to_string(),
+        "messenger:consume".to_string(),
+    ];
+    args.extend(transports.iter().cloned());
+    args.push("--time-limit=3600".to_string());
+    args.push("--memory-limit=256M".to_string());
+    args
+}
+
+/// Spawn one Messenger worker, consuming `transports` in order.
 ///
 /// `--time-limit`/`--memory-limit` make it recycle periodically, which is what a
 /// long-lived PHP process needs; the supervisor below is what makes the recycle
@@ -85,16 +104,10 @@ pub fn spawn_worker(
     app_dir: &Path,
     envs: &[(&str, String)],
     log_dir: &Path,
+    transports: &[String],
 ) -> std::io::Result<Child> {
     let mut command = command_with_env(frankenphp, envs);
-    command.args([
-        "php-cli",
-        "bin/console",
-        "messenger:consume",
-        "async",
-        "--time-limit=3600",
-        "--memory-limit=256M",
-    ]);
+    command.args(consume_args(transports));
     command.current_dir(app_dir);
     let (stdout, stderr) = log::sidecar_log_stdio(log_dir)?;
     command.stdout(stdout).stderr(stderr);
@@ -180,6 +193,7 @@ pub struct WorkerSupervisorConfig {
     pub frankenphp: PathBuf,
     pub app_dir: PathBuf,
     pub envs: Vec<(&'static str, String)>,
+    pub transports: Vec<String>,
     pub pid_file: PathBuf,
     pub server_pid: u32,
     pub log_dir: PathBuf,
@@ -237,6 +251,7 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
         frankenphp,
         app_dir,
         envs,
+        transports,
         pid_file,
         server_pid,
         log_dir,
@@ -336,7 +351,7 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
                     return;
                 }
 
-                match spawn_worker(&frankenphp, &app_dir, &envs, &log_dir) {
+                match spawn_worker(&frankenphp, &app_dir, &envs, &log_dir, &transports) {
                     Ok(child) => match arbitrate_respawn(&worker, &shutting_down, child) {
                         RespawnArbitration::Adopted { worker_pid } => {
                             // The child is in the slot before this durable
