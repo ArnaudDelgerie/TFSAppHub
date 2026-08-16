@@ -38,6 +38,7 @@ use crate::{
     manifest::{self, ManifestError},
     registry::{ReferenceKind, Source, SourceKind},
     release::{self, ReleaseError},
+    version,
 };
 
 /// Top-level directories left out of a local source's content hash.
@@ -324,11 +325,19 @@ fn resolve_release(
         archive_name: assets.archive_name.to_string(),
         source,
     })?;
-    let version = release
-        .tag_name
-        .strip_prefix('v')
-        .expect("resolve_assets accepted only v<canonical-semver> tags");
-    if manifest.manifest.app_version != version {
+    let version = assets
+        .version
+        .as_ref()
+        .expect("resolve_assets always returns the parsed app-release tag version");
+    let manifest_version =
+        version::parse_app_version(&manifest.manifest.app_version).map_err(|_| {
+            SourceError::ManifestVersionNotCanonical {
+                tag: release.tag_name.clone(),
+                archive_name: assets.archive_name.to_string(),
+                manifest_version: manifest.manifest.app_version.clone(),
+            }
+        })?;
+    if manifest_version != *version {
         return Err(SourceError::ManifestVersionMismatch {
             tag: release.tag_name.clone(),
             archive_name: assets.archive_name.to_string(),
@@ -413,6 +422,13 @@ pub enum SourceError {
         archive_name: String,
         source: ManifestError,
     },
+    /// The extracted manifest's version is not the contract's exact
+    /// `MAJOR.MINOR.PATCH` spelling, even before it can be compared to its tag.
+    ManifestVersionNotCanonical {
+        tag: String,
+        archive_name: String,
+        manifest_version: String,
+    },
     /// The extracted manifest names a version different from its release tag.
     ManifestVersionMismatch {
         tag: String,
@@ -495,6 +511,16 @@ impl fmt::Display for SourceError {
                 "release {tag}'s archive {archive_name} declares app_version {manifest_version:?} \
                  in its manifest, not the tag's version — ask the app's author to fix and \
                  republish the release."
+            ),
+            Self::ManifestVersionNotCanonical {
+                tag,
+                archive_name,
+                manifest_version,
+            } => write!(
+                formatter,
+                "release {tag}'s archive {archive_name} declares app_version {manifest_version:?} \
+                 in its manifest, which must be canonical MAJOR.MINOR.PATCH — ask the app's \
+                 author to fix and republish the release."
             ),
             Self::ManifestProjectNameMismatch {
                 tag,

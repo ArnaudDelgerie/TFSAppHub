@@ -13,7 +13,6 @@ use std::fmt;
 /// No caller may normalise the input first: rejecting the author-provided
 /// spelling is the point of this boundary. The returned value preserves the
 /// semantic comparisons callers already need for install and update decisions.
-#[allow(dead_code)] // Step 2 routes the publication and installation boundaries here.
 pub(crate) fn parse_app_version(raw: &str) -> Result<semver::Version, AppVersionError> {
     let version = semver::Version::parse(raw).map_err(|_| AppVersionError)?;
 
@@ -28,7 +27,6 @@ pub(crate) fn parse_app_version(raw: &str) -> Result<semver::Version, AppVersion
 /// spelling. Parser details intentionally stay private: they vary by spelling
 /// but do not change what an app author must correct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Constructed by `parse_app_version`; production callers arrive in step 2.
 pub(crate) struct AppVersionError;
 
 impl fmt::Display for AppVersionError {

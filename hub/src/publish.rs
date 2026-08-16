@@ -27,7 +27,7 @@ use crate::{
     paths::Paths,
     prompt,
     release::{self, ReleaseError},
-    source,
+    source, version,
 };
 
 /// The changelog's filename at the project root (CONTRACT.md §1/§7).
@@ -78,10 +78,17 @@ pub fn run_local_gates(
             });
         }
     }
+    // Refuse the author-visible manifest before even asking Git for a pinned
+    // tree. The same validation runs again below on the pinned bytes, so a
+    // change between the two checks cannot be published under a different
+    // spelling.
+    let manifest_path = project_path.join(MANIFEST_FILE);
+    let author_manifest = manifest::load(project_path)?;
+    validate_version(&author_manifest.manifest, &manifest_path)?;
+
     let snapshot = git.snapshot(project_path, repo)?;
     let entries = git.tree_entries(project_path, &snapshot)?;
     let mut blobs = git.blob_reader(project_path)?;
-    let manifest_path = project_path.join(MANIFEST_FILE);
     let manifest_bytes = pinned_file(&entries, &mut blobs, MANIFEST_FILE)?.ok_or_else(|| {
         ManifestError::Unreadable {
             path: manifest_path.clone(),
@@ -507,11 +514,11 @@ fn announce(gates: &LocalGates, tag: &str, assets: &Assets) {
     }
 }
 
-/// Gate 2: `app_version` must parse as canonical semver — the value a
+/// Gate 2: `app_version` must have the contract's canonical spelling — the value a
 /// published tag and archive name are both built from, and CONTRACT.md §2's
 /// own requirement.
 fn validate_version(manifest: &Manifest, manifest_path: &Path) -> Result<(), PublishError> {
-    release::canonical_semver(&manifest.app_version).map_err(|error| {
+    version::parse_app_version(&manifest.app_version).map_err(|error| {
         PublishError::UnusableVersion {
             path: manifest_path.to_path_buf(),
             version: manifest.app_version.clone(),

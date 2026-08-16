@@ -378,6 +378,26 @@ fn an_app_version_nothing_can_compare_is_refused_at_install() {
 }
 
 #[test]
+fn suffixed_app_versions_are_refused_at_install_before_any_snapshot_is_created() {
+    for version in ["1.2.3-rc.1", "1.2.3+build.7"] {
+        let root = tempfile::tempdir().expect("a temp app root");
+        app_tree(root.path());
+        manifest_at(root.path(), version);
+
+        let error = validate(root.path()).expect_err("a suffixed app version is refused");
+        assert!(
+            matches!(error, InstallError::UnusableVersion { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("MAJOR.MINOR.PATCH"), "{error}");
+        assert!(
+            !root.path().join("snapshot").exists(),
+            "validation creates no snapshot"
+        );
+    }
+}
+
+#[test]
 fn the_snapshot_leaves_out_what_must_never_be_installed() {
     let source = tempfile::tempdir().expect("a temp source");
     let destination = tempfile::tempdir().expect("a temp destination");
@@ -488,9 +508,13 @@ fn the_snapshot_refuses_to_write_over_an_existing_tree() {
 
 #[test]
 fn no_record_is_the_install_event() {
-    let event =
-        lifecycle_event_for_install(None, "1.0.0", Path::new("/data/demo"), "dev.local.demo")
-            .expect("no record lets the install proceed");
+    let event = lifecycle_event_for_install(
+        None,
+        &semver::Version::new(1, 0, 0),
+        Path::new("/data/demo"),
+        "dev.local.demo",
+    )
+    .expect("no record lets the install proceed");
     assert_eq!(event, LifecycleEvent::Install);
 }
 
@@ -498,7 +522,7 @@ fn no_record_is_the_install_event() {
 fn an_equal_record_is_neither_event() {
     let event = lifecycle_event_for_install(
         Some("1.0.0"),
-        "1.0.0",
+        &semver::Version::new(1, 0, 0),
         Path::new("/data/demo"),
         "dev.local.demo",
     )
@@ -510,7 +534,7 @@ fn an_equal_record_is_neither_event() {
 fn an_older_record_is_refused_as_the_update_event_install_does_not_own() {
     let error = lifecycle_event_for_install(
         Some("1.0.0"),
-        "1.1.0",
+        &semver::Version::new(1, 1, 0),
         Path::new("/data/demo"),
         "dev.local.demo",
     )
@@ -532,7 +556,7 @@ fn an_older_record_is_refused_as_the_update_event_install_does_not_own() {
 fn a_newer_record_is_refused_as_a_downgrade() {
     let error = lifecycle_event_for_install(
         Some("2.0.0"),
-        "1.0.0",
+        &semver::Version::new(1, 0, 0),
         Path::new("/data/demo"),
         "dev.local.demo",
     )

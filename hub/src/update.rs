@@ -312,13 +312,14 @@ fn update_into(
         .clone();
 
     let resolved = source::resolve(&origin(&entry.source), reference, scratch, base_url)?;
-    let loaded = install::validate(&resolved.root)?;
+    let install::Validated {
+        loaded,
+        app_version,
+    } = install::validate(&resolved.root)?;
     loaded.report_warnings();
     let manifest = &loaded.manifest;
 
-    let current = semver::Version::parse(&manifest.app_version)
-        .expect("validate() already refused a non-canonical app_version");
-    let action = update_decision(Some(&entry.app_version), &current, force)
+    let action = update_decision(Some(&entry.app_version), &app_version, force)
         .map_err(|refusal| UpdateError::refused(id, refusal))?;
 
     let data_dir = paths.app_data_dir(&entry.identifier)?;

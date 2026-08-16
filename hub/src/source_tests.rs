@@ -135,6 +135,29 @@ fn a_release_manifest_must_confirm_its_tag_version() {
 }
 
 #[test]
+fn a_release_manifest_refuses_pre_release_and_build_version_spellings() {
+    for version in ["1.2.0-rc.1", "1.2.0+build.7"] {
+        let (base_url, handle) = stub_release(release_archive(&remote_manifest(version, "demo")));
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+
+        let error = resolve(
+            &classify("github:example/demo"),
+            None,
+            scratch.path(),
+            &base_url,
+        )
+        .expect_err("a suffixed manifest version is refused during resolution");
+        handle.join().expect("the stub thread finishes");
+
+        assert!(
+            matches!(error, SourceError::ManifestVersionNotCanonical { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("MAJOR.MINOR.PATCH"), "{error}");
+    }
+}
+
+#[test]
 fn a_release_manifest_must_confirm_its_archive_project_name() {
     let (base_url, handle) = stub_release(release_archive(&remote_manifest("1.2.0", "other")));
     let scratch = tempfile::tempdir().expect("a scratch directory");
