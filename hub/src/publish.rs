@@ -11,7 +11,10 @@
 
 use std::{
     collections::BTreeSet,
+    ffi::OsString,
     fmt, fs, io,
+    io::{Read, Seek, SeekFrom, Write},
+    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
 };
 
@@ -19,7 +22,7 @@ use crate::{
     archive,
     cli::{EXIT_FAILED, EXIT_OK},
     gh::{Gh, GhError},
-    git::{Commit, Git, GitError},
+    git::{BlobReader, Commit, Git, GitError, TreeEntry},
     manifest::{self, Loaded, Manifest, ManifestError, MANIFEST_FILE},
     paths::Paths,
     prompt,
@@ -30,22 +33,34 @@ use crate::{
 /// The changelog's filename at the project root (CONTRACT.md §1/§7).
 pub const CHANGELOG_FILE: &str = "CHANGELOG.md";
 
-/// What gates 1–8 produce for the steps after them: the loaded manifest, the
-/// commit [`git::Git::ensure_pushed`] proved is on the forge (which names the
-/// target repository too), and the release notes (the changelog section,
-/// verbatim).
-#[derive(Debug)]
+/// What gates 1–8 produce for the steps after them.  The entries and their
+/// reader stay together with the metadata they supplied: all three are from
+/// the one commit [`Git::snapshot`] pinned.
 pub struct LocalGates {
     pub loaded: Loaded,
     pub commit: Commit,
     pub notes: String,
+    entries: Vec<TreeEntry>,
+    blobs: BlobReader,
+}
+
+impl fmt::Debug for LocalGates {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalGates")
+            .field("loaded", &self.loaded)
+            .field("commit", &self.commit)
+            .field("notes", &self.notes)
+            .field("entries", &self.entries)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Run every gate up to (not including) the `gh` seam, in the Overview
-/// table's order: load the manifest (1), check `app_version` is canonical
-/// semver (2), the `git` gate — a work tree, a clean project directory, a
-/// pushed upstream, and the repository it names (3–6) — extract the
-/// changelog section for this version (7), and — only when
+/// table's order after the repository-shape check: the `git` gate pins a
+/// clean, pushed project commit (3–6), then its manifest supplies the
+/// canonical-version check (1–2), and its changelog supplies the release
+/// notes (7).  Only when
 /// `actions.secrets.ipc` is on — block on a confirmation with no `--yes`
 /// escape (8).
 ///
@@ -56,15 +71,6 @@ pub fn run_local_gates(
     repo: Option<&str>,
     git: &Git,
 ) -> Result<LocalGates, PublishError> {
-    let loaded = manifest::load(project_path)?;
-    // Before any further gate runs, so a typo in a key is read next to the
-    // project it came from rather than after the git and changelog gates
-    // have both run — the same ordering `install`'s own pipeline uses.
-    loaded.report_warnings();
-    let manifest_path = project_path.join(MANIFEST_FILE);
-
-    validate_version(&loaded.manifest, &manifest_path)?;
-
     if let Some(repo) = repo {
         if !is_owner_repo_shape(repo) {
             return Err(PublishError::InvalidRepoShape {
@@ -72,16 +78,59 @@ pub fn run_local_gates(
             });
         }
     }
-    let commit = git.ensure_pushed(project_path, repo)?;
+    let snapshot = git.snapshot(project_path, repo)?;
+    let entries = git.tree_entries(project_path, &snapshot)?;
+    let mut blobs = git.blob_reader(project_path)?;
+    let manifest_path = project_path.join(MANIFEST_FILE);
+    let manifest_bytes = pinned_file(&entries, &mut blobs, MANIFEST_FILE)?.ok_or_else(|| {
+        ManifestError::Unreadable {
+            path: manifest_path.clone(),
+            source: io::Error::from(io::ErrorKind::NotFound),
+        }
+    })?;
+    let contents =
+        std::str::from_utf8(&manifest_bytes).map_err(|error| ManifestError::Malformed {
+            path: manifest_path.clone(),
+            detail: error.to_string(),
+        })?;
+    let loaded = manifest::parse(&manifest_path, contents)?;
+    // The pinned path remains an author-facing path, so an unknown key is
+    // still actionable even though its bytes came from Git.
+    loaded.report_warnings();
+    validate_version(&loaded.manifest, &manifest_path)?;
 
-    let notes = changelog_gate(project_path, &loaded.manifest.app_version)?;
+    let changelog_path = project_path.join(CHANGELOG_FILE);
+    let changelog = pinned_file(&entries, &mut blobs, CHANGELOG_FILE)?.ok_or_else(|| {
+        PublishError::MissingChangelog {
+            path: changelog_path.clone(),
+        }
+    })?;
+    let notes = changelog_gate(&changelog_path, &changelog, &loaded.manifest.app_version)?;
     confirm_ipc_secrets(&loaded.manifest)?;
 
     Ok(LocalGates {
         loaded,
-        commit,
+        commit: snapshot.commit,
         notes,
+        entries,
+        blobs,
     })
+}
+
+/// Copy a named project-root file from the pinned tree.  Metadata is small
+/// enough to parse in memory; archive payloads continue to stream one at a
+/// time through the same reader.
+fn pinned_file(
+    entries: &[TreeEntry],
+    blobs: &mut impl BlobSource,
+    name: &str,
+) -> Result<Option<Vec<u8>>, GitError> {
+    let Some(entry) = entries.iter().find(|entry| entry.path == Path::new(name)) else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    blobs.copy_blob(&entry.object_id, &mut bytes)?;
+    Ok(Some(bytes))
 }
 
 /// The two files a published release carries, built into a directory the
@@ -96,19 +145,31 @@ pub struct Assets {
     pub sha256: String,
 }
 
+/// A bounded source of pinned Git blobs.  It intentionally exposes copying,
+/// not whole-blob reads: the archive consumes one object at a time.
+pub(crate) trait BlobSource {
+    fn copy_blob(&mut self, object: &str, destination: &mut dyn Write) -> Result<u64, GitError>;
+}
+
+impl BlobSource for BlobReader {
+    fn copy_blob(&mut self, object: &str, destination: &mut dyn Write) -> Result<u64, GitError> {
+        BlobReader::copy_blob(self, object, destination)
+    }
+}
+
 /// Build `<project_name>-<app_version>.tar.gz` and its `SHA256SUMS.txt` into
-/// `destination`, from the explicit Git-tracked paths under `project_path`.
+/// `destination`, from explicit entries and blobs in one pinned Git tree.
 ///
-/// The list is filtered with [`source::EXCLUDED_FROM_HASH`] before reaching
-/// here, which is what buys the property this step exists for: `tree_hash` of
-/// the archive, once extracted, equals `tree_hash` of the tracked tree minus
-/// those standing exclusions. A symlink whose target would resolve outside the
-/// extracted tree is refused before a byte of the archive is written, with the
-/// exact lexical rule `archive::extract` applies at the other end
+/// The entries are filtered with [`source::EXCLUDED_FROM_HASH`] before any
+/// blob is requested, which is what buys the property this step exists for:
+/// `tree_hash` of the archive, once extracted, equals `tree_hash` of the
+/// pinned tree minus those standing exclusions. A symlink whose target would
+/// resolve outside the extracted tree is refused before anything is uploaded,
+/// with the exact lexical rule `archive::extract` applies at the other end
 /// (`archive::link_target_escapes`).
 pub fn build_archive(
-    project_path: &Path,
-    tracked_paths: &[PathBuf],
+    entries: &[TreeEntry],
+    blobs: &mut impl BlobSource,
     project_name: &str,
     app_version: &str,
     destination: &Path,
@@ -135,48 +196,16 @@ pub fn build_archive(
     // warning), and following one here would silently swap the byte content
     // of a symlink `source::tree_hash` never reads for the content of
     // whatever it points at.
-    builder.follow_symlinks(false);
-
     let archive_root = PathBuf::from(&prefix);
-    builder
-        .append_dir(&archive_root, project_path)
-        .map_err(|source| PublishError::Io {
-            path: project_path.to_path_buf(),
-            source,
-        })?;
+    append_directory(&mut builder, &archive_root)?;
 
-    for (relative_path, is_directory) in archive_paths(tracked_paths) {
-        let source_path = project_path.join(&relative_path);
+    for (relative_path, entry) in archive_paths(entries) {
         let archive_path = archive_root.join(&relative_path);
-        if is_directory {
-            builder
-                .append_dir(&archive_path, &source_path)
-                .map_err(|source| PublishError::Io {
-                    path: source_path,
-                    source,
-                })?;
+        if let Some(entry) = entry {
+            append_blob_entry(&mut builder, &archive_path, entry, blobs)?;
             continue;
         }
-
-        let metadata = fs::symlink_metadata(&source_path).map_err(|source| PublishError::Io {
-            path: source_path.clone(),
-            source,
-        })?;
-        if metadata.is_symlink() {
-            let target = fs::read_link(&source_path).map_err(|source| PublishError::Io {
-                path: source_path.clone(),
-                source,
-            })?;
-            if archive::link_target_escapes(&archive_path, &target) {
-                return Err(PublishError::EscapingSymlink { path: source_path });
-            }
-        }
-        builder
-            .append_path_with_name(&source_path, &archive_path)
-            .map_err(|source| PublishError::Io {
-                path: source_path,
-                source,
-            })?;
+        append_directory(&mut builder, &archive_path)?;
     }
 
     let encoder = builder.into_inner().map_err(|source| PublishError::Io {
@@ -216,8 +245,12 @@ pub fn build_archive(
 /// Sorted archive entries derived from Git's tracked files: every parent
 /// directory once, before files below it. Git does not track empty directories,
 /// so deriving them loses nothing.
-fn archive_paths(tracked_paths: &[PathBuf]) -> Vec<(PathBuf, bool)> {
-    let files: BTreeSet<PathBuf> = tracked_paths.iter().cloned().collect();
+fn archive_paths(entries: &[TreeEntry]) -> Vec<(PathBuf, Option<&TreeEntry>)> {
+    let files: BTreeSet<PathBuf> = entries
+        .iter()
+        .filter(|entry| !excluded_from_archive(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect();
     let mut directories = BTreeSet::new();
     for path in &files {
         let mut parent = path.parent();
@@ -232,17 +265,97 @@ fn archive_paths(tracked_paths: &[PathBuf]) -> Vec<(PathBuf, bool)> {
 
     let mut entries: Vec<_> = directories
         .into_iter()
-        .map(|path| (path, true))
-        .chain(files.into_iter().map(|path| (path, false)))
+        .map(|path| (path, None))
+        .chain(files.into_iter().map(|path| {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .expect("every archive path came from a tree entry");
+            (path, Some(entry))
+        }))
         .collect();
-    entries.sort_by(
-        |(left_path, left_is_directory), (right_path, right_is_directory)| {
-            left_path
-                .cmp(right_path)
-                .then_with(|| right_is_directory.cmp(left_is_directory))
-        },
-    );
+    entries.sort_by(|(left_path, left_entry), (right_path, right_entry)| {
+        left_path
+            .cmp(right_path)
+            .then_with(|| right_entry.is_none().cmp(&left_entry.is_none()))
+    });
     entries
+}
+
+fn append_directory<W: Write>(
+    builder: &mut tar::Builder<W>,
+    path: &Path,
+) -> Result<(), PublishError> {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_mode(0o755);
+    header.set_size(0);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, io::empty())
+        .map_err(|source| PublishError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn append_blob_entry<W: Write>(
+    builder: &mut tar::Builder<W>,
+    archive_path: &Path,
+    entry: &TreeEntry,
+    blobs: &mut impl BlobSource,
+) -> Result<(), PublishError> {
+    let mut blob = tempfile::tempfile().map_err(|source| PublishError::Io {
+        path: archive_path.to_path_buf(),
+        source,
+    })?;
+    let size = blobs.copy_blob(&entry.object_id, &mut blob)?;
+    blob.seek(SeekFrom::Start(0))
+        .map_err(|source| PublishError::Io {
+            path: archive_path.to_path_buf(),
+            source,
+        })?;
+
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(if entry.is_executable() { 0o755 } else { 0o644 });
+    if entry.is_symlink() {
+        let mut target = Vec::new();
+        blob.read_to_end(&mut target)
+            .map_err(|source| PublishError::Io {
+                path: archive_path.to_path_buf(),
+                source,
+            })?;
+        let target = PathBuf::from(OsString::from_vec(target));
+        if archive::link_target_escapes(archive_path, &target) {
+            return Err(PublishError::EscapingSymlink {
+                path: entry.path.clone(),
+            });
+        }
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header
+            .set_link_name(target)
+            .map_err(|source| PublishError::Io {
+                path: archive_path.to_path_buf(),
+                source,
+            })?;
+        header.set_cksum();
+        return builder
+            .append_data(&mut header, archive_path, io::empty())
+            .map_err(|source| PublishError::Io {
+                path: archive_path.to_path_buf(),
+                source,
+            });
+    }
+
+    header.set_size(size);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, archive_path, blob)
+        .map_err(|source| PublishError::Io {
+            path: archive_path.to_path_buf(),
+            source,
+        })
 }
 
 /// Whether a Git-tracked path is still excluded from the archive because a
@@ -320,12 +433,7 @@ fn publish_into(
     git: &Git,
     gh: &Gh,
 ) -> Result<bool, PublishError> {
-    let gates = run_local_gates(project_path, repo, git)?;
-    let tracked_paths: Vec<_> = git
-        .ls_files(project_path)?
-        .into_iter()
-        .filter(|path| !excluded_from_archive(path))
-        .collect();
+    let mut gates = run_local_gates(project_path, repo, git)?;
     let manifest = &gates.loaded.manifest;
     let tag = format!("v{}", manifest.app_version);
 
@@ -334,8 +442,8 @@ fn publish_into(
     gh.ensure_no_existing_release(&gates.commit.repo, &tag)?;
 
     let assets = build_archive(
-        project_path,
-        &tracked_paths,
+        &gates.entries,
+        &mut gates.blobs,
         &manifest.project_name,
         &manifest.app_version,
         scratch,
@@ -375,9 +483,8 @@ fn publish_into(
 
 /// Say what is about to be published, in the terms the user will have to
 /// reason about afterwards — `update::announce`'s counterpart for `publish`.
-/// Names the repository, branch and commit the `git` gate proved is on the
-/// forge — a statement now, not the warning earlier revisions of this plan
-/// printed, since gates 3–6 are what makes it true.
+/// Names the repository, branch and commit the Git gate proved is on the
+/// forge. Every displayed release input was read from that pinned commit.
 fn announce(gates: &LocalGates, tag: &str, assets: &Assets) {
     println!("Repository  {}", gates.commit.repo);
     println!(
@@ -386,6 +493,7 @@ fn announce(gates: &LocalGates, tag: &str, assets: &Assets) {
         gates.commit.branch
     );
     println!("Tag         {tag}");
+    println!("Inputs      pinned Git tree");
     println!(
         "Archive     {} ({} bytes)",
         assets.archive_name, assets.archive_size
@@ -426,12 +534,12 @@ fn is_owner_repo_shape(repo: &str) -> bool {
 
 /// Gate 7: `CHANGELOG.md` must exist at the project root and carry a heading
 /// for `version`. The matched section becomes the release notes, verbatim.
-fn changelog_gate(project_path: &Path, version: &str) -> Result<String, PublishError> {
-    let path = project_path.join(CHANGELOG_FILE);
-    let contents = fs::read_to_string(&path)
-        .map_err(|_| PublishError::MissingChangelog { path: path.clone() })?;
-    changelog_section(&contents, version).ok_or(PublishError::MissingChangelogEntry {
-        path,
+fn changelog_gate(path: &Path, contents: &[u8], version: &str) -> Result<String, PublishError> {
+    let contents = std::str::from_utf8(contents).map_err(|_| PublishError::MissingChangelog {
+        path: path.to_path_buf(),
+    })?;
+    changelog_section(contents, version).ok_or(PublishError::MissingChangelogEntry {
+        path: path.to_path_buf(),
         version: version.to_string(),
     })
 }
