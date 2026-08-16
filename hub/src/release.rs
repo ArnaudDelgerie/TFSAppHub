@@ -16,7 +16,8 @@
 //! **[`resolve_assets`] cannot ask for the full
 //! `<project_name>-<app_version>.tar.gz` name.** `project_name` lives in the
 //! manifest inside the archive, but the tag already supplies the other half:
-//! before extraction this module refuses anything but `v<canonical-semver>`
+//! before extraction this module refuses anything but `vMAJOR.MINOR.PATCH`
+//! (the transport `v` followed by a canonical app version)
 //! and an archive ending in `-<version>.tar.gz`. [`source::resolve_release`]
 //! confirms the remaining project-name half against the extracted manifest.
 //! Together those checks implement plan 018's release identity rule: a
@@ -33,6 +34,8 @@ use std::{collections::HashMap, fmt, fs::File, io, path::Path, time::Duration};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+use crate::version;
 
 /// GitHub rejects API requests with no `User-Agent`.
 const GITHUB_USER_AGENT: &str = "TFSAppHub-release-resolver";
@@ -65,12 +68,6 @@ const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// `CONTRACT.md`'s publishing clause, whether the archive was produced by
 /// hand or by `tfsapp-hub publish` (`../plan/019-publish-an-app.md`).
 pub const SHA256SUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
-
-/// Parse the canonical semantic-version spelling the publishing gate accepts.
-/// Kept here so a release tag and `publish` use one definition of a version.
-pub(crate) fn canonical_semver(version: &str) -> Result<semver::Version, semver::Error> {
-    semver::Version::parse(version)
-}
 
 /// The subset of GitHub's release response this resolver reads.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -144,6 +141,8 @@ fn fetch_release(url: &str) -> Result<GitHubRelease, ReleaseError> {
 /// generic across both callers rather than forking the struct in two.
 #[derive(Debug)]
 pub struct ResolvedAssets<'a> {
+    /// The app version parsed from the tag after its transport-level `v`.
+    pub version: Option<semver::Version>,
     pub archive_name: &'a str,
     pub archive_url: &'a str,
     pub checksums_url: &'a str,
@@ -170,7 +169,7 @@ pub fn resolve_assets(release: &GitHubRelease) -> Result<ResolvedAssets<'_>, Rel
         .tag_name
         .strip_prefix('v')
         .filter(|version| !version.is_empty())
-        .filter(|version| canonical_semver(version).is_ok())
+        .and_then(|version| version::parse_app_version(version).ok())
         .ok_or_else(|| ReleaseError::InvalidTag {
             tag: release.tag_name.clone(),
         })?;
@@ -205,6 +204,7 @@ pub fn resolve_assets(release: &GitHubRelease) -> Result<ResolvedAssets<'_>, Rel
     let checksums = find_checksums(release)?;
 
     Ok(ResolvedAssets {
+        version: Some(version),
         archive_name: &archive.name,
         archive_url: &archive.browser_download_url,
         checksums_url: &checksums.browser_download_url,
@@ -247,6 +247,7 @@ pub fn resolve_appimage_assets(
     let checksums = find_checksums(release)?;
 
     Ok(ResolvedAssets {
+        version: None,
         archive_name: &appimage.name,
         archive_url: &appimage.browser_download_url,
         checksums_url: &checksums.browser_download_url,

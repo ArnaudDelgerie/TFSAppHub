@@ -227,6 +227,22 @@ fn a_non_semver_app_version_is_refused_naming_the_value_and_the_field() {
 }
 
 #[test]
+fn suffixed_app_versions_are_refused_before_git_is_called() {
+    for version in ["1.2.3-rc.1", "1.2.3+build.7"] {
+        let project = tempfile::tempdir().expect("a temp project dir");
+        write_manifest(project.path(), version, "");
+
+        let error = run_local_gates(project.path(), Some("owner/repo"), &git_never_called())
+            .expect_err("a suffixed app version is refused before Git");
+        assert!(
+            matches!(error, PublishError::UnusableVersion { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("MAJOR.MINOR.PATCH"), "{error}");
+    }
+}
+
+#[test]
 fn a_malformed_repo_flag_is_refused_before_git_is_ever_called() {
     for bad in ["not-a-repo", "owner/", "/repo", "owner/repo/extra", ""] {
         assert!(!is_owner_repo_shape(bad), "{bad:?} should be rejected");

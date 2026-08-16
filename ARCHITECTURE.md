@@ -136,7 +136,7 @@ open. In order:
    release source (`github:owner/repo`) is downloaded, verified and extracted
    into scratch space — see "Resolving a release" below.
 2. Read and validate the manifest. Missing required fields, a wrong type on a
-   known key, or a non-semver `app_version` all stop here, naming the file and
+   known key, or a non-canonical `app_version` all stop here, naming the file and
    the field. An unknown key warns and does not stop anything.
 3. Four gates, all against the already-loaded registry or the data directory
    `identifier` names — none of them write anything, so a refusal here costs
@@ -213,7 +213,8 @@ sized for a multi-hundred-megabyte archive landing on the same filesystem
 guarantee:
 
 1. **Name-check, then download**: the release tag must be
-   `v<canonical-semver>` and its one source archive must end in
+   `vMAJOR.MINOR.PATCH`, with a canonical app version after the transport
+   prefix, and its one source archive must end in
    `-<version>.tar.gz`; only then is that
    `<project_name>-<app_version>.tar.gz` asset streamed to a file — never
    buffered whole in memory. The tag supplies the version, but not yet the
@@ -562,7 +563,7 @@ Gates, then archive, then checksums, then one `gh` call — the same order
 1. **Gates 1–8, all local, all before anything is built.** `git.rs` pins one
    clean commit that is reachable from the pushed upstream, then reads that
    commit's tree and blobs — never a later `HEAD` or worktree path. Its
-   manifest supplies canonical-semver validation (1–2), its `CHANGELOG.md`
+   manifest supplies canonical `MAJOR.MINOR.PATCH` validation (1–2), its `CHANGELOG.md`
    supplies the verbatim `## <version>` notes (7), and only its
    `actions.secrets.ipc` can require the deliberately non-bypassable
    confirmation (8). The same snapshot resolves the repository — `--repo` if

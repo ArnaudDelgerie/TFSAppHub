@@ -86,6 +86,22 @@ fn a_release_tag_must_name_a_canonical_version() {
 }
 
 #[test]
+fn a_release_tag_refuses_pre_release_and_build_version_spellings() {
+    for version in ["1.2.3-rc.1", "1.2.3+build.7"] {
+        let tag = format!("v{version}");
+        let archive = format!("demo-{version}.tar.gz");
+        let error = resolve_assets(&release(
+            &tag,
+            vec![asset(&archive), asset("SHA256SUMS.txt")],
+        ))
+        .expect_err("a suffixed app version is not a release version");
+
+        assert!(matches!(error, ReleaseError::InvalidTag { .. }), "{error}");
+        assert!(error.to_string().contains("canonical"), "{error}");
+    }
+}
+
+#[test]
 fn a_source_archive_must_agree_with_its_release_tag() {
     let error = resolve_assets(&release(
         "v1.2.0",

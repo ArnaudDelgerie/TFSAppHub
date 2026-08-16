@@ -46,6 +46,7 @@ use crate::{
     registry::{self, Registry, RegistryEntry, RegistryError, SourceKind, State},
     release,
     source::{self, SourceError},
+    version,
 };
 
 /// The whole command: install `source`, or say why not. Returns the process's
@@ -151,7 +152,10 @@ pub(crate) fn install_into(
     hub_version: &str,
 ) -> Result<Option<String>, InstallError> {
     let resolved = source::resolve(&source::classify(source), reference, scratch, base_url)?;
-    let loaded = validate(&resolved.root)?;
+    let Validated {
+        loaded,
+        app_version,
+    } = validate(&resolved.root)?;
     // Before anything is written, so a typo in a key is read next to the source
     // it came from rather than after a hundred megabytes of copying.
     loaded.report_warnings();
@@ -184,7 +188,7 @@ pub(crate) fn install_into(
     let recorded = lifecycle::read_data_version(&data_dir.join("data"))?;
     let event = lifecycle_event_for_install(
         recorded.as_deref(),
-        &manifest.app_version,
+        &app_version,
         &data_dir,
         &manifest.identifier,
     )?;
@@ -737,23 +741,19 @@ pub fn check_port_free(registry: &Registry, app_port: Option<u16>) -> Result<(),
 /// only in the refusals' messages, as the directory a user would delete or
 /// wait out and the argument `tfsapp-hub purge` takes to do it.
 ///
-/// `app_version` is taken as already-validated semver — `validate` runs
-/// before this is ever called and refuses anything else (CONTRACT.md §2) —
-/// so the parse below cannot fail in practice.
+/// `app_version` is returned by `validate`, so the comparison never reparses
+/// author-controlled text after the contract boundary has accepted it.
 ///
 /// An equal record answers `Ok(LifecycleEvent::None)`: the reinstall-after-
 /// `remove` path, and the event under which `prepare` (below) runs no
 /// lifecycle command at all.
 fn lifecycle_event_for_install(
     recorded: Option<&str>,
-    app_version: &str,
+    app_version: &semver::Version,
     data_dir: &Path,
     identifier: &str,
 ) -> Result<LifecycleEvent, InstallError> {
-    let current = semver::Version::parse(app_version)
-        .expect("validate() already refused a non-canonical app_version");
-
-    match lifecycle::lifecycle_decision(recorded, &current) {
+    match lifecycle::lifecycle_decision(recorded, app_version) {
         // `install` does not own the update event (CONTRACT.md §6) even
         // though the machinery for it exists now: `update <id>` is what
         // snapshots the database and reverts it on failure, and running
@@ -764,7 +764,7 @@ fn lifecycle_event_for_install(
             recorded: recorded
                 .expect("an Update decision is only reached when a record exists")
                 .to_string(),
-            current: current.to_string(),
+            current: app_version.to_string(),
             data_dir: data_dir.to_path_buf(),
         }),
         Ok(event) => Ok(event),
@@ -799,16 +799,23 @@ fn lifecycle_event_for_install(
 /// install / update / downgrade, and a value nothing can compare is a broken
 /// app whose first symptom would appear months later, at the update that needed
 /// it.
-pub fn validate(root: &Path) -> Result<Loaded, InstallError> {
+#[derive(Debug)]
+pub struct Validated {
+    pub loaded: Loaded,
+    pub app_version: semver::Version,
+}
+
+pub fn validate(root: &Path) -> Result<Validated, InstallError> {
     let loaded = manifest::load(root)?;
 
-    if let Err(error) = semver::Version::parse(&loaded.manifest.app_version) {
-        return Err(InstallError::UnusableVersion {
-            path: root.join(MANIFEST_FILE),
-            version: loaded.manifest.app_version.clone(),
-            detail: error.to_string(),
-        });
-    }
+    let app_version =
+        version::parse_app_version(&loaded.manifest.app_version).map_err(|error| {
+            InstallError::UnusableVersion {
+                path: root.join(MANIFEST_FILE),
+                version: loaded.manifest.app_version.clone(),
+                detail: error.to_string(),
+            }
+        })?;
 
     for (relative, why) in REQUIRED_FILES {
         if !root.join(relative).is_file() {
@@ -819,7 +826,10 @@ pub fn validate(root: &Path) -> Result<Loaded, InstallError> {
         }
     }
 
-    Ok(loaded)
+    Ok(Validated {
+        loaded,
+        app_version,
+    })
 }
 
 /// Copy `from` into `to`, minus what must not be installed.
