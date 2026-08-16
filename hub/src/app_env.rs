@@ -110,6 +110,44 @@ pub struct AppEnvironment {
     pub secret_store: crate::secrets::SecretStore,
 }
 
+/// `MESSENGER_TRANSPORT_DSN`, from the manifest's post-fallback `workers`
+/// (plan 045). The legacy spelling keeps its DSN byte for byte — an
+/// already-installed app must not have rows already queued under
+/// `queue_name='async'` stranded by a DSN change under it — while a manifest
+/// that spells `workers` directly gets the bare DSN, so each transport's own
+/// `queue_name` reaches Doctrine instead of being overridden by
+/// `Connection::buildConfiguration()`'s left-hand array merge (this plan's
+/// design decision, `.project/plan/045-declared-workers-and-ordered-transports.md`).
+fn messenger_transport_dsn(manifest: &Manifest) -> String {
+    if manifest.workers.is_empty() {
+        "sync://".to_string()
+    } else if manifest.async_worker {
+        "doctrine://default?queue_name=async".to_string()
+    } else {
+        "doctrine://default".to_string()
+    }
+}
+
+/// `TFS_WORKER_TRANSPORTS`: every transport actually consumed after
+/// fallbacks, in declaration order, deduplicated, comma-separated, empty when
+/// none. The union across workers rather than a per-worker grouping — §3's
+/// question is whether *this* transport is consumed, not which process
+/// consumes it (parse-time refuses a transport repeated across declarations,
+/// so the dedup here only ever guards the invariant, never masks a
+/// collision).
+fn worker_transports(manifest: &Manifest) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered = Vec::new();
+    for declaration in &manifest.workers {
+        for transport in &declaration.transports {
+            if seen.insert(transport.as_str()) {
+                ordered.push(transport.as_str());
+            }
+        }
+    }
+    ordered.join(",")
+}
+
 /// Assemble CONTRACT.md §3 for `manifest`'s app, served from `app_dir`, with
 /// its state rooted at `state_root`.
 ///
@@ -294,25 +332,20 @@ where
             "DATABASE_URL",
             format!("sqlite:///{}", data_subdir.join("app.db").display()),
         ),
-        (
-            "MESSENGER_TRANSPORT_DSN",
-            match manifest.async_worker {
-                true => "doctrine://default?queue_name=async",
-                false => "sync://",
-            }
-            .to_string(),
-        ),
+        ("MESSENGER_TRANSPORT_DSN", messenger_transport_dsn(manifest)),
         ("MERCURE_URL", mercure_url.clone()),
         ("MERCURE_PUBLIC_URL", mercure_url),
         ("MERCURE_JWT_SECRET", mercure_secret),
         (
             "TFS_ASYNC_WORKER",
-            match manifest.async_worker {
-                true => "1",
-                false => "0",
+            if manifest.workers.is_empty() {
+                "0"
+            } else {
+                "1"
             }
             .to_string(),
         ),
+        ("TFS_WORKER_TRANSPORTS", worker_transports(manifest)),
         // What the probe above actually picked, not whether a keyring is
         // installed: a present-but-locked one has already fallen back to the
         // file, and an app is entitled to warn its user on that basis.
