@@ -1,6 +1,6 @@
 use super::{
-    load, now_timestamp, update, Platform, ReferenceKind, Registry, RegistryEntry, RegistryError,
-    Source, SourceKind, State,
+    load, now_timestamp, restore_for_rollback, update, Platform, ReferenceKind, Registry,
+    RegistryEntry, RegistryError, RollbackRestoreOutcome, Source, SourceKind, State,
 };
 use crate::paths::Paths;
 
@@ -323,6 +323,107 @@ fn a_write_never_leaves_its_temp_file_behind() {
         .filter(|name| name.contains(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+// --- rollback restore ------------------------------------------------------
+
+#[test]
+fn rollback_restore_copies_the_anchor_bytes_when_app_entries_match() {
+    let (_base, paths) = temp_paths();
+    let snapshot_path = paths.hub_root().join("registry.json.previous");
+    let anchor = r#"{
+  "hub_version": "0.1.0",
+  "apps": []
+}
+"#;
+    std::fs::create_dir_all(paths.hub_root()).expect("the hub root");
+    std::fs::write(&snapshot_path, anchor).expect("the anchor");
+    update(&paths, |registry| {
+        registry.hub_version = Some("0.2.0".into());
+    })
+    .expect("the live registry");
+
+    let outcome = restore_for_rollback(&paths, &snapshot_path).expect("the restore succeeds");
+
+    assert_eq!(outcome, RollbackRestoreOutcome::RestoredBytes);
+    assert_eq!(
+        std::fs::read(paths.registry_path()).expect("the restored registry"),
+        anchor.as_bytes()
+    );
+}
+
+#[test]
+fn rollback_restore_merges_the_locked_live_entries_and_their_unknown_fields() {
+    let (_base, paths) = temp_paths();
+    let snapshot_path = paths.hub_root().join("registry.json.previous");
+    std::fs::create_dir_all(paths.hub_root()).expect("the hub root");
+    std::fs::write(
+        &snapshot_path,
+        r#"{
+  "hub_version": "0.1.0",
+  "platform": { "php_version": "8.4", "extensions_hash": "old" },
+  "apps": [],
+  "snapshot_only": true
+}
+"#,
+    )
+    .expect("the anchor");
+    std::fs::write(
+        paths.registry_path(),
+        r#"{
+  "hub_version": "0.2.0",
+  "platform": { "php_version": "8.5", "extensions_hash": "new" },
+  "apps": [{
+    "id": "kept",
+    "identifier": "dev.local.kept",
+    "source": { "kind": "local-path", "location": "/source" },
+    "app_version": "2.0.0",
+    "source_revision": "revision",
+    "platform": { "php_version": "8.5", "extensions_hash": "new" },
+    "state": "ready",
+    "installed_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "entry_from_newer_hub": "kept"
+  }],
+  "top_level_from_newer_hub": { "enabled": true }
+}
+"#,
+    )
+    .expect("the live registry");
+
+    let outcome = restore_for_rollback(&paths, &snapshot_path).expect("the merge succeeds");
+
+    let RollbackRestoreOutcome::Merged { live } = outcome else {
+        panic!("divergent app entries must merge");
+    };
+    assert_eq!(live.get("kept").unwrap().app_version, "2.0.0");
+    assert_eq!(
+        live.get("kept")
+            .unwrap()
+            .unknown
+            .get("entry_from_newer_hub"),
+        Some(&serde_json::Value::from("kept"))
+    );
+    assert_eq!(
+        live.unknown.get("top_level_from_newer_hub"),
+        Some(&serde_json::json!({ "enabled": true }))
+    );
+
+    let restored = load(&paths).expect("the merged registry reads");
+    assert_eq!(restored.hub_version.as_deref(), Some("0.1.0"));
+    assert_eq!(restored.platform.as_ref().unwrap().php_version, "8.4");
+    assert_eq!(
+        restored.unknown.get("top_level_from_newer_hub"),
+        Some(&serde_json::json!({ "enabled": true }))
+    );
+    assert_eq!(
+        restored
+            .get("kept")
+            .unwrap()
+            .unknown
+            .get("entry_from_newer_hub"),
+        Some(&serde_json::Value::from("kept"))
+    );
 }
 
 // --- timestamps ------------------------------------------------------------

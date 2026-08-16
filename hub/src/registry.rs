@@ -427,12 +427,62 @@ pub fn snapshot_to(paths: &Paths, destination: &std::path::Path) -> Result<(), R
     })
 }
 
-/// Restore `registry.json` from `source`, under the exclusive lock — the
-/// rollback anchor's registry half restored (`hub_rollback.rs`, this plan's
-/// step 7), the exact inverse of [`snapshot_to`]. Copies `source`'s bytes
-/// verbatim rather than reading them through a [`Registry`] and
-/// re-serialising: the restored file ends up byte-identical to the snapshot,
-/// not merely equivalent under it.
+/// What [`restore_for_rollback`] wrote while holding the registry lock.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the command adopts this primitive in the next atomic plan step"
+)]
+pub enum RollbackRestoreOutcome {
+    /// The live app entries still matched the anchor, so its bytes were copied
+    /// verbatim.
+    RestoredBytes,
+    /// App entries had changed after the anchor. The returned registry is the
+    /// locked live state whose entries were retained.
+    Merged { live: Registry },
+}
+
+/// Restore the rollback anchor without losing an app operation that races the
+/// command.
+///
+/// The snapshot is parsed before the lock, so a malformed anchor still fails
+/// before the caller consumes its binary half. The authoritative comparison,
+/// however, happens only after taking the exclusive lock: it reads the live
+/// registry, selects the byte-copy or merge branch, and writes that selection
+/// before releasing the lock. An app install, removal, or update therefore
+/// cannot land between deciding which branch to use and writing it.
+#[allow(
+    dead_code,
+    reason = "the command adopts this primitive in the next atomic plan step"
+)]
+pub fn restore_for_rollback(
+    paths: &Paths,
+    source: &std::path::Path,
+) -> Result<RollbackRestoreOutcome, RegistryError> {
+    let bytes = fs::read(source).map_err(|read_error| RegistryError::Io {
+        path: source.to_path_buf(),
+        source: read_error,
+    })?;
+    let snapshot = parse_registry(source, &bytes)?;
+
+    let _lock = lock(paths)?;
+    let mut live = load(paths)?;
+    if live.app_entries_match(&snapshot) {
+        write_bytes_locked(paths, &bytes)?;
+        return Ok(RollbackRestoreOutcome::RestoredBytes);
+    }
+
+    let kept = live.clone();
+    live.hub_version = snapshot.hub_version;
+    live.platform = snapshot.platform;
+    write_locked(paths, &live)?;
+    Ok(RollbackRestoreOutcome::Merged { live: kept })
+}
+
+/// Restore an anchor verbatim under the registry lock.
+///
+/// Kept temporarily for the command's existing call site; the rollback path
+/// moves to [`restore_for_rollback`] in the following integration step.
 pub fn restore_from(paths: &Paths, source: &std::path::Path) -> Result<(), RegistryError> {
     let bytes = fs::read(source).map_err(|read_error| RegistryError::Io {
         path: source.to_path_buf(),
@@ -444,11 +494,15 @@ pub fn restore_from(paths: &Paths, source: &std::path::Path) -> Result<(), Regis
 
 /// Read a registry snapshot without changing the live registry.
 pub fn load_from(source: &std::path::Path) -> Result<Registry, RegistryError> {
-    let contents = fs::read_to_string(source).map_err(|source_error| RegistryError::Io {
+    let bytes = fs::read(source).map_err(|source_error| RegistryError::Io {
         path: source.to_path_buf(),
         source: source_error,
     })?;
-    serde_json::from_str(&contents).map_err(|error| RegistryError::Malformed {
+    parse_registry(source, &bytes)
+}
+
+fn parse_registry(source: &std::path::Path, bytes: &[u8]) -> Result<Registry, RegistryError> {
+    serde_json::from_slice(bytes).map_err(|error| RegistryError::Malformed {
         path: source.to_path_buf(),
         detail: error.to_string(),
     })
@@ -456,9 +510,8 @@ pub fn load_from(source: &std::path::Path) -> Result<Registry, RegistryError> {
 
 /// Keep the live app entries, but restore the hub-level stamp from `source`.
 ///
-/// The operation holds the same exclusive lock as [`restore_from`], including
-/// while it reads the live registry and writes the merged result. It returns
-/// the live registry that won, so callers can report the entries they kept.
+/// Kept temporarily for the command's existing call site; the rollback path
+/// moves to [`restore_for_rollback`] in the following integration step.
 pub fn restore_hub_stamp_from(
     paths: &Paths,
     source: &std::path::Path,
