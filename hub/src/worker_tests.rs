@@ -1,5 +1,6 @@
 use std::{
     fs,
+    path::Path,
     process::Command,
     sync::{atomic::AtomicBool, Arc, Mutex},
     thread,
@@ -8,8 +9,8 @@ use std::{
 
 use super::{
     arbitrate_respawn, claim_dialog, consume_args, flatten_worker_slots, sleep_backoff_or_shutdown,
-    supervisor_decision, RespawnArbitration, SupervisorDecision, WorkerPidTable,
-    WORKER_MIN_HEALTHY_UPTIME,
+    spawn_worker, supervisor_decision, worker_log, RespawnArbitration, SupervisorDecision,
+    WorkerPidTable, WORKER_MIN_HEALTHY_UPTIME,
 };
 use crate::manifest::WorkerDeclaration;
 
@@ -82,6 +83,66 @@ fn flattening_expands_each_declaration_by_its_count() {
 #[test]
 fn flattening_no_declarations_is_no_slots() {
     assert!(flatten_worker_slots(&[]).is_empty());
+}
+
+// --- per-slot log files (plan 046) -------------------------------------------
+
+#[test]
+fn worker_log_names_the_slot_one_based() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    assert_eq!(worker_log(dir.path(), 0), dir.path().join("worker-1.log"));
+    assert_eq!(worker_log(dir.path(), 2), dir.path().join("worker-3.log"));
+}
+
+#[test]
+fn spawn_worker_writes_to_its_own_slot_file() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut child = spawn_worker(
+        Path::new("/bin/echo"),
+        dir.path(),
+        &[],
+        dir.path(),
+        &["async".to_string()],
+        0,
+    )
+    .expect("spawn the throwaway worker");
+    child.wait().expect("the throwaway worker exits");
+
+    let contents = fs::read_to_string(worker_log(dir.path(), 0)).expect("read worker-1.log");
+    assert!(contents.contains("messenger:consume"));
+}
+
+#[test]
+fn two_slots_never_write_to_one_file() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut first = spawn_worker(
+        Path::new("/bin/echo"),
+        dir.path(),
+        &[],
+        dir.path(),
+        &["async".to_string()],
+        0,
+    )
+    .expect("spawn slot 0's throwaway worker");
+    first.wait().expect("slot 0 exits");
+
+    let mut second = spawn_worker(
+        Path::new("/bin/echo"),
+        dir.path(),
+        &[],
+        dir.path(),
+        &["scheduler_default".to_string()],
+        1,
+    )
+    .expect("spawn slot 1's throwaway worker");
+    second.wait().expect("slot 1 exits");
+
+    let first_log = fs::read_to_string(worker_log(dir.path(), 0)).expect("read worker-1.log");
+    let second_log = fs::read_to_string(worker_log(dir.path(), 1)).expect("read worker-2.log");
+    assert!(first_log.contains("async"));
+    assert!(!first_log.contains("scheduler_default"));
+    assert!(second_log.contains("scheduler_default"));
+    assert!(!second_log.contains("async"));
 }
 
 // --- the shared pid table -----------------------------------------------------

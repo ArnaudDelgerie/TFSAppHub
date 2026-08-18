@@ -313,8 +313,9 @@ pub fn start(
                 &envs,
                 &environment.log_dir,
                 &transports,
+                slot,
             )
-            .map_err(|error| format!("Cannot start the Messenger worker: {error}"))?;
+            .map_err(|error| format!("Cannot start Messenger worker {}: {error}", slot + 1))?;
             let worker_spawned_at = Instant::now();
 
             // Adopt before the fallible pid-table rewrite. From this point a

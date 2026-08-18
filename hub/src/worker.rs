@@ -84,13 +84,21 @@ fn consume_args(transports: &[String]) -> Vec<String> {
     args
 }
 
+/// `<log_dir>/worker-<n>.log` for `slot` — the single place that name is
+/// spelled. `slot` is the 0-based index shared with the pid table and the
+/// supervisor config; the file name is 1-based, matching how a restart line
+/// or a give-up dialog names the slot to a reader (plan 046).
+pub fn worker_log(log_dir: &Path, slot: usize) -> PathBuf {
+    log_dir.join(format!("worker-{}.log", slot + 1))
+}
+
 /// Spawn one Messenger worker, consuming `transports` in order.
 ///
 /// `--time-limit`/`--memory-limit` make it recycle periodically, which is what a
 /// long-lived PHP process needs; the supervisor below is what makes the recycle
 /// invisible. No `-vvv`: the app's real logs go through Symfony's own logger
-/// under `APP_LOG_DIR`, and duplicating them into `sidecar.log` would only make
-/// the file useless for what it is actually for.
+/// under `APP_LOG_DIR`, and duplicating them into its own `worker-<n>.log`
+/// would only make the file useless for what it is actually for.
 ///
 /// No `--env`/`--no-debug`: `bin/console` reads `APP_ENV`/`APP_DEBUG` straight
 /// from `envs` when neither flag is given, exactly as the FrankenPHP server
@@ -100,17 +108,23 @@ fn consume_args(transports: &[String]) -> Vec<String> {
 /// worker would run its prod kernel while its web server ran dev — silently
 /// breaking CONTRACT.md §3's "every process the hub starts on the app's behalf
 /// gets the same list" the moment `dev` gave `APP_ENV` a second value to carry.
+///
+/// stdout/stderr go to this slot's own `worker-<n>.log` (plan 046), never to
+/// `sidecar.log`: that file is FrankenPHP's own structured output, and a
+/// consumer's PHP fatals or stack traces landing in it would defeat parsing
+/// it as JSON.
 pub fn spawn_worker(
     frankenphp: &Path,
     app_dir: &Path,
     envs: &[(&str, String)],
     log_dir: &Path,
     transports: &[String],
+    slot: usize,
 ) -> std::io::Result<Child> {
     let mut command = command_with_env(frankenphp, envs);
     command.args(consume_args(transports));
     command.current_dir(app_dir);
-    let (stdout, stderr) = log::sidecar_log_stdio(log_dir)?;
+    let (stdout, stderr) = log::append_stdio(&worker_log(log_dir, slot))?;
     command.stdout(stdout).stderr(stderr);
     tfsapp_core::process::set_own_process_group(&mut command);
     command.spawn()
@@ -315,7 +329,10 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
         app,
         dialog_shown,
     } = config;
-    let sidecar_log = log_dir.join("sidecar.log");
+    let worker_log_path = worker_log(&log_dir, slot);
+    // The 1-based number this slot is named by in every line below, matching
+    // `worker_log`'s own file naming.
+    let n = slot + 1;
 
     thread::spawn(move || {
         let mut spawned_at = worker_spawned_at;
@@ -341,7 +358,7 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
                             // oddity is made visible rather than spun on
                             // forever in silence.
                             eprintln!(
-                                "tfsapp-hub: cannot poll the Messenger worker pid {}: {error} \
+                                "tfsapp-hub: cannot poll Messenger worker {n} pid {}: {error} \
                                  (treating it as still running)",
                                 child.id()
                             );
@@ -362,9 +379,9 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
             }
 
             let mut uptime = spawned_at.elapsed();
-            let exit_line = format!("Messenger worker exited ({status}) after {uptime:.1?}");
+            let exit_line = format!("Messenger worker {n} exited ({status}) after {uptime:.1?}");
             println!("{exit_line}");
-            log::append_log(&sidecar_log, &exit_line);
+            log::append_log(&worker_log_path, &exit_line);
 
             // Looping here rather than returning out of the thread: a failed
             // *respawn* is itself a zero-uptime failed start, and it earns the
@@ -375,16 +392,16 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
                         consecutive_failures,
                     } => {
                         let line = format!(
-                            "Messenger worker: giving up after {consecutive_failures} \
+                            "Messenger worker {n}: giving up after {consecutive_failures} \
                              consecutive failed starts"
                         );
                         eprintln!("{line}");
-                        log::append_log(&sidecar_log, &line);
+                        log::append_log(&worker_log_path, &line);
                         // Only this slot's pid leaves the table; a sibling
                         // still running keeps its own line.
                         let _ = pid_table.set(slot, None);
                         if claim_dialog(&dialog_shown) {
-                            gave_up_dialog(&app, &sidecar_log, &transports);
+                            gave_up_dialog(&app, &worker_log_path, &transports);
                         }
                         return;
                     }
@@ -400,17 +417,17 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
                 // alarming for something entirely routine.
                 if attempt > 0 {
                     let line = format!(
-                        "Messenger worker: restarting after {delay:.1?} backoff (attempt {attempt})"
+                        "Messenger worker {n}: restarting after {delay:.1?} backoff (attempt {attempt})"
                     );
                     println!("{line}");
-                    log::append_log(&sidecar_log, &line);
+                    log::append_log(&worker_log_path, &line);
                 }
 
                 if !sleep_backoff_or_shutdown(delay, &shutting_down) {
                     return;
                 }
 
-                match spawn_worker(&frankenphp, &app_dir, &envs, &log_dir, &transports) {
+                match spawn_worker(&frankenphp, &app_dir, &envs, &log_dir, &transports, slot) {
                     Ok(child) => match arbitrate_respawn(&worker, &shutting_down, child) {
                         RespawnArbitration::Adopted { worker_pid } => {
                             // The child is in the slot before this durable
@@ -425,33 +442,36 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
                                 return;
                             }
 
-                            let line = format!("Restarted Messenger worker pid {worker_pid}");
+                            let line = format!("Restarted Messenger worker {n} pid {worker_pid}");
                             println!("{line}");
-                            log::append_log(&sidecar_log, &line);
+                            log::append_log(&worker_log_path, &line);
                             spawned_at = Instant::now();
                             continue 'watch;
                         }
                         RespawnArbitration::CancelledByShutdown(mut child) => {
-                            let line = "Messenger worker respawn cancelled by shutdown";
+                            let line =
+                                format!("Messenger worker {n} respawn cancelled by shutdown");
                             println!("{line}");
-                            log::append_log(&sidecar_log, line);
+                            log::append_log(&worker_log_path, &line);
                             tfsapp_core::process::terminate(child.id());
                             let _ = child.wait();
                             return;
                         }
                         RespawnArbitration::CannotAdopt(mut child) => {
-                            let line = "Cannot supervise respawned Messenger worker; stopping it";
+                            let line = format!(
+                                "Cannot supervise respawned Messenger worker {n}; stopping it"
+                            );
                             eprintln!("{line}");
-                            log::append_log(&sidecar_log, line);
+                            log::append_log(&worker_log_path, &line);
                             tfsapp_core::process::terminate(child.id());
                             let _ = child.wait();
                             return;
                         }
                     },
                     Err(error) => {
-                        let line = format!("Cannot restart the Messenger worker: {error}");
+                        let line = format!("Cannot restart Messenger worker {n}: {error}");
                         eprintln!("{line}");
-                        log::append_log(&sidecar_log, &line);
+                        log::append_log(&worker_log_path, &line);
                         uptime = Duration::ZERO;
                     }
                 }
