@@ -699,10 +699,13 @@ long-poll when the user closes the window is work that will be cut off.
 ```
 
 `log/` is `APP_LOG_DIR`, and it is not the app's alone: the host writes its own
-rotated logs into the same directory — `sidecar.log` (FrankenPHP and the
-Messenger worker's own output), `commands.log` (declared lifecycle commands,
-§6) and `hub.log` (`open`'s own routine output, for a launch with no terminal
-to read it — plan 015). An app that names one of its own files the same loses
+rotated logs into the same directory — `sidecar.log` (FrankenPHP's own
+structured output, and nothing else), one `worker-<n>.log` per declared
+worker slot (that consumer's `messenger:consume` output plus the host's own
+supervision of it, `n` its 1-based slot number), `commands.log` (declared
+lifecycle commands, §6) and `hub.log` (`open`'s own routine output, for a
+launch with no terminal to read it — plan 015). An app that names one of its
+own files `sidecar.log`, `commands.log`, `hub.log` or `worker-<n>.log` loses
 it to a rotation it never asked for; pick something else.
 
 This is the installed layout. A dev session's equivalent lives under the

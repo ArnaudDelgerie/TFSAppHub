@@ -16,7 +16,8 @@ pub const LOG_GENERATIONS: u32 = 3;
 /// itself as needed. Never fails the caller — losing a log line is not
 /// worth aborting a lifecycle command or a worker restart over, unlike the
 /// event it's recording. Shared by the lifecycle command runner
-/// (`commands.log`) and the worker supervisor (`sidecar.log`, plan 032).
+/// (`commands.log`) and the worker supervisor (each slot's own
+/// `worker-<n>.log`, plan 046; previously `sidecar.log`, plan 032).
 pub fn append_log(log_file: &Path, content: &str) {
     if content.is_empty() {
         return;
@@ -47,12 +48,14 @@ pub fn append_stdio(path: &Path) -> std::io::Result<(std::process::Stdio, std::p
     Ok((stdout, stderr))
 }
 
-/// Packaged mode only (plan 031): `<data dir>/log/sidecar.log`, appended to,
-/// never truncated — the same shape as `commands.log`, for the same reason
-/// (multiple launches, and the server plus a recycled Messenger worker, must
-/// stay comparable in one file rather than each clobbering the last). Dev
-/// mode never calls this — it keeps inheriting the developer's own terminal
-/// stdio, same as before this plan.
+/// `<data dir>/log/sidecar.log`, appended to, never truncated — the same
+/// shape as `commands.log`, for the same reason (several launches must stay
+/// comparable in one file rather than each clobbering the last). Called in
+/// every mode, including dev: a dev session's own `var/log/sidecar.log` is
+/// real, not inherited terminal stdio. Since plan 046, a worker slot's PHP
+/// output and its supervisor's lines go to that slot's own `worker-<n>.log`
+/// instead (`worker::spawn_worker`), so this file carries FrankenPHP's own
+/// output alone.
 pub fn sidecar_log_stdio(
     log_dir: &Path,
 ) -> std::io::Result<(std::process::Stdio, std::process::Stdio)> {
@@ -92,10 +95,26 @@ pub fn rotate_log(path: &Path) {
     let _ = fs::rename(path, generation_path(path, 1));
 }
 
-/// Rotate both of `log_dir`'s logs (`commands.log`, `sidecar.log`) once,
-/// called early in both launch paths — before `commands.log` is written and
-/// before `sidecar_log_stdio` opens the sidecar's fd (plan 038) — so a
-/// long-lived install's `log/` stays bounded instead of growing forever.
+/// `true` for exactly `worker-<n>.log`, `n` a run of ASCII digits — never for
+/// one of its own rotated generations (`worker-1.log.1`, whose name does not
+/// end in `.log`), so `rotate_logs` cannot fold a file's rotation into itself.
+fn is_worker_log_name(name: &str) -> bool {
+    name.strip_prefix("worker-")
+        .and_then(|rest| rest.strip_suffix(".log"))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Rotate every log in `log_dir` once — `commands.log`, `sidecar.log`, and
+/// every `worker-<n>.log` present (plan 046) — called early in both launch
+/// paths, before `commands.log` is written and before `sidecar_log_stdio`
+/// opens the sidecar's fd (plan 002), so a long-lived install's `log/` stays
+/// bounded instead of growing forever.
+///
+/// Worker files are found by reading the directory rather than taking a
+/// declared slot count: that keeps `app_env::resolve`'s single call site
+/// unchanged, and it is also what bounds a `worker-<n>.log` a manifest no
+/// longer declares a slot for — orphaned, but still rotated rather than left
+/// to grow forever.
 ///
 /// **`hub.log` is deliberately not among them (plan 015).** This runs in the
 /// *child*, after the *parent* has already opened `hub.log`'s fd for the
@@ -106,6 +125,14 @@ pub fn rotate_log(path: &Path) {
 pub fn rotate_logs(log_dir: &Path) {
     rotate_log(&log_dir.join("commands.log"));
     rotate_log(&log_dir.join("sidecar.log"));
+    let Ok(entries) = fs::read_dir(log_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_str().is_some_and(is_worker_log_name) {
+            rotate_log(&entry.path());
+        }
+    }
 }
 
 #[cfg(test)]

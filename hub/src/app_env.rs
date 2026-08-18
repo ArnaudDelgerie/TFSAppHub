@@ -94,9 +94,10 @@ pub struct AppEnvironment {
     /// rebuilding the path at each call site is how two of them end up
     /// disagreeing.
     pub data_subdir: PathBuf,
-    /// `<data_dir>/log/` — where `commands.log` and `sidecar.log` land. The one
-    /// place a launch failure can be read from afterwards, which is why every
-    /// message that mentions a failure names a file in here.
+    /// `<data_dir>/log/` — where `commands.log`, `sidecar.log` and, since plan
+    /// 046, each worker slot's own `worker-<n>.log` land. The one place a
+    /// launch failure can be read from afterwards, which is why every message
+    /// that mentions a failure names a file in here.
     pub log_dir: PathBuf,
     /// The port `APP_PORT`/`APP_ORIGIN` were built from, for the caller that has
     /// to poll `/healthz` on it and point a window at it. Reading it back out of

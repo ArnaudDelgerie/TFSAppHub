@@ -236,12 +236,12 @@ pub fn start(
         envs.push(("TFS_BRIDGE_TOKEN", bridge.token));
     }
 
-    // The app's own stdout and stderr have nowhere to go when it was launched
-    // from a desktop entry, so they are redirected rather than inherited. The
-    // file is appended to, never truncated: several launches, plus a recycled
-    // worker, have to stay comparable in one file. `open`'s own detached
-    // child gets the same treatment, for the same reason, into `hub.log`
-    // beside this file — see `open::prepare_hub_log` (plan 015).
+    // The server's own stdout and stderr have nowhere to go when it was
+    // launched from a desktop entry, so they are redirected rather than
+    // inherited. The file is appended to, never truncated: several launches
+    // have to stay comparable in one file. `open`'s own detached child gets
+    // the same treatment, for the same reason, into `hub.log` beside this
+    // file — see `open::prepare_hub_log` (plan 015).
     let (stdout, stderr) = log::sidecar_log_stdio(&environment.log_dir).map_err(|error| {
         format!(
             "Cannot open {}: {error}",
@@ -313,8 +313,9 @@ pub fn start(
                 &envs,
                 &environment.log_dir,
                 &transports,
+                slot,
             )
-            .map_err(|error| format!("Cannot start the Messenger worker: {error}"))?;
+            .map_err(|error| format!("Cannot start Messenger worker {}: {error}", slot + 1))?;
             let worker_spawned_at = Instant::now();
 
             // Adopt before the fallible pid-table rewrite. From this point a

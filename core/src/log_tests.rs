@@ -182,3 +182,67 @@ fn rotate_logs_rotates_both_commands_log_and_sidecar_log() {
     assert!(dir.path().join("commands.log.1").exists());
     assert!(dir.path().join("sidecar.log.1").exists());
 }
+
+#[test]
+fn rotate_logs_rotates_every_worker_log_present_orphans_included() {
+    // worker-1.log and worker-2.log stand for two declared slots; worker-3.log
+    // stands for a slot a manifest no longer declares (plan 046) — nothing at
+    // this layer tells them apart, which is exactly the point: rotation finds
+    // whatever `worker-<n>.log` files are actually in the directory.
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["worker-1.log", "worker-2.log", "worker-3.log"] {
+        fs::write(dir.path().join(name), vec![b'x'; MAX_LOG_BYTES as usize]).unwrap();
+    }
+
+    rotate_logs(dir.path());
+
+    for name in ["worker-1.log", "worker-2.log", "worker-3.log"] {
+        assert!(
+            !dir.path().join(name).exists(),
+            "{name} should have rotated"
+        );
+        assert!(
+            dir.path().join(format!("{name}.1")).exists(),
+            "{name}.1 should exist"
+        );
+    }
+}
+
+#[test]
+fn rotate_logs_does_not_mistake_a_rotated_generation_for_a_live_worker_log() {
+    // worker-1.log.1 is already a rotated generation, not a live log — its
+    // name does not end in `.log`, so it must be left alone rather than
+    // shifted again into worker-1.log.2.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("worker-1.log.1"),
+        vec![b'x'; MAX_LOG_BYTES as usize],
+    )
+    .unwrap();
+
+    rotate_logs(dir.path());
+
+    assert!(dir.path().join("worker-1.log.1").exists());
+    assert!(!dir.path().join("worker-1.log.2").exists());
+}
+
+#[test]
+fn rotate_logs_does_not_panic_when_the_directory_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("worker-1.log"),
+        vec![b'x'; MAX_LOG_BYTES as usize],
+    )
+    .unwrap();
+
+    let mut perms = fs::metadata(dir.path()).unwrap().permissions();
+    perms.set_mode(0o300);
+    fs::set_permissions(dir.path(), perms.clone()).unwrap();
+
+    rotate_logs(dir.path());
+
+    perms.set_mode(0o700);
+    fs::set_permissions(dir.path(), perms).unwrap();
+}
