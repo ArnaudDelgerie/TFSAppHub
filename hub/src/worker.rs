@@ -499,7 +499,7 @@ fn claim_dialog(dialog_shown: &AtomicBool) -> bool {
 /// and the window still usable, so nothing here should block either this thread
 /// or the user's work. Relaunching is the only retry, which is what the message
 /// has to convey without saying "restart" as if it were a bug report.
-fn gave_up_dialog(app: &tauri::AppHandle, sidecar_log: &Path, transports: &[String]) {
+fn gave_up_dialog(app: &tauri::AppHandle, worker_log_path: &Path, transports: &[String]) {
     use tauri_plugin_dialog::DialogExt;
 
     app.dialog()
@@ -508,7 +508,7 @@ fn gave_up_dialog(app: &tauri::AppHandle, sidecar_log: &Path, transports: &[Stri
              for this session. The app itself is unaffected, but jobs that rely on it will not \
              complete until you open it again. See {} for details.",
             transports.join(", "),
-            sidecar_log.display()
+            worker_log_path.display()
         ))
         .title("Background processing unavailable")
         .kind(tauri_plugin_dialog::MessageDialogKind::Warning)

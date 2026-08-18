@@ -16,7 +16,8 @@ pub const LOG_GENERATIONS: u32 = 3;
 /// itself as needed. Never fails the caller — losing a log line is not
 /// worth aborting a lifecycle command or a worker restart over, unlike the
 /// event it's recording. Shared by the lifecycle command runner
-/// (`commands.log`) and the worker supervisor (`sidecar.log`, plan 032).
+/// (`commands.log`) and the worker supervisor (each slot's own
+/// `worker-<n>.log`, plan 046; previously `sidecar.log`, plan 032).
 pub fn append_log(log_file: &Path, content: &str) {
     if content.is_empty() {
         return;
