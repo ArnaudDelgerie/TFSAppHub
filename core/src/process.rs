@@ -480,11 +480,11 @@ pub fn is_owner_live(pid_file: &Path) -> std::io::Result<bool> {
 
 /// Terminate `pid` only if it still carries `identifier`'s exact
 /// `TFS_APP_IDENTIFIER` marker at the moment of the call (plan 052). This is
-/// the guard `spawn_signal_forwarder` and `spawn_coexistence_watchdog` need
-/// before calling `terminate` below: both react on a detached thread, woken
-/// up an unbounded time after `pid` was recorded, so by the time they fire
-/// the original child may already have exited and been reaped, letting the
-/// OS recycle its number onto an unrelated process. `cleanup_previous_sidecar`
+/// the guard `spawn_signal_forwarder` needs before calling `terminate` below:
+/// it reacts on a detached thread, woken up an unbounded time after `pid` was
+/// recorded, so by the time it fires the original child may already have
+/// exited and been reaped, letting the OS recycle its number onto an
+/// unrelated process. `cleanup_previous_sidecar`
 /// above closes the identical race on its own call site with the same
 /// primitive. Checking immediately before signalling is what keeps the proof
 /// from going stale itself; `terminate` itself stays unchanged and ungated,
@@ -590,32 +590,6 @@ pub fn spawn_on_signal<F: FnOnce() + Send + 'static>(read_fd: RawFd, action: F) 
         let mut byte = [0u8; 1];
         if unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut libc::c_void, 1) } > 0 {
             action();
-        }
-    });
-}
-
-/// Spawn the coexistence watchdog (rule 3, CONTRACT.md §2/§6, plan 047):
-/// polls `is_owner_live(&pid_file)` once a second and, the moment the app
-/// window's owner drops, terminates `child_pid` — only ever spawned when a
-/// window was confirmed live at `run <alias>`'s own start (reachable only by
-/// a `concurrent` alias, since a non-concurrent one already refused to start
-/// in that case); a lone `run` command never gets one, since there is
-/// nothing to watch. An I/O error probing liveness is treated the same as
-/// "the owner is gone" rather than looping forever on an unreadable lock
-/// file. The termination itself goes through `terminate_if_identifier_matches`
-/// (plan 052), gated on `child_pid` still carrying `identifier`, since this
-/// thread only reacts to a poll tick after the owner drops — long enough for
-/// `child_pid` to have been reaped and recycled onto an unrelated process by
-/// then.
-pub fn spawn_coexistence_watchdog(pid_file: PathBuf, child_pid: u32, identifier: String) {
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(1));
-        match is_owner_live(&pid_file) {
-            Ok(true) => continue,
-            Ok(false) | Err(_) => {
-                terminate_if_identifier_matches(child_pid, &identifier);
-                return;
-            }
         }
     });
 }

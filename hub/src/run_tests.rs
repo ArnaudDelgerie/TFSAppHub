@@ -527,6 +527,75 @@ fn run_entry_status_stale_when_pid_dead_identity_mismatched_or_no_record() {
     );
 }
 
+// --- resolve_active_runs -------------------------------------------------------
+
+fn run_alias(command: &str, concurrent: bool) -> RunAlias {
+    RunAlias {
+        command: command.to_string(),
+        concurrent,
+    }
+}
+
+#[test]
+fn resolve_active_runs_looks_up_concurrent_from_the_manifest() {
+    let mut aliases = BTreeMap::new();
+    aliases.insert("mcp-serve".to_string(), run_alias("app:mcp", true));
+    aliases.insert("cleanup".to_string(), run_alias("app:cleanup", false));
+    let active = vec![
+        ActiveRunEntry {
+            alias: Some("mcp-serve".to_string()),
+            pid: Some(1),
+            orphaned: false,
+            path: PathBuf::from("/data/runs/1.lock"),
+        },
+        ActiveRunEntry {
+            alias: Some("cleanup".to_string()),
+            pid: Some(2),
+            orphaned: false,
+            path: PathBuf::from("/data/runs/2.lock"),
+        },
+    ];
+    assert_eq!(
+        resolve_active_runs(active, &aliases),
+        vec![
+            ActiveRun {
+                alias: "mcp-serve".to_string(),
+                pid: Some(1),
+                concurrent: true,
+            },
+            ActiveRun {
+                alias: "cleanup".to_string(),
+                pid: Some(2),
+                concurrent: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn resolve_active_runs_treats_an_unknown_or_missing_alias_as_non_concurrent() {
+    let aliases = BTreeMap::new();
+    let active = vec![
+        ActiveRunEntry {
+            alias: Some("gone-from-the-manifest".to_string()),
+            pid: Some(1),
+            orphaned: false,
+            path: PathBuf::from("/data/runs/1.lock"),
+        },
+        ActiveRunEntry {
+            alias: None,
+            pid: Some(2),
+            orphaned: false,
+            path: PathBuf::from("/data/runs/2.lock"),
+        },
+    ];
+    let resolved = resolve_active_runs(active, &aliases);
+    assert_eq!(resolved[0].alias, "gone-from-the-manifest");
+    assert!(!resolved[0].concurrent);
+    assert_eq!(resolved[1].alias, "an unknown alias");
+    assert!(!resolved[1].concurrent);
+}
+
 // --- run_start_verdict --------------------------------------------------------
 
 fn active_run(alias: &str, concurrent: bool) -> ActiveRun {

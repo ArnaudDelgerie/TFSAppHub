@@ -7,7 +7,7 @@
 //! and every primitive it stands on — `try_lock_file`, `wait_for_lock_release`,
 //! `is_owner_live`, `terminate_if_identifier_matches`,
 //! `install_signal_forwarding`, `spawn_signal_forwarder`,
-//! `spawn_coexistence_watchdog`, `set_own_process_group` — already lives in
+//! `set_own_process_group` — already lives in
 //! `tfsapp_core::process` (plan 002). What is genuinely new is one step in
 //! front of it — resolving *which* app — and the fact that the hub has two
 //! apps' worth of state to keep apart while doing it. `../TFSAppWorkstation/
@@ -494,6 +494,34 @@ pub enum RunStartVerdict {
     },
 }
 
+/// Resolve a scan's raw entries against the app's manifest, filling in each
+/// entry's `concurrent` flag by the alias its record names — an entry naming
+/// an alias the manifest no longer declares, or none at all, is treated as
+/// non-`concurrent` (the conservative default: it cannot be proven safe to
+/// stack beside). Shared by `run::start`'s own guard and
+/// `lifecycle::prepare_launch`'s launch-side gate, so the two verdicts never
+/// diverge on what "active" means.
+pub fn resolve_active_runs(
+    active: Vec<ActiveRunEntry>,
+    run_aliases: &BTreeMap<String, RunAlias>,
+) -> Vec<ActiveRun> {
+    active
+        .into_iter()
+        .map(|entry| ActiveRun {
+            alias: entry
+                .alias
+                .clone()
+                .unwrap_or_else(|| "an unknown alias".to_string()),
+            pid: entry.pid,
+            concurrent: entry
+                .alias
+                .as_deref()
+                .and_then(|name| run_aliases.get(name))
+                .is_some_and(|declared| declared.concurrent),
+        })
+        .collect()
+}
+
 /// Pure verdict over an already-resolved `active` list — the caller has
 /// already matched each entry's alias against the manifest to fill in
 /// `concurrent`.
@@ -519,14 +547,12 @@ pub fn run_start_verdict(newcomer_concurrent: bool, active: &[ActiveRun]) -> Run
 /// with a lifecycle event to run refuses over *any* active command, since the
 /// launch path is the only one that can show progress; a launch with nothing
 /// to run refuses only over a non-`concurrent` one.
-#[allow(dead_code)] // Plan 047 step 4 wires this into lifecycle::prepare_launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchVerdict {
     MayOpen,
     Refuse { blocker: ActiveRun },
 }
 
-#[allow(dead_code)] // Plan 047 step 4 wires this into lifecycle::prepare_launch.
 pub fn launch_verdict(has_lifecycle_event: bool, active: &[ActiveRun]) -> LaunchVerdict {
     let blocker = if has_lifecycle_event {
         active.first()
@@ -661,12 +687,14 @@ pub fn stop(id: &str, alias: Option<&str>) -> i32 {
 /// — a different app's `runs/` is a different directory and is unaffected)
 /// and on the per-alias concurrency permission (rule 3), then spawns the
 /// declared `bin/console` command in the foreground — inherited stdio,
-/// `SIGINT`/`SIGTERM` forwarded, a coexistence watchdog when a window was
-/// already live at start — and exits with its status. Rule 2 is lifted
+/// `SIGINT`/`SIGTERM` forwarded — and exits with its status. Rule 2 is lifted
 /// (plan 047 step 3, `../decision/005-concurrency-belongs-to-the-alias.md`):
 /// a `concurrent` alias stacks with itself and with other `concurrent`
 /// aliases; a non-`concurrent` one still refuses beside anything, and is
-/// refused by anything already active.
+/// refused by anything already active. Its lifetime belongs to whoever
+/// started it, not to a window that happened to be open at the time (plan
+/// 047 step 4, decision 005 point 4: the coexistence watchdog that used to
+/// tie the two together is gone).
 ///
 /// This is the one hub command whose exit code is the child's rather than the
 /// hub's own: a child that happens to exit `2` is indistinguishable from a
@@ -812,21 +840,7 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
             return EXIT_FAILED;
         }
     };
-    let active_runs: Vec<ActiveRun> = active
-        .into_iter()
-        .map(|entry| ActiveRun {
-            alias: entry
-                .alias
-                .clone()
-                .unwrap_or_else(|| "an unknown alias".to_string()),
-            pid: entry.pid,
-            concurrent: entry
-                .alias
-                .as_deref()
-                .and_then(|name| spec.manifest.run.get(name))
-                .is_some_and(|declared| declared.concurrent),
-        })
-        .collect();
+    let active_runs = resolve_active_runs(active, &spec.manifest.run);
     if let RunStartVerdict::Blocked {
         blocker,
         newcomer_non_concurrent,
@@ -976,13 +990,6 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
     // rather than trusting a pid that may since have been reaped and
     // recycled onto an unrelated process.
     tfsapp_core::process::spawn_signal_forwarder(signal_read_fd, child_pid, identifier.clone());
-
-    // Coexistence watchdog (rule 3): only when a window was already live at
-    // this command's own start — reachable only by a `concurrent` alias,
-    // since a non-concurrent one already refused above.
-    if owner_live {
-        tfsapp_core::process::spawn_coexistence_watchdog(pid_file, child_pid, identifier);
-    }
 
     let status = child.wait();
     // Unlinked on clean exit — a process that dies without reaching this

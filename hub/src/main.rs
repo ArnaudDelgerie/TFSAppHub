@@ -348,6 +348,7 @@ fn prepare(source: &OpenChildSource, identity: &Identity) -> Launching {
             &identity.identifier,
             &spec.manifest.app_version,
             spec.manifest.app_port,
+            &spec.manifest.run,
         ),
         launch::Source::Live => lifecycle::prepare_dev_launch(
             &data_dir,

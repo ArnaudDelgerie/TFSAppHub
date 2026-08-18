@@ -38,6 +38,7 @@
 //! record these guards read.
 
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     time::Duration,
@@ -45,6 +46,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tfsapp_core::ports::DataConfig;
+
+use crate::manifest::RunAlias;
 
 /// Which lifecycle event (CONTRACT.md §6), if any, a launch represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -766,6 +769,7 @@ pub fn prepare_launch(
     identifier: &str,
     app_version: &str,
     app_port: Option<u16>,
+    run_aliases: &BTreeMap<String, RunAlias>,
 ) -> Option<LaunchLocks> {
     let locks = match acquire_launch_locks(
         &data_dir.join("sidecar.pid"),
@@ -778,21 +782,29 @@ pub fn prepare_launch(
     };
     locks.as_ref()?;
 
-    // Rule 3's launch-side refusal (plan 013, CONTRACT.md §6's "Running a
-    // declared command"): a `run` command holding a `runs/` entry for this
-    // app owns its data dir just as much as a live window does, so a window must
-    // not open over it — a `bin/console` command opening the app's SQLite
-    // while a window is being spawned into it is the same hazard `run.rs`'s
-    // own rule 3 exists to prevent, read the other way round. Placed here,
-    // after `acquire_launch_locks` has already decided to launch rather than
-    // hand off: a launch that hands off to a live sibling
-    // (`LaunchDecision::HandOff`, `locks.as_ref()?` above) must never reach
-    // this check, since it is the ordinary "second window on an app that is
-    // already up" case and a `concurrent` alias legitimately running beside
-    // that window would otherwise be blocked by it.
-    check_run_lock(id, data_dir, identifier);
-
     let event = check_version(id, data_subdir, app_version);
+
+    // Rule 3's launch-side refusal (plan 013, widened by plan 047,
+    // `../decision/005-concurrency-belongs-to-the-alias.md` point 3,
+    // CONTRACT.md §6's "Running a declared command"): a `run` command
+    // holding a `runs/` entry for this app owns its data dir just as much as
+    // a live window does, so a window must not open over a non-`concurrent`
+    // one, or over any of them when this launch has an `event` to run — the
+    // launch path is the only one that can show progress. Placed here, after
+    // `acquire_launch_locks` has already decided to launch rather than hand
+    // off: a launch that hands off to a live sibling (`LaunchDecision::HandOff`,
+    // `locks.as_ref()?` above) must never reach this check, since it is the
+    // ordinary "second window on an app that is already up" case and a
+    // `concurrent` alias legitimately running beside that window would
+    // otherwise be blocked by it.
+    check_run_lock(
+        id,
+        data_dir,
+        identifier,
+        run_aliases,
+        event != LifecycleEvent::None,
+    );
+
     // A data dir with no record at all, under an app the hub installed: the
     // install event already ran, at install time, so there is nothing to run
     // here and only a record to catch up on. Stamping it is what makes the next
@@ -970,29 +982,41 @@ pub fn data_dir_holder(data_dir: &Path, identifier: &str) -> io::Result<Option<D
     }
 }
 
-/// Rule 3's launch-side refusal (plan 013, CONTRACT.md §6): refuse to open a
-/// window while a `run` command holds a `runs/` entry for this app, naming
-/// the active alias when [`probe_run_lock`] found one and pointing at the
-/// way to release it either way.
-fn check_run_lock(id: &str, data_dir: &Path, identifier: &str) {
-    match probe_run_lock(data_dir, identifier) {
-        Ok(RunLockHeld::Free) => {}
-        Ok(RunLockHeld::Held { active }) => {
-            match active.first().and_then(|run| run.alias.as_deref()) {
-                Some(alias) => fatal_startup_error(&format!(
-                    "{id} cannot open a window while its \"{alias}\" run command is active — stop \
-                     it first with `tfsapp-hub run --stop {id}`."
-                )),
-                None => fatal_startup_error(&format!(
-                    "{id} cannot open a window while a run command is active — stop it first with \
-                     `tfsapp-hub run --stop {id}`."
-                )),
-            }
-        }
+/// Rule 3's launch-side gate (plan 013, widened by plan 047,
+/// `../decision/005-concurrency-belongs-to-the-alias.md` point 3,
+/// CONTRACT.md §6): resolve the scan against the manifest exactly as
+/// `run::start`'s own guard does ([`crate::run::resolve_active_runs`]), then
+/// let [`crate::run::launch_verdict`] decide — a launch with an `event` to
+/// run refuses over any active command, one with nothing to run refuses only
+/// over a non-`concurrent` one, naming it and pointing at the way to release
+/// it.
+fn check_run_lock(
+    id: &str,
+    data_dir: &Path,
+    identifier: &str,
+    run_aliases: &BTreeMap<String, RunAlias>,
+    has_lifecycle_event: bool,
+) {
+    let active = match crate::run::scan_runs(data_dir, identifier) {
+        Ok(active) => active,
         Err(error) => fatal_startup_error(&format!(
             "cannot probe {}: {error}",
             data_dir.join("runs").display()
         )),
+    };
+    let active_runs = crate::run::resolve_active_runs(active, run_aliases);
+    if let crate::run::LaunchVerdict::Refuse { blocker } =
+        crate::run::launch_verdict(has_lifecycle_event, &active_runs)
+    {
+        let pid = blocker
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        fatal_startup_error(&format!(
+            "{id} cannot open a window while its \"{}\" run command is active (pid {pid}) — stop \
+             it first with `tfsapp-hub run --stop {id}`.",
+            blocker.alias
+        ));
     }
 }
 
