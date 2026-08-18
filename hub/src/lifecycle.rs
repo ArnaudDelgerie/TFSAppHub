@@ -779,8 +779,8 @@ pub fn prepare_launch(
     locks.as_ref()?;
 
     // Rule 3's launch-side refusal (plan 013, CONTRACT.md §6's "Running a
-    // declared command"): a `run` command holding `run.lock` for this app
-    // owns its data dir just as much as a live window does, so a window must
+    // declared command"): a `run` command holding a `runs/` entry for this
+    // app owns its data dir just as much as a live window does, so a window must
     // not open over it — a `bin/console` command opening the app's SQLite
     // while a window is being spawned into it is the same hazard `run.rs`'s
     // own rule 3 exists to prevent, read the other way round. Placed here,
@@ -815,10 +815,10 @@ pub fn prepare_launch(
 /// `pre-install`/`post-install`/`pre-update`/`post-update` belong to
 /// `install`/`update`, and a dev launch is neither.
 ///
-/// Nor does the rule 3 `run.lock` probe (plan 013) reach here: a dev
-/// session's `run.lock` would live under its own project's `var/`, not under
-/// `data_dir`, and `run <id> <alias>` takes a hub-local `id` a dev session
-/// never has — nothing in the hub ever writes one for it.
+/// Nor does the rule 3 `runs/` probe (plan 013, widened by plan 047) reach
+/// here: a dev session's `runs/` would live under its own project's `var/`,
+/// not under `data_dir`, and `run <id> <alias>` takes a hub-local `id` a dev
+/// session never has — nothing in the hub ever writes one for it.
 ///
 /// `id` and `data_subdir` from [`prepare_launch`] have no dev counterpart to
 /// pass, since there is no version guard here to name an app to or a
@@ -898,72 +898,40 @@ fn check_version(id: &str, data_subdir: &Path, app_version: &str) -> LifecycleEv
 }
 
 /// What [`probe_run_lock`] found: `Free` means a launch may proceed.
-/// `Held { alias }` means `run.lock` is held — `alias` is whatever its record
-/// could tell us, from the alias name it was written with down to `None` when
-/// the lock is held but its record could not be read (a race with `run`'s own
-/// acquisition-time write, or a legacy/corrupt file) — the caller still
-/// refuses either way, just with a shorter message when there is nothing to
-/// name.
+/// `Held { active }` means [`crate::run::scan_runs`] found at least one live
+/// launcher or active orphan — never empty when this variant is constructed.
 ///
 /// `pub(crate)`, not private: plan 016's `install::check_data_dir_available`
-/// reads this same lock before writing into a data directory, and it must be
+/// reads this same scan before writing into a data directory, and it must be
 /// the one reader of what "held" means — never a second probe with its own,
 /// possibly diverging, idea of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RunLockHeld {
     Free,
-    Held { alias: Option<String> },
+    Held {
+        active: Vec<crate::run::ActiveRunEntry>,
+    },
 }
 
-// Turn the flock observation and the shared orphan decision into one answer.
-// The held-lock alias is read only when a live launcher owns the flock.
-pub(crate) fn run_lock_held_decision(
-    flock_held: bool,
-    held_alias: Option<String>,
-    orphan: crate::run::OrphanedRun,
-) -> RunLockHeld {
-    if flock_held {
-        return RunLockHeld::Held { alias: held_alias };
-    }
-    match orphan {
-        crate::run::OrphanedRun::ActiveOrphan { alias, .. } => {
-            RunLockHeld::Held { alias: Some(alias) }
-        }
-        crate::run::OrphanedRun::Stale => RunLockHeld::Free,
-    }
-}
-
-/// Probe `<data_dir>/run.lock` (plan 013, CONTRACT.md §6): the pure,
-/// Result-returning half of [`check_run_lock`], kept apart from it exactly as
-/// [`acquire_launch_locks`] is kept apart from [`prepare_launch`] — so a held
-/// lock, a free one, and an unreadable record are each a unit test with no
-/// process willing to exit under it.
-///
-/// Never retains the lock — probe and drop, the same "never retain, just
-/// observe" pattern [`tfsapp_core::process::is_owner_live`] uses for the
-/// liveness lock.
+/// Probe `<data_dir>/runs/` (plan 013's rule 3, widened by plan 047,
+/// CONTRACT.md §6): the pure*-ish, `Result`-returning half of
+/// [`check_run_lock`], kept apart from it exactly as [`acquire_launch_locks`]
+/// is kept apart from [`prepare_launch`] — so a held entry, a free directory,
+/// and an unreadable record are each a unit test with no process willing to
+/// exit under it. (*[`crate::run::scan_runs`] also unlinks stale entries as
+/// it reads them — the one side effect this probe is not otherwise free of.)
 pub(crate) fn probe_run_lock(data_dir: &Path, identifier: &str) -> std::io::Result<RunLockHeld> {
-    let run_lock_path = data_dir.join("run.lock");
-    let Some(_lock) = tfsapp_core::process::try_lock_file(&run_lock_path)? else {
-        let alias = fs::read_to_string(&run_lock_path)
-            .ok()
-            .and_then(|contents| crate::run::parse_run_lock(&contents))
-            .map(|record| record.alias);
-        return Ok(run_lock_held_decision(
-            true,
-            alias,
-            crate::run::OrphanedRun::Stale,
-        ));
-    };
-    Ok(run_lock_held_decision(
-        false,
-        None,
-        crate::run::probe_orphaned_run(&run_lock_path, identifier),
-    ))
+    let active = crate::run::scan_runs(data_dir, identifier)?;
+    Ok(if active.is_empty() {
+        RunLockHeld::Free
+    } else {
+        RunLockHeld::Held { active }
+    })
 }
 
-/// Who is already using a data directory — a live app window, or an active
-/// `run` command. Returned by [`data_dir_holder`]; `None` there means free.
+/// Who is already using a data directory — a live app window, or one or more
+/// active `run` commands. Returned by [`data_dir_holder`]; `None` there means
+/// free.
 ///
 /// Shared, not install-specific despite the name it carries over from plan
 /// 016: `export`/`import` (plan 022) are further writers into a data
@@ -974,11 +942,11 @@ pub(crate) fn probe_run_lock(data_dir: &Path, identifier: &str) -> std::io::Resu
 pub enum DataDirHolder {
     /// A live app window holds the sidecar liveness lock (CONTRACT.md §6).
     Window,
-    /// An active `run` command holds `run.lock` (rule 3). `alias` is
-    /// whatever [`probe_run_lock`] could read from the record — `None` in
-    /// the narrow window between `run`'s own lock acquisition and its first
-    /// write.
-    RunCommand { alias: Option<String> },
+    /// One or more active `run` commands hold `runs/` entries (rule 3).
+    /// `active` is whatever [`probe_run_lock`] found — never empty.
+    RunCommand {
+        active: Vec<crate::run::ActiveRunEntry>,
+    },
 }
 
 /// Probe whether something already holds `data_dir` — a live window, then an
@@ -998,28 +966,32 @@ pub fn data_dir_holder(data_dir: &Path, identifier: &str) -> io::Result<Option<D
 
     match probe_run_lock(data_dir, identifier)? {
         RunLockHeld::Free => Ok(None),
-        RunLockHeld::Held { alias } => Ok(Some(DataDirHolder::RunCommand { alias })),
+        RunLockHeld::Held { active } => Ok(Some(DataDirHolder::RunCommand { active })),
     }
 }
 
 /// Rule 3's launch-side refusal (plan 013, CONTRACT.md §6): refuse to open a
-/// window while a `run` command holds `run.lock` for this app, naming the
-/// active alias when [`probe_run_lock`] found one and pointing at the way to
-/// release it either way.
+/// window while a `run` command holds a `runs/` entry for this app, naming
+/// the active alias when [`probe_run_lock`] found one and pointing at the
+/// way to release it either way.
 fn check_run_lock(id: &str, data_dir: &Path, identifier: &str) {
     match probe_run_lock(data_dir, identifier) {
         Ok(RunLockHeld::Free) => {}
-        Ok(RunLockHeld::Held { alias: Some(alias) }) => fatal_startup_error(&format!(
-            "{id} cannot open a window while its \"{alias}\" run command is active — stop it \
-             first with `tfsapp-hub run --stop {id}`."
-        )),
-        Ok(RunLockHeld::Held { alias: None }) => fatal_startup_error(&format!(
-            "{id} cannot open a window while a run command is active — stop it first with \
-             `tfsapp-hub run --stop {id}`."
-        )),
+        Ok(RunLockHeld::Held { active }) => {
+            match active.first().and_then(|run| run.alias.as_deref()) {
+                Some(alias) => fatal_startup_error(&format!(
+                    "{id} cannot open a window while its \"{alias}\" run command is active — stop \
+                     it first with `tfsapp-hub run --stop {id}`."
+                )),
+                None => fatal_startup_error(&format!(
+                    "{id} cannot open a window while a run command is active — stop it first with \
+                     `tfsapp-hub run --stop {id}`."
+                )),
+            }
+        }
         Err(error) => fatal_startup_error(&format!(
             "cannot probe {}: {error}",
-            data_dir.join("run.lock").display()
+            data_dir.join("runs").display()
         )),
     }
 }

@@ -12,9 +12,15 @@
 //! front of it — resolving *which* app — and the fact that the hub has two
 //! apps' worth of state to keep apart while doing it. `../TFSAppWorkstation/
 //! .project/hub/003-cli-surface.md` §4 already answers why two different apps
-//! running commands at once costs zero design work: `run.lock` is keyed on the
+//! running commands at once costs zero design work: `runs/` is keyed on the
 //! app's own `identifier`, not on the hub-local `id`, so it is already
 //! per-app.
+//!
+//! **Plan 047 turned the single `run.lock` file into `runs/`, one entry per
+//! launcher** (`../decision/005-concurrency-belongs-to-the-alias.md`): an app
+//! now runs as many commands at once as its aliases declare themselves
+//! `concurrent`. [`scan_runs`] is the one shared reader every guard in this
+//! module and in `lifecycle.rs` consults.
 //!
 //! **Rule 1's message changes owner.** The station tells the user to launch
 //! the app first, because on the station only a launch writes
@@ -115,266 +121,48 @@ pub fn format_alias_list(aliases: &BTreeMap<String, RunAlias>) -> String {
         .join("\n")
 }
 
-/// `run.lock`'s own parsed content: the alias name that holds the lock, and
-/// the spawned child's pid once recorded. `pid` is `None` in the narrow
-/// window between the lock being acquired and the post-spawn rewrite, never
-/// an error.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunLockRecord {
-    pub alias: String,
-    pub pid: Option<u32>,
-}
-
-/// Format `run.lock`'s content: `<alias>` alone when `pid` is `None` (the
-/// lock-acquisition-time write, before the child exists), `<alias>\n<pid>`
-/// once it does. Pure counterpart to [`parse_run_lock`] — round-trips through
-/// it.
-pub fn format_run_lock(alias: &str, pid: Option<u32>) -> String {
-    match pid {
-        Some(pid) => format!("{alias}\n{pid}"),
-        None => alias.to_string(),
-    }
-}
-
-/// Parse `run.lock`'s content: `None` for empty content (nothing ever written
-/// — should not happen while the lock is held, but this is the pure, total
-/// counterpart callers can match on regardless). Otherwise the first line is
-/// the alias; a present, numeric second line is the pid, and anything else
-/// (absent, non-numeric, a stale trailing newline) parses as "no pid yet"
-/// rather than an error — the record format is advisory, not a wire contract
-/// with a hard failure mode.
-pub fn parse_run_lock(contents: &str) -> Option<RunLockRecord> {
-    let mut lines = contents.lines();
-    let alias = lines.next()?.to_string();
-    let pid = lines
-        .next()
-        .and_then(|line| line.trim().parse::<u32>().ok());
-    Some(RunLockRecord { alias, pid })
-}
-
-/// Result of examining a free run lock record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OrphanedRun {
-    ActiveOrphan { alias: String, pid: u32 },
-    Stale,
-}
-
-/// Pure policy for a run lock whose flock is already known to be free.
-pub fn orphaned_run_decision(
-    record: Option<&RunLockRecord>,
-    pid_alive: bool,
-    identifier_matches: bool,
-) -> OrphanedRun {
-    match record {
-        Some(RunLockRecord {
-            alias,
-            pid: Some(pid),
-        }) if pid_alive && identifier_matches => OrphanedRun::ActiveOrphan {
-            alias: alias.clone(),
-            pid: *pid,
-        },
-        _ => OrphanedRun::Stale,
-    }
-}
-
-/// Probe a free run lock record for a child that outlived its launcher.
-/// Callers must first establish that the flock is free, or hold it themselves.
-pub fn probe_orphaned_run(run_lock_path: &Path, identifier: &str) -> OrphanedRun {
-    let record = std::fs::read_to_string(run_lock_path)
-        .ok()
-        .and_then(|contents| parse_run_lock(&contents));
-    let (pid_alive, identifier_matches) = match record.as_ref().and_then(|record| record.pid) {
-        Some(pid) => (
-            tfsapp_core::process::process_exists(pid),
-            tfsapp_core::process::process_environ_has_identifier(pid, identifier),
-        ),
-        None => (false, false),
-    };
-    orphaned_run_decision(record.as_ref(), pid_alive, identifier_matches)
-}
-
-/// Rule 2 after attempting to acquire `run.lock`. A free flock still refuses
-/// when its durable record identity-proves a child that outlived its launcher.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RunStartGuard {
-    MayStart,
-    ActiveLauncher,
-    ActiveOrphan { alias: String, pid: u32 },
-}
-
-/// Pure Rule-2 decision. `orphan` is relevant only after acquiring the flock,
-/// before that acquisition rewrites its record.
-pub fn run_start_guard_decision(flock_acquired: bool, orphan: OrphanedRun) -> RunStartGuard {
-    if !flock_acquired {
-        return RunStartGuard::ActiveLauncher;
-    }
-    match orphan {
-        OrphanedRun::ActiveOrphan { alias, pid } => RunStartGuard::ActiveOrphan { alias, pid },
-        OrphanedRun::Stale => RunStartGuard::MayStart,
-    }
-}
-
-/// How long `stop_active_run` waits for `run.lock` to free after signalling
-/// the recorded child — must outlast `terminate`'s own SIGTERM-then-3s-SIGKILL
-/// escalation plus a little slack for the launcher to actually observe
-/// `child.wait()` return and drop the lock.
-const STOP_LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The outcome of `run --stop`/the stop half of `run --replace <id> <alias>`
-/// — exactly the six states [`stop_active_run`] can end in. Kept as plain
-/// data — no message text or exit-code logic inside the enum itself — so
-/// [`stop_outcome_message`] below can be unit-tested directly against each
-/// variant without any process I/O.
-pub enum StopOutcome {
-    /// `run.lock` was free: no `run` command is active for this app.
-    NotRunning,
-    /// A record with a pid was found, signalled, and the lock freed.
-    Stopped { alias: String },
-    /// A free lock record named a live child whose launcher had already gone;
-    /// the child was terminated and observed gone.
-    StoppedOrphan { alias: String },
-    /// A free lock record named a live child whose launcher had already gone,
-    /// but it remained live after the bounded stop wait.
-    OrphanStillRunning { alias: String, pid: u32 },
-    /// The lock is held but its record has no pid yet — the narrow window
-    /// between lock acquisition and the post-spawn rewrite.
-    PidUnknown { alias: String },
-    /// A record with a pid was found and signalled, but the lock was still
-    /// held once `STOP_LOCK_RELEASE_TIMEOUT` elapsed.
-    LockHeld { alias: String, pid: u32 },
-}
-
-/// Render `outcome` as the message `run --stop`/`--replace` prints.
-/// `run_lock_path` is only used by the `LockHeld` message, which names the
-/// file the way every other lock-contention message in this module does.
-pub fn stop_outcome_message(outcome: &StopOutcome, run_lock_path: &Path) -> String {
-    match outcome {
-        StopOutcome::NotRunning => "no run command is currently active".to_string(),
-        StopOutcome::Stopped { alias } => format!("stopped the active run command \"{alias}\""),
-        StopOutcome::StoppedOrphan { alias } => format!(
-            "stopped the orphaned run command \"{alias}\" after its launcher had already gone"
-        ),
-        StopOutcome::OrphanStillRunning { alias, pid } => format!(
-            "signalled the orphaned run command \"{alias}\" (pid {pid}) but it was still live after \
-             waiting"
-        ),
-        StopOutcome::PidUnknown { alias } => format!(
-            "the run command \"{alias}\" is active but has not yet recorded its child process — \
-             retry in a moment"
-        ),
-        StopOutcome::LockHeld { alias, pid } => format!(
-            "signalled the run command \"{alias}\" (pid {pid}) but {} was still held after \
-             waiting — it may be wedged outside its own child process",
-            run_lock_path.display()
-        ),
-    }
-}
-
-/// Whether `run.lock` is free once [`stop_active_run`] returns — `NotRunning`
-/// and `Stopped` mean the app is launchable again; `PidUnknown` and
-/// `OrphanStillRunning`, `PidUnknown`, and `LockHeld` mean it is not. Shared by `--stop`'s exit code and
-/// `--replace`'s decision to abort rather than continue into rule 2.
-pub fn stop_outcome_succeeded(outcome: &StopOutcome) -> bool {
-    matches!(
-        outcome,
-        StopOutcome::NotRunning | StopOutcome::Stopped { .. } | StopOutcome::StoppedOrphan { .. }
-    )
-}
-
-/// `run --stop`/the stop half of `run --replace <id> <alias>`'s whole
-/// imperative flow: resolves whatever `run.lock` currently records,
-/// terminates the recorded child through
-/// `tfsapp_core::process::terminate_if_identifier_matches` (never a bare,
-/// unguarded terminate — the identity proof against pid reuse), and waits for
-/// the lock to actually free before reporting. Deliberately does **not** take
-/// rule 1's version gate as an argument or call it itself: recovering an
-/// installation whose app layer is stale is one of this command's own jobs.
-pub fn stop_active_run(data_dir: &Path, identifier: &str) -> std::io::Result<StopOutcome> {
-    let run_lock_path = data_dir.join("run.lock");
-    // A free lock is momentarily reacquired here to observe it, then
-    // immediately dropped. Its durable record may still name a child whose
-    // launcher died, so it must be probed before calling the app idle.
-    if tfsapp_core::process::try_lock_file(&run_lock_path)?.is_some() {
-        return match probe_orphaned_run(&run_lock_path, identifier) {
-            OrphanedRun::Stale => Ok(StopOutcome::NotRunning),
-            OrphanedRun::ActiveOrphan { alias, pid } => {
-                tfsapp_core::process::terminate_if_identifier_matches(pid, identifier);
-                let deadline = Instant::now() + STOP_LOCK_RELEASE_TIMEOUT;
-                while tfsapp_core::process::process_exists(pid) && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                if tfsapp_core::process::process_exists(pid) {
-                    Ok(StopOutcome::OrphanStillRunning { alias, pid })
-                } else {
-                    Ok(StopOutcome::StoppedOrphan { alias })
-                }
-            }
-        };
-    }
-
-    let record = std::fs::read_to_string(&run_lock_path)
-        .ok()
-        .and_then(|contents| parse_run_lock(&contents));
-    let Some(record) = record else {
-        return Ok(StopOutcome::PidUnknown {
-            alias: "an unknown alias".to_string(),
-        });
-    };
-    let Some(pid) = record.pid else {
-        return Ok(StopOutcome::PidUnknown {
-            alias: record.alias,
-        });
-    };
-
-    tfsapp_core::process::terminate_if_identifier_matches(pid, identifier);
-    if tfsapp_core::process::wait_for_lock_release(&run_lock_path, STOP_LOCK_RELEASE_TIMEOUT)? {
-        Ok(StopOutcome::Stopped {
-            alias: record.alias,
-        })
-    } else {
-        Ok(StopOutcome::LockHeld {
-            alias: record.alias,
-            pid,
-        })
-    }
-}
-
-// --- `runs/`: the record set rule 2 will move onto (plan 047,
+// --- `runs/`: one entry per launcher (plan 047,
 // `../decision/005-concurrency-belongs-to-the-alias.md`) --------------------
 //
-// `run.lock` above stays exactly as today — nothing below is wired to any
-// caller yet. `runs/` replaces it one file at a time in plan 047 step 2: one
-// entry per launcher, named after the launcher's own pid, each exclusively
-// flocked by its owner and carrying the same `<alias>\n<child pid>` content
-// `format_run_lock`/`parse_run_lock` already round-trip.
+// Replaces the single fixed `run.lock` file: one entry per launcher, named
+// after the launcher's own pid, each exclusively flocked by its owner and
+// carrying `<alias>\n<child pid>`.
 
-/// One `runs/` entry's parsed content — the record set's counterpart to
-/// [`RunLockRecord`], same shape, same "alias alone, no pid yet" window
-/// between a launcher's flock acquisition and its post-spawn rewrite.
-#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ writer and scan.
+/// One `runs/` entry's parsed content: the alias that owns it, and the
+/// spawned child's pid once recorded. `pid` is `None` in the narrow window
+/// between the entry's flock being acquired and the post-spawn rewrite, never
+/// an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunEntry {
     pub alias: String,
     pub pid: Option<u32>,
 }
 
-/// Format one `runs/` entry's content. Delegates to [`format_run_lock`]: the
-/// content shape does not change, only where it is written — one file per
-/// launcher instead of one file per app.
-#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ writer.
+/// Format one `runs/` entry's content: `<alias>` alone when `pid` is `None`
+/// (the acquisition-time write, before the child exists), `<alias>\n<pid>`
+/// once it does. Pure counterpart to [`parse_run_entry`] — round-trips
+/// through it.
 pub fn format_run_entry(alias: &str, pid: Option<u32>) -> String {
-    format_run_lock(alias, pid)
+    match pid {
+        Some(pid) => format!("{alias}\n{pid}"),
+        None => alias.to_string(),
+    }
 }
 
-/// Parse one `runs/` entry's content — the pure, total counterpart to
-/// [`format_run_entry`], round-tripping through it. Delegates to
-/// [`parse_run_lock`] for the same reason [`format_run_entry`] does.
-#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ scan.
+/// Parse one `runs/` entry's content: `None` for empty content (nothing ever
+/// written — should not happen while the entry's flock is held, but this is
+/// the pure, total counterpart callers can match on regardless). Otherwise
+/// the first line is the alias; a present, numeric second line is the pid,
+/// and anything else (absent, non-numeric, a stale trailing newline) parses
+/// as "no pid yet" rather than an error — the record format is advisory, not
+/// a wire contract with a hard failure mode.
 pub fn parse_run_entry(contents: &str) -> Option<RunEntry> {
-    parse_run_lock(contents).map(|record| RunEntry {
-        alias: record.alias,
-        pid: record.pid,
-    })
+    let mut lines = contents.lines();
+    let alias = lines.next()?.to_string();
+    let pid = lines
+        .next()
+        .and_then(|line| line.trim().parse::<u32>().ok());
+    Some(RunEntry { alias, pid })
 }
 
 /// The file name a `runs/` entry is written under: its launcher's own pid.
@@ -383,7 +171,6 @@ pub fn parse_run_entry(contents: &str) -> Option<RunEntry> {
 /// another's name, and nobody unlinks an entry whose pid is live
 /// (`../decision/005-concurrency-belongs-to-the-alias.md`, "What is lost,
 /// honestly").
-#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ writer.
 pub fn run_entry_file_name(launcher_pid: u32) -> String {
     format!("{launcher_pid}.lock")
 }
@@ -391,9 +178,7 @@ pub fn run_entry_file_name(launcher_pid: u32) -> String {
 /// One entry's status once a scanner has tried to flock it and, if that
 /// succeeded, identity-probed the pid its record names — the exact ternary
 /// `../plan/035-the-run-record-outlives-its-flock.md` gave `run.lock` as a
-/// single file, restated once for one `runs/` entry: [`run_start_guard_decision`]
-/// and [`orphaned_run_decision`]'s decision halves, combined.
-#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ scan.
+/// single file, applied once to one `runs/` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunEntryStatus {
     /// The scanner could not acquire the entry's flock: its launcher is
@@ -416,7 +201,6 @@ pub enum RunEntryStatus {
 /// Pure per-entry ternary. `record` is read regardless of whether the flock
 /// was acquired — a best-effort read, since the write it might race is a
 /// truncate-then-rewrite by the entry's own owner, never a second writer.
-#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ scan.
 pub fn run_entry_status(
     flock_acquired: bool,
     record: Option<&RunEntry>,
@@ -441,12 +225,228 @@ pub fn run_entry_status(
     }
 }
 
-/// One active `run` command a scan of `runs/` found — a live launcher or an
-/// active orphan, never a stale entry (the scan unlinks those instead of
-/// reporting them, plan 047 step 2). `concurrent` is resolved by the caller
-/// from the app's manifest, keyed on `alias` — this module knows nothing of
-/// manifests.
-#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ scan.
+/// One active `runs/` entry [`scan_runs`] found — a live launcher or an
+/// active orphan; a stale entry is unlinked on the spot instead of reported.
+/// `alias`/`pid` are best-effort reads of the entry's record, `None` only in
+/// the narrow acquisition-to-write race any single reader could observe.
+/// `orphaned` distinguishes the two active cases for callers whose message or
+/// stop action differs between them. `path` is the entry's own file, kept for
+/// callers that act on this specific entry (`stop_active_run`) or report it
+/// (`run --stop`'s bare listing, plan 047 step 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveRunEntry {
+    pub alias: Option<String>,
+    pub pid: Option<u32>,
+    pub orphaned: bool,
+    pub path: std::path::PathBuf,
+}
+
+/// Scan `<data_dir>/runs/`, applying [`run_entry_status`] to every entry: a
+/// live launcher or an active orphan is reported; a stale entry is unlinked
+/// on the spot rather than reported — the scan is its own janitor, so every
+/// caller that asks "what's active" also cleans up after whoever left an
+/// entry behind. Never unlinks an entry whose recorded pid is live, which is
+/// what keeps the unlink-versus-flock race closed
+/// (`../decision/005-concurrency-belongs-to-the-alias.md`). A missing
+/// `runs/` directory is nothing running, not an error. The result is sorted
+/// by entry path for a deterministic order.
+pub fn scan_runs(data_dir: &Path, identifier: &str) -> std::io::Result<Vec<ActiveRunEntry>> {
+    let runs_dir = data_dir.join("runs");
+    let entries = match std::fs::read_dir(&runs_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+
+    let mut active = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if !path.is_file() {
+            continue;
+        }
+        match tfsapp_core::process::try_lock_file(&path)? {
+            Some(_lock) => {
+                let record = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|contents| parse_run_entry(&contents));
+                let (pid_alive, identifier_matches) =
+                    match record.as_ref().and_then(|record| record.pid) {
+                        Some(pid) => (
+                            tfsapp_core::process::process_exists(pid),
+                            tfsapp_core::process::process_environ_has_identifier(pid, identifier),
+                        ),
+                        None => (false, false),
+                    };
+                match run_entry_status(true, record.as_ref(), pid_alive, identifier_matches) {
+                    RunEntryStatus::ActiveOrphan { alias, pid } => active.push(ActiveRunEntry {
+                        alias: Some(alias),
+                        pid: Some(pid),
+                        orphaned: true,
+                        path,
+                    }),
+                    RunEntryStatus::Stale => {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    RunEntryStatus::LiveLauncher { .. } => {
+                        unreachable!("an acquired flock never decides as a live launcher")
+                    }
+                }
+            }
+            None => {
+                let record = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|contents| parse_run_entry(&contents));
+                match run_entry_status(false, record.as_ref(), false, false) {
+                    RunEntryStatus::LiveLauncher { alias, pid } => active.push(ActiveRunEntry {
+                        alias,
+                        pid,
+                        orphaned: false,
+                        path,
+                    }),
+                    _ => unreachable!("a free flock always decides as a live launcher"),
+                }
+            }
+        }
+    }
+    active.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(active)
+}
+
+/// How long `stop_active_run` waits for an entry's flock to free after
+/// signalling the recorded child — must outlast `terminate`'s own
+/// SIGTERM-then-3s-SIGKILL escalation plus a little slack for the launcher to
+/// actually observe `child.wait()` return and drop the lock.
+const STOP_LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The outcome of `run --stop`/the stop half of `run --replace <id> <alias>`
+/// — exactly the six states [`stop_active_run`] can end in. Kept as plain
+/// data — no message text or exit-code logic inside the enum itself — so
+/// [`stop_outcome_message`] below can be unit-tested directly against each
+/// variant without any process I/O.
+pub enum StopOutcome {
+    /// `runs/` had nothing active: no `run` command is active for this app.
+    NotRunning,
+    /// A record with a pid was found, signalled, and its entry's lock freed.
+    Stopped { alias: String },
+    /// An entry named a live child whose launcher had already gone; the
+    /// child was terminated and observed gone.
+    StoppedOrphan { alias: String },
+    /// An entry named a live child whose launcher had already gone, but it
+    /// remained live after the bounded stop wait.
+    OrphanStillRunning { alias: String, pid: u32 },
+    /// An entry's lock is held but its record has no pid yet — the narrow
+    /// window between lock acquisition and the post-spawn rewrite.
+    PidUnknown { alias: String },
+    /// A record with a pid was found and signalled, but its entry's lock was
+    /// still held once `STOP_LOCK_RELEASE_TIMEOUT` elapsed.
+    LockHeld {
+        alias: String,
+        pid: u32,
+        entry_path: std::path::PathBuf,
+    },
+}
+
+/// Render `outcome` as the message `run --stop`/`--replace` prints.
+pub fn stop_outcome_message(outcome: &StopOutcome) -> String {
+    match outcome {
+        StopOutcome::NotRunning => "no run command is currently active".to_string(),
+        StopOutcome::Stopped { alias } => format!("stopped the active run command \"{alias}\""),
+        StopOutcome::StoppedOrphan { alias } => format!(
+            "stopped the orphaned run command \"{alias}\" after its launcher had already gone"
+        ),
+        StopOutcome::OrphanStillRunning { alias, pid } => format!(
+            "signalled the orphaned run command \"{alias}\" (pid {pid}) but it was still live after \
+             waiting"
+        ),
+        StopOutcome::PidUnknown { alias } => format!(
+            "the run command \"{alias}\" is active but has not yet recorded its child process — \
+             retry in a moment"
+        ),
+        StopOutcome::LockHeld {
+            alias,
+            pid,
+            entry_path,
+        } => format!(
+            "signalled the run command \"{alias}\" (pid {pid}) but {} was still held after \
+             waiting — it may be wedged outside its own child process",
+            entry_path.display()
+        ),
+    }
+}
+
+/// Whether every `runs/` entry this app had is free once [`stop_active_run`]
+/// returns — `NotRunning` and `Stopped` mean the app is launchable again;
+/// `PidUnknown`, `OrphanStillRunning`, and `LockHeld` mean it is not. Shared
+/// by `--stop`'s exit code and `--replace`'s decision to abort rather than
+/// continue into rule 2.
+pub fn stop_outcome_succeeded(outcome: &StopOutcome) -> bool {
+    matches!(
+        outcome,
+        StopOutcome::NotRunning | StopOutcome::Stopped { .. } | StopOutcome::StoppedOrphan { .. }
+    )
+}
+
+/// `run --stop`/the stop half of `run --replace <id> <alias>`'s whole
+/// imperative flow: [`scan_runs`] for whatever `runs/` currently records —
+/// at most one entry while rule 2 stays fully enforced (plan 047 step 2;
+/// step 3 lifts it) — terminates the recorded child through
+/// `tfsapp_core::process::terminate_if_identifier_matches` (never a bare,
+/// unguarded terminate — the identity proof against pid reuse), and waits for
+/// its entry's lock to actually free before reporting. Deliberately does
+/// **not** take rule 1's version gate as an argument or call it itself:
+/// recovering an installation whose app layer is stale is one of this
+/// command's own jobs.
+pub fn stop_active_run(data_dir: &Path, identifier: &str) -> std::io::Result<StopOutcome> {
+    let Some(entry) = scan_runs(data_dir, identifier)?.into_iter().next() else {
+        return Ok(StopOutcome::NotRunning);
+    };
+
+    if entry.orphaned {
+        let alias = entry
+            .alias
+            .expect("an active orphan always names its alias");
+        let pid = entry
+            .pid
+            .expect("an active orphan always records its child pid");
+        tfsapp_core::process::terminate_if_identifier_matches(pid, identifier);
+        let deadline = Instant::now() + STOP_LOCK_RELEASE_TIMEOUT;
+        while tfsapp_core::process::process_exists(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        return if tfsapp_core::process::process_exists(pid) {
+            Ok(StopOutcome::OrphanStillRunning { alias, pid })
+        } else {
+            let _ = std::fs::remove_file(&entry.path);
+            Ok(StopOutcome::StoppedOrphan { alias })
+        };
+    }
+
+    let Some(alias) = entry.alias else {
+        return Ok(StopOutcome::PidUnknown {
+            alias: "an unknown alias".to_string(),
+        });
+    };
+    let Some(pid) = entry.pid else {
+        return Ok(StopOutcome::PidUnknown { alias });
+    };
+
+    tfsapp_core::process::terminate_if_identifier_matches(pid, identifier);
+    if tfsapp_core::process::wait_for_lock_release(&entry.path, STOP_LOCK_RELEASE_TIMEOUT)? {
+        Ok(StopOutcome::Stopped { alias })
+    } else {
+        Ok(StopOutcome::LockHeld {
+            alias,
+            pid,
+            entry_path: entry.path,
+        })
+    }
+}
+
+/// One active `run` command, resolved for rule 2's lifted verdict — the
+/// [`ActiveRunEntry`] a scan found, with `concurrent` looked up by the
+/// caller from the app's manifest, keyed on `alias`. This module knows
+/// nothing of manifests, hence the two separate types.
+#[allow(dead_code)] // Plan 047 step 3 wires this into run::start's guard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveRun {
     pub alias: String,
@@ -570,9 +570,9 @@ pub fn list(id: &str) -> i32 {
 
 /// `run --stop <id>`/the stop half of `run --replace <id> <alias>`'s whole
 /// imperative flow: packaged-only in spirit — an app must be installed to
-/// have a `run.lock` at all — but deliberately **not** gated on rule 1's
-/// version check above: recovering an installation whose app layer is stale
-/// is one of this command's own jobs, so it must work even then.
+/// have a `runs/` directory at all — but deliberately **not** gated on rule
+/// 1's version check above: recovering an installation whose app layer is
+/// stale is one of this command's own jobs, so it must work even then.
 pub fn stop(id: &str) -> i32 {
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
@@ -610,11 +610,7 @@ pub fn stop(id: &str) -> i32 {
 
     match stop_active_run(&data_dir, identifier) {
         Ok(outcome) => {
-            let run_lock_path = data_dir.join("run.lock");
-            println!(
-                "tfsapp-hub: {}",
-                stop_outcome_message(&outcome, &run_lock_path)
-            );
+            println!("tfsapp-hub: {}", stop_outcome_message(&outcome));
             if stop_outcome_succeeded(&outcome) {
                 EXIT_OK
             } else {
@@ -632,12 +628,15 @@ pub fn stop(id: &str) -> i32 {
 /// whole imperative flow (CONTRACT.md §6's "Running a declared command"):
 /// resolves the alias against the installed manifest, gates on the app layer
 /// being up to date (rule 1), on being the only active `run` command for
-/// *this* app (rule 2, an exclusive `run.lock` flock keyed on the app's own
-/// `identifier` — a different app's `run.lock` is a different file and is
-/// unaffected) and on the per-alias concurrency permission (rule 3), then
-/// spawns the declared `bin/console` command in the foreground — inherited
-/// stdio, `SIGINT`/`SIGTERM` forwarded, a coexistence watchdog when a window
-/// was already live at start — and exits with its status.
+/// *this* app (rule 2, a scan of `runs/` keyed on the app's own `identifier`
+/// — a different app's `runs/` is a different directory and is unaffected)
+/// and on the per-alias concurrency permission (rule 3), then spawns the
+/// declared `bin/console` command in the foreground — inherited stdio,
+/// `SIGINT`/`SIGTERM` forwarded, a coexistence watchdog when a window was
+/// already live at start — and exits with its status. Plan 047 step 3 lifts
+/// rule 2's blanket exclusivity onto `concurrent`; here it still refuses
+/// whenever the scan finds anything active, matching today's behaviour
+/// exactly.
 ///
 /// This is the one hub command whose exit code is the child's rather than the
 /// hub's own: a child that happens to exit `2` is indistinguishable from a
@@ -720,11 +719,11 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
         return EXIT_FAILED;
     }
 
-    // `--replace`: stop whatever currently holds `run.lock` before rule 2
+    // `--replace`: stop whatever `runs/` currently records before rule 2
     // below gets a chance to refuse over it. Runs after the version gate (a
     // stale app layer must still refuse a plain `run <id> <alias>`) but
     // before rule 2 (there would be nothing left to stop once it already
-    // refused). A free lock makes this a no-op (`stop_active_run` itself
+    // refused). Nothing active makes this a no-op (`stop_active_run` itself
     // reports `NotRunning`), so `--replace` is safe to pass unconditionally.
     if replace {
         match stop_active_run(&data_dir, &identifier) {
@@ -732,7 +731,7 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
             Ok(outcome) => {
                 eprintln!(
                     "tfsapp-hub: cannot replace \"{alias_name}\": {}",
-                    stop_outcome_message(&outcome, &data_dir.join("run.lock"))
+                    stop_outcome_message(&outcome)
                 );
                 return EXIT_FAILED;
             }
@@ -744,39 +743,60 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
     }
 
     // Rule 2 (CONTRACT.md §6): at most one `run` command per app at a time —
-    // the same non-blocking exclusive-flock primitive the sidecar liveness
-    // lock uses, just a different file. Held for this process's whole
-    // lifetime (bound to `run_lock`), released on drop — including if this
-    // process dies without a clean exit.
-    let run_lock_path = data_dir.join("run.lock");
-    let mut run_lock = match tfsapp_core::process::try_lock_file(&run_lock_path) {
-        Ok(Some(lock)) => {
-            match run_start_guard_decision(true, probe_orphaned_run(&run_lock_path, &identifier)) {
-                RunStartGuard::MayStart => lock,
-                RunStartGuard::ActiveOrphan { alias, pid } => {
-                    eprintln!(
-                        "tfsapp-hub: cannot start \"{alias_name}\": orphaned run command \"{alias}\" \
-                     (pid {pid}) is still active for {id} — stop it with `tfsapp-hub run --stop {id}` \
-                     or replace it with `tfsapp-hub run --replace {id} {alias_name}`."
-                    );
-                    return EXIT_FAILED;
-                }
-                RunStartGuard::ActiveLauncher => {
-                    unreachable!("a held lock cannot yield a lock handle")
-                }
-            }
+    // still enforced exactly as today (plan 047 step 3 lifts it onto
+    // `concurrent`), just proven by a scan of `runs/` instead of one fixed
+    // file's flock.
+    let runs_dir = data_dir.join("runs");
+    if let Err(error) = std::fs::create_dir_all(&runs_dir) {
+        eprintln!("tfsapp-hub: cannot create {}: {error}", runs_dir.display());
+        return EXIT_FAILED;
+    }
+    let active = match scan_runs(&data_dir, &identifier) {
+        Ok(active) => active,
+        Err(error) => {
+            eprintln!("tfsapp-hub: cannot scan {}: {error}", runs_dir.display());
+            return EXIT_FAILED;
         }
-        Ok(None) => {
+    };
+    if let Some(blocker) = active.first() {
+        if blocker.orphaned {
+            let alias = blocker.alias.as_deref().unwrap_or("an unknown alias");
+            let pid = blocker.pid.unwrap_or_default();
+            eprintln!(
+                "tfsapp-hub: cannot start \"{alias_name}\": orphaned run command \"{alias}\" \
+                 (pid {pid}) is still active for {id} — stop it with `tfsapp-hub run --stop {id}` \
+                 or replace it with `tfsapp-hub run --replace {id} {alias_name}`."
+            );
+        } else {
             eprintln!(
                 "tfsapp-hub: another run command is already active for {id} ({})",
-                run_lock_path.display()
+                runs_dir.display()
+            );
+        }
+        return EXIT_FAILED;
+    }
+
+    // This launcher's own entry, named after its own pid — never contested,
+    // since no other live process can share this pid
+    // (`../decision/005-concurrency-belongs-to-the-alias.md`, "What is lost,
+    // honestly"). Held for this process's whole lifetime (bound to
+    // `run_entry_lock`), released on drop — including if this process dies
+    // without a clean exit.
+    let entry_path = runs_dir.join(run_entry_file_name(std::process::id()));
+    let mut run_entry_lock = match tfsapp_core::process::try_lock_file(&entry_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            eprintln!(
+                "tfsapp-hub: cannot acquire {} — already held, which should not happen for a \
+                 launcher's own pid",
+                entry_path.display()
             );
             return EXIT_FAILED;
         }
         Err(error) => {
             eprintln!(
                 "tfsapp-hub: cannot acquire {}: {error}",
-                run_lock_path.display()
+                entry_path.display()
             );
             return EXIT_FAILED;
         }
@@ -784,8 +804,8 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
     // Recorded so a would-be app-launch refusal (step 3) can name the active
     // alias rather than just the lock path. No pid yet — the child hasn't
     // been spawned; rewritten with the pid right after it is, below.
-    let _ = run_lock.set_len(0);
-    let _ = run_lock.write_all(format_run_lock(alias_name, None).as_bytes());
+    let _ = run_entry_lock.set_len(0);
+    let _ = run_entry_lock.write_all(format_run_entry(alias_name, None).as_bytes());
 
     // Rule 3 (CONTRACT.md §6): probe whether an app window is already live —
     // the exact same liveness lock the launcher itself uses. A window live
@@ -864,13 +884,13 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
     };
     let child_pid = child.id();
 
-    // Rewrite `run.lock`'s record with the now-known child pid. Reuses the
+    // Rewrite this entry's record with the now-known child pid. Reuses the
     // same handle the lock-acquisition-time write used above, so it must
     // `seek` back to the start in addition to `set_len(0)` — `set_len`
     // truncates but does not move the file cursor.
-    let _ = run_lock.set_len(0);
-    let _ = run_lock.seek(SeekFrom::Start(0));
-    let _ = run_lock.write_all(format_run_lock(alias_name, Some(child_pid)).as_bytes());
+    let _ = run_entry_lock.set_len(0);
+    let _ = run_entry_lock.seek(SeekFrom::Start(0));
+    let _ = run_entry_lock.write_all(format_run_entry(alias_name, Some(child_pid)).as_bytes());
 
     // Both detached threads below get their own clone of `identifier`: each
     // reacts an unbounded time after `child_pid` was recorded, so it
@@ -887,7 +907,11 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
     }
 
     let status = child.wait();
-    drop(run_lock);
+    // Unlinked on clean exit — a process that dies without reaching this
+    // line leaves its entry for the next scan to read (as a live orphan, if
+    // the child outlived it, or as stale once it hasn't).
+    let _ = std::fs::remove_file(&entry_path);
+    drop(run_entry_lock);
     match status {
         Ok(status) => status.code().unwrap_or(EXIT_FAILED),
         Err(error) => {

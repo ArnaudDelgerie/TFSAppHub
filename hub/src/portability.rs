@@ -218,7 +218,7 @@ fn run_export(paths: &Paths, id: &str, target: &Path) -> Result<(), PortabilityE
     let data_dir = paths.app_data_dir(&entry.identifier)?;
     let holder =
         busy_holder(&data_dir, &entry.identifier).map_err(|source| PortabilityError::Io {
-            path: data_dir.join("run.lock"),
+            path: data_dir.join("runs"),
             source,
         })?;
     if let Some(holder) = holder {
@@ -432,7 +432,7 @@ fn run_import(
     let data_dir = paths.app_data_dir(&entry.identifier)?;
     let holder =
         busy_holder(&data_dir, &entry.identifier).map_err(|source| PortabilityError::Io {
-            path: data_dir.join("run.lock"),
+            path: data_dir.join("runs"),
             source,
         })?;
     if let Some(holder) = holder {
@@ -822,16 +822,22 @@ impl fmt::Display for PortabilityError {
                         "{id} has a window open right now — {verb} while it's open could \
                          {risk}. Close {id} first."
                     ),
-                    lifecycle::DataDirHolder::RunCommand { alias: Some(alias) } => write!(
-                        formatter,
-                        "{id}'s \"{alias}\" run command is still active — {verb} while it's \
-                         running could {risk}. Stop it first with `tfsapp-hub run --stop {id}`."
-                    ),
-                    lifecycle::DataDirHolder::RunCommand { alias: None } => write!(
-                        formatter,
-                        "a run command is still active for {id} — {verb} while it's running \
-                         could {risk}. Stop it first with `tfsapp-hub run --stop {id}`."
-                    ),
+                    lifecycle::DataDirHolder::RunCommand { active } => {
+                        match active.first().and_then(|run| run.alias.as_deref()) {
+                            Some(alias) => write!(
+                                formatter,
+                                "{id}'s \"{alias}\" run command is still active — {verb} while \
+                                 it's running could {risk}. Stop it first with `tfsapp-hub run \
+                                 --stop {id}`."
+                            ),
+                            None => write!(
+                                formatter,
+                                "a run command is still active for {id} — {verb} while it's \
+                                 running could {risk}. Stop it first with `tfsapp-hub run --stop \
+                                 {id}`."
+                            ),
+                        }
+                    }
                 }
             }
             Self::NoManifest { path } => write!(

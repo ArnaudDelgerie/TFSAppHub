@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use super::*;
 
@@ -62,210 +66,58 @@ fn version_gate_refuses_invalid_record_naming_the_file() {
     assert!(message.contains("/data/config.json"), "{message}");
 }
 
-// --- format_run_lock / parse_run_lock ---------------------------------------
-
-#[test]
-fn format_run_lock_alias_only_without_pid() {
-    assert_eq!(format_run_lock("mcp-serve", None), "mcp-serve");
-}
-
-#[test]
-fn format_run_lock_alias_and_pid() {
-    assert_eq!(format_run_lock("mcp-serve", Some(1234)), "mcp-serve\n1234");
-}
-
-#[test]
-fn parse_run_lock_none_for_empty_content() {
-    assert!(parse_run_lock("").is_none());
-}
-
-#[test]
-fn parse_run_lock_legacy_one_line_form_has_no_pid() {
-    let record = parse_run_lock("mcp-serve").expect("parsed");
-    assert_eq!(record.alias, "mcp-serve");
-    assert_eq!(record.pid, None);
-}
-
-#[test]
-fn parse_run_lock_two_line_form_has_pid() {
-    let record = parse_run_lock("mcp-serve\n1234").expect("parsed");
-    assert_eq!(record.alias, "mcp-serve");
-    assert_eq!(record.pid, Some(1234));
-}
-
-#[test]
-fn parse_run_lock_tolerates_trailing_newline() {
-    let record = parse_run_lock("mcp-serve\n1234\n").expect("parsed");
-    assert_eq!(record.alias, "mcp-serve");
-    assert_eq!(record.pid, Some(1234));
-}
-
-#[test]
-fn parse_run_lock_non_numeric_second_line_is_no_pid_not_an_error() {
-    let record = parse_run_lock("mcp-serve\nnot-a-pid").expect("parsed");
-    assert_eq!(record.alias, "mcp-serve");
-    assert_eq!(record.pid, None);
-}
-
-// --- orphaned_run_decision / probe_orphaned_run -----------------------------
-
-#[test]
-fn orphaned_run_decision_is_active_only_for_a_live_identity_proven_pid() {
-    let record = RunLockRecord {
-        alias: "mcp-serve".to_string(),
-        pid: Some(1234),
-    };
-    assert_eq!(
-        orphaned_run_decision(Some(&record), true, true),
-        OrphanedRun::ActiveOrphan {
-            alias: "mcp-serve".to_string(),
-            pid: 1234,
-        }
-    );
-    assert_eq!(
-        orphaned_run_decision(Some(&record), false, true),
-        OrphanedRun::Stale
-    );
-    assert_eq!(
-        orphaned_run_decision(Some(&record), true, false),
-        OrphanedRun::Stale
-    );
-    assert_eq!(
-        orphaned_run_decision(None, false, false),
-        OrphanedRun::Stale
-    );
-}
-
-#[test]
-fn probe_orphaned_run_finds_a_live_identity_proven_child_then_stale_after_reaping() {
-    let dir = tempfile::tempdir().unwrap();
-    let run_lock_path = dir.path().join("run.lock");
-    let identifier = "test-identifier";
-    let mut child = spawn_run_lock_holder(&run_lock_path, identifier);
-    let pid = child.id();
-    std::fs::write(&run_lock_path, format_run_lock("mcp-serve", Some(pid))).unwrap();
-
-    assert_eq!(
-        probe_orphaned_run(&run_lock_path, identifier),
-        OrphanedRun::ActiveOrphan {
-            alias: "mcp-serve".to_string(),
-            pid,
-        }
-    );
-    child.kill().unwrap();
-    child.wait().unwrap();
-    assert_eq!(
-        probe_orphaned_run(&run_lock_path, identifier),
-        OrphanedRun::Stale
-    );
-}
-
-#[test]
-fn probe_orphaned_run_ignores_a_live_child_with_the_wrong_identifier() {
-    let dir = tempfile::tempdir().unwrap();
-    let run_lock_path = dir.path().join("run.lock");
-    let mut child = spawn_run_lock_holder(&run_lock_path, "another-app");
-    std::fs::write(
-        &run_lock_path,
-        format_run_lock("mcp-serve", Some(child.id())),
-    )
-    .unwrap();
-
-    assert_eq!(
-        probe_orphaned_run(&run_lock_path, "test-identifier"),
-        OrphanedRun::Stale
-    );
-    child.kill().unwrap();
-    child.wait().unwrap();
-}
-
-// --- run_start_guard_decision -----------------------------------------------
-
-#[test]
-fn run_start_guard_decision_refuses_a_live_orphan_after_acquiring_the_flock() {
-    assert_eq!(
-        run_start_guard_decision(
-            true,
-            OrphanedRun::ActiveOrphan {
-                alias: "mcp-serve".to_string(),
-                pid: 1234,
-            },
-        ),
-        RunStartGuard::ActiveOrphan {
-            alias: "mcp-serve".to_string(),
-            pid: 1234,
-        }
-    );
-}
-
-#[test]
-fn run_start_guard_decision_allows_stale_records_and_refuses_held_flocks() {
-    assert_eq!(
-        run_start_guard_decision(true, OrphanedRun::Stale),
-        RunStartGuard::MayStart
-    );
-    assert_eq!(
-        run_start_guard_decision(false, OrphanedRun::Stale),
-        RunStartGuard::ActiveLauncher
-    );
-}
-
 // --- stop_outcome_message / stop_outcome_succeeded --------------------------
 
 #[test]
 fn stop_outcome_message_not_running() {
-    let path = Path::new("/data/run.lock");
     assert_eq!(
-        stop_outcome_message(&StopOutcome::NotRunning, path),
+        stop_outcome_message(&StopOutcome::NotRunning),
         "no run command is currently active"
     );
 }
 
 #[test]
 fn stop_outcome_message_stopped_names_the_alias() {
-    let path = Path::new("/data/run.lock");
     let outcome = StopOutcome::Stopped {
         alias: "mcp-serve".to_string(),
     };
     assert_eq!(
-        stop_outcome_message(&outcome, path),
+        stop_outcome_message(&outcome),
         "stopped the active run command \"mcp-serve\""
     );
 }
 
 #[test]
 fn stop_outcome_message_stopped_orphan_names_the_alias_and_gone_launcher() {
-    let path = Path::new("/data/run.lock");
     let outcome = StopOutcome::StoppedOrphan {
         alias: "mcp-serve".to_string(),
     };
-    let message = stop_outcome_message(&outcome, path);
+    let message = stop_outcome_message(&outcome);
     assert!(message.contains("mcp-serve"));
     assert!(message.contains("launcher had already gone"));
 }
 
 #[test]
 fn stop_outcome_message_pid_unknown_names_the_alias_and_suggests_a_retry() {
-    let path = Path::new("/data/run.lock");
     let outcome = StopOutcome::PidUnknown {
         alias: "mcp-serve".to_string(),
     };
-    let message = stop_outcome_message(&outcome, path);
+    let message = stop_outcome_message(&outcome);
     assert!(message.contains("mcp-serve"));
     assert!(message.contains("retry"));
 }
 
 #[test]
-fn stop_outcome_message_lock_held_names_the_alias_pid_and_lock_path() {
-    let path = Path::new("/data/run.lock");
+fn stop_outcome_message_lock_held_names_the_alias_pid_and_entry_path() {
     let outcome = StopOutcome::LockHeld {
         alias: "mcp-serve".to_string(),
         pid: 4321,
+        entry_path: PathBuf::from("/data/runs/1.lock"),
     };
-    let message = stop_outcome_message(&outcome, path);
+    let message = stop_outcome_message(&outcome);
     assert!(message.contains("mcp-serve"));
     assert!(message.contains("4321"));
-    assert!(message.contains("/data/run.lock"));
+    assert!(message.contains("/data/runs/1.lock"));
 }
 
 #[test]
@@ -286,7 +138,8 @@ fn stop_outcome_succeeded_false_for_pid_unknown_and_lock_held() {
     }));
     assert!(!stop_outcome_succeeded(&StopOutcome::LockHeld {
         alias: "mcp-serve".to_string(),
-        pid: 4321
+        pid: 4321,
+        entry_path: PathBuf::from("/data/runs/1.lock"),
     }));
     assert!(!stop_outcome_succeeded(&StopOutcome::OrphanStillRunning {
         alias: "mcp-serve".to_string(),
@@ -294,9 +147,9 @@ fn stop_outcome_succeeded_false_for_pid_unknown_and_lock_held() {
     }));
 }
 
-// --- stop_active_run ---------------------------------------------------------
+// --- scan_runs / stop_active_run ---------------------------------------------
 
-/// Spawn a controlled child that holds `run_lock_path`'s exclusive flock — a
+/// Spawn a controlled child that holds `entry_path`'s exclusive flock — a
 /// genuinely separate process, the same shape a real `run <id> <alias>`
 /// launcher is — and carries `identifier` in its own environment, the way the
 /// launcher marks every child it spawns. Deliberately not `flock(1)` given a
@@ -314,20 +167,20 @@ fn stop_outcome_succeeded_false_for_pid_unknown_and_lock_held() {
 /// here) releases the lock immediately, with no descendant left holding a
 /// stray reference. Blocks until the lock is observed held so the caller
 /// never races it.
-fn spawn_run_lock_holder(run_lock_path: &Path, identifier: &str) -> std::process::Child {
+fn spawn_run_entry_holder(entry_path: &Path, identifier: &str) -> std::process::Child {
     let child = std::process::Command::new("sh")
         .args([
             "-c",
             r#"exec 9>"$1"; flock -n 9 || exit 1; exec sleep 30"#,
             "sh",
         ])
-        .arg(run_lock_path)
+        .arg(entry_path)
         .env("TFS_APP_IDENTIFIER", identifier)
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     while std::time::Instant::now() < deadline {
-        if tfsapp_core::process::try_lock_file(run_lock_path)
+        if tfsapp_core::process::try_lock_file(entry_path)
             .unwrap()
             .is_none()
         {
@@ -339,7 +192,61 @@ fn spawn_run_lock_holder(run_lock_path: &Path, identifier: &str) -> std::process
 }
 
 #[test]
-fn stop_active_run_not_running_when_the_lock_is_free() {
+fn scan_runs_empty_when_the_directory_does_not_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        scan_runs(dir.path(), "test-identifier").unwrap(),
+        Vec::new()
+    );
+}
+
+#[test]
+fn scan_runs_finds_a_live_launcher_from_its_held_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs_dir = dir.path().join("runs");
+    std::fs::create_dir_all(&runs_dir).unwrap();
+    let entry_path = runs_dir.join("1.lock");
+    let identifier = "test-identifier";
+    let mut holder = spawn_run_entry_holder(&entry_path, identifier);
+    std::fs::write(&entry_path, format_run_entry("mcp-serve", Some(4321))).unwrap();
+
+    let active = scan_runs(dir.path(), identifier).unwrap();
+
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].alias, Some("mcp-serve".to_string()));
+    assert_eq!(active[0].pid, Some(4321));
+    assert!(!active[0].orphaned);
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+}
+
+#[test]
+fn scan_runs_finds_an_active_orphan_then_unlinks_it_once_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs_dir = dir.path().join("runs");
+    std::fs::create_dir_all(&runs_dir).unwrap();
+    let entry_path = runs_dir.join("1.lock");
+    let identifier = "test-identifier";
+    let mut child = spawn_run_entry_holder(&entry_path, identifier);
+    let pid = child.id();
+    std::fs::write(&entry_path, format_run_entry("mcp-serve", Some(pid))).unwrap();
+    // The launcher's own lock is held by `child` above; the *entry's* flock
+    // is free the instant the launcher itself is gone — simulated here by
+    // never acquiring a competing lock in this test process at all, since
+    // `spawn_run_entry_holder` already dropped its own local probe handle.
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let active = scan_runs(dir.path(), identifier).unwrap();
+    assert_eq!(active, Vec::new());
+    assert!(
+        !entry_path.exists(),
+        "a dead, non-identity-proven pid reads as stale and is unlinked"
+    );
+}
+
+#[test]
+fn stop_active_run_not_running_when_nothing_is_active() {
     let dir = tempfile::tempdir().unwrap();
     let outcome = stop_active_run(dir.path(), "test-identifier").unwrap();
     assert!(matches!(outcome, StopOutcome::NotRunning));
@@ -348,11 +255,13 @@ fn stop_active_run_not_running_when_the_lock_is_free() {
 #[test]
 fn stop_active_run_pid_unknown_when_the_record_has_no_pid_yet() {
     let dir = tempfile::tempdir().unwrap();
-    let run_lock_path = dir.path().join("run.lock");
-    let _held = tfsapp_core::process::try_lock_file(&run_lock_path)
+    let runs_dir = dir.path().join("runs");
+    std::fs::create_dir_all(&runs_dir).unwrap();
+    let entry_path = runs_dir.join("1.lock");
+    let _held = tfsapp_core::process::try_lock_file(&entry_path)
         .unwrap()
         .unwrap();
-    std::fs::write(&run_lock_path, format_run_lock("mcp-serve", None)).unwrap();
+    std::fs::write(&entry_path, format_run_entry("mcp-serve", None)).unwrap();
 
     let outcome = stop_active_run(dir.path(), "test-identifier").unwrap();
     assert!(matches!(outcome, StopOutcome::PidUnknown { alias } if alias == "mcp-serve"));
@@ -361,11 +270,13 @@ fn stop_active_run_pid_unknown_when_the_record_has_no_pid_yet() {
 #[test]
 fn stop_active_run_stops_a_matching_child_and_frees_the_lock() {
     let dir = tempfile::tempdir().unwrap();
-    let run_lock_path = dir.path().join("run.lock");
+    let runs_dir = dir.path().join("runs");
+    std::fs::create_dir_all(&runs_dir).unwrap();
+    let entry_path = runs_dir.join("1.lock");
     let identifier = "test-identifier";
-    let mut holder = spawn_run_lock_holder(&run_lock_path, identifier);
+    let mut holder = spawn_run_entry_holder(&entry_path, identifier);
     let pid = holder.id();
-    std::fs::write(&run_lock_path, format_run_lock("mcp-serve", Some(pid))).unwrap();
+    std::fs::write(&entry_path, format_run_entry("mcp-serve", Some(pid))).unwrap();
     // Started before `stop_active_run`, blocked in `wait()` on the still-alive
     // holder. Since plan 014 it is no longer what keeps `terminate` from
     // escalating — its poll stopped counting an unreaped zombie as a live
@@ -385,10 +296,39 @@ fn stop_active_run_stops_a_matching_child_and_frees_the_lock() {
     assert!(!tfsapp_core::process::process_exists(pid));
 }
 
+#[test]
+fn stop_active_run_stops_an_active_orphan() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs_dir = dir.path().join("runs");
+    std::fs::create_dir_all(&runs_dir).unwrap();
+    let entry_path = runs_dir.join("1.lock");
+    let identifier = "test-identifier";
+    // A real, separate process carrying `identifier` in its own environment,
+    // standing in for the orphaned child — `stop_active_run`'s orphan branch
+    // terminates the *recorded* pid directly, never a launcher.
+    let mut orphan = std::process::Command::new("sleep")
+        .arg("30")
+        .env("TFS_APP_IDENTIFIER", identifier)
+        .spawn()
+        .unwrap();
+    let pid = orphan.id();
+    std::fs::write(&entry_path, format_run_entry("mcp-serve", Some(pid))).unwrap();
+
+    let outcome = stop_active_run(dir.path(), identifier).unwrap();
+    let _ = orphan.wait();
+
+    assert!(matches!(outcome, StopOutcome::StoppedOrphan { alias } if alias == "mcp-serve"));
+    assert!(!tfsapp_core::process::process_exists(pid));
+    assert!(
+        !entry_path.exists(),
+        "the orphan's entry is removed once stopped"
+    );
+}
+
 // --- `runs/` entries: format_run_entry / parse_run_entry / run_entry_file_name
 
 #[test]
-fn format_run_entry_matches_format_run_lock() {
+fn format_run_entry_alias_alone_or_with_a_pid() {
     assert_eq!(format_run_entry("mcp-serve", None), "mcp-serve");
     assert_eq!(format_run_entry("mcp-serve", Some(1234)), "mcp-serve\n1234");
 }
