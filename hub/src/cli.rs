@@ -231,8 +231,8 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "run",
-        form: "run --stop <id>",
-        summary: "Stop whatever run command that app is running.",
+        form: "run --stop <id> [alias]",
+        summary: "Stop every active run command for that app, or just <alias>.",
         level: Level::App,
         availability: Availability::Implemented,
     },
@@ -421,11 +421,12 @@ pub enum RunInvocation {
     /// The hub's own addition, absent from the station's grammar — the
     /// station discovers aliases through `--help`, which the hub cannot do
     /// because the aliases belong to an app and not to the binary.
-    List {
-        id: String,
-    },
+    List { id: String },
     Stop {
         id: String,
+        /// Narrows the stop to this alias's instances (plan 047 step 3); `None`
+        /// stops every active command for the app.
+        alias: Option<String>,
     },
     Start {
         id: String,
@@ -644,8 +645,8 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     }
 }
 
-/// `run <id> <alias> [args...]`, `run --stop <id>`, `run --replace <id> <alias>
-/// [args...]`.
+/// `run <id> <alias> [args...]`, `run --stop <id> [alias]`, `run --replace
+/// <id> <alias> [args...]`.
 ///
 /// Parsed by hand rather than through [`options`] because of what makes `run`
 /// different from every other form: after the alias, argv stops being the
@@ -682,12 +683,19 @@ fn parse_run(args: &[String]) -> Result<Command, UsageError> {
     let positionals = &args[index..];
     if stop {
         return match positionals {
-            [id] => Ok(Command::Run(RunInvocation::Stop { id: id.clone() })),
+            [id] => Ok(Command::Run(RunInvocation::Stop {
+                id: id.clone(),
+                alias: None,
+            })),
+            [id, alias] => Ok(Command::Run(RunInvocation::Stop {
+                id: id.clone(),
+                alias: Some(alias.clone()),
+            })),
             [] => Err(usage_error("run", "run --stop needs an app id".to_string())),
             _ => Err(usage_error(
                 "run",
-                "run --stop takes an app id and nothing else — it stops \
-                 whatever command that app is running"
+                "run --stop takes an app id and an optional alias to narrow which active \
+                 command it stops"
                     .to_string(),
             )),
         };

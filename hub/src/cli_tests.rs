@@ -227,7 +227,15 @@ fn run_takes_an_app_before_its_alias() {
     assert_eq!(
         command("run --stop demo"),
         Command::Run(RunInvocation::Stop {
-            id: "demo".to_string()
+            id: "demo".to_string(),
+            alias: None,
+        })
+    );
+    assert_eq!(
+        command("run --stop demo console"),
+        Command::Run(RunInvocation::Stop {
+            id: "demo".to_string(),
+            alias: Some("console".to_string()),
         })
     );
 }
@@ -300,7 +308,7 @@ fn a_malformed_invocation_names_the_right_form() {
         ("update demo --ref", "update <id>"),
         ("run", "run <id>"),
         ("run --stop", "run <id>"),
-        ("run --stop demo console", "run <id>"),
+        ("run --stop demo console extra", "run <id>"),
         ("run --stop --replace demo console", "run <id>"),
         ("--update --now", "--update [--yes]"),
         ("--version extra", "--version"),

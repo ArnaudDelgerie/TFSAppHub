@@ -231,7 +231,7 @@ pub fn run_entry_status(
 /// the narrow acquisition-to-write race any single reader could observe.
 /// `orphaned` distinguishes the two active cases for callers whose message or
 /// stop action differs between them. `path` is the entry's own file, kept for
-/// callers that act on this specific entry (`stop_active_run`) or report it
+/// callers that act on this specific entry ([`stop_one_entry`]) or report it
 /// (`run --stop`'s bare listing, plan 047 step 5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveRunEntry {
@@ -312,17 +312,17 @@ pub fn scan_runs(data_dir: &Path, identifier: &str) -> std::io::Result<Vec<Activ
     Ok(active)
 }
 
-/// How long `stop_active_run` waits for an entry's flock to free after
+/// How long [`stop_one_entry`] waits for an entry's flock to free after
 /// signalling the recorded child — must outlast `terminate`'s own
 /// SIGTERM-then-3s-SIGKILL escalation plus a little slack for the launcher to
 /// actually observe `child.wait()` return and drop the lock.
 const STOP_LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The outcome of `run --stop`/the stop half of `run --replace <id> <alias>`
-/// — exactly the six states [`stop_active_run`] can end in. Kept as plain
-/// data — no message text or exit-code logic inside the enum itself — so
-/// [`stop_outcome_message`] below can be unit-tested directly against each
-/// variant without any process I/O.
+/// The outcome of stopping one target for `run --stop`/the stop half of
+/// `run --replace <id> <alias>` — exactly the six states [`stop_one_entry`]
+/// can end in. Kept as plain data — no message text or exit-code logic
+/// inside the enum itself — so [`stop_outcome_message`] below can be
+/// unit-tested directly against each variant without any process I/O.
 pub enum StopOutcome {
     /// `runs/` had nothing active: no `run` command is active for this app.
     NotRunning,
@@ -374,8 +374,8 @@ pub fn stop_outcome_message(outcome: &StopOutcome) -> String {
     }
 }
 
-/// Whether every `runs/` entry this app had is free once [`stop_active_run`]
-/// returns — `NotRunning` and `Stopped` mean the app is launchable again;
+/// Whether one target's `runs/` entry is free once [`stop_one_entry`]
+/// returns for it — `NotRunning` and `Stopped` mean it is launchable again;
 /// `PidUnknown`, `OrphanStillRunning`, and `LockHeld` mean it is not. Shared
 /// by `--stop`'s exit code and `--replace`'s decision to abort rather than
 /// continue into rule 2.
@@ -386,21 +386,44 @@ pub fn stop_outcome_succeeded(outcome: &StopOutcome) -> bool {
     )
 }
 
-/// `run --stop`/the stop half of `run --replace <id> <alias>`'s whole
-/// imperative flow: [`scan_runs`] for whatever `runs/` currently records —
-/// at most one entry while rule 2 stays fully enforced (plan 047 step 2;
-/// step 3 lifts it) — terminates the recorded child through
+/// `run --stop <id> [alias]`/the stop half of `run --replace <id> <alias>`'s
+/// whole imperative flow (plan 047 step 3): [`scan_runs`] for whatever
+/// `runs/` currently records, narrows to `alias_filter`'s instances when
+/// given, and stops each target through [`stop_one_entry`]. Never returns an
+/// empty `Vec`: nothing matching is reported as a single `NotRunning`, so
+/// every caller can print every outcome and take an aggregate exit without a
+/// separate empty check — one wedged command does not hide the ones that
+/// stopped (`../decision/005-concurrency-belongs-to-the-alias.md`,
+/// "`--stop <id>` becomes blunt"). `alias_filter: None` is that bluntness:
+/// every active command for the app. Deliberately does **not** take rule 1's
+/// version gate as an argument or call it itself: recovering an installation
+/// whose app layer is stale is one of this command's own jobs.
+pub fn stop_active_runs(
+    data_dir: &Path,
+    identifier: &str,
+    alias_filter: Option<&str>,
+) -> std::io::Result<Vec<StopOutcome>> {
+    let targets: Vec<_> = scan_runs(data_dir, identifier)?
+        .into_iter()
+        .filter(|entry| match alias_filter {
+            Some(alias) => entry.alias.as_deref() == Some(alias),
+            None => true,
+        })
+        .collect();
+    if targets.is_empty() {
+        return Ok(vec![StopOutcome::NotRunning]);
+    }
+    targets
+        .into_iter()
+        .map(|entry| stop_one_entry(entry, identifier))
+        .collect()
+}
+
+/// Stop one `runs/` entry: terminates the recorded child through
 /// `tfsapp_core::process::terminate_if_identifier_matches` (never a bare,
 /// unguarded terminate — the identity proof against pid reuse), and waits for
-/// its entry's lock to actually free before reporting. Deliberately does
-/// **not** take rule 1's version gate as an argument or call it itself:
-/// recovering an installation whose app layer is stale is one of this
-/// command's own jobs.
-pub fn stop_active_run(data_dir: &Path, identifier: &str) -> std::io::Result<StopOutcome> {
-    let Some(entry) = scan_runs(data_dir, identifier)?.into_iter().next() else {
-        return Ok(StopOutcome::NotRunning);
-    };
-
+/// its entry's lock to actually free before reporting.
+fn stop_one_entry(entry: ActiveRunEntry, identifier: &str) -> std::io::Result<StopOutcome> {
     if entry.orphaned {
         let alias = entry
             .alias
@@ -446,7 +469,6 @@ pub fn stop_active_run(data_dir: &Path, identifier: &str) -> std::io::Result<Sto
 /// [`ActiveRunEntry`] a scan found, with `concurrent` looked up by the
 /// caller from the app's manifest, keyed on `alias`. This module knows
 /// nothing of manifests, hence the two separate types.
-#[allow(dead_code)] // Plan 047 step 3 wires this into run::start's guard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveRun {
     pub alias: String,
@@ -459,7 +481,6 @@ pub struct ActiveRun {
 /// every alias the scan found active. `true` stacks with itself and with
 /// other `concurrent` aliases; `false` refuses whenever anything is active,
 /// and is refused by anything already active.
-#[allow(dead_code)] // Plan 047 step 3 wires this into run::start's guard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStartVerdict {
     MayStart,
@@ -476,7 +497,6 @@ pub enum RunStartVerdict {
 /// Pure verdict over an already-resolved `active` list — the caller has
 /// already matched each entry's alias against the manifest to fill in
 /// `concurrent`.
-#[allow(dead_code)] // Plan 047 step 3 wires this into run::start's guard.
 pub fn run_start_verdict(newcomer_concurrent: bool, active: &[ActiveRun]) -> RunStartVerdict {
     if !newcomer_concurrent {
         if let Some(blocker) = active.first() {
@@ -568,12 +588,17 @@ pub fn list(id: &str) -> i32 {
     EXIT_OK
 }
 
-/// `run --stop <id>`/the stop half of `run --replace <id> <alias>`'s whole
-/// imperative flow: packaged-only in spirit — an app must be installed to
-/// have a `runs/` directory at all — but deliberately **not** gated on rule
-/// 1's version check above: recovering an installation whose app layer is
-/// stale is one of this command's own jobs, so it must work even then.
-pub fn stop(id: &str) -> i32 {
+/// `run --stop <id> [alias]`/the stop half of `run --replace <id> <alias>`'s
+/// whole imperative flow: packaged-only in spirit — an app must be installed
+/// to have a `runs/` directory at all — but deliberately **not** gated on
+/// rule 1's version check above: recovering an installation whose app layer
+/// is stale is one of this command's own jobs, so it must work even then.
+/// `alias` narrows the stop to that alias's instances (plan 047 step 3);
+/// `None` stops every active command for the app. Prints one line per
+/// target and exits `EXIT_OK` only when every one of them succeeded — a
+/// wedged target does not hide the others in the exit code any more than in
+/// the printed output.
+pub fn stop(id: &str, alias: Option<&str>) -> i32 {
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
         Err(error) => {
@@ -608,10 +633,14 @@ pub fn stop(id: &str) -> i32 {
         }
     };
 
-    match stop_active_run(&data_dir, identifier) {
-        Ok(outcome) => {
-            println!("tfsapp-hub: {}", stop_outcome_message(&outcome));
-            if stop_outcome_succeeded(&outcome) {
+    match stop_active_runs(&data_dir, identifier, alias) {
+        Ok(outcomes) => {
+            let mut all_succeeded = true;
+            for outcome in &outcomes {
+                println!("tfsapp-hub: {}", stop_outcome_message(outcome));
+                all_succeeded &= stop_outcome_succeeded(outcome);
+            }
+            if all_succeeded {
                 EXIT_OK
             } else {
                 EXIT_FAILED
@@ -633,10 +662,11 @@ pub fn stop(id: &str) -> i32 {
 /// and on the per-alias concurrency permission (rule 3), then spawns the
 /// declared `bin/console` command in the foreground — inherited stdio,
 /// `SIGINT`/`SIGTERM` forwarded, a coexistence watchdog when a window was
-/// already live at start — and exits with its status. Plan 047 step 3 lifts
-/// rule 2's blanket exclusivity onto `concurrent`; here it still refuses
-/// whenever the scan finds anything active, matching today's behaviour
-/// exactly.
+/// already live at start — and exits with its status. Rule 2 is lifted
+/// (plan 047 step 3, `../decision/005-concurrency-belongs-to-the-alias.md`):
+/// a `concurrent` alias stacks with itself and with other `concurrent`
+/// aliases; a non-`concurrent` one still refuses beside anything, and is
+/// refused by anything already active.
 ///
 /// This is the one hub command whose exit code is the child's rather than the
 /// hub's own: a child that happens to exit `2` is indistinguishable from a
@@ -668,6 +698,19 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
         );
         return EXIT_FAILED;
     };
+
+    // `--replace` on a `concurrent` alias (plan 047 step 3,
+    // `../decision/005-concurrency-belongs-to-the-alias.md`, point 5): there
+    // is nothing to replace when instances stack, so this refuses before
+    // touching anything rather than silently replacing one of several.
+    if replace && alias.concurrent {
+        eprintln!(
+            "tfsapp-hub: \"{alias_name}\" is declared concurrent — there is nothing for \
+             --replace to replace. Start another instance instead with `tfsapp-hub run {id} \
+             {alias_name}`."
+        );
+        return EXIT_FAILED;
+    }
 
     let identifier = spec.identity.identifier.clone();
     // This covers all foreground forms, including one `--replace` stop/start
@@ -719,21 +762,29 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
         return EXIT_FAILED;
     }
 
-    // `--replace`: stop whatever `runs/` currently records before rule 2
-    // below gets a chance to refuse over it. Runs after the version gate (a
+    // `--replace`: stop everything `runs/` currently records for this app
+    // before rule 2 below gets a chance to refuse over it — the alias being
+    // started is non-`concurrent` here (the check above already refused a
+    // `concurrent` one), so rule 2 would refuse beside *any* active entry,
+    // not just ones sharing its own alias. Runs after the version gate (a
     // stale app layer must still refuse a plain `run <id> <alias>`) but
     // before rule 2 (there would be nothing left to stop once it already
-    // refused). Nothing active makes this a no-op (`stop_active_run` itself
-    // reports `NotRunning`), so `--replace` is safe to pass unconditionally.
+    // refused). Nothing active makes this a no-op (`stop_active_runs` itself
+    // reports a single `NotRunning`), so `--replace` is safe to pass
+    // unconditionally.
     if replace {
-        match stop_active_run(&data_dir, &identifier) {
-            Ok(outcome) if stop_outcome_succeeded(&outcome) => {}
-            Ok(outcome) => {
-                eprintln!(
-                    "tfsapp-hub: cannot replace \"{alias_name}\": {}",
-                    stop_outcome_message(&outcome)
-                );
-                return EXIT_FAILED;
+        match stop_active_runs(&data_dir, &identifier, None) {
+            Ok(outcomes) => {
+                if let Some(failed) = outcomes
+                    .iter()
+                    .find(|outcome| !stop_outcome_succeeded(outcome))
+                {
+                    eprintln!(
+                        "tfsapp-hub: cannot replace \"{alias_name}\": {}",
+                        stop_outcome_message(failed)
+                    );
+                    return EXIT_FAILED;
+                }
             }
             Err(error) => {
                 eprintln!("tfsapp-hub: cannot stop the active run command: {error}");
@@ -742,10 +793,13 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
         }
     }
 
-    // Rule 2 (CONTRACT.md §6): at most one `run` command per app at a time —
-    // still enforced exactly as today (plan 047 step 3 lifts it onto
-    // `concurrent`), just proven by a scan of `runs/` instead of one fixed
-    // file's flock.
+    // Rule 2, lifted (plan 047 step 3,
+    // `../decision/005-concurrency-belongs-to-the-alias.md`): resolve this
+    // alias's own `concurrent` flag and, for each active entry the scan
+    // found, its alias's flag from the manifest — an entry naming an alias
+    // the manifest no longer declares, or none at all, is treated as
+    // non-`concurrent` (the conservative default: it cannot be proven safe
+    // to stack beside) — then let `run_start_verdict` decide.
     let runs_dir = data_dir.join("runs");
     if let Err(error) = std::fs::create_dir_all(&runs_dir) {
         eprintln!("tfsapp-hub: cannot create {}: {error}", runs_dir.display());
@@ -758,19 +812,43 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
             return EXIT_FAILED;
         }
     };
-    if let Some(blocker) = active.first() {
-        if blocker.orphaned {
-            let alias = blocker.alias.as_deref().unwrap_or("an unknown alias");
-            let pid = blocker.pid.unwrap_or_default();
+    let active_runs: Vec<ActiveRun> = active
+        .into_iter()
+        .map(|entry| ActiveRun {
+            alias: entry
+                .alias
+                .clone()
+                .unwrap_or_else(|| "an unknown alias".to_string()),
+            pid: entry.pid,
+            concurrent: entry
+                .alias
+                .as_deref()
+                .and_then(|name| spec.manifest.run.get(name))
+                .is_some_and(|declared| declared.concurrent),
+        })
+        .collect();
+    if let RunStartVerdict::Blocked {
+        blocker,
+        newcomer_non_concurrent,
+    } = run_start_verdict(alias.concurrent, &active_runs)
+    {
+        let pid = blocker
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        if newcomer_non_concurrent {
             eprintln!(
-                "tfsapp-hub: cannot start \"{alias_name}\": orphaned run command \"{alias}\" \
-                 (pid {pid}) is still active for {id} — stop it with `tfsapp-hub run --stop {id}` \
-                 or replace it with `tfsapp-hub run --replace {id} {alias_name}`."
+                "tfsapp-hub: cannot start \"{alias_name}\": it is not declared concurrent, and \
+                 \"{}\" (pid {pid}) is already active for {id} — stop it first with \
+                 `tfsapp-hub run --stop {id} {}`, or declare \"{alias_name}\" concurrent.",
+                blocker.alias, blocker.alias
             );
         } else {
             eprintln!(
-                "tfsapp-hub: another run command is already active for {id} ({})",
-                runs_dir.display()
+                "tfsapp-hub: cannot start \"{alias_name}\": \"{}\" (pid {pid}) is active for {id} \
+                 and is not declared concurrent — stop it first with `tfsapp-hub run --stop {id} \
+                 {}`.",
+                blocker.alias, blocker.alias
             );
         }
         return EXIT_FAILED;

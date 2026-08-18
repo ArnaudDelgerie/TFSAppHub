@@ -245,10 +245,19 @@ fn scan_runs_finds_an_active_orphan_then_unlinks_it_once_stale() {
     );
 }
 
+/// Every existing single-target test wants exactly one outcome back —
+/// [`stop_active_runs`] with no alias filter, asserted to have stopped (or
+/// reported on) exactly one target.
+fn stop_all(data_dir: &Path, identifier: &str) -> StopOutcome {
+    let mut outcomes = stop_active_runs(data_dir, identifier, None).unwrap();
+    assert_eq!(outcomes.len(), 1, "expected exactly one target");
+    outcomes.remove(0)
+}
+
 #[test]
 fn stop_active_run_not_running_when_nothing_is_active() {
     let dir = tempfile::tempdir().unwrap();
-    let outcome = stop_active_run(dir.path(), "test-identifier").unwrap();
+    let outcome = stop_all(dir.path(), "test-identifier");
     assert!(matches!(outcome, StopOutcome::NotRunning));
 }
 
@@ -263,7 +272,7 @@ fn stop_active_run_pid_unknown_when_the_record_has_no_pid_yet() {
         .unwrap();
     std::fs::write(&entry_path, format_run_entry("mcp-serve", None)).unwrap();
 
-    let outcome = stop_active_run(dir.path(), "test-identifier").unwrap();
+    let outcome = stop_all(dir.path(), "test-identifier");
     assert!(matches!(outcome, StopOutcome::PidUnknown { alias } if alias == "mcp-serve"));
 }
 
@@ -277,19 +286,19 @@ fn stop_active_run_stops_a_matching_child_and_frees_the_lock() {
     let mut holder = spawn_run_entry_holder(&entry_path, identifier);
     let pid = holder.id();
     std::fs::write(&entry_path, format_run_entry("mcp-serve", Some(pid))).unwrap();
-    // Started before `stop_active_run`, blocked in `wait()` on the still-alive
-    // holder. Since plan 014 it is no longer what keeps `terminate` from
-    // escalating — its poll stopped counting an unreaped zombie as a live
-    // process — but it is still what keeps the guard honest: the identity
-    // check `stop_active_run` makes reads `/proc/<pid>/environ`, which a
-    // corpse no longer has, so the holder must be reaped only once the signal
-    // has actually been sent, never before. It also leaves no zombie behind
-    // for the rest of the suite.
+    // Started before `stop_active_runs`, blocked in `wait()` on the
+    // still-alive holder. Since plan 014 it is no longer what keeps
+    // `terminate` from escalating — its poll stopped counting an unreaped
+    // zombie as a live process — but it is still what keeps the guard
+    // honest: the identity check `stop_active_runs` makes reads
+    // `/proc/<pid>/environ`, which a corpse no longer has, so the holder
+    // must be reaped only once the signal has actually been sent, never
+    // before. It also leaves no zombie behind for the rest of the suite.
     let reaper = std::thread::spawn(move || {
         let _ = holder.wait();
     });
 
-    let outcome = stop_active_run(dir.path(), identifier).unwrap();
+    let outcome = stop_all(dir.path(), identifier);
     reaper.join().unwrap();
 
     assert!(matches!(outcome, StopOutcome::Stopped { alias } if alias == "mcp-serve"));
@@ -304,8 +313,8 @@ fn stop_active_run_stops_an_active_orphan() {
     let entry_path = runs_dir.join("1.lock");
     let identifier = "test-identifier";
     // A real, separate process carrying `identifier` in its own environment,
-    // standing in for the orphaned child — `stop_active_run`'s orphan branch
-    // terminates the *recorded* pid directly, never a launcher.
+    // standing in for the orphaned child — the orphan branch terminates the
+    // *recorded* pid directly, never a launcher.
     let mut orphan = std::process::Command::new("sleep")
         .arg("30")
         .env("TFS_APP_IDENTIFIER", identifier)
@@ -314,7 +323,7 @@ fn stop_active_run_stops_an_active_orphan() {
     let pid = orphan.id();
     std::fs::write(&entry_path, format_run_entry("mcp-serve", Some(pid))).unwrap();
 
-    let outcome = stop_active_run(dir.path(), identifier).unwrap();
+    let outcome = stop_all(dir.path(), identifier);
     let _ = orphan.wait();
 
     assert!(matches!(outcome, StopOutcome::StoppedOrphan { alias } if alias == "mcp-serve"));
@@ -323,6 +332,94 @@ fn stop_active_run_stops_an_active_orphan() {
         !entry_path.exists(),
         "the orphan's entry is removed once stopped"
     );
+}
+
+#[test]
+fn stop_active_runs_with_no_filter_stops_every_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs_dir = dir.path().join("runs");
+    std::fs::create_dir_all(&runs_dir).unwrap();
+    let identifier = "test-identifier";
+    let first_path = runs_dir.join("1.lock");
+    let mut first = spawn_run_entry_holder(&first_path, identifier);
+    std::fs::write(&first_path, format_run_entry("mcp-serve", Some(first.id()))).unwrap();
+    let second_path = runs_dir.join("2.lock");
+    let mut second = spawn_run_entry_holder(&second_path, identifier);
+    std::fs::write(
+        &second_path,
+        format_run_entry("mcp-serve", Some(second.id())),
+    )
+    .unwrap();
+
+    let reaper = std::thread::spawn(move || {
+        let _ = first.wait();
+        let _ = second.wait();
+    });
+    let outcomes = stop_active_runs(dir.path(), identifier, None).unwrap();
+    reaper.join().unwrap();
+
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes
+        .iter()
+        .all(|outcome| matches!(outcome, StopOutcome::Stopped { alias } if alias == "mcp-serve")));
+}
+
+#[test]
+fn stop_active_runs_with_an_alias_filter_narrows_to_matching_instances() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs_dir = dir.path().join("runs");
+    std::fs::create_dir_all(&runs_dir).unwrap();
+    let identifier = "test-identifier";
+    let matching_path = runs_dir.join("1.lock");
+    let mut matching = spawn_run_entry_holder(&matching_path, identifier);
+    std::fs::write(
+        &matching_path,
+        format_run_entry("mcp-serve", Some(matching.id())),
+    )
+    .unwrap();
+    let other_path = runs_dir.join("2.lock");
+    let other = spawn_run_entry_holder(&other_path, identifier);
+    std::fs::write(&other_path, format_run_entry("cleanup", Some(other.id()))).unwrap();
+
+    let reaper = std::thread::spawn(move || {
+        let _ = matching.wait();
+    });
+    let outcomes = stop_active_runs(dir.path(), identifier, Some("mcp-serve")).unwrap();
+    reaper.join().unwrap();
+
+    assert_eq!(outcomes.len(), 1);
+    assert!(matches!(&outcomes[0], StopOutcome::Stopped { alias } if alias == "mcp-serve"));
+    // The other alias's instance was left untouched — still held.
+    assert!(tfsapp_core::process::try_lock_file(&other_path)
+        .unwrap()
+        .is_none());
+    kill_and_wait_run_entry(other);
+}
+
+#[test]
+fn stop_active_runs_with_a_non_matching_alias_filter_reports_not_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs_dir = dir.path().join("runs");
+    std::fs::create_dir_all(&runs_dir).unwrap();
+    let identifier = "test-identifier";
+    let entry_path = runs_dir.join("1.lock");
+    let holder = spawn_run_entry_holder(&entry_path, identifier);
+    std::fs::write(
+        &entry_path,
+        format_run_entry("mcp-serve", Some(holder.id())),
+    )
+    .unwrap();
+
+    let outcomes = stop_active_runs(dir.path(), identifier, Some("cleanup")).unwrap();
+
+    assert_eq!(outcomes.len(), 1);
+    assert!(matches!(outcomes[0], StopOutcome::NotRunning));
+    kill_and_wait_run_entry(holder);
+}
+
+fn kill_and_wait_run_entry(mut child: std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // --- `runs/` entries: format_run_entry / parse_run_entry / run_entry_file_name
