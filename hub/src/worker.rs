@@ -309,6 +309,22 @@ fn arbitrate_respawn(
     RespawnArbitration::Adopted { worker_pid }
 }
 
+/// Clear a given-up slot's pid and report whether its dialog should still show.
+///
+/// Mirrors [`arbitrate_respawn`]'s post-write recheck: the write below can land
+/// after `stop()` already removed the pid file, resurrecting it. Re-clearing
+/// the slot keeps the resurrected file honest, and `false` tells the caller to
+/// skip the dialog — nothing should pop up once teardown is already closing
+/// the app's windows.
+fn arbitrate_give_up(pid_table: &WorkerPidTable, slot: usize, shutting_down: &AtomicBool) -> bool {
+    let _ = pid_table.set(slot, None);
+    if shutting_down.load(Ordering::SeqCst) {
+        let _ = pid_table.set(slot, None);
+        return false;
+    }
+    true
+}
+
 /// Watch the worker and respawn it under [`supervisor_decision`]'s policy.
 ///
 /// Without this the worker would stop consuming after its first time or memory
@@ -399,7 +415,9 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
                         log::append_log(&worker_log_path, &line);
                         // Only this slot's pid leaves the table; a sibling
                         // still running keeps its own line.
-                        let _ = pid_table.set(slot, None);
+                        if !arbitrate_give_up(&pid_table, slot, &shutting_down) {
+                            return;
+                        }
                         if claim_dialog(&dialog_shown) {
                             gave_up_dialog(&app, &worker_log_path, &transports);
                         }

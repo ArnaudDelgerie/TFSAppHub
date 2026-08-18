@@ -33,17 +33,18 @@ fn project(dir: &std::path::Path, identifier: &str, icon_path: Option<&str>) {
 fn a_live_project_resolves_with_a_prefixed_identity_and_a_var_state_root() {
     let dir = tempfile::tempdir().expect("a temp project dir");
     project(dir.path(), "dev.local.demo", None);
+    let canonical = dir.path().canonicalize().expect("a canonical project dir");
 
     let spec = resolve(dir.path().to_str().expect("a utf8 path")).expect("a resolvable project");
 
     assert_eq!(spec.source, Source::Live);
-    assert_eq!(spec.app_dir, dir.path());
+    assert_eq!(spec.app_dir, canonical);
     // The prefix is a runtime namespace, never a rename the user should read:
     // the identifier alone carries it, product_name never does.
     assert_eq!(spec.identity.identifier, "dev.dev.local.demo");
     assert_eq!(spec.identity.product_name, "Demo App");
-    assert_eq!(spec.state_root, dir.path().join("var"));
-    assert_eq!(spec.label, dir.path().display().to_string());
+    assert_eq!(spec.state_root, canonical.join("var"));
+    assert_eq!(spec.label, canonical.display().to_string());
     // Named, never created: resolving is not launching.
     assert!(!spec.state_root.exists());
 }
@@ -52,12 +53,13 @@ fn a_live_project_resolves_with_a_prefixed_identity_and_a_var_state_root() {
 fn an_icon_resolves_inside_the_project_unprefixed() {
     let dir = tempfile::tempdir().expect("a temp project dir");
     project(dir.path(), "dev.local.demo", Some("assets/icon.png"));
+    let canonical = dir.path().canonicalize().expect("a canonical project dir");
 
     let spec = resolve(dir.path().to_str().expect("a utf8 path")).expect("a resolvable project");
 
     assert_eq!(
         spec.identity.icon_path.as_deref(),
-        Some(dir.path().join("assets/icon.png").as_path())
+        Some(canonical.join("assets/icon.png").as_path())
     );
 }
 
@@ -65,6 +67,7 @@ fn an_icon_resolves_inside_the_project_unprefixed() {
 fn the_child_argv_carries_the_project_path_not_an_id() {
     let dir = tempfile::tempdir().expect("a temp project dir");
     project(dir.path(), "dev.local.demo", Some("assets/icon.png"));
+    let canonical = dir.path().canonicalize().expect("a canonical project dir");
 
     let spec = resolve(dir.path().to_str().expect("a utf8 path")).expect("a resolvable project");
     let args = child_args(&spec);
@@ -77,15 +80,40 @@ fn the_child_argv_carries_the_project_path_not_an_id() {
         vec![
             "__open".to_string(),
             "--project".to_string(),
-            dir.path().display().to_string(),
+            canonical.display().to_string(),
             "--identity".to_string(),
             "dev.dev.local.demo".to_string(),
             "--name".to_string(),
             "Demo App".to_string(),
             "--icon".to_string(),
-            dir.path().join("assets/icon.png").display().to_string(),
+            canonical.join("assets/icon.png").display().to_string(),
         ]
     );
+}
+
+#[test]
+fn an_unnormalized_project_path_resolves_to_an_absolute_app_dir() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let project_dir = dir.path().join("project");
+    let sibling_dir = dir.path().join("sibling");
+    fs::create_dir_all(&project_dir).expect("a project dir");
+    fs::create_dir_all(&sibling_dir).expect("a sibling dir");
+    project(&project_dir, "dev.local.demo", None);
+    let canonical = project_dir.canonicalize().expect("a canonical project dir");
+
+    // Doesn't depend on the process cwd: an absolute path carrying a `..`
+    // segment exercises the same un-normalized-path bug a genuinely relative
+    // `dev ../Foo/app` argument would, without the test's outcome depending
+    // on cwd matching the temp dir's parent.
+    let unnormalized = sibling_dir.join("..").join("project");
+
+    let spec = resolve(unnormalized.to_str().expect("a utf8 path")).expect("a resolvable project");
+
+    // Left un-normalized, `sidecar::start` would resolve the Caddyfile path a
+    // second time against a different `current_dir` and fail to find it.
+    assert!(spec.app_dir.is_absolute());
+    assert_eq!(spec.app_dir, canonical);
+    assert_eq!(spec.state_root, canonical.join("var"));
 }
 
 #[test]

@@ -15,7 +15,7 @@
 //! project's own, unprefixed, because a user should never read "dev." in a
 //! window title.
 
-use std::{fmt, path::PathBuf, process::Command};
+use std::{fmt, fs, path::PathBuf, process::Command};
 
 use crate::{
     cli::{EXIT_FAILED, OPEN_CHILD_SUBCOMMAND},
@@ -134,6 +134,18 @@ pub fn resolve(project_path: &str) -> Result<LaunchSpec, DevError> {
     if !project_path.is_dir() {
         return Err(DevError::NotADirectory { path: project_path });
     }
+    // Canonicalize once, here: left verbatim, a relative `dev ../Foo/app`
+    // builds a relative `state_root`, and `sidecar::start` passes that
+    // relative Caddyfile path to FrankenPHP while also setting
+    // `current_dir(app_dir)` — the server resolves it a second time against
+    // the project dir and dies looking for `../Foo/app/var/Caddyfile`. Doing
+    // it once here, rather than at every path built below, fixes `app_dir`,
+    // `state_root`, `icon_path` and the child's own `--project` together.
+    // `is_dir` above already proved the path exists, so a failure here is a
+    // TOCTOU race, not the ordinary "no such project" case — folded into the
+    // same refusal rather than given its own untestable variant.
+    let project_path = fs::canonicalize(&project_path)
+        .map_err(|_| DevError::NotADirectory { path: project_path })?;
 
     for (what, relative) in [
         ("bin/console", "bin/console"),
