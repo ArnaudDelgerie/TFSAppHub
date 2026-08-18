@@ -339,6 +339,188 @@ pub fn stop_active_run(data_dir: &Path, identifier: &str) -> std::io::Result<Sto
     }
 }
 
+// --- `runs/`: the record set rule 2 will move onto (plan 047,
+// `../decision/005-concurrency-belongs-to-the-alias.md`) --------------------
+//
+// `run.lock` above stays exactly as today — nothing below is wired to any
+// caller yet. `runs/` replaces it one file at a time in plan 047 step 2: one
+// entry per launcher, named after the launcher's own pid, each exclusively
+// flocked by its owner and carrying the same `<alias>\n<child pid>` content
+// `format_run_lock`/`parse_run_lock` already round-trip.
+
+/// One `runs/` entry's parsed content — the record set's counterpart to
+/// [`RunLockRecord`], same shape, same "alias alone, no pid yet" window
+/// between a launcher's flock acquisition and its post-spawn rewrite.
+#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ writer and scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunEntry {
+    pub alias: String,
+    pub pid: Option<u32>,
+}
+
+/// Format one `runs/` entry's content. Delegates to [`format_run_lock`]: the
+/// content shape does not change, only where it is written — one file per
+/// launcher instead of one file per app.
+#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ writer.
+pub fn format_run_entry(alias: &str, pid: Option<u32>) -> String {
+    format_run_lock(alias, pid)
+}
+
+/// Parse one `runs/` entry's content — the pure, total counterpart to
+/// [`format_run_entry`], round-tripping through it. Delegates to
+/// [`parse_run_lock`] for the same reason [`format_run_entry`] does.
+#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ scan.
+pub fn parse_run_entry(contents: &str) -> Option<RunEntry> {
+    parse_run_lock(contents).map(|record| RunEntry {
+        alias: record.alias,
+        pid: record.pid,
+    })
+}
+
+/// The file name a `runs/` entry is written under: its launcher's own pid.
+/// Naming an entry after its launcher is what closes the unlink-versus-flock
+/// race a lock directory usually carries — nobody creates an entry under
+/// another's name, and nobody unlinks an entry whose pid is live
+/// (`../decision/005-concurrency-belongs-to-the-alias.md`, "What is lost,
+/// honestly").
+#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ writer.
+pub fn run_entry_file_name(launcher_pid: u32) -> String {
+    format!("{launcher_pid}.lock")
+}
+
+/// One entry's status once a scanner has tried to flock it and, if that
+/// succeeded, identity-probed the pid its record names — the exact ternary
+/// `../plan/035-the-run-record-outlives-its-flock.md` gave `run.lock` as a
+/// single file, restated once for one `runs/` entry: [`run_start_guard_decision`]
+/// and [`orphaned_run_decision`]'s decision halves, combined.
+#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunEntryStatus {
+    /// The scanner could not acquire the entry's flock: its launcher is
+    /// still alive. `alias`/`pid` are a best-effort read of its record —
+    /// `None` in the acquisition-to-spawn window, or if the record could not
+    /// be read at all.
+    LiveLauncher {
+        alias: Option<String>,
+        pid: Option<u32>,
+    },
+    /// The flock was free but the record names a pid that is alive and
+    /// identity-proven: the launcher died without cleaning up, but its
+    /// child is still active.
+    ActiveOrphan { alias: String, pid: u32 },
+    /// The flock was free and the record is empty, unparseable, or names a
+    /// pid that is dead or fails the identity proof. Inert.
+    Stale,
+}
+
+/// Pure per-entry ternary. `record` is read regardless of whether the flock
+/// was acquired — a best-effort read, since the write it might race is a
+/// truncate-then-rewrite by the entry's own owner, never a second writer.
+#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ scan.
+pub fn run_entry_status(
+    flock_acquired: bool,
+    record: Option<&RunEntry>,
+    pid_alive: bool,
+    identifier_matches: bool,
+) -> RunEntryStatus {
+    if !flock_acquired {
+        return RunEntryStatus::LiveLauncher {
+            alias: record.map(|record| record.alias.clone()),
+            pid: record.and_then(|record| record.pid),
+        };
+    }
+    match record {
+        Some(RunEntry {
+            alias,
+            pid: Some(pid),
+        }) if pid_alive && identifier_matches => RunEntryStatus::ActiveOrphan {
+            alias: alias.clone(),
+            pid: *pid,
+        },
+        _ => RunEntryStatus::Stale,
+    }
+}
+
+/// One active `run` command a scan of `runs/` found — a live launcher or an
+/// active orphan, never a stale entry (the scan unlinks those instead of
+/// reporting them, plan 047 step 2). `concurrent` is resolved by the caller
+/// from the app's manifest, keyed on `alias` — this module knows nothing of
+/// manifests.
+#[allow(dead_code)] // Plan 047 step 2 wires this into the runs/ scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveRun {
+    pub alias: String,
+    pub pid: Option<u32>,
+    pub concurrent: bool,
+}
+
+/// Rule 2, lifted (`../decision/005-concurrency-belongs-to-the-alias.md`):
+/// whether a newcomer alias may start, given its own `concurrent` flag and
+/// every alias the scan found active. `true` stacks with itself and with
+/// other `concurrent` aliases; `false` refuses whenever anything is active,
+/// and is refused by anything already active.
+#[allow(dead_code)] // Plan 047 step 3 wires this into run::start's guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunStartVerdict {
+    MayStart,
+    /// `newcomer_non_concurrent` distinguishes the two refusal shapes: the
+    /// newcomer's own flag blocked it (refuses regardless of `blocker`'s
+    /// flag), or a non-`concurrent` `blocker` is what blocked an otherwise
+    /// `concurrent` newcomer. The two cases have different fixes.
+    Blocked {
+        blocker: ActiveRun,
+        newcomer_non_concurrent: bool,
+    },
+}
+
+/// Pure verdict over an already-resolved `active` list — the caller has
+/// already matched each entry's alias against the manifest to fill in
+/// `concurrent`.
+#[allow(dead_code)] // Plan 047 step 3 wires this into run::start's guard.
+pub fn run_start_verdict(newcomer_concurrent: bool, active: &[ActiveRun]) -> RunStartVerdict {
+    if !newcomer_concurrent {
+        if let Some(blocker) = active.first() {
+            return RunStartVerdict::Blocked {
+                blocker: blocker.clone(),
+                newcomer_non_concurrent: true,
+            };
+        }
+    } else if let Some(blocker) = active.iter().find(|run| !run.concurrent) {
+        return RunStartVerdict::Blocked {
+            blocker: blocker.clone(),
+            newcomer_non_concurrent: false,
+        };
+    }
+    RunStartVerdict::MayStart
+}
+
+/// Rule 3's window-side verdict, narrowed to its motive
+/// (`../decision/005-concurrency-belongs-to-the-alias.md`, point 3): a launch
+/// with a lifecycle event to run refuses over *any* active command, since the
+/// launch path is the only one that can show progress; a launch with nothing
+/// to run refuses only over a non-`concurrent` one.
+#[allow(dead_code)] // Plan 047 step 4 wires this into lifecycle::prepare_launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchVerdict {
+    MayOpen,
+    Refuse { blocker: ActiveRun },
+}
+
+#[allow(dead_code)] // Plan 047 step 4 wires this into lifecycle::prepare_launch.
+pub fn launch_verdict(has_lifecycle_event: bool, active: &[ActiveRun]) -> LaunchVerdict {
+    let blocker = if has_lifecycle_event {
+        active.first()
+    } else {
+        active.iter().find(|run| !run.concurrent)
+    };
+    match blocker {
+        Some(blocker) => LaunchVerdict::Refuse {
+            blocker: blocker.clone(),
+        },
+        None => LaunchVerdict::MayOpen,
+    }
+}
+
 // --- The imperative flow ----------------------------------------------------
 //
 // Everything above is pure; everything below touches the registry, the

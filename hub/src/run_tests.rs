@@ -385,6 +385,193 @@ fn stop_active_run_stops_a_matching_child_and_frees_the_lock() {
     assert!(!tfsapp_core::process::process_exists(pid));
 }
 
+// --- `runs/` entries: format_run_entry / parse_run_entry / run_entry_file_name
+
+#[test]
+fn format_run_entry_matches_format_run_lock() {
+    assert_eq!(format_run_entry("mcp-serve", None), "mcp-serve");
+    assert_eq!(format_run_entry("mcp-serve", Some(1234)), "mcp-serve\n1234");
+}
+
+#[test]
+fn parse_run_entry_round_trips_through_format_run_entry() {
+    let entry = parse_run_entry(&format_run_entry("mcp-serve", Some(1234))).unwrap();
+    assert_eq!(
+        entry,
+        RunEntry {
+            alias: "mcp-serve".to_string(),
+            pid: Some(1234),
+        }
+    );
+    let entry = parse_run_entry(&format_run_entry("mcp-serve", None)).unwrap();
+    assert_eq!(
+        entry,
+        RunEntry {
+            alias: "mcp-serve".to_string(),
+            pid: None,
+        }
+    );
+    assert!(parse_run_entry("").is_none());
+}
+
+#[test]
+fn run_entry_file_name_is_the_launcher_pid() {
+    assert_eq!(run_entry_file_name(4321), "4321.lock");
+}
+
+// --- run_entry_status --------------------------------------------------------
+
+#[test]
+fn run_entry_status_live_launcher_reads_the_record_best_effort() {
+    let record = RunEntry {
+        alias: "mcp-serve".to_string(),
+        pid: Some(1234),
+    };
+    assert_eq!(
+        run_entry_status(false, Some(&record), false, false),
+        RunEntryStatus::LiveLauncher {
+            alias: Some("mcp-serve".to_string()),
+            pid: Some(1234),
+        }
+    );
+}
+
+#[test]
+fn run_entry_status_live_launcher_with_no_record_yet() {
+    assert_eq!(
+        run_entry_status(false, None, false, false),
+        RunEntryStatus::LiveLauncher {
+            alias: None,
+            pid: None,
+        }
+    );
+}
+
+#[test]
+fn run_entry_status_active_orphan_needs_flock_free_pid_alive_and_identity_match() {
+    let record = RunEntry {
+        alias: "mcp-serve".to_string(),
+        pid: Some(1234),
+    };
+    assert_eq!(
+        run_entry_status(true, Some(&record), true, true),
+        RunEntryStatus::ActiveOrphan {
+            alias: "mcp-serve".to_string(),
+            pid: 1234,
+        }
+    );
+}
+
+#[test]
+fn run_entry_status_stale_when_pid_dead_identity_mismatched_or_no_record() {
+    let record = RunEntry {
+        alias: "mcp-serve".to_string(),
+        pid: Some(1234),
+    };
+    assert_eq!(
+        run_entry_status(true, Some(&record), false, true),
+        RunEntryStatus::Stale
+    );
+    assert_eq!(
+        run_entry_status(true, Some(&record), true, false),
+        RunEntryStatus::Stale
+    );
+    assert_eq!(
+        run_entry_status(true, None, false, false),
+        RunEntryStatus::Stale
+    );
+    let no_pid = RunEntry {
+        alias: "mcp-serve".to_string(),
+        pid: None,
+    };
+    assert_eq!(
+        run_entry_status(true, Some(&no_pid), false, false),
+        RunEntryStatus::Stale
+    );
+}
+
+// --- run_start_verdict --------------------------------------------------------
+
+fn active_run(alias: &str, concurrent: bool) -> ActiveRun {
+    ActiveRun {
+        alias: alias.to_string(),
+        pid: Some(1),
+        concurrent,
+    }
+}
+
+#[test]
+fn run_start_verdict_may_start_when_nothing_is_active() {
+    assert_eq!(run_start_verdict(false, &[]), RunStartVerdict::MayStart);
+    assert_eq!(run_start_verdict(true, &[]), RunStartVerdict::MayStart);
+}
+
+#[test]
+fn run_start_verdict_non_concurrent_newcomer_refuses_beside_anything_active() {
+    let active = [active_run("mcp-serve", true)];
+    assert_eq!(
+        run_start_verdict(false, &active),
+        RunStartVerdict::Blocked {
+            blocker: active[0].clone(),
+            newcomer_non_concurrent: true,
+        }
+    );
+}
+
+#[test]
+fn run_start_verdict_concurrent_newcomer_stacks_beside_concurrent_actives() {
+    let active = [active_run("mcp-serve", true), active_run("mcp-serve", true)];
+    assert_eq!(run_start_verdict(true, &active), RunStartVerdict::MayStart);
+}
+
+#[test]
+fn run_start_verdict_concurrent_newcomer_refused_by_a_non_concurrent_active() {
+    let active = [active_run("mcp-serve", true), active_run("cleanup", false)];
+    assert_eq!(
+        run_start_verdict(true, &active),
+        RunStartVerdict::Blocked {
+            blocker: active[1].clone(),
+            newcomer_non_concurrent: false,
+        }
+    );
+}
+
+// --- launch_verdict ------------------------------------------------------------
+
+#[test]
+fn launch_verdict_opens_beside_concurrent_commands_when_nothing_to_run() {
+    let active = [active_run("mcp-serve", true)];
+    assert_eq!(launch_verdict(false, &active), LaunchVerdict::MayOpen);
+}
+
+#[test]
+fn launch_verdict_refuses_a_non_concurrent_active_when_nothing_to_run() {
+    let active = [active_run("cleanup", false)];
+    assert_eq!(
+        launch_verdict(false, &active),
+        LaunchVerdict::Refuse {
+            blocker: active[0].clone(),
+        }
+    );
+}
+
+#[test]
+fn launch_verdict_refuses_any_active_command_when_an_event_is_pending() {
+    let active = [active_run("mcp-serve", true)];
+    assert_eq!(
+        launch_verdict(true, &active),
+        LaunchVerdict::Refuse {
+            blocker: active[0].clone(),
+        }
+    );
+}
+
+#[test]
+fn launch_verdict_may_open_with_nothing_active_regardless_of_the_event() {
+    assert_eq!(launch_verdict(false, &[]), LaunchVerdict::MayOpen);
+    assert_eq!(launch_verdict(true, &[]), LaunchVerdict::MayOpen);
+}
+
 // --- format_alias_list --------------------------------------------------------
 
 #[test]
