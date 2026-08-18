@@ -87,8 +87,8 @@ pub struct Spec {
 
 /// The whole CLI surface, in the order `--help` prints it.
 ///
-/// Several rows may share a `name` (`run` has three forms); [`spec`] answers
-/// with the first, which is the form a usage error quotes.
+/// Several rows may share a `name` (`run` has several forms); [`spec`]
+/// answers with the first, which is the form a usage error quotes.
 pub const SURFACE: &[Spec] = &[
     Spec {
         name: "--version",
@@ -231,8 +231,8 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "run",
-        form: "run --stop <id>",
-        summary: "Stop whatever run command that app is running.",
+        form: "run --stop <id> [alias]",
+        summary: "Stop every active run command for that app, or just <alias>.",
         level: Level::App,
         availability: Availability::Implemented,
     },
@@ -241,6 +241,20 @@ pub const SURFACE: &[Spec] = &[
         form: "run --replace <id> <alias> [args...]",
         summary: "Stop an active run command, then start <alias> in its place.",
         level: Level::App,
+        availability: Availability::Implemented,
+    },
+    Spec {
+        name: "run",
+        form: "run --stop",
+        summary: "List every active run command across every installed app.",
+        level: Level::Hub,
+        availability: Availability::Implemented,
+    },
+    Spec {
+        name: "run",
+        form: "run --replace",
+        summary: "List every active run command across every installed app.",
+        level: Level::Hub,
         availability: Availability::Implemented,
     },
 ];
@@ -421,11 +435,18 @@ pub enum RunInvocation {
     /// The hub's own addition, absent from the station's grammar — the
     /// station discovers aliases through `--help`, which the hub cannot do
     /// because the aliases belong to an app and not to the binary.
-    List {
-        id: String,
-    },
+    List { id: String },
+    /// `run --stop`/`run --replace` with no id (plan 047 step 5): every
+    /// active `run` command across every installed app, rather than an error
+    /// about a missing id. `usage` carries which typed form asked — `--stop`
+    /// or `--replace` — so the listing's own usage line names the one the
+    /// user actually typed.
+    ListActive { usage: &'static str },
     Stop {
         id: String,
+        /// Narrows the stop to this alias's instances (plan 047 step 3); `None`
+        /// stops every active command for the app.
+        alias: Option<String>,
     },
     Start {
         id: String,
@@ -644,8 +665,8 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     }
 }
 
-/// `run <id> <alias> [args...]`, `run --stop <id>`, `run --replace <id> <alias>
-/// [args...]`.
+/// `run <id> <alias> [args...]`, `run --stop <id> [alias]`, `run --replace
+/// <id> <alias> [args...]`.
 ///
 /// Parsed by hand rather than through [`options`] because of what makes `run`
 /// different from every other form: after the alias, argv stops being the
@@ -682,15 +703,33 @@ fn parse_run(args: &[String]) -> Result<Command, UsageError> {
     let positionals = &args[index..];
     if stop {
         return match positionals {
-            [id] => Ok(Command::Run(RunInvocation::Stop { id: id.clone() })),
-            [] => Err(usage_error("run", "run --stop needs an app id".to_string())),
+            [id] => Ok(Command::Run(RunInvocation::Stop {
+                id: id.clone(),
+                alias: None,
+            })),
+            [id, alias] => Ok(Command::Run(RunInvocation::Stop {
+                id: id.clone(),
+                alias: Some(alias.clone()),
+            })),
+            // No id (plan 047 step 5): list every active run command across
+            // every installed app rather than refuse for want of one.
+            [] => Ok(Command::Run(RunInvocation::ListActive {
+                usage: "run --stop <id> [alias]",
+            })),
             _ => Err(usage_error(
                 "run",
-                "run --stop takes an app id and nothing else — it stops \
-                 whatever command that app is running"
+                "run --stop takes an app id and an optional alias to narrow which active \
+                 command it stops"
                     .to_string(),
             )),
         };
+    }
+
+    if replace && positionals.is_empty() {
+        // Same reasoning as `--stop` with no id above.
+        return Ok(Command::Run(RunInvocation::ListActive {
+            usage: "run --replace <id> <alias> [args...]",
+        }));
     }
 
     let (id, alias) =

@@ -686,7 +686,7 @@ pub fn check_data_dir_available(
             holder,
         }),
         Err(source) => Err(InstallError::Io {
-            path: data_dir.join("run.lock"),
+            path: data_dir.join("runs"),
             source,
         }),
     }
@@ -1084,18 +1084,22 @@ impl fmt::Display for InstallError {
                      has open; close {id} first.",
                     data_dir.display()
                 ),
-                lifecycle::DataDirHolder::RunCommand { alias: Some(alias) } => write!(
-                    formatter,
-                    "{} is in use — {id}'s \"{alias}\" run command is still active. Stop it \
-                     first with `tfsapp-hub run --stop {id}`.",
-                    data_dir.display()
-                ),
-                lifecycle::DataDirHolder::RunCommand { alias: None } => write!(
-                    formatter,
-                    "{} is in use — a run command is still active for {id}. Stop it first with \
-                     `tfsapp-hub run --stop {id}`.",
-                    data_dir.display()
-                ),
+                lifecycle::DataDirHolder::RunCommand { active } => {
+                    match active.first().and_then(|run| run.alias.as_deref()) {
+                        Some(alias) => write!(
+                            formatter,
+                            "{} is in use — {id}'s \"{alias}\" run command is still active. Stop \
+                             it first with `tfsapp-hub run --stop {id}`.",
+                            data_dir.display()
+                        ),
+                        None => write!(
+                            formatter,
+                            "{} is in use — a run command is still active for {id}. Stop it \
+                             first with `tfsapp-hub run --stop {id}`.",
+                            data_dir.display()
+                        ),
+                    }
+                }
             },
             Self::DataNewerThanSource {
                 recorded,

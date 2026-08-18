@@ -224,7 +224,8 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         // header for why the app-resolution step in front of all three is
         // the only genuinely new thing plan 013 adds.
         Command::Run(RunInvocation::List { id }) => run::list(&id),
-        Command::Run(RunInvocation::Stop { id }) => run::stop(&id),
+        Command::Run(RunInvocation::ListActive { usage }) => run::list_active(usage),
+        Command::Run(RunInvocation::Stop { id, alias }) => run::stop(&id, alias.as_deref()),
         Command::Run(RunInvocation::Start {
             id,
             alias,
@@ -263,7 +264,7 @@ fn interrupted_app_id(command: &Command) -> Option<&str> {
         | Command::Export { id, .. }
         | Command::Import { id, .. } => Some(id),
         Command::Run(RunInvocation::List { id })
-        | Command::Run(RunInvocation::Stop { id })
+        | Command::Run(RunInvocation::Stop { id, .. })
         | Command::Run(RunInvocation::Start { id, .. }) => Some(id),
         Command::OpenChild {
             source: OpenChildSource::Id(id),
@@ -348,6 +349,7 @@ fn prepare(source: &OpenChildSource, identity: &Identity) -> Launching {
             &identity.identifier,
             &spec.manifest.app_version,
             spec.manifest.app_port,
+            &spec.manifest.run,
         ),
         launch::Source::Live => lifecycle::prepare_dev_launch(
             &data_dir,

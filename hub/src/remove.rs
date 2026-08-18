@@ -146,7 +146,7 @@ fn remove(paths: &Paths, id: &str, purge: bool, assume_yes: bool) -> Result<bool
 /// Whether something already holds `data_dir` — a live window, or an active
 /// `run` command. Mirrors `portability::busy_holder`'s own guard:
 /// [`lifecycle::data_dir_holder`] has no opinion about a missing directory
-/// (probing `run.lock` inside one would just fail to open it), and a data
+/// (scanning `runs/` inside one would just find it absent), and a data
 /// directory that has never been written to is not busy.
 fn busy_holder(data_dir: &Path, identifier: &str) -> io::Result<Option<lifecycle::DataDirHolder>> {
     if !data_dir.is_dir() {
@@ -874,16 +874,20 @@ impl fmt::Display for RemoveError {
                         "{name} has a window open right now — purging would delete the \
                          database it has open. Close {name} first."
                     ),
-                    lifecycle::DataDirHolder::RunCommand { alias: Some(alias) } => write!(
-                        formatter,
-                        "{name}'s \"{alias}\" run command is still active — purging would \
-                         delete the database it has open.{stop}"
-                    ),
-                    lifecycle::DataDirHolder::RunCommand { alias: None } => write!(
-                        formatter,
-                        "a run command is still active for {name} — purging would delete the \
-                         database it has open.{stop}"
-                    ),
+                    lifecycle::DataDirHolder::RunCommand { active } => {
+                        match active.first().and_then(|run| run.alias.as_deref()) {
+                            Some(alias) => write!(
+                                formatter,
+                                "{name}'s \"{alias}\" run command is still active — purging \
+                                 would delete the database it has open.{stop}"
+                            ),
+                            None => write!(
+                                formatter,
+                                "a run command is still active for {name} — purging would \
+                                 delete the database it has open.{stop}"
+                            ),
+                        }
+                    }
                 }
             }
             Self::AlreadyInstalled { id, identifier } => write!(

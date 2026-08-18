@@ -413,12 +413,13 @@ fn an_active_run_command_refuses_the_export_naming_the_alias() {
     let (base, paths) = temp_paths();
     seed_registry(&paths, seeded_entry());
     let data_dir = base.path().join("TFSApp/dev.local.demo");
-    fs::create_dir_all(&data_dir).expect("a data dir");
-    let run_lock_path = data_dir.join("run.lock");
-    let _holder = tfsapp_core::process::try_lock_file(&run_lock_path)
+    let runs_dir = data_dir.join("runs");
+    fs::create_dir_all(&runs_dir).expect("a runs dir");
+    let entry_path = runs_dir.join("1.lock");
+    let _holder = tfsapp_core::process::try_lock_file(&entry_path)
         .expect("no I/O error")
         .expect("the lock is free to take");
-    fs::write(&run_lock_path, "migrate\n1234").expect("a run.lock record");
+    fs::write(&entry_path, "migrate\n1234").expect("an entry record");
     let target = base.path().join("backup.tar.gz");
 
     let error =
@@ -837,12 +838,13 @@ fn an_active_run_command_refuses_the_import_naming_the_alias() {
     let (base, paths) = temp_paths();
     seed_registry(&paths, seeded_entry());
     let data_dir = base.path().join("TFSApp/dev.local.demo");
-    fs::create_dir_all(&data_dir).expect("a data dir");
-    let run_lock_path = data_dir.join("run.lock");
-    let _holder = tfsapp_core::process::try_lock_file(&run_lock_path)
+    let runs_dir = data_dir.join("runs");
+    fs::create_dir_all(&runs_dir).expect("a runs dir");
+    let entry_path = runs_dir.join("1.lock");
+    let _holder = tfsapp_core::process::try_lock_file(&entry_path)
         .expect("no I/O error")
         .expect("the lock is free to take");
-    fs::write(&run_lock_path, "migrate\n1234").expect("a run.lock record");
+    fs::write(&entry_path, "migrate\n1234").expect("an entry record");
     let archive = base.path().join("backup.tar.gz");
     write_test_archive(
         &archive,

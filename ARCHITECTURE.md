@@ -529,7 +529,7 @@ gains nothing from the trick they didn't already have.
 
 **The busy guard is `lifecycle::data_dir_holder`, and `remove --purge` now
 goes through it too.** Plan 022 built the shared probe for `export`/`import`
-— `is_owner_live` on `sidecar.pid`, then `probe_run_lock` on `run.lock`.
+— `is_owner_live` on `sidecar.pid`, then `probe_run_lock` on `runs/`.
 `remove --purge` used to probe only `sidecar.pid`, so an active `run`
 command did not stop a purge from deleting the database out from under it;
 routing it through the shared probe (plan 023 step 2) closed that gap
@@ -862,7 +862,7 @@ Everything it stands on already lived in `core::process` (the locks, the
 signal machinery, the process-group teardown), because the station had
 already built and measured it; the hub's own addition is the app-resolution
 step, and the fact that it has two apps' worth of this state to keep apart —
-`run.lock` is keyed on the app's own `identifier`, the same key the two locks
+`runs/` is keyed on the app's own `identifier`, the same key the two locks
 above already use, so two different apps running commands at once costs
 nothing.
 
@@ -873,7 +873,7 @@ nothing.
 | `hub/locks/<identifier>.lifecycle.lock` | Is any installed lifecycle activity or maintenance operation retained for this identifier? | installed `open`, foreground `run`, and every installed maintenance pipeline |
 | `serving.lock` | Will handing this launch's argv to that process get you a window right now? | a launch's own hand-off probe |
 | `sidecar.pid.lock` (the liveness lock) | Does a process still own this data dir at all? | a launch's reap, and `run`'s own rule-3 concurrency probe |
-| `run.lock` | Is its launcher live, or did its child outlive it? | `run`'s rule 2, launch's rule-3-in-reverse refusal, and data-dir writers |
+| `runs/` | Is each entry's launcher live, or did its child outlive it? | `run`'s lifted rule 2, launch's rule-3-in-reverse refusal, and data-dir writers |
 
 The lifecycle gate is a non-blocking `flock` over a hub-root file, deliberately
 separate from the app data tree: `install` can reach it before that tree exists
@@ -891,21 +891,29 @@ Rule 3's "is a window live" probe deliberately reads the **liveness** lock,
 not the serving one: a process mid-teardown still owns the data dir, and a
 `bin/console` command opening the app's SQLite while its server is being
 killed is the same hazard as one opening it next to a live server. A launch's
-own refusal reads `run.lock` the other way round — only once it has already
+own refusal reads `runs/` the other way round — only once it has already
 decided to launch (past the serving/liveness probe above), never against a
 sibling it is about to hand off to, since a `concurrent` alias legitimately
 running beside an already-open window must not be blocked by a second window
 opening beside it.
 
-`run.lock` separates the two questions: its flock answers whether the
-launcher still lives, while its durable record — `<alias>`, then
+Between that probe and the refusal sits one more question: has this launch
+anything to run at all? The scan is resolved against the manifest and
+combined with the version guard's own verdict (`crate::run::launch_verdict`)
+— a launch with nothing to run opens beside every `concurrent` command, one
+with a lifecycle event to perform or a non-`concurrent` holder refuses either
+way. See `.project/decision/005-concurrency-belongs-to-the-alias.md` for why.
+
+`runs/` separates the two questions per entry: each entry's flock answers
+whether its launcher still lives, while its durable record — `<alias>`, then
 `<alias>\n<pid>` once the child is spawned — answers what it was running when
-the flock has already gone. Every guard consults the flock and, when it is
-free, identity-proves that recorded pid through `TFS_APP_IDENTIFIER`; a live
-match is an orphaned active command, while a dead or mismatched pid is stale.
-That lets refusals name the alias, and lets `run --stop`/`--replace` know what
-to signal without ever killing a command as a side effect of `open` or a
-data-dir writer.
+the flock has already gone. Every guard consults each entry's flock and, when
+it is free, identity-proves that recorded pid through `TFS_APP_IDENTIFIER`; a
+live match is an orphaned active command, while a dead or mismatched pid is
+stale — the same ternary plan 035 gave the single file, now applied per
+entry. That lets refusals name the alias, and lets `run --stop`/`--replace`
+know what to signal without ever killing a command as a side effect of `open`
+or a data-dir writer.
 
 ### Forwarding a signal past `Child::wait()`'s own retry
 
@@ -917,10 +925,12 @@ trick: the signal handler itself only writes one byte to a pipe (the one
 thing sound to do inside a handler), and a *separate* thread blocks reading
 that pipe and reacts once a byte arrives, leaving the thread in `wait()`
 alone. `core::process::install_signal_forwarding` sets the pipe and the
-handlers up once; `spawn_signal_forwarder` and the coexistence watchdog
-(`spawn_coexistence_watchdog`) are two different reasons to terminate the
-child, sharing the one mechanism — the first reacting to a caught signal, the
-second to a poll of the liveness lock.
+handlers up once; `spawn_signal_forwarder` is what reacts to a caught signal,
+terminating the child through it. Plan 047 deleted the coexistence watchdog
+that used to share this mechanism for a second reason (a window's owner
+dropping) — a `run` command's lifetime belongs to whoever started it, not to
+a window that happened to be open at the time
+(`.project/decision/005-concurrency-belongs-to-the-alias.md`, point 4).
 
 ### Hub-side, and never `tauri`
 

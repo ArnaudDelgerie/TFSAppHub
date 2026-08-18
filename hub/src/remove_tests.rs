@@ -221,18 +221,19 @@ fn a_live_window_refuses_a_plain_remove() {
 #[test]
 fn an_active_run_command_now_refuses_a_purge() {
     // The gap this step closes: `remove --purge` used to probe only
-    // `sidecar.pid` and ignore `run.lock`, so an active `run` command did not
+    // `sidecar.pid` and ignore `runs/`, so an active `run` command did not
     // stop a purge from deleting the data underneath it.
     let (_base, paths) = temp_paths();
     installed_snapshot(&paths, "demo");
     registry::save_entry(&paths, "demo");
     let data_dir = paths.app_data_dir(IDENTIFIER).expect("a data dir");
-    fs::create_dir_all(&data_dir).expect("a data dir");
-    let run_lock_path = data_dir.join("run.lock");
-    let _holder = tfsapp_core::process::try_lock_file(&run_lock_path)
+    let runs_dir = data_dir.join("runs");
+    fs::create_dir_all(&runs_dir).expect("a runs dir");
+    let entry_path = runs_dir.join("1.lock");
+    let _holder = tfsapp_core::process::try_lock_file(&entry_path)
         .expect("no I/O error")
         .expect("the lock is free to take");
-    fs::write(&run_lock_path, "migrate\n1234").expect("a run.lock record");
+    fs::write(&entry_path, "migrate\n1234").expect("an entry record");
 
     let error =
         remove(&paths, "demo", true, true).expect_err("an active run command owns this data dir");
