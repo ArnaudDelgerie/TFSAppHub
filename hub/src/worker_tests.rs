@@ -8,9 +8,9 @@ use std::{
 };
 
 use super::{
-    arbitrate_respawn, claim_dialog, consume_args, flatten_worker_slots, sleep_backoff_or_shutdown,
-    spawn_worker, supervisor_decision, worker_log, RespawnArbitration, SupervisorDecision,
-    WorkerPidTable, WORKER_MIN_HEALTHY_UPTIME,
+    arbitrate_give_up, arbitrate_respawn, claim_dialog, consume_args, flatten_worker_slots,
+    sleep_backoff_or_shutdown, spawn_worker, supervisor_decision, worker_log, RespawnArbitration,
+    SupervisorDecision, WorkerPidTable, WORKER_MIN_HEALTHY_UPTIME,
 };
 use crate::manifest::WorkerDeclaration;
 
@@ -195,6 +195,50 @@ fn giving_up_on_one_slot_clears_only_that_pid() {
     assert_eq!(
         fs::read_to_string(&pid_file).expect("read the pid file"),
         "100\n201\n203\n"
+    );
+}
+
+#[test]
+fn a_give_up_racing_teardown_leaves_no_stale_pid_and_skips_the_dialog() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let pid_file = dir.path().join("sidecar.pid");
+    let table = WorkerPidTable::new(100, pid_file.clone(), 1);
+    table
+        .set(0, Some(201))
+        .expect("record the failing worker's last pid");
+
+    // Teardown removes the file first ...
+    fs::remove_file(&pid_file).expect("simulate teardown's own removal");
+    let shutting_down = AtomicBool::new(true);
+
+    // ... and only then does the give-up's write land.
+    let show_dialog = arbitrate_give_up(&table, 0, &shutting_down);
+
+    assert!(
+        !show_dialog,
+        "a give-up racing teardown must not raise a dialog"
+    );
+    assert_eq!(
+        fs::read_to_string(&pid_file).expect("read the resurrected pid file"),
+        "100\n",
+        "the late write must still leave the file without this slot's pid"
+    );
+}
+
+#[test]
+fn a_give_up_without_teardown_still_shows_the_dialog() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let pid_file = dir.path().join("sidecar.pid");
+    let table = WorkerPidTable::new(100, pid_file.clone(), 1);
+    table
+        .set(0, Some(201))
+        .expect("record the failing worker's last pid");
+    let shutting_down = AtomicBool::new(false);
+
+    assert!(arbitrate_give_up(&table, 0, &shutting_down));
+    assert_eq!(
+        fs::read_to_string(&pid_file).expect("read the pid file"),
+        "100\n"
     );
 }
 
