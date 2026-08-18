@@ -224,6 +224,7 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         // header for why the app-resolution step in front of all three is
         // the only genuinely new thing plan 013 adds.
         Command::Run(RunInvocation::List { id }) => run::list(&id),
+        Command::Run(RunInvocation::ListActive { usage }) => run::list_active(usage),
         Command::Run(RunInvocation::Stop { id, alias }) => run::stop(&id, alias.as_deref()),
         Command::Run(RunInvocation::Start {
             id,

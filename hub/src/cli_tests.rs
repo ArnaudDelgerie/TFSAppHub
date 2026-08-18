@@ -241,6 +241,26 @@ fn run_takes_an_app_before_its_alias() {
 }
 
 #[test]
+fn run_stop_or_replace_with_no_id_lists_every_active_command() {
+    // Plan 047 step 5: with no id, both typed forms list every active `run`
+    // command across every installed app rather than refuse for want of one
+    // — the usage line printed after it is which one the user actually
+    // typed.
+    assert_eq!(
+        command("run --stop"),
+        Command::Run(RunInvocation::ListActive {
+            usage: "run --stop <id> [alias]",
+        })
+    );
+    assert_eq!(
+        command("run --replace"),
+        Command::Run(RunInvocation::ListActive {
+            usage: "run --replace <id> <alias> [args...]",
+        })
+    );
+}
+
+#[test]
 fn run_with_no_alias_lists_the_apps_declared_aliases() {
     // The hub's own addition to the station's grammar: the station discovers
     // aliases through `--help`, which the hub cannot do since they belong to
@@ -307,7 +327,6 @@ fn a_malformed_invocation_names_the_right_form() {
         ("import demo /tmp/x.tar.gz --purge", "import <id> <path>"),
         ("update demo --ref", "update <id>"),
         ("run", "run <id>"),
-        ("run --stop", "run <id>"),
         ("run --stop demo console extra", "run <id>"),
         ("run --stop --replace demo console", "run <id>"),
         ("--update --now", "--update [--yes]"),

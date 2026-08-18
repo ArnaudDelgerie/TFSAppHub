@@ -121,6 +121,75 @@ pub fn format_alias_list(aliases: &BTreeMap<String, RunAlias>) -> String {
         .join("\n")
 }
 
+/// [`format_alias_list`], with each alias's active instance count appended
+/// (plan 047 step 5, `../decision/005-concurrency-belongs-to-the-alias.md`,
+/// "What is lost, honestly": the record set trades one hidden flock for a
+/// list nobody sees unless it is made readable). `active_counts` maps an
+/// alias name to how many `runs/` entries the scan found naming it; an alias
+/// absent from the map, or mapped to `0`, prints no count at all.
+pub fn format_alias_list_with_activity(
+    aliases: &BTreeMap<String, RunAlias>,
+    active_counts: &BTreeMap<String, usize>,
+) -> String {
+    if aliases.is_empty() {
+        return "no run aliases are declared by this app".to_string();
+    }
+    aliases
+        .iter()
+        .map(|(name, alias)| {
+            let concurrency = if alias.concurrent {
+                "concurrent"
+            } else {
+                "standalone-only"
+            };
+            match active_counts.get(name).copied().unwrap_or(0) {
+                0 => format!("  {name} -> {} ({concurrency})", alias.command),
+                1 => format!("  {name} -> {} ({concurrency}, active)", alias.command),
+                count => format!(
+                    "  {name} -> {} ({concurrency}, {count} active)",
+                    alias.command
+                ),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One active `run` command found across *every* installed app —
+/// `run --stop`/`run --replace` with no id (plan 047 step 5): the recovery
+/// listing decision 005's "A user can now start ten commands and not know
+/// it" buys back. `id` is the hub-local id ([`format_alias_list`] and
+/// [`ActiveRun`] never need it, since they already work within one app's own
+/// resolution).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveInstance {
+    pub id: String,
+    pub alias: String,
+    pub pid: Option<u32>,
+}
+
+/// Format every active instance, one line each as `<id>  <alias>  <pid>` —
+/// `pid` prints `unknown` for the same reason [`stop_outcome_message`] does,
+/// never a fatal condition on its own. Empty is not an error: a hub with
+/// nothing running answers exactly as plainly as [`list::render`] does with
+/// nothing installed.
+pub fn format_active_instances(instances: &[ActiveInstance]) -> String {
+    if instances.is_empty() {
+        return "no run command is active for any installed app".to_string();
+    }
+    instances
+        .iter()
+        .map(|instance| {
+            let pid = instance
+                .pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("{}  {}  {pid}", instance.id, instance.alias)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // --- `runs/`: one entry per launcher (plan 047,
 // `../decision/005-concurrency-belongs-to-the-alias.md`) --------------------
 //
@@ -583,13 +652,18 @@ use crate::{
     cli::{EXIT_FAILED, EXIT_OK},
     lifecycle_gate, open,
     paths::Paths,
-    php,
+    php, registry,
 };
 
 /// `run <id>` with no alias: list the app's declared aliases (the hub's own
 /// addition to the station's grammar — see `cli::RunInvocation::List`). The
 /// station discovers its aliases through `--help`, which the hub cannot do
 /// since they belong to an app and not to the binary.
+///
+/// Marks each alias with how many instances are active (plan 047 step 5): a
+/// scan of its own `runs/`, tallied by alias — the same scan every other
+/// guard in this module reads, so the count can never disagree with what a
+/// start or stop would see.
 pub fn list(id: &str) -> i32 {
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
@@ -609,8 +683,90 @@ pub fn list(id: &str) -> i32 {
         eprintln!("tfsapp-hub: warning: {warning}");
     }
 
+    let identifier = &spec.identity.identifier;
+    let data_dir = match paths.app_data_dir(identifier) {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    let active = match scan_runs(&data_dir, identifier) {
+        Ok(active) => active,
+        Err(error) => {
+            eprintln!(
+                "tfsapp-hub: cannot scan {}: {error}",
+                data_dir.join("runs").display()
+            );
+            return EXIT_FAILED;
+        }
+    };
+    let mut active_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in active {
+        if let Some(alias) = entry.alias {
+            *active_counts.entry(alias).or_insert(0) += 1;
+        }
+    }
+
     println!("{id}'s declared run aliases:");
-    println!("{}", format_alias_list(&spec.manifest.run));
+    println!(
+        "{}",
+        format_alias_list_with_activity(&spec.manifest.run, &active_counts)
+    );
+    EXIT_OK
+}
+
+/// `run --stop`/`run --replace` with no id (plan 047 step 5,
+/// `../decision/005-concurrency-belongs-to-the-alias.md`, "A user can now
+/// start ten commands and not know it"): every active `run` command across
+/// every installed app, enumerated through the registry the way `list::run`
+/// is, followed by the usage line of whichever typed form asked for it —
+/// `--stop` or `--replace`, so the message points back at the command that
+/// produced it.
+pub fn list_active(usage: &str) -> i32 {
+    let paths = match Paths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+    let registry = match registry::load(&paths) {
+        Ok(registry) => registry,
+        Err(error) => {
+            eprintln!("tfsapp-hub: {error}");
+            return EXIT_FAILED;
+        }
+    };
+
+    let mut instances = Vec::new();
+    for entry in &registry.apps {
+        let data_dir = match paths.app_data_dir(&entry.identifier) {
+            Ok(data_dir) => data_dir,
+            Err(error) => {
+                eprintln!("tfsapp-hub: {error}");
+                return EXIT_FAILED;
+            }
+        };
+        let active = match scan_runs(&data_dir, &entry.identifier) {
+            Ok(active) => active,
+            Err(error) => {
+                eprintln!(
+                    "tfsapp-hub: cannot scan {}: {error}",
+                    data_dir.join("runs").display()
+                );
+                return EXIT_FAILED;
+            }
+        };
+        instances.extend(active.into_iter().map(|run| ActiveInstance {
+            id: entry.id.clone(),
+            alias: run.alias.unwrap_or_else(|| "an unknown alias".to_string()),
+            pid: run.pid,
+        }));
+    }
+
+    println!("{}", format_active_instances(&instances));
+    println!("usage: tfsapp-hub {usage}");
     EXIT_OK
 }
 

@@ -711,3 +711,62 @@ fn format_alias_list_sorted_and_annotated() {
         "  alpha -> app:alpha (concurrent)\n  zeta -> app:zeta (standalone-only)"
     );
 }
+
+// --- format_alias_list_with_activity ------------------------------------------
+
+#[test]
+fn format_alias_list_with_activity_empty_message_when_no_aliases() {
+    assert_eq!(
+        format_alias_list_with_activity(&BTreeMap::new(), &BTreeMap::new()),
+        "no run aliases are declared by this app"
+    );
+}
+
+#[test]
+fn format_alias_list_with_activity_marks_count_only_for_active_aliases() {
+    let mut aliases = BTreeMap::new();
+    aliases.insert("mcp-serve".to_string(), run_alias("app:mcp", true));
+    aliases.insert("cleanup".to_string(), run_alias("app:cleanup", false));
+    aliases.insert("idle".to_string(), run_alias("app:idle", true));
+    let mut active_counts = BTreeMap::new();
+    active_counts.insert("mcp-serve".to_string(), 2);
+    active_counts.insert("cleanup".to_string(), 1);
+
+    let formatted = format_alias_list_with_activity(&aliases, &active_counts);
+    assert_eq!(
+        formatted,
+        "  cleanup -> app:cleanup (standalone-only, active)\n  \
+         idle -> app:idle (concurrent)\n  \
+         mcp-serve -> app:mcp (concurrent, 2 active)"
+    );
+}
+
+// --- format_active_instances ---------------------------------------------------
+
+#[test]
+fn format_active_instances_empty_message_when_nothing_is_active() {
+    assert_eq!(
+        format_active_instances(&[]),
+        "no run command is active for any installed app"
+    );
+}
+
+#[test]
+fn format_active_instances_names_id_alias_and_pid_per_line() {
+    let instances = [
+        ActiveInstance {
+            id: "tfsapp-test".to_string(),
+            alias: "mcp-serve".to_string(),
+            pid: Some(4321),
+        },
+        ActiveInstance {
+            id: "tfsapp-test".to_string(),
+            alias: "mcp-serve".to_string(),
+            pid: None,
+        },
+    ];
+    assert_eq!(
+        format_active_instances(&instances),
+        "tfsapp-test  mcp-serve  4321\ntfsapp-test  mcp-serve  unknown"
+    );
+}
