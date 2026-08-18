@@ -374,7 +374,7 @@ an update:
 | Key | Type | Meaning |
 | --- | --- | --- |
 | `command` | string, required | A `bin/console` argument string, split on whitespace and passed as `argv` directly — same no-shell-interpretation rule as `commands` (§6). |
-| `concurrent` | boolean, optional | Default `false`. Whether this alias may run alongside an already-open window of the same app — see "Running a declared command" (§6) for the full gating. |
+| `concurrent` | boolean, optional | Default `false`. Whether this alias tolerates siblings — other instances of itself, other active `run` commands, an already-open window — in any arrival order, rather than requiring to run alone. See "Running a declared command" (§6) for the full gating, and `.project/decision/005-concurrency-belongs-to-the-alias.md` for why. |
 
 Each top-level key is the alias name a user types. `tfsapp-hub run <id>` with
 no alias lists them back, naming each one's command and whether it is
@@ -914,7 +914,7 @@ preflight through confirmation and the final write for post-manifest
 `install`, `update`, `rollback`, `export`, `import`, `remove`, and `purge`.
 A competing operation fails immediately, naming the maintenance operation when
 one owns the lease; it never waits or begins a partial mutation. Different
-identifiers have independent leases. The existing window and `run.lock` probes
+identifiers have independent leases. The existing window and `runs/` probes
 remain compatibility guards for older hub processes, not substitutes for this
 no-overlap guarantee. A lease released by process death does not repair an
 interrupted mutation; crash recovery is deliberately outside this contract.
@@ -1073,26 +1073,34 @@ exempt — recovering an installation stuck on a stale app layer is one of its
 own jobs, and stopping whatever holds the command's lock never touches this
 record.
 
-**Rule 2 — at most one `run` command per app at a time.** An exclusive flock
-on the app's own data directory, the same directory two different apps never
-share (§5), proves a launcher is live. When that flock is free, its durable
-`run.lock` record is still consulted: a recorded pid that is live and carries
-the app's `TFS_APP_IDENTIFIER` is an orphaned command whose launcher died,
-and it refuses exactly like a held flock. Thus two apps running commands at
-once costs nothing, while a second `run` of the *same* app is refused.
-`run --stop` reads that record and stops whichever active command it names;
-`run --replace` folds a stop into an ordinary start, and is safe to reach for
-unconditionally since neither a free flock nor a stale record has work to do.
+**Rule 2 — an app runs as many commands at once as its aliases permit.**
+`<data dir>/runs/` (§5) holds one entry per launcher, named after the
+launcher's own pid, each exclusively flocked by its owner and carrying the
+alias and child pid it started. A flock held proves a live launcher; a flock
+free but the recorded pid alive and identity-proven is an orphaned command
+whose launcher died, refused exactly like a held flock; otherwise the entry
+is stale and inert. Whether a newcomer alias may start is decided against
+every entry the scan finds active: a `concurrent` newcomer (§2) stacks with
+itself and with other `concurrent` entries, and is refused only by a
+non-`concurrent` one; a non-`concurrent` newcomer refuses beside anything
+active at all. Two apps running commands at once costs nothing either way —
+`runs/` is keyed on the app's own `identifier`, a different directory per
+app. `run --stop <id>` stops every active command for that app; `run --stop
+<id> <alias>` narrows it to that alias's instances. `run --stop`/
+`run --replace` with no id list every active command across
+every installed app. See `.project/decision/005-concurrency-belongs-to-the-alias.md`
+for why the exclusivity moved from the command to the app layer's own
+mutation.
 
-**Rule 3 — per-alias concurrency permission, the app is always owner-first.**
-Each alias's `concurrent` flag (§2) decides whether it may run alongside an
-already-open window of the same app: `false` (the default) refuses to start
-while a window is live, and may only run on its own; `true` may start either
-way, and — started beside a live window — is stopped the moment that window
-closes. Regardless of the flag, a `run` command holding its app's lock
-refuses a *subsequent* window from opening, naming the active alias and
-`run --stop`. The only way to have both at once is app-first: open the
-window, then start a `concurrent` alias.
+**Rule 3 — the window's refusal is narrowed to its motive.** A `run` command
+does not by itself keep a window from opening: a launch refuses over active
+commands only when a non-`concurrent` one is live, or when the launch has a
+lifecycle event to perform (an install or a pending update) — the launch path
+is the only one that can show progress. A launch with nothing to run opens
+beside every `concurrent` command, naming nothing; either refusal names the
+blocking alias, its pid, and `run --stop <id>`. A `concurrent` command started
+beside a window survives that window's closing — its lifetime belongs to
+whoever started it, not to the window that happened to be open at the time.
 
 **Self-contained-command boundary.** A `run` command gets everything the
 server gets from §3 — `DATABASE_URL`, `APP_SECRET`, the writable directories
@@ -1103,10 +1111,14 @@ so a command that needs to reach the app over HTTP is outside the contract.
 **What `--stop`/`--replace` do not promise.** The `run` *command's own
 process* is never force-killed, only what it started — `run --stop` against
 one wedged somewhere other than waiting on its own child reports that the
-lock did not release, rather than guessing at what to kill next. A lock
-record with no pid yet — the narrow window between it being taken and the
-command actually starting — is reported as such, not assumed to be either
-free or wedged.
+lock did not release, rather than guessing at what to kill next, and a
+multi-target `--stop` reports every target's own outcome rather than one
+combined verdict, so one wedged command does not hide the ones that stopped.
+A lock record with no pid yet — the narrow window between it being taken and
+the command actually starting — is reported as such, not assumed to be
+either free or wedged. `run --replace <id> <alias>` refuses outright on a
+`concurrent` alias: there is nothing for it to replace when instances stack,
+and the message points at starting another instance instead.
 
 ---
 
