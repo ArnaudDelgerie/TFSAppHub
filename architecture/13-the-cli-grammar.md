@@ -1,0 +1,21 @@
+## The CLI grammar
+
+> **`--flags` act on the hub. Bare words act on an app.**
+
+One sentence, no ambiguous case. Two rules keep the dispatcher small:
+
+- **It parses and routes; it never works.** Argv becomes a command and nothing
+  else — no filesystem, no registry, no process — which is what makes every form
+  in the grammar testable on a machine with nothing installed.
+- **The whole surface is declared from the start**, including the parts no plan
+  has implemented. A recognised-but-unavailable command answers "not implemented
+  yet", never "unknown command" — a wrong message there sends someone hunting
+  for a typo that is not present.
+
+One carve-out is worth naming because it is easy to get wrong: after a `run`
+alias, **every word belongs to the app's own command**. `run demo console --help`
+asks the app's console for its help, not the hub for its own. The property, not
+the flag, is what the test pins — forwarded arguments are the app's — because
+every other host-level flag sits in the same trap the day an app declares an
+alias that takes one.
+
