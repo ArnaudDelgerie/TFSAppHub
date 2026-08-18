@@ -1,0 +1,238 @@
+## 2. `tfsapp.config.json`
+
+A JSON file at the project root. It is the single source of truth for the app's
+identity and for what it declares.
+
+### Required fields
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `product_name` | string | The human-readable name. Feeds the window title and the desktop entry's `Name=`. |
+| `identifier` | string | Reverse-domain technical identity, e.g. `dev.local.myapp`. Everything the operating system keys per app derives from it — see "One identity, several surfaces" below. |
+| `project_name` | string | Machine-friendly slug for the project. |
+| `app_version` | string | The app's own release version. Must be canonical semver — see "`app_version` is semver, and it is load-bearing" below. |
+
+An app that declares none of these has no identity, and every downstream
+decision — where its data lives, which keyring namespace is its own, what the
+window manager thinks it is, whether a given source is an install or an update —
+hangs off one of them. All four are refused if missing or empty.
+
+`project_name` is the odd one out and it is worth being explicit: on the hub it
+is **not** an identity key. The handle you type on the command line is assigned
+by the hub at install time and recorded in its registry; it is derived from the
+project but does not have to equal this field. `project_name` remains required
+because a project without a slug has nothing to derive from, not because
+anything downstream is keyed on it.
+
+At install time, `identifier` may not be exactly `hub`, `TFSApp`, or
+`applications`. Those values name, respectively, the hub's own root, the shared
+vendor directory, and the XDG desktop-entry directory; the hub refuses them
+rather than letting an app overlap its infrastructure. This is a rule about
+known **values**: unknown top-level keys still only warn and never refuse.
+
+The hub-local `id`, whether derived from `project_name` or supplied with
+`--as`, may not end in `.previous`. `update` deletes and recreates
+`apps/<id>.previous` as its rollback anchor, so an app installed under that
+suffix would be destroyed by another app's update.
+
+### Optional fields
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `app_port` | integer or null | Pins the app's loopback port instead of taking a fresh free one each launch. Absent (the default) is dynamic, and dynamic is the right answer unless something outside the app must know the port in advance. |
+| `icon_path` | string | Project-root-relative path to one square source PNG (1024×1024 RGBA recommended, ≥512 wanted) used as the app's launcher, switcher and window icon. Absent keeps a placeholder. |
+| `splash_path` | string | Project-root-relative path to one self-contained HTML file (inline CSS and JS only, no external assets) shown while the app cold-starts, served read-only over a scheme scoped to the app's own snapshot. Missing or unreadable falls back to the host's own cold-start page — see §8. |
+| `splash_bg` / `splash_text` | string, `#rgb` or `#rrggbb` | Recolour the cold-start page's background and text without authoring one. Either or both; an unset one keeps the default. |
+| `commands` | object | Lifecycle commands the hub runs around an install or an update — §6. |
+| `run` | object | Named `bin/console` aliases a user can run directly. |
+| `actions` | object | Which native capabilities the app's own code may reach, and over which transport — §7. `actions.picker` is IPC-only: `{ "ipc": true }`. |
+| `workers` | array of objects | Declares one or more background consumers, each an ordered list of Messenger transports plus an optional copy count — see "Declaring off-window work" below. |
+| `async_worker` | boolean | Sugar for a single worker consuming `async`; refused together with `workers` — see "Declaring off-window work" below. |
+
+A minimal manifest is four lines:
+
+```json
+{
+  "product_name": "LabelBoard",
+  "identifier": "dev.local.labelboard",
+  "project_name": "labelboard",
+  "app_version": "1.4.0"
+}
+```
+
+### One identity, several surfaces
+
+Several things the operating system shows the user are fed from this file, and
+each surface is fed by exactly **one** field. Stating which is not pedantry: a
+name that reaches two surfaces through two different routes is a name that
+eventually differs between them, and a user meets that as "the window says one
+thing and the dock says another".
+
+| Surface | Fed by |
+| --- | --- |
+| Window title | `product_name` |
+| Desktop entry `Name=` | `product_name` |
+| Window class (`WM_CLASS`), GTK application id, D-Bus name, single-instance key | `identifier` |
+| Data directory, keyring namespace, cookie store | `identifier` |
+| The handle you type on the command line | assigned at install, recorded in the hub's registry |
+
+Every surface fed by `identifier` reads `dev.<identifier>` instead, for a dev
+session — see §9.
+
+**An installed app has a desktop entry, and this is the normal case.**
+Installing writes `Name=` from `product_name` and `Icon=` from `icon_path` at
+full size — the same fields and the same one-field-per-surface rule as the
+table above — to a per-user location with no root required. The user may
+decline it at install (`--no-desktop-entry`), and `remove` reverses it. An app
+must not ship a `.desktop` file of its own: the hub writes and owns the one
+that names it.
+
+One consequence surprises people the first time and is not a defect, and it is
+now the *exception's* behaviour rather than the rule's: without a desktop
+entry — a dev session (§9), or an install that declined one — a desktop
+environment has no `Name=` to read and falls back to a label derived from the
+window class, which is the identifier. So a window with no entry behind it can
+appear in the switcher as `dev.local.labelboard` rather than as *LabelBoard*.
+The fix is the desktop entry, never the window class: the class has to be the
+identifier or nothing can match a window to its own app.
+
+### `app_version` is semver, and it is load-bearing
+
+`app_version` must be canonical `MAJOR.MINOR.PATCH` — no leading zeros, no
+suffix, no `v`. This is not a stylistic preference. It is the value the hub
+compares to decide whether putting a given source on this machine is an
+install, an update, or a downgrade to refuse, and a value that cannot be
+compared makes that decision unanswerable.
+
+The hub **refuses at the transitions**: installing or updating an app whose
+`app_version` is not canonical semver fails, naming the file, the value, and
+what the value is for. `tfsapp-hub publish` enforces the same rule on the
+author's own machine, before anything is built or uploaded — the station's
+`build/scripts/release.sh` used to be where this was checked; `publish` is
+where it is checked now. It does **not** re-check when opening an app that is
+already installed — an app that passed the gate on its way in should not become
+unopenable later, and re-refusing it would make the hub reject something it
+itself accepted. A dev session never installs, so neither check ever runs
+against one — see §9.
+
+Bump it when the app changes in a way that its data has to follow. The hub runs
+the update lifecycle (§6) on the strength of this field alone; a source whose
+code moved but whose version did not is, as far as the contract is concerned,
+the same version of the app.
+
+### Declaring off-window work
+
+`workers` declares one or more background consumers, each an ordered,
+non-empty list of Messenger transport names plus an optional `count` (a
+number of identical copies, default `1`, capped at `4`). Declaring at least
+one worker gets the app real Messenger transports it can dispatch to; declaring
+none gets `sync://`, where handlers run inline. Either way the app's own code
+is the same code, which is the point.
+
+```json
+{
+  "workers": [
+    { "transports": ["courant", "planifie", "fond"] },
+    { "transports": ["urgent"] }
+  ]
+}
+```
+
+**A transport list's order is its priority, and there is no separate priority
+key.** `messenger:consume a b c` is Symfony's own mechanism — a worker
+rescans from the first transport after handling a single envelope — so a long
+queued run never starves short interactive work on the same consumer. An app
+that wants several transports to interleave in a given order declares them in
+that order on one worker; several *workers* are for latency, letting one
+transport's handlers run while another's are busy, never for throughput on one
+transport and never for routing — the manifest declares transports and their
+order, the app's own `framework.messenger.routing` decides what lands where.
+
+`count` is copies of one declaration, default `1`. `DATABASE_URL` is always
+SQLite, which serializes writers regardless, so extra copies pay off only for
+handlers that spend time outside SQLite. A `count` above `4` falls back to
+`4`, and a declaration naming a `scheduler_*` transport falls back to `count:
+1` regardless of what was asked — a Scheduler transport consumed twice fires
+every task twice — both with a printed reason, per the standing
+fall-back-and-say-so rule. Naming the same transport twice, within one
+declaration or across several, is refused rather than falling back: two
+consumers on one transport is what `count` spells.
+
+`async_worker: true` is kept as sugar for exactly one declaration consuming
+`async`, with the DSN it always had — see §3 — so an already-installed app
+migrates to `workers` at its own pace rather than under it. A manifest
+spelling both keys is refused: two spellings of one thing, where guessing
+which wins is worse than asking the author to pick one.
+
+Two things about this declaration are deliberate and will not change even as
+its shape does.
+
+**Declaration is not consent.** The manifest says *this app has off-window
+work*. Whether that work is allowed to continue once the window is closed — a
+process living on someone's machine after they have closed the application — is
+the user's decision and is asked for outside the manifest. A manifest never
+grants itself a permanent process. Today nothing outlives the window, so the
+question does not yet arise; when it does, it arrives as a consent step and not
+as a manifest key.
+
+**The app is told what is actually running, not what it asked for.** §3 injects
+the effective worker state, and the question it answers is the one a user
+message needs — *does my scheduled work continue once I close the window?* — not
+"is something consuming right now". An app whose 8 a.m. task will not fire
+because the window will be closed is entitled to say so, and can only say it if
+the environment tells the truth about the machine rather than echoing the
+manifest back.
+
+The list above is plan 045's landed replacement for a boolean that hardcoded
+one transport, an app using Symfony Scheduler having always needed
+`scheduler_<name>` and often several transports at once. `async_worker`
+remains, unchanged in meaning, as the one-line spelling for the common case.
+The two paragraphs above are the ones a future change to this shape may not
+touch.
+
+### `run`
+
+Named `bin/console` aliases a user runs directly and interactively —
+`tfsapp-hub run <id> <alias> [args...]` — as opposed to `commands`' four
+launch-time hooks (§6), which the host runs unattended around an install or
+an update:
+
+```json
+{
+  "run": {
+    "mcp-serve": { "command": "app:run:mcp-serve", "concurrent": true },
+    "cleanup":   { "command": "app:run:cleanup" }
+  }
+}
+```
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `command` | string, required | A `bin/console` argument string, split on whitespace and passed as `argv` directly — same no-shell-interpretation rule as `commands` (§6). |
+| `concurrent` | boolean, optional | Default `false`. Whether this alias tolerates siblings — other instances of itself, other active `run` commands, an already-open window — in any arrival order, rather than requiring to run alone. See "Running a declared command" (§6) for the full gating, and `.project/decision/005-concurrency-belongs-to-the-alias.md` for why. |
+
+Each top-level key is the alias name a user types. `tfsapp-hub run <id>` with
+no alias lists them back, naming each one's command and whether it is
+`concurrent`. Running one is covered in §6.
+
+### Keys this contract does not define
+
+Unknown top-level keys are warned about and ignored (see "Standing rules"). One
+key escapes that warning without being part of this contract: `releases_repo`,
+which named the forge repository an app's release lived on for the archived
+per-app packaging route, and may still sit in manifests written against it.
+The hub accepts it silently and does nothing with it — deliberately, not for
+lack of a use: `tfsapp-hub update <id>` resolves what its own registry
+recorded at install time, never a location read out of the source it is about
+to replace. A manifest that could redirect its own future updates would let
+one good release permanently steer every machine that ever installed it. Only
+what the hub itself wrote may steer a fetch; an app asks about its own updates
+through §7, and how an update is *applied* belongs to the host.
+
+`tfsapp-hub publish` reads nothing more out of it than `update` does: the
+repository a release lands on comes from `--repo` or from the project's own
+git remote, never from the manifest, so a stale `releases_repo` — naming a
+downloads repository this route retired — cannot steer a publish either. The
+key is accepted and read by nothing, on every path alike; an author who finds
+one in an old manifest can take it as inert, not as a setting to update.
+

@@ -207,6 +207,6 @@ real fix is sandboxing the processes, which is a change of distribution format
 and is not on the roadmap.
 
 Read per-`identifier` storage as tidiness, not as secrecy.
-[`CONTRACT.md` §5](CONTRACT.md) states the full guarantee, including the one
+[`CONTRACT.md` §5](contract/5-the-apps-own-state.md) states the full guarantee, including the one
 thing the hub *is* strict about: a webview reaches its secret store through the
 window it belongs to and can never name another app's.
