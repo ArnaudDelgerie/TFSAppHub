@@ -134,9 +134,10 @@ it will not reappear.)
 ### `picker`
 
 Shows one native chooser owned by the calling app window. It is for selecting a
-directory, or for retaining the local path an integration itself understands;
-it is not the normal way to upload a file. For an upload, prefer the browser's
-`<input type="file">`: it provides a `File` object and owns the upload flow.
+directory, retaining the local path an integration itself understands, or
+letting a person choose where a file the app is about to write should go. It is
+not the normal way to upload a file: for an upload, prefer the browser's
+`<input type="file">`, which provides a `File` object and owns the upload flow.
 
 `picker` has one transport and one exact manifest shape:
 
@@ -150,20 +151,51 @@ page on the splash origin cannot open a chooser. A manifest that names
 `actions.picker.bridge` is invalid and says that this group has no bridge
 transport.
 
-The webview calls Tauri's raw IPC as either
-`invoke("pick_path", { kind: "file" })` or
+**`pick_path`** — "which existing file or directory?" The webview calls
+Tauri's raw IPC as either `invoke("pick_path", { kind: "file" })` or
 `invoke("pick_path", { kind: "directory" })`. `kind` is required; any other
 value is invalid input and returns an IPC error. A selection resolves to its
 absolute path as a string, and cancellation resolves successfully to `null`.
 
+**`save_path`** — "where should this new file go?" The webview calls
+`invoke("save_path", { filters, fileName, directory })`, all three arguments
+optional:
+
+```js
+invoke("save_path", {
+  filters:   [{ name: "Markdown", extensions: ["md"] }, { name: "Text", extensions: ["txt"] }],
+  fileName:  "notes.md",
+  directory: "/home/…/Documents"
+})
+```
+
+`filters` opens the dialog with one filter per entry, in the order given, the
+first one active; each `extensions` entry is written without a leading dot.
+`fileName` pre-fills the suggested name. `directory` sets the starting
+directory and must be an absolute path — a relative one is invalid input and
+returns an IPC error, like any other invalid input in this group.
+`invoke("save_path", {})` opens a bare dialog. The result shape is exactly
+`pick_path`'s: the chosen absolute path as a string, or `null` on
+cancellation, including GTK's own "replace?" confirmation when the typed name
+already exists.
+
+The hub never writes. The path `save_path` returns may name a file that does
+not exist yet — the app's own PHP creates it, no filesystem scope is granted,
+and the hub cannot tell whether a path handed to a route came from this
+dialog, so that route writing to it is the app's responsibility like any
+other route. The path is also returned exactly as typed: the filter list is a
+view filter, not an enforced extension, and the hub does not append one — an
+app that appends an extension itself is writing to a name GTK's own dialog
+never asked "replace?" about.
+
 The dialog is the person's consent to that one selection. It does **not** grant
-the app filesystem scope, read the selected file or directory, copy it, upload
-it, retain an OS file descriptor, or persist anything. A returned path remains
-privacy-relevant information: an app that sends it to its PHP backend or saves
-it is responsible for that choice. Treat a saved path as machine-local
-configuration, never as exportable application state or a promise that it will
-survive another computer, an OS migration, a missing mount, or a permission
-change.
+the app filesystem scope, read or write the selected file or directory, copy
+it, upload it, retain an OS file descriptor, or persist anything. A returned
+path remains privacy-relevant information: an app that sends it to its PHP
+backend or saves it is responsible for that choice. Treat a saved path as
+machine-local configuration, never as exportable application state or a
+promise that it will survive another computer, an OS migration, a missing
+mount, or a permission change.
 
 ### The bridge wire contract
 
