@@ -36,3 +36,28 @@ dynamic linker is left to fall through to the session's own copy instead.
 Every repair is verified against the repacked artifact, not assumed from the
 input to the repack.
 
+### Text rendering
+
+Every WebView this process creates renders text with greyscale antialiasing
+rather than subpixel, via `gtk-xft-rgba = none` set on GTK's settings object in
+`.setup()`, before any window exists — the whole app, GTK chrome included, and
+no stylesheet interacts with it. WebKitGTK renders text with subpixel
+antialiasing only on the root layer; an `overflow-y: auto` column that
+overflows gets promoted to a non-root composited layer, where rendering falls
+back to greyscale, and Skia's mask-gamma preblend — designed to correct per
+channel against an LCD mask — lands "in the nearest gray instead of the
+nearest colour" against a greyscale mask, so dark text visibly fattens the
+moment a column overflows. Measured on one machine (TFSAppWorkstation's plan
+058, the station this repo inherited the setting from): **+16.1%** ink per
+text pixel between a column below the fold and the same column scrolled,
+down to **+0.2%** (noise) once the whole app renders greyscale uniformly.
+
+This is deliberately not configurable — no key exists in `CONTRACT.md`, and
+none is planned. The cost is real, not zero: subpixel antialiasing is a
+genuine horizontal-resolution gain around 96 dpi, and this removes it from
+every app, including ones that never showed the defect. On HiDPI it is a
+non-event. The ecosystem took the same direction anyway — GTK4 dropped
+subpixel text rendering outright, and macOS has shipped greyscale-only since
+Mojave — so this trades a resolution gain few displays still cash in for a
+rendering mode that no longer silently switches mid-screen.
+

@@ -27,7 +27,7 @@ use std::{
 
 use tauri::{
     http::{header, Response, StatusCode},
-    webview::NewWindowResponse,
+    webview::{DownloadEvent, NewWindowResponse},
     Url, WebviewUrl, WebviewWindowBuilder,
 };
 
@@ -133,6 +133,15 @@ pub fn classify_navigation(app_origin: Option<&Url>, target: &Url) -> Navigation
 /// on an `<input type="file">`, and JavaScript cannot repair that. The hub
 /// registers no drag-drop handler and exposes none, so the interception would
 /// buy nothing and break uploads.
+///
+/// The download handler accepts whatever destination wry already computed
+/// (the OS download directory, de-duplicated against an existing file of the
+/// same name) rather than prompting: `DownloadEvent::Requested` runs
+/// synchronously on the GTK main thread, and `tauri-plugin-dialog`'s save-file
+/// dialog — blocking or not — round-trips through `run_on_main_thread` before
+/// answering, which never returns while that same thread is the one waiting
+/// on it. Both events still get one `hub.log` line each, so a launch's log
+/// shows a download was seen and where it landed.
 fn with_window_policy<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
     builder: WebviewWindowBuilder<'a, R, M>,
     app_origin: AppOriginSlot,
@@ -140,6 +149,31 @@ fn with_window_policy<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
     let new_window_origin = app_origin.clone();
     builder
         .disable_drag_drop_handler()
+        .on_download(|_webview, event| {
+            match event {
+                DownloadEvent::Requested { url, destination } => {
+                    println!(
+                        "tfsapp-hub: download requested: {url} -> {}",
+                        destination.display()
+                    );
+                }
+                DownloadEvent::Finished {
+                    url,
+                    path: Some(path),
+                    success,
+                } => {
+                    println!(
+                        "tfsapp-hub: download finished (success: {success}): {url} -> {}",
+                        path.display()
+                    );
+                }
+                DownloadEvent::Finished { url, path: None, success } => {
+                    println!("tfsapp-hub: download finished (success: {success}, no path recorded): {url}");
+                }
+                _ => {}
+            }
+            true
+        })
         .on_navigation(
             move |target| match classify_navigation(app_origin.get(), target) {
                 NavigationTarget::Internal => true,
