@@ -168,15 +168,23 @@ impl std::fmt::Display for ImportRefusal {
     }
 }
 
-/// Whether `data_subdir` already holds a database — the one criterion
-/// [`import_decision`] and `import` itself act on.
+/// Whether `data_dir` already holds something `import` would silently
+/// replace — the one criterion [`import_decision`] and `import` itself act
+/// on. True when `data/app.db` exists, or when `uploads/` holds anything at
+/// all — a durable file is exactly as much the user's data as the database
+/// that indexes it (decision 006).
 ///
-/// `app.db` existing, specifically: not "the directory exists" (`install`
-/// creates it empty before anything else runs) and not "`config.json`
-/// exists" (same), so a reinstall-then-import sequence is never spuriously
-/// refused.
-pub fn data_dir_populated(data_subdir: &Path) -> bool {
-    data_subdir.join("app.db").is_file()
+/// Not "the directories exist" (`install` creates both empty before anything
+/// else runs) and not "`config.json` exists" (same), so a reinstall-then-
+/// import sequence is never spuriously refused.
+pub fn data_dir_populated(data_dir: &Path) -> bool {
+    if data_dir.join(DATA_DIR).join("app.db").is_file() {
+        return true;
+    }
+    match fs::read_dir(data_dir.join(UPLOADS_DIR)) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => false,
+    }
 }
 
 /// `tfsapp-hub export <id> <path>` — resolve `Paths`, run the pipeline, and
@@ -566,7 +574,7 @@ fn run_import(
 
     let installed_version = semver::Version::parse(&entry.app_version)
         .expect("the registry only ever holds a canonical semver app_version");
-    let populated = data_dir_populated(&data_subdir);
+    let populated = data_dir_populated(&data_dir);
     import_decision(
         &manifest,
         &entry.identifier,
@@ -579,7 +587,7 @@ fn run_import(
     if populated {
         announce_overwrite(
             id,
-            &data_subdir,
+            &data_dir,
             &entry.app_version,
             &archive_version.to_string(),
         );
@@ -598,7 +606,18 @@ fn run_import(
         import_incomplete(
             &data_subdir,
             rescue_path.as_deref(),
+            None,
             "the previous database was rescued but could not be fully moved aside",
+            error,
+        )
+    })?;
+    let uploads_rescue_path = rescue_uploads(&data_dir).map_err(|error| {
+        import_incomplete(
+            &data_subdir,
+            rescue_path.as_deref(),
+            None,
+            "the previous database was rescued and removed but its uploads/ directory could \
+             not be rescued aside",
             error,
         )
     })?;
@@ -608,6 +627,7 @@ fn run_import(
         import_incomplete(
             &data_subdir,
             rescue_path.as_deref(),
+            uploads_rescue_path.as_deref(),
             "the previous database was rescued but the import could not start",
             error,
         )
@@ -618,10 +638,22 @@ fn run_import(
         import_incomplete(
             &data_subdir,
             rescue_path.as_deref(),
+            uploads_rescue_path.as_deref(),
             "the data directory may be partially extracted",
             error,
         )
     })?;
+    archive::extract_prefix(archive_path, UPLOADS_DIR, &data_dir.join(UPLOADS_DIR)).map_err(
+        |error| {
+            import_incomplete(
+                &data_subdir,
+                rescue_path.as_deref(),
+                uploads_rescue_path.as_deref(),
+                "the database was extracted but uploads/ may be partially extracted",
+                error,
+            )
+        },
+    )?;
 
     // Stamp the archive's version before any forward migration. If a hook
     // fails now, `open` reads this older record as the same unfinished update
@@ -631,6 +663,7 @@ fn run_import(
         import_incomplete(
             &data_subdir,
             rescue_path.as_deref(),
+            uploads_rescue_path.as_deref(),
             "the database was extracted but its version record could not be written",
             error,
         )
@@ -656,6 +689,7 @@ fn run_import(
                 import_incomplete(
                     &data_subdir,
                     rescue_path.as_deref(),
+                    uploads_rescue_path.as_deref(),
                     "the database was extracted but not migrated forward",
                     error,
                 )
@@ -665,6 +699,7 @@ fn run_import(
             import_incomplete(
                 &data_subdir,
                 rescue_path.as_deref(),
+                uploads_rescue_path.as_deref(),
                 "the database was extracted but not migrated forward",
                 error,
             )
@@ -681,6 +716,7 @@ fn run_import(
             import_incomplete(
                 &data_subdir,
                 rescue_path.as_deref(),
+                uploads_rescue_path.as_deref(),
                 "the database was extracted but not migrated forward",
                 error,
             )
@@ -696,6 +732,12 @@ fn run_import(
         println!(
             "The database being replaced was saved to {}.",
             rescue_path.display()
+        );
+    }
+    if let Some(uploads_rescue_path) = uploads_rescue_path {
+        println!(
+            "The uploads/ directory being replaced was saved to {}.",
+            uploads_rescue_path.display()
         );
     }
     if migrated_forward {
@@ -755,19 +797,18 @@ fn read_manifest(archive_path: &Path) -> Result<Manifest, PortabilityError> {
 /// Say what overwriting is about to cost, in the terms the user will have to
 /// reason about afterwards — `rollback.rs`'s own `announce` for this
 /// command's shape of "and if I got this wrong?".
-fn announce_overwrite(
-    id: &str,
-    data_subdir: &Path,
-    installed_version: &str,
-    archive_version: &str,
-) {
+fn announce_overwrite(id: &str, data_dir: &Path, installed_version: &str, archive_version: &str) {
     println!(
         "Import into {id}: {installed_version} data -> replaced by the archive's {archive_version}"
     );
     println!(
         "  its current database will be replaced — the database being replaced will be saved \
          to {}",
-        lifecycle::rescue_dump_pattern(data_subdir, "app.db").display()
+        lifecycle::rescue_dump_pattern(&data_dir.join(DATA_DIR), "app.db").display()
+    );
+    println!(
+        "  its uploads/ directory, if not empty, will be replaced too — it will be saved to {}",
+        lifecycle::rescue_dump_pattern(data_dir, UPLOADS_DIR).display()
     );
     println!(
         "  its rollback anchor, if any, will be discarded — a rollback after this import would \
@@ -803,6 +844,38 @@ fn rescue_dump(data_subdir: &Path) -> Result<Option<PathBuf>, PortabilityError> 
     Ok(app_db_rescue)
 }
 
+/// Rename an existing, non-empty `uploads/` aside to
+/// `uploads.rescue-<YYYYMMDDTHHMMSSZ>`, following the same naming and
+/// collision rule `app.db.rescue-*` uses (plan 027). A rename, not a copy —
+/// unlike [`rescue_dump`], nothing afterwards needs the source gone on its
+/// own account, but a directory of uploads can be gigabytes and copying it
+/// would make every forced import pay for a case nobody asked for (the
+/// plan's Overview). `None` when there was nothing to rescue: an absent or
+/// empty `uploads/` needs no rescue, and extraction alone seeds it.
+fn rescue_uploads(data_dir: &Path) -> Result<Option<PathBuf>, PortabilityError> {
+    let uploads_dir = data_dir.join(UPLOADS_DIR);
+    let non_empty = match fs::read_dir(&uploads_dir) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(source) => {
+            return Err(PortabilityError::Io {
+                path: uploads_dir,
+                source,
+            })
+        }
+    };
+    if !non_empty {
+        return Ok(None);
+    }
+    let rescue = lifecycle::move_rescue_dump_dir(data_dir, UPLOADS_DIR).map_err(|error| {
+        PortabilityError::Io {
+            path: error.path,
+            source: error.source,
+        }
+    })?;
+    Ok(Some(rescue))
+}
+
 /// Remove the live database set after [`rescue_dump`] has copied it aside and
 /// before an archive writes its replacement. Extraction only creates files it
 /// carries, so leaving an old WAL or SHM beside an archive that has only the
@@ -821,13 +894,15 @@ fn remove_live_db_files(data_subdir: &Path) -> Result<(), PortabilityError> {
 
 fn import_incomplete(
     data_subdir: &Path,
-    rescue_path: Option<&Path>,
+    db_rescue_path: Option<&Path>,
+    uploads_rescue_path: Option<&Path>,
     data_state: &'static str,
     source: impl std::fmt::Display,
 ) -> PortabilityError {
     PortabilityError::ImportIncomplete {
         data_subdir: data_subdir.to_path_buf(),
-        rescue_path: rescue_path.map(Path::to_path_buf),
+        db_rescue_path: db_rescue_path.map(Path::to_path_buf),
+        uploads_rescue_path: uploads_rescue_path.map(Path::to_path_buf),
         data_state,
         detail: source.to_string(),
     }
@@ -891,10 +966,12 @@ pub enum PortabilityError {
     Refused(ImportRefusal),
     /// An import failed after its rescue dump was safely taken. The ordinary
     /// error alone is not enough: the caller also needs to know the state now
-    /// left on disk and where the data it replaced can be recovered.
+    /// left on disk and where the data it replaced can be recovered — both
+    /// halves of it, the database and (since plan 049) `uploads/`.
     ImportIncomplete {
         data_subdir: PathBuf,
-        rescue_path: Option<PathBuf>,
+        db_rescue_path: Option<PathBuf>,
+        uploads_rescue_path: Option<PathBuf>,
         data_state: &'static str,
         detail: String,
     },
@@ -975,7 +1052,8 @@ impl fmt::Display for PortabilityError {
             Self::Refused(refusal) => write!(formatter, "{refusal}"),
             Self::ImportIncomplete {
                 data_subdir,
-                rescue_path,
+                db_rescue_path,
+                uploads_rescue_path,
                 data_state,
                 detail,
             } => {
@@ -984,13 +1062,24 @@ impl fmt::Display for PortabilityError {
                     "import did not finish: {detail}. {data_state} in {}",
                     data_subdir.display()
                 )?;
-                match rescue_path {
+                match db_rescue_path {
                     Some(path) => write!(
                         formatter,
                         "; the database it replaced was saved to {}",
                         path.display()
+                    )?,
+                    None => write!(formatter, "; no existing database needed a rescue dump")?,
+                }
+                match uploads_rescue_path {
+                    Some(path) => write!(
+                        formatter,
+                        "; the uploads/ directory it replaced was saved to {}",
+                        path.display()
                     ),
-                    None => write!(formatter, "; no existing database needed a rescue dump"),
+                    None => write!(
+                        formatter,
+                        "; no existing uploads/ directory needed a rescue"
+                    ),
                 }
             }
         }
