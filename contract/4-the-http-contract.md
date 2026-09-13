@@ -16,6 +16,19 @@ the cause named.
 An app that never answers is an app that never opens. Keep the route cheap and
 free of any session requirement — it is a liveness probe, not a diagnostic.
 
+### The host serves the app's document root, and nothing of its own
+
+The web server's document root is `APP_PUBLIC_DIR` (§3), and that is the whole
+of what the host puts on the wire. There is no second mount, no reserved path
+prefix, no static serving of `APP_UPLOAD_DIR` or anything else outside
+`public/` — reading a durable file back is a route the app writes, behind the
+app's own authorization, exactly like any other route. `Content-Disposition:
+attachment` is the default worth reaching for on that route: `default-src
+'self'` above permits everything the app serves, so an uploaded file handed
+back inline is same-origin content with the same reach as the app's own
+scripts. See `.project/decision/006-durable-files-live-in-the-data-directory.md`
+for why this was decided rather than defaulted.
+
 ### Response headers the app is given, and can override
 
 Every response carries these unless the app sets them itself:

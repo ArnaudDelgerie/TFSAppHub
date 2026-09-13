@@ -23,8 +23,18 @@ to race. `VACUUM INTO` was not on the table either way — the hub links no
 SQLite library — but even with one, it would buy consistency the guard
 already provides for free.
 
+**`uploads/` travels beside the database, under the same guard (plan 049 /
+decision 006).** `export` walks `<data>/uploads/` recursively, sorted at every
+level, and appends every regular file it finds under the archive's own
+`uploads/` prefix with the same fixed-header `append_bytes` the database
+uses — so two exports of identical content produce byte-identical archives. A
+symlink, socket or fifo is skipped and named on stderr rather than followed or
+embedded; an absent `uploads/` is the ordinary case for an app that has never
+written a file, not a skip and not an error.
+
 **`--force` draws the same line `017` already drew for `update`.** It unlocks
-exactly one refusal — a populated data directory — and none of the other
+exactly one refusal — a populated data directory, now read from either the
+database or `uploads/` holding anything at all — and none of the other
 three: not a foreign `identifier` (nothing to override), not an archive newer
 than the installed app (writing a future version into `data/config.json`
 would leave the next launch on `LifecycleDecisionError::Downgrade`, which has
@@ -41,6 +51,19 @@ unreserved `app.db.rescue-<timestamp>[-N]` pattern, while outcomes name the
 actual committed path. Once the copies are safe, import removes each live
 `DB_FILE_NAMES` file before extraction, so an archive lacking a WAL cannot
 inherit one from the database it replaces.
+
+**A non-empty `uploads/` is rescued the same way, by rename rather than by
+copy.** `lifecycle::move_rescue_dump_dir` follows the identical
+`uploads.rescue-<YYYYMMDDTHHMMSSZ>` naming and collision rule, its path
+printed beside `app.db.rescue-*`, but moves the directory aside instead of
+duplicating it: nothing downstream needs the source gone the way the
+database's own removal does, and copying a tree that can be gigabytes would
+make every forced import pay for a case nobody asked for. The archive's
+`uploads/` entries are then extracted into the fresh directory with a second
+`archive::extract_prefix` call — an archive with none, every one written
+before this guarantee existed included, simply leaves it empty rather than
+merging. Every `import_incomplete` error from this point on names both rescue
+paths, not only the database's.
 
 **A forced import also discards the rollback anchor, both halves.** The
 anchor pairs `apps/<id>.previous` with the `.pre-update` snapshot; seeding
