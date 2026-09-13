@@ -29,6 +29,13 @@ back inline is same-origin content with the same reach as the app's own
 scripts. See `.project/decision/006-durable-files-live-in-the-data-directory.md`
 for why this was decided rather than defaulted.
 
+What the window does with such a response, today: the file is saved straight
+into the OS download directory, under the name the response gives it —
+de-duplicated if a file of that name is already there — with no Save-As
+prompt, and each download leaves a line in `hub.log`. This is provisional, not
+a guarantee: a prompt is wanted and not yet built, so an app must not rely on
+either the silent save or the destination.
+
 ### Response headers the app is given, and can override
 
 Every response carries these unless the app sets them itself:
