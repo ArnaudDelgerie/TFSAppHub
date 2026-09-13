@@ -476,6 +476,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             secrets::secret_list,
             update_check::update_check,
             picker::pick_path,
+            picker::save_path,
         ])
         .setup(move |app| {
             // Greyscale rather than subpixel text antialiasing, for every

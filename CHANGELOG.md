@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+An app declaring `actions.picker.ipc` can now open a native Save As dialog
+(`save_path`), with its own filters, suggested file name, starting directory
+and GTK's own overwrite confirmation, resolving to the path typed or to
+`null` on cancel — the hub never writes to it. And a plain
+`Content-Disposition: attachment` response saving into the OS download
+directory is no longer provisional: it is documented, definitive behaviour,
+with `save_path` as the way to offer a person a choice of destination
+instead.
+
 Opening an installed app is now measurably faster the second time, and every
 time after that: `cache/`/`build/` used to be emptied on every single launch,
 so each `open` compiled the Symfony container from scratch — now `install`
