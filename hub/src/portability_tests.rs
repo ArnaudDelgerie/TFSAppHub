@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use super::{
     append_bytes, data_dir_populated, export_temp_path, import_decision, run_export, run_import,
-    ImportRefusal, Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE,
+    write_archive, ImportRefusal, Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE, UPLOADS_DIR,
 };
 use crate::{
     install, lifecycle, lifecycle_gate,
@@ -104,29 +104,56 @@ fn a_matching_identifier_and_version_over_an_empty_dir_needs_no_force() {
 // --- data_dir_populated -----------------------------------------------------
 
 #[test]
-fn a_data_dir_with_no_database_is_not_populated() {
-    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+fn a_data_dir_with_no_database_and_no_uploads_is_not_populated() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
 
-    assert!(!data_dir_populated(data_subdir.path()));
+    assert!(!data_dir_populated(data_dir.path()));
 }
 
 #[test]
 fn a_data_dir_holding_app_db_is_populated() {
-    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
-    std::fs::write(data_subdir.path().join("app.db"), b"sqlite").expect("a fake app.db");
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    fs::create_dir_all(data_dir.path().join(DATA_DIR)).expect("a data subdir");
+    fs::write(data_dir.path().join(DATA_DIR).join("app.db"), b"sqlite").expect("a fake app.db");
 
-    assert!(data_dir_populated(data_subdir.path()));
+    assert!(data_dir_populated(data_dir.path()));
+}
+
+#[test]
+fn a_data_dir_holding_only_an_upload_is_populated() {
+    // decision 006: a durable file is exactly as much the user's data as the
+    // database that indexes it — an app with uploads and no database yet
+    // must still be refused without --force.
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    fs::create_dir_all(data_dir.path().join(UPLOADS_DIR)).expect("an uploads dir");
+    fs::write(
+        data_dir.path().join(UPLOADS_DIR).join("avatar.png"),
+        b"an upload with no database behind it yet",
+    )
+    .expect("a fake upload");
+
+    assert!(data_dir_populated(data_dir.path()));
+}
+
+#[test]
+fn an_empty_uploads_directory_is_not_populated() {
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    fs::create_dir_all(data_dir.path().join(UPLOADS_DIR)).expect("an empty uploads dir");
+
+    assert!(!data_dir_populated(data_dir.path()));
 }
 
 #[test]
 fn an_empty_directory_left_by_a_fresh_install_is_not_populated() {
-    // `install` creates the data dir, empty, before anything else runs — a
-    // reinstall-then-import must not be refused just because the directory
-    // itself exists.
-    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
-    std::fs::write(data_subdir.path().join("config.json"), "{}").expect("a bare config.json");
+    // `install` creates both the data dir and `uploads/`, empty, before
+    // anything else runs — a reinstall-then-import must not be refused just
+    // because the directories themselves exist.
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    fs::create_dir_all(data_dir.path().join(DATA_DIR)).expect("a data subdir");
+    fs::write(data_dir.path().join(DATA_DIR).join("config.json"), "{}")
+        .expect("a bare config.json");
 
-    assert!(!data_dir_populated(data_subdir.path()));
+    assert!(!data_dir_populated(data_dir.path()));
 }
 
 // --- Manifest: round trip, and an unknown key surviving it -----------------
@@ -384,6 +411,89 @@ fn a_manifest_written_by_export_names_the_registry_entry_not_the_hub() {
 
     assert_eq!(manifest.identifier, "dev.local.demo");
     assert_eq!(manifest.app_version, "1.2.3");
+}
+
+// --- run_export carries uploads/ (plan 049 / decision 006) -----------------
+
+#[test]
+fn a_nested_upload_tree_round_trips_into_the_archive_with_its_structure_intact() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let uploads_dir = base.path().join("TFSApp/dev.local.demo/uploads");
+    fs::create_dir_all(uploads_dir.join("invoices")).expect("a nested uploads dir");
+    fs::write(uploads_dir.join("avatar.png"), b"top-level file").expect("a top-level upload");
+    fs::write(uploads_dir.join("invoices/2026-01.pdf"), b"nested file").expect("a nested upload");
+    let target = base.path().join("backup.tar.gz");
+
+    run_export(&paths, "demo", &target).expect("a nested upload tree exports cleanly");
+
+    let mut entries = archive_entries(&target);
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![
+            MANIFEST_FILE.to_string(),
+            format!("{UPLOADS_DIR}/avatar.png"),
+            format!("{UPLOADS_DIR}/invoices/2026-01.pdf"),
+        ]
+    );
+}
+
+#[test]
+fn an_absent_uploads_directory_exports_cleanly() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let target = base.path().join("backup.tar.gz");
+
+    run_export(&paths, "demo", &target).expect("no uploads/ at all is the ordinary case");
+
+    assert_eq!(archive_entries(&target), vec![MANIFEST_FILE.to_string()]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_symlink_under_uploads_is_skipped_rather_than_followed() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let uploads_dir = base.path().join("TFSApp/dev.local.demo/uploads");
+    fs::create_dir_all(&uploads_dir).expect("an uploads dir");
+    fs::write(uploads_dir.join("real.txt"), b"a real file").expect("a real upload");
+    std::os::unix::fs::symlink("/etc/hostname", uploads_dir.join("link.txt"))
+        .expect("a symlink planted under uploads");
+    let target = base.path().join("backup.tar.gz");
+
+    run_export(&paths, "demo", &target).expect("a symlink must not fail the export");
+
+    assert_eq!(
+        archive_entries(&target),
+        vec![MANIFEST_FILE.to_string(), format!("{UPLOADS_DIR}/real.txt")],
+        "the symlink travels in neither name nor content"
+    );
+}
+
+#[test]
+fn two_exports_of_the_same_upload_tree_are_byte_identical() {
+    let base = tempfile::tempdir().expect("a temp base");
+    let data_subdir = base.path().join("data");
+    let uploads_dir = base.path().join("uploads");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    fs::create_dir_all(uploads_dir.join("a")).expect("a nested uploads dir");
+    fs::write(uploads_dir.join("a/one.txt"), b"one").expect("a nested upload");
+    fs::write(uploads_dir.join("two.txt"), b"two").expect("a top-level upload");
+    let archive_manifest = manifest("dev.local.demo", "1.2.3");
+
+    let first = base.path().join("first.tar.gz");
+    write_archive(&first, &archive_manifest, &data_subdir, &uploads_dir)
+        .expect("the first export succeeds");
+    let second = base.path().join("second.tar.gz");
+    write_archive(&second, &archive_manifest, &data_subdir, &uploads_dir)
+        .expect("the second export succeeds");
+
+    assert_eq!(
+        fs::read(&first).expect("the first archive"),
+        fs::read(&second).expect("the second archive"),
+        "two exports of identical content must produce byte-identical archives"
+    );
 }
 
 #[test]
@@ -885,6 +995,141 @@ fn an_archive_with_a_traversal_entry_is_refused_by_archives_own_checks() {
         "{error}"
     );
     assert!(error.to_string().contains("partially extracted"), "{error}");
+}
+
+// --- import restores uploads/, rescuing what it replaces by rename
+// (plan 049 / decision 006) --------------------------------------------
+
+#[test]
+fn a_round_trip_through_export_then_import_restores_a_nested_upload_tree_exactly() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let uploads_dir = base.path().join("TFSApp/dev.local.demo/uploads");
+    fs::create_dir_all(uploads_dir.join("invoices")).expect("a nested uploads dir");
+    fs::write(uploads_dir.join("avatar.png"), b"avatar bytes").expect("a top-level upload");
+    fs::write(uploads_dir.join("invoices/2026-01.pdf"), b"invoice bytes").expect("a nested upload");
+    let archive = base.path().join("backup.tar.gz");
+    run_export(&paths, "demo", &archive).expect("export succeeds");
+    fs::remove_dir_all(&uploads_dir).expect("empty the data dir before reimporting");
+
+    run_import(&paths, "demo", &archive, false, true).expect("an empty data dir needs no force");
+
+    assert_eq!(
+        fs::read(uploads_dir.join("avatar.png")).expect("the top-level upload restored"),
+        b"avatar bytes"
+    );
+    assert_eq!(
+        fs::read(uploads_dir.join("invoices/2026-01.pdf")).expect("the nested upload restored"),
+        b"invoice bytes"
+    );
+}
+
+#[test]
+fn a_forced_import_over_a_populated_uploads_directory_rescues_it_by_rename_and_writes_the_new_tree()
+{
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let uploads_dir = data_dir.join(UPLOADS_DIR);
+    fs::create_dir_all(&uploads_dir).expect("an uploads dir");
+    fs::write(uploads_dir.join("old.txt"), b"old upload").expect("an existing upload");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{UPLOADS_DIR}/new.txt"), b"new upload"),
+        ],
+    );
+
+    let proceeded = run_import(&paths, "demo", &archive, true, true)
+        .expect("force unlocks a populated uploads/ directory");
+    assert!(proceeded);
+
+    assert_eq!(
+        fs::read(uploads_dir.join("new.txt")).expect("the archive's upload"),
+        b"new upload"
+    );
+    assert!(
+        !uploads_dir.join("old.txt").exists(),
+        "the old tree was moved aside, not merged with the archive's"
+    );
+    let rescue_dir = fs::read_dir(&data_dir)
+        .expect("the data directory")
+        .map(|entry| entry.expect("a directory entry").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("uploads.rescue-"))
+        })
+        .expect("the replaced uploads/ directory, rescue-renamed");
+    assert_eq!(
+        fs::read(rescue_dir.join("old.txt")).expect("the rescued upload"),
+        b"old upload"
+    );
+}
+
+#[test]
+fn an_archive_with_no_uploads_entries_empties_the_destination_and_rescues_the_old_one() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let uploads_dir = data_dir.join(UPLOADS_DIR);
+    fs::create_dir_all(&uploads_dir).expect("an uploads dir");
+    fs::write(uploads_dir.join("old.txt"), b"old upload").expect("an existing upload");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[(MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3"))],
+    );
+
+    let proceeded = run_import(&paths, "demo", &archive, true, true)
+        .expect("force unlocks a populated uploads/ directory even with nothing to replace it");
+    assert!(proceeded);
+
+    assert_eq!(
+        fs::read_dir(&uploads_dir)
+            .expect("uploads/ exists, empty")
+            .count(),
+        0,
+        "an archive carrying no uploads/ entries leaves the destination empty, not merged"
+    );
+    assert!(
+        fs::read_dir(&data_dir)
+            .expect("the data directory")
+            .any(|entry| entry
+                .expect("a directory entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with("uploads.rescue-")),
+        "the previous uploads/ tree must still be recoverable"
+    );
+}
+
+#[test]
+fn a_pre_049_archive_carrying_no_uploads_prefix_at_all_imports_without_error() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{DATA_DIR}/app.db"), b"seeded"),
+        ],
+    );
+
+    run_import(&paths, "demo", &archive, false, true)
+        .expect("an archive written before plan 049 carries no uploads/ prefix at all");
+
+    assert_eq!(
+        fs::read(data_dir.join("data/app.db")).expect("the seeded database"),
+        b"seeded"
+    );
+    assert!(
+        data_dir.join(UPLOADS_DIR).is_dir(),
+        "import still creates an empty uploads/ for a legacy archive"
+    );
 }
 
 // --- import migrates an older archive forward --------------------------

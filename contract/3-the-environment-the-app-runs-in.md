@@ -15,11 +15,12 @@ console command. An app cannot tell them apart, and that is deliberate.
 | `APP_SECRET` | a per-app secret, generated once and kept — §5 | Symfony |
 | `APP_PORT` | `app_port` if pinned, else a free loopback port for this launch | the web server |
 | `APP_ORIGIN` | `http://127.0.0.1:<APP_PORT>` | Symfony, the web server |
-| `APP_PUBLIC_DIR` | the app's `public/` — inside the installed snapshot, or inside the live project in dev (§9) | the web server's document root |
+| `APP_PUBLIC_DIR` | the app's `public/` — inside the installed snapshot, or inside the live project in dev (§9) | the web server's document root — replaced wholesale on update, rollback, or an install over an existing app; nothing durable survives here |
 | `APP_CACHE_DIR` | a writable cache directory — see the lifetime note below | Symfony |
 | `APP_BUILD_DIR` | a writable build directory — same lifetime note | Symfony |
 | `APP_LOG_DIR` | a writable log directory | Symfony |
 | `APP_SESSION_DIR` | a writable session directory, this app's own | Symfony |
+| `APP_UPLOAD_DIR` | a writable directory for the app's own durable files — see the note below | the app |
 | `DATABASE_URL` | `sqlite:///<app data>/data/app.db` | Doctrine, if the app uses it |
 | `MESSENGER_TRANSPORT_DSN` | `doctrine://default` when `workers` is declared, `doctrine://default?queue_name=async` when only the legacy `async_worker: true` is, `sync://` otherwise | Symfony Messenger |
 | `MERCURE_URL` | `<APP_ORIGIN>/.well-known/mercure` | Symfony, publishing |
@@ -67,6 +68,20 @@ cause. A dev session never wipes at all, so its container survives a relaunch
 instead of paying for a full rebuild on every reload (§9). That difference is
 a choice about safety and cost, not a property of this clause, and it is
 `ARCHITECTURE.md`'s to explain.)*
+
+### `APP_UPLOAD_DIR` is never emptied, at any launch, under any circumstance
+
+The counterpart to the clause above: `APP_UPLOAD_DIR` is the one directory in
+the data dir the app owns outright, and the host never invalidates it — not at
+an ordinary launch, not when the cache stamp above mismatches, not on an
+update or a rollback. A file an app writes there stays there until the app
+itself removes it.
+
+It is a sibling of `data/`, not a child of it (§5's layout), so nothing that
+touches the database — the rollback anchor, the rescue-dump machinery — reaches
+it either, with one accepted exception the rollback clause states on its own
+(§5). `export`/`import` carry it alongside the database (§5); `public/`'s row
+above is where a file put in the wrong place goes to be destroyed instead.
 
 ### The database is SQLite, and that is a constraint on the app
 

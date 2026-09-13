@@ -36,7 +36,9 @@ from removing the first update's `apps/<id>.previous` anchor.
    `apps/<id>.update-transaction`, copy the new tree in, empty the app's own
    cache/build directories
    (they are about to boot a container compiled from code that is no longer
-   there), run `install::prepare` under the update event (`pre-update` then
+   there) — `uploads/` is not a third: it is never emptied by an update, or by
+   anything else the host does (`CONTRACT.md` §3) — run `install::prepare`
+   under the update event (`pre-update` then
    `post-update`, then the same `cache:warmup`-and-stamp `install` itself
    runs — plan 024), then — only once every step above has succeeded — stamp
    the registry with the new one and rewrite the desktop entry. Only then is
@@ -71,6 +73,13 @@ The third half exists because the first two cannot answer what it does:
 `source_revision` is hashed over the *source*, while the retained tree was
 copied with `install`'s own excluded paths — recomputing it from the tree
 would produce a different string that means nothing.
+
+The anchor stays three halves, not four: `uploads/` is not snapshotted, so a
+rollback can restore a database that no longer agrees with what an update
+since left on disk there (decision 006). Copying a directory that can be
+gigabytes on every update, to protect against a version that reorganises its
+own files, was rejected as the wrong trade — that case is a `pre-update`
+command's to handle, not the anchor's.
 
 A rollback rescue-dumps the current database first, printing its timestamped
 `app.db.rescue-<YYYYMMDDTHHMMSSZ>` path (with a numeric suffix on a collision),

@@ -24,6 +24,13 @@
 //!
 //! Built once per invocation and handed to whatever needs it: the install-time
 //! lifecycle commands, and the sidecar (`sidecar::start`).
+//!
+//! One of the five directories this module creates is not like the other
+//! four: `uploads/` (`APP_UPLOAD_DIR`, decision 006) is never emptied by the
+//! host, at any launch, under any circumstance. `cache/` and `build/` are
+//! wiped on a cache-stamp mismatch and `log/`/`sessions/` are the app's own
+//! churn; `uploads/` is where a durable file goes precisely because nothing
+//! here ever clears it.
 
 use std::{
     fmt, fs, io,
@@ -164,7 +171,7 @@ fn worker_transports(manifest: &Manifest) -> String {
 /// caller's to have prepared — an installed app's `0700` tightening is
 /// `paths::create_app_data_dir`'s job, done before this is ever called, and a
 /// dev session's `var/` needs no such tightening at all. This function only
-/// ever creates what hangs *under* `state_root`: its five subdirectories.
+/// ever creates what hangs *under* `state_root`: its six subdirectories.
 ///
 /// **The launch-time cache wipe used to be unconditional; now it is a
 /// comparison (plan 024).** The station empties `cache/` and `build/` on every
@@ -227,6 +234,7 @@ where
     let build_dir = data_dir.join("build");
     let log_dir = data_dir.join("log");
     let sessions_dir = data_dir.join("sessions");
+    let uploads_dir = data_dir.join("uploads");
     if let Mode::Launch(expected) = &mode {
         let wipe_reason = match read_cache_stamp(&data_subdir, &cache_dir, expected) {
             CacheStatus::Matches => None,
@@ -238,7 +246,9 @@ where
             // Best-effort: a directory that cannot be removed is recreated below
             // and the launch carries on, rather than refusing to open the app
             // over a cache it could not clear. Dev never reaches this branch —
-            // see the doc comment above.
+            // see the doc comment above. These two calls name `cache` and
+            // `build` and will never grow a third: `uploads/` is never emptied
+            // by the host, at any launch, under any circumstance (decision 006).
             let _ = fs::remove_dir_all(&cache_dir);
             let _ = fs::remove_dir_all(&build_dir);
         }
@@ -249,6 +259,7 @@ where
         &build_dir,
         &log_dir,
         &sessions_dir,
+        &uploads_dir,
     ] {
         fs::create_dir_all(directory).map_err(|source| EnvError::Io {
             path: directory.clone(),
@@ -329,6 +340,7 @@ where
         ("APP_BUILD_DIR", path_to_string(&build_dir)),
         ("APP_LOG_DIR", path_to_string(&log_dir)),
         ("APP_SESSION_DIR", path_to_string(&sessions_dir)),
+        ("APP_UPLOAD_DIR", path_to_string(&uploads_dir)),
         (
             "DATABASE_URL",
             format!("sqlite:///{}", data_subdir.join("app.db").display()),

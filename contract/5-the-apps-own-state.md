@@ -13,6 +13,7 @@
   build/            APP_BUILD_DIR — same
   log/              APP_LOG_DIR — persists, rotated
   sessions/         APP_SESSION_DIR — persists
+  uploads/          APP_UPLOAD_DIR — the app's own durable files, never emptied (§3)
 ```
 
 `log/` is `APP_LOG_DIR`, and it is not the app's alone: the host writes its own
@@ -147,18 +148,34 @@ application on the same machine would be a breach.
 
 `tfsapp-hub export <id> <path>` and `tfsapp-hub import <id> <path>` carry one
 installed app's data to another machine, or to a fresh install on the same
-one. The guarantee is narrow and worth stating in exactly those terms: **the
-database travels, and nothing else in the data directory does.**
+one. The guarantee names exactly two things: **the database travels, and so
+does `uploads/`; nothing else in the data directory does.**
 
 `cache/`, `build/`, `log/`, `sessions/` do not travel — each is either
 machine-specific or gets regenerated on the destination's next launch anyway.
 Neither does `secrets.json`, the plaintext keyring fallback: it holds
 `APP_SECRET` and every `actions.secrets` value in the clear, and shipping it
 in a file people copy around would turn a convenience into a disclosure. An
-app must not treat anything outside its own database as portable state — a
-value stashed in `cache/` or read back from a file it wrote beside the
-database is not carried by an export, whatever survives a reinstall on the
-same machine.
+app must not treat anything outside its own database and `uploads/` as
+portable state — a value stashed in `cache/` or read back from a file it wrote
+beside the database is not carried by an export, whatever survives a
+reinstall on the same machine.
+
+`uploads/` travels the same way the database's raw bytes do: `export` walks it
+recursively and writes every regular file it finds under the archive's own
+`uploads/` prefix; a symlink, socket or fifo is skipped and named on stderr
+rather than followed or embedded. `import` replaces rather than merges — an
+archive carrying no `uploads/` entries at all, which is every archive written
+before this guarantee existed, simply leaves the destination's `uploads/`
+empty, its previous contents rescued aside exactly as below.
+
+**The rollback anchor stays asymmetric.** It snapshots `app.db` and nothing
+else, so rolling back to the previous version restores a database that may no
+longer agree with what is on disk in `uploads/` — a row pointing at a file a
+newer version renamed or removed, for instance. Snapshotting a directory that
+can be gigabytes on every update was rejected as the wrong trade; an app that
+reorganises its files across a version bump handles that itself, in a
+`pre-update` command.
 
 Two consequences an app author should know rather than discover. **The
 destination's `APP_SECRET` is never part of the transfer** — it keeps
@@ -191,12 +208,21 @@ consecutive forced imports never overwrite an earlier rescue. The live `app.db`,
 that carries only `app.db` cannot inherit a stale WAL from the data it
 replaced.
 
+**A non-empty `uploads/` is rescued too, by rename rather than by copy.** The
+same naming and collision rule applies — `uploads.rescue-<YYYYMMDDTHHMMSSZ>`,
+its path printed beside `app.db.rescue-*` — but the directory is moved aside
+instead of copied: nothing afterwards needs the source gone the way the
+database's own removal does, and a directory of uploads can be gigabytes,
+which a copy would make every forced import pay for regardless of whether
+anything is even wrong.
+
 After extraction, import immediately records the archive's version in
 `data/config.json` before any forward migration runs. If the import fails
-after the rescue point, its error retains the underlying reason and names both
-the data directory's resulting state (partially extracted, unmigrated, or
-otherwise unable to proceed) and the rescue path. In particular, a failed
-forward migration leaves the archive's older version on disk; the next `open`
+after the rescue point, its error retains the underlying reason and names the
+data directory's resulting state (partially extracted, unmigrated, or
+otherwise unable to proceed) together with both rescue paths — the database's
+and, when one was taken, `uploads/`'s. In particular, a failed forward
+migration leaves the archive's older version on disk; the next `open`
 recognises it as an unfinished update and refuses it rather than serving an
 unmigrated database.
 

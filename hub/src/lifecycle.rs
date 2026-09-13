@@ -464,6 +464,47 @@ fn copy_rescue_dump_at(source_path: &Path, base: &Path) -> Result<PathBuf, Rescu
     unreachable!("a u32 suffix range never ends")
 }
 
+/// Rename `data_dir`/`name` aside to `<name>.rescue-<timestamp>`, the same
+/// naming and collision-avoidance rule [`copy_rescue_dump`] uses — a rename
+/// rather than a copy, for a caller whose rescued thing is a directory (or
+/// otherwise too large to double), where `import`'s own reason to copy
+/// rather than move the database (`remove_live_db_files` unlinks it right
+/// after) does not apply (plan 049 / decision 006).
+///
+/// The exclusive check here is not atomic against a concurrent claimant the
+/// way [`copy_rescue_dump`]'s `create_new` is — `rename(2)` has no equivalent
+/// reservation for a target that must not already exist — but the caller
+/// holds the maintenance lease for the whole pipeline, so a to-the-second
+/// collision between two of *its own* rescues is the only case this loop
+/// exists to survive.
+pub fn move_rescue_dump_dir(data_dir: &Path, name: &str) -> Result<PathBuf, RescueDumpError> {
+    let source_path = data_dir.join(name);
+    let base = rescue_dump_base(data_dir, name);
+    move_rescue_dump_dir_at(&source_path, &base)
+}
+
+fn move_rescue_dump_dir_at(source_path: &Path, base: &Path) -> Result<PathBuf, RescueDumpError> {
+    for suffix in 1_u32.. {
+        let candidate = match suffix {
+            1 => base.to_path_buf(),
+            _ => base.with_file_name(format!(
+                "{}-{suffix}",
+                base.file_name().unwrap().to_string_lossy()
+            )),
+        };
+        if candidate.exists() {
+            continue;
+        }
+        return fs::rename(source_path, &candidate)
+            .map(|()| candidate.clone())
+            .map_err(|source| RescueDumpError {
+                path: candidate,
+                source,
+            });
+    }
+    unreachable!("a u32 suffix range never ends")
+}
+
 /// `apps/<id>.previous` — the rollback anchor's tree half: the outgoing
 /// `apps/<id>` renamed rather than copied (the per-app update and rollback
 /// plan's Overview — a rename costs one generation of the tree, never a copy

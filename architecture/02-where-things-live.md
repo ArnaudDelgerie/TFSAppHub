@@ -6,7 +6,7 @@
 <OS data dir>/TFSApp/hub/scratch/<pid>/      a release download/verify/extract, removed on exit
 <OS data dir>/TFSApp/hub/bin/php             the interpreter shim (see below)
 <OS data dir>/TFSApp/hub/bin/tfsapp-hub      the stable hub copy .desktop entries point at
-<OS data dir>/TFSApp/<identifier>/           the app's own data — CONTRACT.md §5
+<OS data dir>/TFSApp/<identifier>/           the app's own data, including uploads/ — CONTRACT.md §5
 <OS data dir>/applications/<identifier>.desktop  the generated entry — XDG's own directory,
                                                   a sibling of TFSApp/, not a child of it
 ```
