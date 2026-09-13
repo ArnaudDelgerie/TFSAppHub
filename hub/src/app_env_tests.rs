@@ -101,6 +101,7 @@ fn every_variable_the_contract_lists_is_injected() {
         "APP_BUILD_DIR",
         "APP_LOG_DIR",
         "APP_SESSION_DIR",
+        "APP_UPLOAD_DIR",
         "DATABASE_URL",
         "MESSENGER_TRANSPORT_DSN",
         "MERCURE_URL",
@@ -373,6 +374,7 @@ fn a_dev_launch_roots_every_app_path_under_var() {
         "APP_BUILD_DIR",
         "APP_LOG_DIR",
         "APP_SESSION_DIR",
+        "APP_UPLOAD_DIR",
     ] {
         let path = value(&environment.vars, key);
         assert!(
@@ -399,11 +401,13 @@ fn a_dev_launch_roots_every_app_path_under_var() {
     );
 
     // Named, never created by this call alone up front — but by the time
-    // `resolve` returns, its five subdirectories exist under `var/` and
+    // `resolve` returns, its six subdirectories exist under `var/` and
     // nowhere else in the project.
     assert!(state_root.join("data").is_dir());
     assert!(state_root.join("cache").is_dir());
+    assert!(state_root.join("uploads").is_dir());
     assert!(!project.path().join("cache").exists());
+    assert!(!project.path().join("uploads").exists());
 }
 
 #[test]
@@ -427,6 +431,125 @@ fn a_dev_launch_never_wipes_cache_or_build() {
         state_root.join("cache/marker").is_file(),
         "dev must never wipe a warm cache — Symfony's own container invalidation is the \
          mechanism, not a wipe on every relaunch"
+    );
+}
+
+// --- `APP_UPLOAD_DIR`, never emptied by the host (plan 049 / decision 006) --
+
+#[test]
+fn app_upload_dir_is_injected_and_created_in_every_mode() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+
+    let install_identifier = identifier_for("upload-dir-install");
+    let install_root = state_root(&paths, &install_identifier);
+    let install_env = resolve(
+        &manifest_for(&install_identifier, ""),
+        Path::new("/apps/demo"),
+        &install_identifier,
+        &install_root,
+        Mode::Install,
+    )
+    .expect("install resolves");
+    assert_eq!(
+        value(&install_env.vars, "APP_UPLOAD_DIR"),
+        tfsapp_core::sidecar::path_to_string(&install_root.join("uploads"))
+    );
+    assert!(install_root.join("uploads").is_dir());
+
+    let launch_identifier = identifier_for("upload-dir-launch");
+    let launch_root = state_root(&paths, &launch_identifier);
+    let launch_env = resolve(
+        &manifest_for(&launch_identifier, ""),
+        Path::new("/apps/demo"),
+        &launch_identifier,
+        &launch_root,
+        Mode::Launch(any_cache_stamp()),
+    )
+    .expect("launch resolves");
+    assert_eq!(
+        value(&launch_env.vars, "APP_UPLOAD_DIR"),
+        tfsapp_core::sidecar::path_to_string(&launch_root.join("uploads"))
+    );
+    assert!(launch_root.join("uploads").is_dir());
+
+    let run_identifier = identifier_for("upload-dir-run");
+    let run_root = state_root(&paths, &run_identifier);
+    let run_env = resolve(
+        &manifest_for(&run_identifier, ""),
+        Path::new("/apps/demo"),
+        &run_identifier,
+        &run_root,
+        Mode::Run,
+    )
+    .expect("run resolves");
+    assert_eq!(
+        value(&run_env.vars, "APP_UPLOAD_DIR"),
+        tfsapp_core::sidecar::path_to_string(&run_root.join("uploads"))
+    );
+    assert!(run_root.join("uploads").is_dir());
+
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let bare_dev_identifier = identifier_for("upload-dir-dev");
+    let dev_identifier = format!("dev.{bare_dev_identifier}");
+    let dev_root = project.path().join("var");
+    let dev_env = resolve(
+        &manifest_for(&bare_dev_identifier, ""),
+        project.path(),
+        &dev_identifier,
+        &dev_root,
+        Mode::Dev,
+    )
+    .expect("dev resolves");
+    assert_eq!(
+        value(&dev_env.vars, "APP_UPLOAD_DIR"),
+        tfsapp_core::sidecar::path_to_string(&dev_root.join("uploads"))
+    );
+    assert!(dev_root.join("uploads").is_dir());
+}
+
+#[test]
+fn a_mismatched_cache_stamp_wipes_cache_and_build_but_never_uploads() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("mismatched-stamp-spares-uploads");
+    let installed_state_root = state_root(&paths, &identifier);
+    std::fs::create_dir_all(installed_state_root.join("cache")).expect("a pre-existing cache dir");
+    std::fs::write(installed_state_root.join("cache/marker"), "warm").expect("a marker file");
+    std::fs::create_dir_all(installed_state_root.join("uploads"))
+        .expect("a pre-existing uploads dir");
+    let upload_content = b"a file the app wrote and must never lose";
+    std::fs::write(
+        installed_state_root.join("uploads/invoice.pdf"),
+        upload_content,
+    )
+    .expect("a planted upload");
+    std::fs::create_dir_all(installed_state_root.join("data")).expect("a data dir");
+
+    let recorded = any_cache_stamp();
+    crate::lifecycle::write_cache_stamp(&installed_state_root.join("data"), &recorded)
+        .expect("a written stamp");
+    let mut expected = recorded.clone();
+    expected.app_version = "0.7.0".to_string();
+
+    resolve(
+        &manifest_for(&identifier, ""),
+        Path::new(&recorded.snapshot_path),
+        &identifier,
+        &installed_state_root,
+        Mode::Launch(expected),
+    )
+    .expect("the launch environment resolves");
+
+    assert!(
+        !installed_state_root.join("cache/marker").exists(),
+        "a mismatched app_version must still wipe the stale cache"
+    );
+    assert_eq!(
+        std::fs::read(installed_state_root.join("uploads/invoice.pdf"))
+            .expect("the upload survives"),
+        upload_content,
+        "a cache-stamp mismatch must never reach uploads/ — it is never emptied by the host"
     );
 }
 

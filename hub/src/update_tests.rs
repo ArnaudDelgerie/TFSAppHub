@@ -664,6 +664,48 @@ fn an_update_leaves_a_cache_stamp_the_next_launch_will_match() {
 }
 
 #[test]
+fn an_update_s_post_replacement_cache_wipe_never_reaches_uploads() {
+    // Plan 049 step 1: `apply`'s best-effort `remove_dir_all` on `cache/`/
+    // `build/`, right after the replacement snapshot lands, is the second of
+    // the two places a directory is emptied at update time — `app_env.rs`'s
+    // own launch-time wipe is the first, pinned in `app_env_tests.rs`. Both
+    // must stay a two-directory wipe forever; `uploads/` (decision 006) is
+    // never emptied by the host, at any launch, under any circumstance.
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+
+    runnable_app_tree(source.path(), "0.6.0", "{}");
+    crate::install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the first install");
+
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let uploads_dir = data_dir.join("uploads");
+    fs::create_dir_all(&uploads_dir).expect("an uploads dir");
+    let content = b"a file the app wrote and must never lose";
+    fs::write(uploads_dir.join("invoice.pdf"), content).expect("a planted upload");
+
+    runnable_app_tree(source.path(), "0.7.0", "{}");
+    update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
+
+    assert_eq!(
+        fs::read(uploads_dir.join("invoice.pdf")).expect("the upload survives an update"),
+        content,
+        "update's post-replacement cache wipe must never reach uploads/"
+    );
+}
+
+#[test]
 fn force_on_an_equal_source_resyncs_without_running_any_hook() {
     if !resources_present() {
         return;
