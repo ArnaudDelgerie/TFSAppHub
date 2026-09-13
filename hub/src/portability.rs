@@ -11,14 +11,17 @@
 //! [`export`] and [`import`], added once the primitives below have their own
 //! tests.
 //!
-//! **What travels, and what does not.** The archive holds exactly
-//! `manifest.json` at its root and `data/` plus [`lifecycle::DB_FILE_NAMES`],
-//! whichever of those three exist — never re-listed here, read from
-//! `lifecycle` directly so there is one spelling of "the database" across the
-//! update/rollback anchor and this pair. Everything else in a data directory
-//! (`cache/`, `build/`, `log/`, `sessions/`, `secrets.json`, `config.json`,
-//! the live locks, the rollback anchor) is excluded, each for its own reason
-//! — see the plan's Overview, not restated here.
+//! **What travels, and what does not.** The archive holds `manifest.json` at
+//! its root, `data/` plus [`lifecycle::DB_FILE_NAMES`] (whichever of those
+//! exist — never re-listed here, read from `lifecycle` directly so there is
+//! one spelling of "the database" across the update/rollback anchor and this
+//! pair), and — since plan 049 — every regular file under `uploads/`
+//! (decision 006: `<app data>/uploads/`, injected as `APP_UPLOAD_DIR`, is the
+//! app's own durable-file directory and travels alongside the database it
+//! indexes). Everything else in a data directory (`cache/`, `build/`, `log/`,
+//! `sessions/`, `secrets.json`, `config.json`, the live locks, the rollback
+//! anchor) is excluded, each for its own reason — see the plan's Overview,
+//! not restated here.
 
 use std::{
     fmt, fs,
@@ -72,6 +75,11 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 /// The archive's internal directory holding the curated database files —
 /// [`lifecycle::DB_FILE_NAMES`] joined under it, never a separate list.
 pub const DATA_DIR: &str = "data";
+
+/// The archive's internal directory holding the app's durable files — a
+/// sibling of [`DATA_DIR`] here exactly as `uploads/` is a sibling of `data/`
+/// on disk (decision 006), never a child of it.
+pub const UPLOADS_DIR: &str = "uploads";
 
 /// Why `import <id> <path>` refuses, in the fixed order [`import_decision`]
 /// checks them.
@@ -229,6 +237,7 @@ fn run_export(paths: &Paths, id: &str, target: &Path) -> Result<(), PortabilityE
         });
     }
     let data_subdir = data_dir.join("data");
+    let uploads_dir = data_dir.join("uploads");
 
     let manifest = Manifest {
         identifier: entry.identifier.clone(),
@@ -237,19 +246,27 @@ fn run_export(paths: &Paths, id: &str, target: &Path) -> Result<(), PortabilityE
         unknown: serde_json::Map::new(),
     };
 
-    let written = write_archive(target, &manifest, &data_subdir)?;
+    let written = write_archive(target, &manifest, &data_subdir, &uploads_dir)?;
 
     println!(
         "Exported {id} ({}) to {}.",
         manifest.app_version,
         target.display()
     );
-    if written.is_empty() {
+    if written.database.is_empty() {
         println!("  no database yet — this installation has never been opened.");
     } else {
-        for name in &written {
+        for name in &written.database {
             println!("  {DATA_DIR}/{name}");
         }
+    }
+    if written.uploads_count > 0 {
+        println!(
+            "  {UPLOADS_DIR}/ ({} file{}, {} bytes)",
+            written.uploads_count,
+            if written.uploads_count == 1 { "" } else { "s" },
+            written.uploads_bytes
+        );
     }
 
     Ok(())
@@ -270,18 +287,28 @@ fn busy_holder(data_dir: &Path, identifier: &str) -> io::Result<Option<lifecycle
     lifecycle::data_dir_holder(data_dir, identifier)
 }
 
-/// Write `manifest` and whichever of [`lifecycle::DB_FILE_NAMES`] exist under
-/// `data_subdir` into a fresh `.tar.gz`, to a temp path beside `target` and
-/// `rename`d into place — so a failure midway leaves `target` itself
-/// untouched, never a half-written archive at the name the caller asked for.
-///
-/// Returns the DB file names actually written, in [`lifecycle::DB_FILE_NAMES`]'s
-/// order — empty when the installation has no database yet.
+/// What [`write_archive`] actually wrote, for `run_export`'s report — a count
+/// and a total size for `uploads/` is enough; the point is that the user sees
+/// the archive is not just a database.
+struct ArchiveContents {
+    /// The DB file names actually written, in [`lifecycle::DB_FILE_NAMES`]'s
+    /// order — empty when the installation has no database yet.
+    database: Vec<&'static str>,
+    uploads_count: u64,
+    uploads_bytes: u64,
+}
+
+/// Write `manifest`, whichever of [`lifecycle::DB_FILE_NAMES`] exist under
+/// `data_subdir`, and every regular file under `uploads_dir` into a fresh
+/// `.tar.gz`, to a temp path beside `target` and `rename`d into place — so a
+/// failure midway leaves `target` itself untouched, never a half-written
+/// archive at the name the caller asked for.
 fn write_archive(
     target: &Path,
     manifest: &Manifest,
     data_subdir: &Path,
-) -> Result<Vec<&'static str>, PortabilityError> {
+    uploads_dir: &Path,
+) -> Result<ArchiveContents, PortabilityError> {
     let temporary = export_temp_path(target);
     let io_error = |path: &Path| {
         let path = path.to_path_buf();
@@ -314,7 +341,7 @@ fn write_archive(
             .expect("a Manifest holds nothing that can fail to serialise");
         append_bytes(&mut builder, MANIFEST_FILE, &manifest_json).map_err(io_error(&temporary))?;
 
-        let mut written = Vec::new();
+        let mut database = Vec::new();
         for name in lifecycle::DB_FILE_NAMES {
             let source_path = data_subdir.join(name);
             if !source_path.is_file() {
@@ -323,20 +350,113 @@ fn write_archive(
             let bytes = fs::read(&source_path).map_err(io_error(&source_path))?;
             let archive_path = format!("{DATA_DIR}/{name}");
             append_bytes(&mut builder, &archive_path, &bytes).map_err(io_error(&temporary))?;
-            written.push(name);
+            database.push(name);
         }
+
+        let (uploads_count, uploads_bytes) = append_uploads(&mut builder, uploads_dir, &temporary)?;
 
         let encoder = builder.into_inner().map_err(io_error(&temporary))?;
         encoder.finish().map_err(io_error(&temporary))?;
 
         fs::rename(&temporary, target).map_err(io_error(target))?;
 
-        Ok(written)
+        Ok(ArchiveContents {
+            database,
+            uploads_count,
+            uploads_bytes,
+        })
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Walk `uploads_dir` and append every regular file it holds under an
+/// `uploads/`-prefixed archive path, sorted at every level so two exports of
+/// identical content produce byte-identical archives (the same determinism
+/// the fixed header in [`append_bytes`] exists for). A directory that does
+/// not exist is not a skip and not an error — the ordinary case for an app
+/// that has never written a file. Anything that is not a regular file (a
+/// symlink, a socket, a fifo) is skipped and named on stderr rather than
+/// followed or embedded.
+///
+/// `io_error`s are attributed to `temporary` — `append_bytes`'s own failure
+/// is always a write to the archive being built, never to the source file
+/// just read, matching the database loop just above this call.
+fn append_uploads<W: io::Write>(
+    builder: &mut tar::Builder<W>,
+    uploads_dir: &Path,
+    temporary: &Path,
+) -> Result<(u64, u64), PortabilityError> {
+    if !uploads_dir.is_dir() {
+        return Ok((0, 0));
+    }
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    append_uploads_dir(
+        builder,
+        uploads_dir,
+        Path::new(""),
+        temporary,
+        &mut count,
+        &mut bytes,
+    )?;
+    Ok((count, bytes))
+}
+
+fn append_uploads_dir<W: io::Write>(
+    builder: &mut tar::Builder<W>,
+    uploads_dir: &Path,
+    relative: &Path,
+    temporary: &Path,
+    count: &mut u64,
+    bytes: &mut u64,
+) -> Result<(), PortabilityError> {
+    let absolute = uploads_dir.join(relative);
+    let io_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| PortabilityError::Io { path, source }
+    };
+
+    let mut entries: Vec<fs::DirEntry> = fs::read_dir(&absolute)
+        .map_err(io_error(&absolute))?
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(io_error(&absolute))?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+
+    for entry in entries {
+        let file_type = entry.file_type().map_err(io_error(&absolute))?;
+        let child_relative = relative.join(entry.file_name());
+        let child_absolute = uploads_dir.join(&child_relative);
+        if file_type.is_dir() {
+            append_uploads_dir(
+                builder,
+                uploads_dir,
+                &child_relative,
+                temporary,
+                count,
+                bytes,
+            )?;
+        } else if file_type.is_file() {
+            let data = fs::read(&child_absolute).map_err(io_error(&child_absolute))?;
+            let archive_path = Path::new(UPLOADS_DIR).join(&child_relative);
+            append_bytes(builder, &archive_path, &data).map_err(io_error(temporary))?;
+            *count += 1;
+            *bytes += data.len() as u64;
+        } else {
+            eprintln!(
+                "skipping {}: not a regular file ({})",
+                child_absolute.display(),
+                if file_type.is_symlink() {
+                    "a symlink"
+                } else {
+                    "neither a file nor a directory"
+                }
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The unfinished archive sits next to its eventual target under its complete
@@ -352,7 +472,7 @@ fn export_temp_path(target: &Path) -> PathBuf {
 /// reads back a timestamp so any fixed, valid one does.
 fn append_bytes<W: io::Write>(
     builder: &mut tar::Builder<W>,
-    archive_path: &str,
+    archive_path: impl AsRef<Path>,
     data: &[u8],
 ) -> io::Result<()> {
     let mut header = tar::Header::new_gnu();

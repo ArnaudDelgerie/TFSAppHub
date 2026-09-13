@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use super::{
     append_bytes, data_dir_populated, export_temp_path, import_decision, run_export, run_import,
-    ImportRefusal, Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE,
+    write_archive, ImportRefusal, Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE, UPLOADS_DIR,
 };
 use crate::{
     install, lifecycle, lifecycle_gate,
@@ -384,6 +384,89 @@ fn a_manifest_written_by_export_names_the_registry_entry_not_the_hub() {
 
     assert_eq!(manifest.identifier, "dev.local.demo");
     assert_eq!(manifest.app_version, "1.2.3");
+}
+
+// --- run_export carries uploads/ (plan 049 / decision 006) -----------------
+
+#[test]
+fn a_nested_upload_tree_round_trips_into_the_archive_with_its_structure_intact() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let uploads_dir = base.path().join("TFSApp/dev.local.demo/uploads");
+    fs::create_dir_all(uploads_dir.join("invoices")).expect("a nested uploads dir");
+    fs::write(uploads_dir.join("avatar.png"), b"top-level file").expect("a top-level upload");
+    fs::write(uploads_dir.join("invoices/2026-01.pdf"), b"nested file").expect("a nested upload");
+    let target = base.path().join("backup.tar.gz");
+
+    run_export(&paths, "demo", &target).expect("a nested upload tree exports cleanly");
+
+    let mut entries = archive_entries(&target);
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![
+            MANIFEST_FILE.to_string(),
+            format!("{UPLOADS_DIR}/avatar.png"),
+            format!("{UPLOADS_DIR}/invoices/2026-01.pdf"),
+        ]
+    );
+}
+
+#[test]
+fn an_absent_uploads_directory_exports_cleanly() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let target = base.path().join("backup.tar.gz");
+
+    run_export(&paths, "demo", &target).expect("no uploads/ at all is the ordinary case");
+
+    assert_eq!(archive_entries(&target), vec![MANIFEST_FILE.to_string()]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_symlink_under_uploads_is_skipped_rather_than_followed() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let uploads_dir = base.path().join("TFSApp/dev.local.demo/uploads");
+    fs::create_dir_all(&uploads_dir).expect("an uploads dir");
+    fs::write(uploads_dir.join("real.txt"), b"a real file").expect("a real upload");
+    std::os::unix::fs::symlink("/etc/hostname", uploads_dir.join("link.txt"))
+        .expect("a symlink planted under uploads");
+    let target = base.path().join("backup.tar.gz");
+
+    run_export(&paths, "demo", &target).expect("a symlink must not fail the export");
+
+    assert_eq!(
+        archive_entries(&target),
+        vec![MANIFEST_FILE.to_string(), format!("{UPLOADS_DIR}/real.txt")],
+        "the symlink travels in neither name nor content"
+    );
+}
+
+#[test]
+fn two_exports_of_the_same_upload_tree_are_byte_identical() {
+    let base = tempfile::tempdir().expect("a temp base");
+    let data_subdir = base.path().join("data");
+    let uploads_dir = base.path().join("uploads");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    fs::create_dir_all(uploads_dir.join("a")).expect("a nested uploads dir");
+    fs::write(uploads_dir.join("a/one.txt"), b"one").expect("a nested upload");
+    fs::write(uploads_dir.join("two.txt"), b"two").expect("a top-level upload");
+    let archive_manifest = manifest("dev.local.demo", "1.2.3");
+
+    let first = base.path().join("first.tar.gz");
+    write_archive(&first, &archive_manifest, &data_subdir, &uploads_dir)
+        .expect("the first export succeeds");
+    let second = base.path().join("second.tar.gz");
+    write_archive(&second, &archive_manifest, &data_subdir, &uploads_dir)
+        .expect("the second export succeeds");
+
+    assert_eq!(
+        fs::read(&first).expect("the first archive"),
+        fs::read(&second).expect("the second archive"),
+        "two exports of identical content must produce byte-identical archives"
+    );
 }
 
 #[test]
