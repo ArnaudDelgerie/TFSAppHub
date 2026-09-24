@@ -226,17 +226,26 @@ struct Inner {
     backend: BTreeSet<String>,
     pending: Option<PendingDecision>,
     /// The windows whose close is committed but whose destruction has not
-    /// been observed yet — an approved secondary close whose `destroy()` has
-    /// only been posted, or an unguarded close between the default being let
-    /// through and the `Destroyed` event — each bound to the document
-    /// incarnation the close was decided on. A reserved window is never a
-    /// survivor for another close's topology question, and its document's
-    /// namespace is closed; `drop_window` is the one release that matches
-    /// the destruction actually happening, and
-    /// [`CloseGuardState::committed_close_applies`] is the application
-    /// boundary's check that the queued effect still addresses that same
-    /// incarnation.
+    /// been observed yet — an approved secondary close whose native close
+    /// request has only been posted, or an unguarded close between the
+    /// default being let through and the `Destroyed` event — each bound to
+    /// the document incarnation the close was decided on. A reserved window
+    /// is never a survivor for another close's topology question, and its
+    /// document's namespace is closed; `drop_window` is the one release that
+    /// matches the destruction actually happening, and
+    /// [`CloseGuardState::committed_close_applies`] is the pre-post check
+    /// that the queued effect still addresses that same incarnation.
     committed_closes: BTreeMap<String, Option<DocumentContext>>,
+    /// The windows with a native close request the hub itself posted for an
+    /// approved close (audit 017, finding 1), not yet consumed by the
+    /// `CloseRequested` dispatch that will decide it. One-shot per window:
+    /// `begin_close` consumes the mark when the request arrives, because
+    /// that dispatch — the same one that proceeds to the native destruction
+    /// when it is not vetoed — is the final authorization boundary, and it
+    /// must be able to tell the hub's own queued request from a fresh
+    /// person's click. Released with the reservation, cleared with the
+    /// window.
+    queued_close_requests: BTreeSet<String>,
     closing: bool,
     /// Bumped on every mutation, so callers can log *that* guard state moved
     /// without logging what it holds — the guard IDs themselves stay private.
@@ -272,6 +281,14 @@ pub enum CloseFlow {
     /// window stays open, guards untouched) — the person can close it again
     /// once the pending dialog has resolved.
     Busy,
+    /// The hub's own queued close request arrived for a document it was
+    /// never decided on (audit 017, finding 1). The approved close was
+    /// decided on an incarnation this window no longer holds — a
+    /// replacement landed between the approval and the native close
+    /// request's dispatch — so the request applies to nothing: the caller
+    /// vetoes it, the reservation is released, and the successor stays
+    /// open until someone asks to close it explicitly.
+    Replaced,
 }
 
 /// What applying a dialog's answer did. Only `Approved` authorises a close,
@@ -484,6 +501,7 @@ impl CloseGuardState {
     pub fn drop_window(&self, window: &str) {
         let mut inner = self.lock();
         let dropped_guards = inner.windows.remove(window).is_some();
+        inner.queued_close_requests.remove(window);
         let unreserved = inner.committed_closes.remove(window).is_some();
         if dropped_guards || unreserved {
             inner.revision += 1;
@@ -510,9 +528,24 @@ impl CloseGuardState {
         if inner.closing {
             return;
         }
+        inner.queued_close_requests.remove(window);
         if inner.committed_closes.remove(window).is_some() {
             inner.revision += 1;
         }
+    }
+
+    /// Mark that the hub has posted a native close request for `window`'s
+    /// approved close — the request `CloseRequested` will hand back to
+    /// `begin_close` when the runtime dispatches it (audit 017, finding 1).
+    /// Called only with the reservation still applying, and only on the
+    /// event loop; the mark is one-shot and consumed by `begin_close`, so
+    /// the boundary dispatch can tell the hub's own queued request from a
+    /// fresh person's click and authorize it against the incarnation the
+    /// window *then* holds.
+    pub fn queue_close_request(&self, window: &str) {
+        let mut inner = self.lock();
+        inner.queued_close_requests.insert(window.to_string());
+        inner.revision += 1;
     }
 
     /// The windows whose close is committed but whose destruction has not
@@ -572,6 +605,17 @@ impl CloseGuardState {
     /// this close takes the last window and so stops the shared backend; the
     /// backend's guards never make a surviving-window close prompt.
     ///
+    /// This is also the final authorization boundary of a queued close
+    /// (audit 017, finding 1): an approved secondary close travels as a
+    /// native close request, and the `CloseRequested` dispatch that will
+    /// proceed to the destruction when it is not vetoed lands here. The
+    /// one-shot mark tells the hub's own queued request from a fresh
+    /// person's click: the queued request is authorized exactly while the
+    /// window still holds the incarnation the close was decided on, and a
+    /// replacement in between turns it into [`CloseFlow::Replaced`] — the
+    /// approval applies to nothing, the reservation is released, and the
+    /// successor stays open.
+    ///
     /// An unguarded close commits right here, atomically with the check that
     /// found nothing at stake: the window is reserved (it stops counting as
     /// a survivor for every later close) and, when this close stops the
@@ -591,6 +635,36 @@ impl CloseGuardState {
         // close itself is about to be overtaken by `destroy_windows` anyway.
         if inner.closing {
             return CloseFlow::Allow;
+        }
+        // The hub's own queued close request, at the boundary (audit 017,
+        // finding 1). Decided before the pending slot: this close was
+        // already approved, and another window's dialog must not hold it —
+        // and a fresh click while the request is in flight wants the same
+        // thing this request does.
+        if inner.queued_close_requests.remove(window) {
+            if let Some(decided) = inner.committed_closes.get(window).cloned() {
+                let current = inner
+                    .windows
+                    .get(window)
+                    .and_then(|entry| entry.context.clone());
+                // The window still holds the incarnation the close was
+                // decided on: the default close may proceed, and the
+                // destruction observation will release the reservation.
+                if decided.is_none() || decided == current {
+                    return CloseFlow::Allow;
+                }
+                // A replacement landed between the approval and this
+                // dispatch: the request was never decided for the successor,
+                // so it authorizes nothing. The reservation is released and
+                // the close is vetoed; a later explicit close of the
+                // successor starts a decision of its own.
+                inner.committed_closes.remove(window);
+                inner.revision += 1;
+                return CloseFlow::Replaced;
+            }
+            // No reservation left to apply (released or the window dropped
+            // since the post): fall through and decide this as the fresh
+            // request it now is.
         }
         if inner.pending.is_some() {
             return CloseFlow::Busy;
