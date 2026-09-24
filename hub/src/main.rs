@@ -9,6 +9,7 @@ mod app_env;
 mod archive;
 mod bridge;
 mod cli;
+mod close_guard;
 mod desktop;
 mod dev;
 mod gh;
