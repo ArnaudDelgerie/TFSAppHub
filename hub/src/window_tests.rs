@@ -375,3 +375,102 @@ fn a_committed_shutdown_refuses_to_revive_the_closing_instance() {
         SecondInstanceAction::ShuttingDown
     );
 }
+
+// --- admit_second_instance_window (plan 055 step 8, audit 017 finding 2) -----
+//
+// The admission unit a second `open` resolves to, as one piece of work on
+// the event loop: the shutdown commitment is re-read inside it, at decision
+// time, and the window is created inside it too. The D-Bus service thread
+// that schedules it is serialized with nothing, which is exactly what these
+// regressions model with explicit barriers — no timing, no sleeps.
+
+fn admit_once(
+    state: &crate::close_guard::CloseGuardState,
+    launch_present: bool,
+) -> (
+    super::SecondInstanceOutcome,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let created = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = created.clone();
+    let outcome = super::admit_second_instance_window(state, launch_present, move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    });
+    (outcome, created)
+}
+
+#[test]
+fn an_arrival_suspended_across_a_committed_shutdown_creates_no_window() {
+    // Audit 017, finding 2's interleaving, pinned with barriers: the arrival
+    // reads its launch facts, the GTK loop commits a final shutdown while
+    // the arrival hangs between that read and its admission unit, and only
+    // then does the unit run. The unit re-reads the commitment at decision
+    // time — from inside the event loop's serialization — so the closing
+    // instance is not revived, whatever the suspended thread once saw.
+    let state = std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
+    let suspended = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let committed = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let created = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let arrival = {
+        let state = state.clone();
+        let created = created.clone();
+        let suspended = suspended.clone();
+        let committed = committed.clone();
+        std::thread::spawn(move || {
+            // The D-Bus thread's read, before the suspension: the backend is
+            // up, and at this instant no shutdown has committed.
+            let launch_present = true;
+            assert!(!state.is_closing());
+            suspended.wait();
+            committed.wait();
+            // The scheduled unit finally runs on the event loop.
+            let outcome = super::admit_second_instance_window(&state, launch_present, move || {
+                created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            });
+            assert_eq!(outcome, super::SecondInstanceOutcome::ShuttingDown);
+        })
+    };
+    suspended.wait();
+    // The loop commits the final shutdown while the arrival is suspended.
+    state.commit_shutdown();
+    committed.wait();
+    arrival.join().expect("the arrival completes");
+    assert_eq!(
+        created.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no window was created on the closing instance"
+    );
+}
+
+#[test]
+fn an_arrival_admitted_before_the_commitment_opens_its_window() {
+    // The inverse order, still pinned: the unit runs to completion before
+    // the loop commits anything, so the window is created — inside the same
+    // serialization every later close decision reads, which is what makes
+    // the topology of that decision count it.
+    let state = crate::close_guard::CloseGuardState::new();
+    let (outcome, created) = admit_once(&state, true);
+    assert_eq!(outcome, super::SecondInstanceOutcome::WindowOpened);
+    assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn an_admission_unit_refuses_before_the_backend_and_reports_its_failures() {
+    let state = crate::close_guard::CloseGuardState::new();
+    // No launch to open a window on: the arrival was given nothing but the
+    // wait it already had, and nothing is created.
+    let (outcome, created) = admit_once(&state, false);
+    assert_eq!(outcome, super::SecondInstanceOutcome::StillStarting);
+    assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // A creation that fails is an outcome, not a panic: the caller reports
+    // it and the arrival is over.
+    let failed = super::admit_second_instance_window(&state, true, || {
+        Err("the webview could not be built".to_string())
+    });
+    assert_eq!(
+        failed,
+        super::SecondInstanceOutcome::WindowFailed("the webview could not be built".to_string())
+    );
+}

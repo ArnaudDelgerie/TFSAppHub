@@ -550,6 +550,49 @@ pub fn second_instance_action(
     }
 }
 
+/// What running the second-instance admission unit actually did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecondInstanceOutcome {
+    /// The launch's own window is still on its way; the arrival was given
+    /// nothing but the wait it already had.
+    StillStarting,
+    /// A final shutdown has committed; this process opens no window again.
+    ShuttingDown,
+    /// The window was created on the running backend.
+    WindowOpened,
+    /// The window could not be created; the reason is the caller's to
+    /// report.
+    WindowFailed(String),
+}
+
+/// The second-instance admission unit: everything a second `open` of an
+/// already-running app does, as one piece of work (audit 017, finding 2).
+///
+/// The single-instance plugin invokes its callback from its D-Bus service
+/// thread, which is serialized with nothing — the GTK loop's close decisions
+/// and shutdown commitments can land between any two reads this function's
+/// caller makes. So the caller schedules this whole unit on the event loop
+/// (`run_on_main_thread`) and does nothing else: the shutdown commitment is
+/// re-read *here*, at decision time, and the window is created *here*, in
+/// the same unit — an arrival suspended across a committed shutdown finds
+/// the commitment when it finally runs, and opens nothing; a window admitted
+/// before a commitment is created inside the same serialization every close
+/// decision reads, so no topology can miss it.
+pub fn admit_second_instance_window(
+    guards: &crate::close_guard::CloseGuardState,
+    launch_present: bool,
+    create_window: impl FnOnce() -> Result<(), String>,
+) -> SecondInstanceOutcome {
+    match second_instance_action(launch_present, guards.is_closing()) {
+        SecondInstanceAction::StillStarting => SecondInstanceOutcome::StillStarting,
+        SecondInstanceAction::ShuttingDown => SecondInstanceOutcome::ShuttingDown,
+        SecondInstanceAction::OpenWindow => match create_window() {
+            Ok(()) => SecondInstanceOutcome::WindowOpened,
+            Err(error) => SecondInstanceOutcome::WindowFailed(error),
+        },
+    }
+}
+
 /// A further window on an already-running backend — what a second `open` of the
 /// same app resolves to.
 ///
