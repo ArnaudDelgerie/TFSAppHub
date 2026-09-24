@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+An app declaring `actions.picker.ipc` can now restrict what the native file
+chooser shows: `pick_path` accepts the same optional `filters` list as
+`save_path` — one entry per filter, in the order given, the first one
+active, extensions written without a leading dot. Omitted, `null` and an
+empty list all leave the chooser unrestricted. A well-formed filter list on
+a directory selection is ignored rather than refused, so callers can share
+one options object between both kinds; a wrongly typed filter field still
+fails the call before any dialog opens.
+
 Restoring a backup no longer keeps settings cached from the previous
 database. `import` now clears the destination's `cache/` and `build/` and
 discards its stamp before replacing anything — including when the archive's
