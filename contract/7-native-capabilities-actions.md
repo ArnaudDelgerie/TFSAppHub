@@ -314,11 +314,39 @@ window's confirmation stops the backend. While a decision is pending the
 hub shows one dialog at a time, and rechecks what is at stake before applying
 an answer — a guard that appeared while the dialog was open, or a close that
 became the backend-stopping one, gets a fresh warning rather than a stale
-approval. An acknowledgement protects subsequent close decisions; it cannot
-reverse a close that already committed. Once shutdown has committed, every
-register or remove — from either transport — answers `closing` explicitly,
-so a job starting during teardown learns the truth instead of installing a
-guard nobody will ever see.
+approval.
+
+**A close commits as one atomic transition, and the commitment reserves its
+window.** The final guard check and the commitment are the same step: a
+registration racing a close is either in the decision's past — covered by the
+warning, or the cause of the fresh one — or in its future, where `closing`
+refuses it. It is never accepted and then ignored by a close that
+revalidates nothing, on either transport. Once a close is committed, its
+window stops counting as a survivor for every other close until its
+destruction is actually observed — so two nearly-simultaneous closes cannot
+both conclude that the other window preserves the backend — and that window's
+document can no longer register or remove guards: the person already approved
+closing it, so a guard that appeared now could never earn its own
+confirmation. A window whose close is committed and whose destruction failed
+while it stayed usable goes back to being an ordinary window; a committed
+whole-app shutdown releases nothing.
+
+**A decision belongs to the document it was decided on.** The confirmation
+and the close it commits are bound to the window's document incarnation, not
+just its label and the guard IDs the warning named. A page replaced while
+its dialog stands — a reload, a programmatically scheduled navigation — makes
+the answer apply to nothing, whatever guard IDs the successor reuses or
+registers: the successor stays open with its own guards, no second dialog is
+stacked while the first stands, and a new explicit close request starts a
+decision of its own. The same binding holds at the moment the approved close
+is applied: a destruction queued for one document is never redirected onto
+its replacement, and a window label reused after a destruction is a new owner
+that inherits neither the queued close nor a pending decision. An
+acknowledgement protects subsequent close decisions; it cannot reverse a
+close that already committed. Once shutdown has committed, every register or
+remove — from either transport — answers `closing` explicitly, so a job
+starting during teardown learns the truth instead of installing a guard
+nobody will ever see.
 
 **Unavailable is a result, not an exception.** A hub older than this group
 refuses the `invoke` outright, and a missing or refused bridge route is
@@ -353,8 +381,9 @@ The IPC commands and their exact errors: `close_guard_context` answers
 `close_guard_register` and `close_guard_remove` take `{ context, id }` and
 answer `null` on success. Their error codes, shared with the bridge routes
 where the transport has them: `stale_document` (frontend only), `invalid_id`,
-`too_many_guards`, `closing`, and `unavailable` when no state backs the
-calling window at all.
+`too_many_guards`, `closing` — shutdown has committed, or this window's close
+already has, so the namespace is closed — and `unavailable` when no state backs
+the calling window at all.
 
 ### The bridge wire contract
 

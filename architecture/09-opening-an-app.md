@@ -234,11 +234,24 @@ mark vetoes the default close and shows one native confirmation, `Cancel` as
 the safe default, before the window is hidden or the backend stopped. Backend
 guards only matter on the close that would stop the shared backend — a clean
 secondary window closes without a word even while jobs run elsewhere. The
-decision machinery lives in `close_guard.rs`, plain state with no GTK in it:
-one pending decision at a time across the app's windows (repeated clicks
-veto rather than stack dialogs), the guards rechecked against the topology at
-answer time (a guard that appeared mid-dialog earns a fresh warning, never a
-stale approval), and the approval consumed the moment it is applied.
+decision machinery lives in `close_guard.rs`, plain state with no GTK in it,
+and its effects are coordinated on the event loop: one pending decision at a
+time across the app's windows (repeated clicks veto rather than stack
+dialogs), the guards rechecked against the topology at answer time (a guard
+that appeared mid-dialog earns a fresh warning, never a stale approval), and
+the approval consumed the moment it is applied. The final guard check and the
+close commitment are one atomic transition: a registration racing a close is
+either part of its decision or refused with `closing`, never accepted and
+then ignored by a teardown that revalidates nothing — and a committed close
+reserves its window until the destruction is actually observed, so two
+nearly-simultaneous closes cannot both count the other as the survivor that
+preserves the backend. A decision, and the close it commits, belong to the
+document incarnation they were decided on: a page replaced while its dialog
+stands makes the answer apply to nothing — the successor stays open with its
+guards, and a queued close is never redirected onto it. The teardown itself
+has exactly one owner — a one-shot latch, not the state commitment — so an
+approved final close and a signal arriving together still tear down once, and
+a second `open` after the commitment cannot revive the closing instance.
 Mandatory shutdown never asks: the first step of every teardown path — the
 approved close itself, a signal, a fatal error — commits shutdown one-way,
 which turns any dialog still standing stale and refuses new guards. Cancelling

@@ -14,9 +14,17 @@ it was. Backend guards only weigh on the close that would stop the shared
 backend, one decision is pending at a time across the app's windows, and
 what is at stake is rechecked before an answer is applied, so a guard that
 appears while the dialog stands earns a fresh warning rather than a stale
-approval. Both switches default to off, neither transport can reach the
+approval. A close commits in the same atomic step as its final guard check,
+and the commitment reserves its window until its destruction is actually
+observed — so a registration racing a close is refused with `closing` rather
+than accepted and silently ignored, and two nearly-simultaneous closes
+cannot both count the other window as the survivor that preserves the
+backend. The confirmation and the close it commits belong to the document
+incarnation they were decided on: a page replaced while its dialog stands
+makes the answer apply to nothing, and the successor stays open with its
+own guards. Both switches default to off, neither transport can reach the
 other's namespace, and a mandatory shutdown (signal, fatal error) commits
-first and never waits on a person.
+first, owns a one-shot teardown latch, and never waits on a person.
 
 An app declaring `actions.picker.ipc` can now restrict what the native file
 chooser shows: `pick_path` accepts the same optional `filters` list as
