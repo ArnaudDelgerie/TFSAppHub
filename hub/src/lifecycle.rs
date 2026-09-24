@@ -1449,11 +1449,22 @@ fn handle_close_request<W: CloseWorld>(
 }
 
 /// The dialog-answer half of the coordinator, on the event loop: revalidate
-/// the topology and the guards, commit the close or refuse it, and dispatch
-/// the effect — destroy an approved secondary window (releasing the
-/// reservation when even the destruction could not be posted), hide and
-/// tear down an approved final one, or ask again when the warning no longer
-/// described what is at stake.
+/// the topology, the guards and the document incarnation, commit the close
+/// or refuse it, and dispatch the effect — destroy an approved secondary
+/// window (releasing the reservation when even the destruction could not be
+/// posted), hide and tear down an approved final one, or ask again when the
+/// warning no longer described what was at stake.
+///
+/// The incarnation is validated twice on purpose (audit 016, finding 3):
+/// `resolve_close` refuses an answer whose decision's document was replaced,
+/// and the destruction dispatch itself re-checks
+/// [`crate::close_guard::CloseGuardState::committed_close_applies`] — the
+/// final application boundary — so a replacement that slipped between the
+/// answer and the effect can never redirect an already-queued close onto a
+/// successor document that never went through a decision. The invalidation
+/// consumes the queued close and frees the slot without opening another
+/// dialog: the successor stays open, and a new explicit close request starts
+/// a decision of its own.
 fn handle_close_answer<W: CloseWorld>(
     state: &crate::close_guard::SharedCloseGuards,
     world: &mut W,
@@ -1465,7 +1476,7 @@ fn handle_close_answer<W: CloseWorld>(
     match close_effect(state.resolve_close(token, approved, stops)) {
         CloseEffect::Nothing => {}
         CloseEffect::CloseWindow => {
-            if !world.destroy(window) {
+            if state.committed_close_applies(window) && !world.destroy(window) {
                 state.release_close(window);
             }
         }

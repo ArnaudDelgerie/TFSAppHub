@@ -1569,3 +1569,81 @@ fn the_teardown_latch_admits_exactly_one_owner() {
     assert!(!claim_teardown(&latch));
     assert!(!claim_teardown(&latch));
 }
+
+// --- document-identity binding (plan 055 step 6, audit 016 finding 3) -------
+
+#[test]
+fn a_replacement_during_the_dialog_leaves_the_successor_open() {
+    // A programmatically scheduled navigation replaces the document while
+    // its close dialog stands. Approving the old dialog must close
+    // nothing — not the successor, whatever guard IDs it reuses — and must
+    // not stack a second native dialog while the first one is still up.
+    let state = shared_close_state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    let mut world = RecordedWorld::two_windows();
+
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main"),
+        CloseAction::KeepOpen
+    );
+    assert_eq!(world.dialogs.len(), 1);
+
+    // The replacement, then the successor's own registration of the same
+    // guard ID under its own identity.
+    state.rotate_context("main");
+    let fresh = state.context("main");
+    state
+        .frontend_register("main", &fresh, "editor:42")
+        .expect("the successor's own guard");
+
+    let token = world.dialogs[0].token.clone();
+    handle_close_answer(&state, &mut world, "main", &token, true);
+    assert!(
+        world.effects.is_empty(),
+        "the stale approval performed no hide, no destroy, no teardown"
+    );
+    assert_eq!(
+        world.dialogs.len(),
+        1,
+        "the invalidation consumed the answer without stacking a second dialog"
+    );
+
+    // The successor keeps its guard, and a new explicit close request
+    // starts a decision of its own.
+    assert!(state.frontend_guards("main").contains("editor:42"));
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main"),
+        CloseAction::KeepOpen
+    );
+    assert_eq!(world.dialogs.len(), 2);
+}
+
+#[test]
+fn a_mismatched_callback_cannot_apply_its_decision_to_another_window() {
+    // The dialog callback binds its window and token together, so this is
+    // a shape no production callback can build — driven anyway to prove
+    // the final application boundary: an answer that somehow names
+    // another window with main-2's token may consume main-2's decision,
+    // but its queued effect cannot be dispatched onto the named window.
+    let state = shared_close_state();
+    let context = state.context("main-2");
+    state
+        .frontend_register("main-2", &context, "editor:42")
+        .expect("registration");
+    let mut world = RecordedWorld::two_windows();
+
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main-2"),
+        CloseAction::KeepOpen
+    );
+    let token = world.dialogs[0].token.clone();
+
+    handle_close_answer(&state, &mut world, "main", &token, true);
+    assert!(
+        world.effects.is_empty(),
+        "no destroy was dispatched onto the named window"
+    );
+}

@@ -816,6 +816,294 @@ fn a_committed_close_leaves_unrelated_surviving_windows_usable() {
         .expect("and keeps full control of its own guards");
 }
 
+// --- document-identity binding (plan 055 step 6, audit 016 finding 3) -------
+//
+// A decision — and the close it commits — belongs to the document
+// incarnation it was decided on. A replacement during a confirmation makes
+// the answer apply to nothing, whatever guard IDs the successor reuses or
+// registers; and a destruction queued for one document is never redirected
+// onto its successor at the effect's application boundary.
+
+#[test]
+fn a_replacement_during_confirmation_invalidates_even_with_the_same_guard_id() {
+    // Audit 016, finding 3's own reproduction: the successor re-registers
+    // the very guard ID the warning covered, and the old dialog's approval
+    // used to apply — closing a document nobody decided about.
+    let state = state();
+    let old = state.context("main");
+    state
+        .frontend_register("main", &old, "editor:42")
+        .expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", true) else {
+        panic!("a guarded close asks");
+    };
+
+    // The page is replaced while the dialog stands: a committed load
+    // rotates, the successor fetches its context, and it re-registers the
+    // same ID under its own identity.
+    state.rotate_context("main");
+    let fresh = state.context("main");
+    assert_ne!(old, fresh);
+    state
+        .frontend_register("main", &fresh, "editor:42")
+        .expect("the successor registers its own guard");
+
+    assert_eq!(
+        state.resolve_close(&token, true, true),
+        Resolution::Invalidated,
+        "the approval was shown about a document the window no longer holds"
+    );
+
+    // The replayed answer is now stale, and the successor's guard — its
+    // own, under its own incarnation — survived the refused approval.
+    assert_eq!(state.resolve_close(&token, true, true), Resolution::Stale);
+    assert_eq!(registered(&state, "main"), ids(&["editor:42"]));
+
+    // A fresh close request starts a decision of its own, honestly about
+    // the successor's guard.
+    assert!(matches!(
+        state.begin_close("main", true),
+        CloseFlow::Confirm { .. }
+    ));
+}
+
+#[test]
+fn a_replacement_during_confirmation_invalidates_even_with_no_successor_guards() {
+    // The finding's second shape: the successor registers nothing at all.
+    // The empty recheck used to pass the approval through — closing the
+    // successor with no decision ever shown about it.
+    let state = state();
+    let old = state.context("main");
+    state
+        .frontend_register("main", &old, "editor:42")
+        .expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks");
+    };
+
+    state.rotate_context("main");
+    state.context("main");
+    assert!(
+        registered(&state, "main").is_empty(),
+        "the fetch erased the replaced document's guards"
+    );
+
+    assert_eq!(
+        state.resolve_close(&token, true, false),
+        Resolution::Invalidated
+    );
+    assert_eq!(
+        state.begin_close("main", false),
+        CloseFlow::Allow,
+        "nothing is at stake anymore, so the successor closes cleanly"
+    );
+}
+
+#[test]
+fn a_unchanged_document_never_invalidates_on_its_own_registration() {
+    // The mirror of the replacement rules: the same document idempotently
+    // re-asserting its own guard — or registering a new one, which must ask
+    // again rather than silently apply — is never a replacement.
+    let state = state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks");
+    };
+
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("the idempotent re-registration");
+    assert_eq!(
+        state.resolve_close(&token, true, false),
+        Resolution::Approved {
+            stop_backend: false
+        }
+    );
+}
+
+#[test]
+fn a_first_context_fetch_is_not_a_replacement_for_a_document_free_decision() {
+    // A backend-only decision opens on a window whose page never fetched a
+    // context — no frontend guard, so no document identity was involved.
+    // The page fetching its context *while the dialog stands* is a first
+    // fetch, not a replacement: nothing is invalidated by gaining an
+    // identity that the decision never depended on.
+    let state = state();
+    state.backend_register("export:1").expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", true) else {
+        panic!("a backend-only close asks");
+    };
+
+    state.context("main");
+    assert_eq!(
+        state.resolve_close(&token, true, true),
+        Resolution::Approved { stop_backend: true }
+    );
+    assert!(state.committed_close_applies("main"));
+}
+
+#[test]
+fn the_queued_close_applies_only_while_its_incarnation_holds() {
+    // The application boundary: the destruction queued for an approved
+    // close may only run while the window still holds the document the
+    // approval was shown about.
+    let state = state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks");
+    };
+    assert_eq!(
+        state.resolve_close(&token, true, false),
+        Resolution::Approved {
+            stop_backend: false
+        }
+    );
+    assert!(state.committed_close_applies("main"));
+
+    // A replacement lands between the answer and the application: the
+    // queued close must not be redirected onto the successor, and the
+    // reservation is released so the window is usable again.
+    state.rotate_context("main");
+    let fresh = state.context("main");
+    assert!(!state.committed_close_applies("main"));
+    assert!(state.committed_closing_windows().is_empty());
+    state
+        .frontend_register("main", &fresh, "editor:43")
+        .expect("the successor's document registers again");
+
+    // And a later legitimate close of the successor starts, and applies,
+    // its own decision.
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks");
+    };
+    assert_eq!(
+        state.resolve_close(&token, true, false),
+        Resolution::Approved {
+            stop_backend: false
+        }
+    );
+    assert!(state.committed_close_applies("main"));
+}
+
+#[test]
+fn a_committed_shutdown_never_releases_a_mismatched_close() {
+    let state = state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks");
+    };
+    assert_eq!(
+        state.resolve_close(&token, true, false),
+        Resolution::Approved {
+            stop_backend: false
+        }
+    );
+
+    // A signal commits the whole-app shutdown; a replacement that lands
+    // afterwards cannot turn the mismatch into a survivor — every window
+    // is going away.
+    state.commit_shutdown();
+    state.rotate_context("main");
+    assert!(!state.committed_close_applies("main"));
+    assert_eq!(
+        state.committed_closing_windows(),
+        ids(&["main"]),
+        "a committed shutdown releases nothing"
+    );
+    assert!(state.is_closing());
+}
+
+#[test]
+fn a_repeated_close_after_a_replacement_is_decided_fresh() {
+    // The repeated-request rule meets the identity rule: a committed close
+    // keeps absorbing repeated requests while it still addresses the
+    // window's current document — but once that document was replaced,
+    // the next request releases the stale reservation and is decided
+    // fresh, so the close it commits addresses the successor.
+    let state = state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks");
+    };
+    assert_eq!(
+        state.resolve_close(&token, true, false),
+        Resolution::Approved {
+            stop_backend: false
+        }
+    );
+
+    // While the reservation addresses the current document, a repeated
+    // request is the already-happening close.
+    assert_eq!(state.begin_close("main", false), CloseFlow::Allow);
+    assert!(state.committed_close_applies("main"));
+
+    // The destruction has not been observed yet, and the document is
+    // replaced: the successor's own registrations stay refused — the
+    // window's close is committed, so nothing in it can earn a
+    // confirmation — and the queued effect will never address them.
+    state.rotate_context("main");
+    let fresh = state.context("main");
+    assert_eq!(
+        state.frontend_register("main", &fresh, "editor:43"),
+        Err(GuardError::Closing)
+    );
+    assert!(!state.committed_close_applies("main"));
+
+    // A repeated close request is a fresh decision about the successor,
+    // not the inherited one: nothing is at stake, so it commits cleanly —
+    // and the close it commits addresses the current document.
+    assert_eq!(state.begin_close("main", false), CloseFlow::Allow);
+    assert!(
+        state.committed_close_applies("main"),
+        "the fresh commitment carries the successor's incarnation"
+    );
+}
+
+#[test]
+fn a_destroyed_window_s_reused_label_never_inherits_the_queued_close() {
+    let state = state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks");
+    };
+    assert_eq!(
+        state.resolve_close(&token, true, false),
+        Resolution::Approved {
+            stop_backend: false
+        }
+    );
+
+    // The destruction is observed before the queued effect could run, and
+    // a later window takes the same label: the reservation died with the
+    // window it was decided on, and the successor owes it nothing.
+    state.drop_window("main");
+    assert!(!state.committed_close_applies("main"));
+    let fresh = state.context("main");
+    assert_ne!(context, fresh, "a reused label is a new owner");
+    state
+        .frontend_register("main", &fresh, "editor:42")
+        .expect("the successor registers under its own identity");
+    assert!(matches!(
+        state.begin_close("main", false),
+        CloseFlow::Confirm { .. }
+    ));
+}
+
 // --- the IPC surface, through the mock runtime ------------------------------
 //
 // The state model above answers every decision; these exercise the thin

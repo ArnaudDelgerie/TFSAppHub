@@ -44,6 +44,18 @@
 //! the window is destroyed — the conservative policy, because a close warning
 //! the user can dismiss costs nothing and a silently-erased guard is data loss.
 //!
+//! **Close decisions are bound to that incarnation too** (plan 055 step 6,
+//! audit 016 finding 3). A pending decision remembers the document
+//! incarnation the window held when it opened, and an answer arriving after
+//! a replacement is `Invalidated` — the approval was shown about a document
+//! the window no longer holds, so it applies to nothing, whatever guard IDs
+//! the successor reuses or registers. A committed close carries the same
+//! binding, re-checked at the effect's application boundary
+//! ([`CloseGuardState::committed_close_applies`]): a destruction queued for
+//! document X is never redirected onto X's successor. The refused answer
+//! leaves the successor open with its guards, and a new explicit close
+//! request starts a decision of its own.
+//!
 //! **Bounded, explicit, no silent eviction.** Guard IDs are app-chosen
 //! (`1..=128` bytes of UTF-8, non-empty — `editor:<document-id>`,
 //! `export:<job-id>`), idempotent per owner, and capped per namespace
@@ -189,6 +201,11 @@ struct PendingDecision {
     token: String,
     /// The window whose close the decision covers.
     window: String,
+    /// The document incarnation the window held when the decision opened —
+    /// the identity the displayed warning was shown about. `None` when the
+    /// window had no fetched context (a backend-only decision): nothing was
+    /// replaced when nothing had an identity to lose.
+    context: Option<DocumentContext>,
     /// The frontend guard IDs the displayed warning covered.
     frontend: BTreeSet<String>,
     /// Whether the warning covered the backend guards too — true only when
@@ -211,11 +228,15 @@ struct Inner {
     /// The windows whose close is committed but whose destruction has not
     /// been observed yet — an approved secondary close whose `destroy()` has
     /// only been posted, or an unguarded close between the default being let
-    /// through and the `Destroyed` event. A reserved window is never a
+    /// through and the `Destroyed` event — each bound to the document
+    /// incarnation the close was decided on. A reserved window is never a
     /// survivor for another close's topology question, and its document's
     /// namespace is closed; `drop_window` is the one release that matches
-    /// the destruction actually happening.
-    committed_closes: BTreeSet<String>,
+    /// the destruction actually happening, and
+    /// [`CloseGuardState::committed_close_applies`] is the application
+    /// boundary's check that the queued effect still addresses that same
+    /// incarnation.
+    committed_closes: BTreeMap<String, Option<DocumentContext>>,
     closing: bool,
     /// Bumped on every mutation, so callers can log *that* guard state moved
     /// without logging what it holds — the guard IDs themselves stay private.
@@ -356,7 +377,7 @@ impl CloseGuardState {
         if inner.closing {
             return Err(GuardError::Closing);
         }
-        if inner.committed_closes.contains(window) {
+        if inner.committed_closes.contains_key(window) {
             return Err(GuardError::Closing);
         }
         validate_guard_id(id)?;
@@ -404,7 +425,7 @@ impl CloseGuardState {
         if inner.closing {
             return Err(GuardError::Closing);
         }
-        if inner.committed_closes.contains(window) {
+        if inner.committed_closes.contains_key(window) {
             return Err(GuardError::Closing);
         }
         let entry = inner
@@ -462,7 +483,9 @@ impl CloseGuardState {
     /// touch it (see [`DocumentContext`]).
     pub fn drop_window(&self, window: &str) {
         let mut inner = self.lock();
-        if inner.windows.remove(window).is_some() | inner.committed_closes.remove(window) {
+        let dropped_guards = inner.windows.remove(window).is_some();
+        let unreserved = inner.committed_closes.remove(window).is_some();
+        if dropped_guards || unreserved {
             inner.revision += 1;
         }
         // The pending decision is kept rather than consumed, so its dialog's
@@ -487,7 +510,7 @@ impl CloseGuardState {
         if inner.closing {
             return;
         }
-        if inner.committed_closes.remove(window) {
+        if inner.committed_closes.remove(window).is_some() {
             inner.revision += 1;
         }
     }
@@ -497,7 +520,33 @@ impl CloseGuardState {
     /// survivors — two nearly-simultaneous closes must not both conclude
     /// that the other window will preserve the backend.
     pub fn committed_closing_windows(&self) -> BTreeSet<String> {
-        self.lock().committed_closes.clone()
+        self.lock().committed_closes.keys().cloned().collect()
+    }
+
+    /// The final application boundary: the committed close queued for
+    /// `window` was decided on a document incarnation, and the effect may
+    /// only run while the window still holds that same incarnation. A
+    /// replacement in between — a committed load rotating the context —
+    /// means the queued close was never decided for the successor, so it
+    /// must not be redirected onto it: the reservation is released (never
+    /// across a committed shutdown) and the answer is `false`. `None` on
+    /// either side means no document identity was involved in the decision,
+    /// and nothing to redirect.
+    pub fn committed_close_applies(&self, window: &str) -> bool {
+        let mut inner = self.lock();
+        let Some(decided) = inner.committed_closes.get(window).cloned() else {
+            return false;
+        };
+        let current = inner
+            .windows
+            .get(window)
+            .and_then(|entry| entry.context.clone());
+        let applies = decided.is_none() || decided == current;
+        if !applies && !inner.closing {
+            inner.committed_closes.remove(window);
+            inner.revision += 1;
+        }
+        applies
     }
 
     /// Every frontend guard `window` still holds, across every incarnation.
@@ -531,7 +580,11 @@ impl CloseGuardState {
     /// accepted and then ignored by a teardown that revalidates nothing.
     /// A window whose close is already committed is not re-decided either: a
     /// repeated `CloseRequested` must not stack a second dialog or a second
-    /// effect on a close that is already happening.
+    /// effect on a close that is already happening — unless the committed
+    /// close no longer addresses the window's current document (a
+    /// replacement landed after the commitment), in which case the stale
+    /// reservation is released and the request is decided as the fresh
+    /// close it is, guards and all.
     pub fn begin_close(&self, window: &str, backend_would_stop: bool) -> CloseFlow {
         let mut inner = self.lock();
         // Teardown already committed: no dialog may stand in its way, and the
@@ -542,8 +595,24 @@ impl CloseGuardState {
         if inner.pending.is_some() {
             return CloseFlow::Busy;
         }
-        if inner.committed_closes.contains(window) {
-            return CloseFlow::Allow;
+        if let Some(decided) = inner.committed_closes.get(window).cloned() {
+            // The reservation still addresses the window's current document:
+            // the close is already happening, and a repeated request must
+            // not stack a second decision or a second effect on it.
+            let current = inner
+                .windows
+                .get(window)
+                .and_then(|entry| entry.context.clone());
+            if decided.is_none() || decided == current {
+                return CloseFlow::Allow;
+            }
+            // The document was replaced after this close committed (a
+            // committed shutdown would have answered `Allow` above): the
+            // queued effect will never address the successor, so the stale
+            // reservation is released here — atomically — and this
+            // request is decided as the fresh close it is.
+            inner.committed_closes.remove(window);
+            inner.revision += 1;
         }
         let frontend = frontend_guards_of(&inner, window);
         let backend = if backend_would_stop {
@@ -551,8 +620,15 @@ impl CloseGuardState {
         } else {
             BTreeSet::default()
         };
+        // The identity the decision is decided on: the incarnation the
+        // window holds right now, whatever incarnation its counted guards
+        // were registered under.
+        let context = inner
+            .windows
+            .get(window)
+            .and_then(|entry| entry.context.clone());
         if frontend.is_empty() && backend.is_empty() {
-            inner.committed_closes.insert(window.to_string());
+            inner.committed_closes.insert(window.to_string(), context);
             if backend_would_stop {
                 inner.closing = true;
             }
@@ -563,6 +639,7 @@ impl CloseGuardState {
         inner.pending = Some(PendingDecision {
             token: token.clone(),
             window: window.to_string(),
+            context,
             frontend: frontend.clone(),
             backend_relevant: backend_would_stop,
             backend: backend.clone(),
@@ -579,6 +656,12 @@ impl CloseGuardState {
     /// `backend_would_stop_now` is the topology *at answer time* — the caller
     /// rechecks which window is last, because a nearly-simultaneous close of
     /// another window may have changed it.
+    ///
+    /// The answer is first checked against the decision's document
+    /// incarnation: a replacement while the dialog stood makes the answer
+    /// `Invalidated`, whatever guard IDs the successor reuses or registers —
+    /// the approval was never shown about the document the window now holds
+    /// (audit 016, finding 3). The successor stays open with its guards.
     ///
     /// An approval commits the close in the same critical section as its
     /// final guard recheck: the window is reserved until its destruction is
@@ -601,6 +684,20 @@ impl CloseGuardState {
         // longer happen, and a destroyed window's callback certainly cannot
         // authorise closing anything else.
         if pending.destroyed {
+            return Resolution::Invalidated;
+        }
+        // The decision belongs to the document incarnation it was decided
+        // on (audit 016, finding 3). A replacement while the dialog stood —
+        // a committed load rotating the context — means the approval was
+        // never given for the successor's document, so it applies to
+        // nothing: not when the successor reuses the same guard IDs, and
+        // not when it registers none at all. A window whose decision never
+        // involved a document identity (`None`) has nothing to be replaced.
+        let current_context = inner
+            .windows
+            .get(&pending.window)
+            .and_then(|entry| entry.context.clone());
+        if pending.context.is_some() && current_context != pending.context {
             return Resolution::Invalidated;
         }
         if !approved {
@@ -627,7 +724,9 @@ impl CloseGuardState {
             // the fresh decision above — or in its future, where `closing`
             // refuses it.
             inner.closing = true;
-            inner.committed_closes.insert(pending.window.clone());
+            inner
+                .committed_closes
+                .insert(pending.window.clone(), pending.context.clone());
             inner.revision += 1;
             return Resolution::Approved { stop_backend: true };
         }
@@ -636,7 +735,9 @@ impl CloseGuardState {
         // last one to begin with): the approval covers closing this window,
         // the backend keeps running, and the window is reserved until its
         // destruction is observed.
-        inner.committed_closes.insert(pending.window.clone());
+        inner
+            .committed_closes
+            .insert(pending.window.clone(), pending.context.clone());
         inner.revision += 1;
         Resolution::Approved {
             stop_backend: false,
