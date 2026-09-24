@@ -339,10 +339,12 @@ the answer apply to nothing, whatever guard IDs the successor reuses or
 registers: the successor stays open with its own guards, no second dialog is
 stacked while the first stands, and a new explicit close request starts a
 decision of its own. The same binding holds at the moment the approved close
-is applied: a destruction queued for one document is never redirected onto
-its replacement, and a window label reused after a destruction is a new owner
-that inherits neither the queued close nor a pending decision. An
-acknowledgement protects subsequent close decisions; it cannot reverse a
+is applied: it travels as a native close request, decided again in the very
+dispatch that would proceed to the destruction, so a replacement landing
+between the approval and that dispatch makes the request veto itself rather
+than close the successor — and a window label reused after a destruction is
+a new owner that inherits neither the queued close nor a pending decision.
+An acknowledgement protects subsequent close decisions; it cannot reverse a
 close that already committed. Once shutdown has committed, every register or
 remove — from either transport — answers `closing` explicitly, so a job
 starting during teardown learns the truth instead of installing a guard

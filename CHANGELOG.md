@@ -22,7 +22,13 @@ cannot both count the other window as the survivor that preserves the
 backend. The confirmation and the close it commits belong to the document
 incarnation they were decided on: a page replaced while its dialog stands
 makes the answer apply to nothing, and the successor stays open with its
-own guards. Both switches default to off, neither transport can reach the
+own guards — and the approved close itself travels as a native close
+request, rechecked in the very dispatch that would destroy the window, so
+a replacement landing after the answer still cannot close the successor.
+A second `open` of the running app is admitted on the same event loop as
+every close decision: it cannot open a window on an instance whose
+shutdown has committed, and the window it admits is counted by every later
+close decision. Both switches default to off, neither transport can reach the
 other's namespace, and a mandatory shutdown (signal, fatal error) commits
 first, owns a one-shot teardown latch, and never waits on a person.
 

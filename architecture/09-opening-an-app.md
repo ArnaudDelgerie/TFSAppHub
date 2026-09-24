@@ -248,7 +248,13 @@ nearly-simultaneous closes cannot both count the other as the survivor that
 preserves the backend. A decision, and the close it commits, belong to the
 document incarnation they were decided on: a page replaced while its dialog
 stands makes the answer apply to nothing — the successor stays open with its
-guards, and a queued close is never redirected onto it. The teardown itself
+guards, and a queued close is never redirected onto it — the approved close
+travels as a native close request, decided again in the very dispatch that
+would proceed to the destruction. The second-instance arrival is part of
+the same serialization: its admission — shutdown re-check and window
+creation — runs on the event loop as one unit, so a second `open` cannot
+open a window on an instance whose shutdown committed, and a window it
+admits is counted by every later close decision. The teardown itself
 has exactly one owner — a one-shot latch, not the state commitment — so an
 approved final close and a signal arriving together still tear down once, and
 a second `open` after the commitment cannot revive the closing instance.
