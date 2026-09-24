@@ -8,6 +8,7 @@ use crate::{
     install, lifecycle, lifecycle_gate,
     paths::Paths,
     registry::{self, Platform, RegistryEntry, Source, SourceKind, State},
+    run,
 };
 
 fn version(text: &str) -> semver::Version {
@@ -231,6 +232,58 @@ fn seeded_entry() -> RegistryEntry {
 
 fn seed_registry(paths: &Paths, entry: RegistryEntry) {
     registry::update(paths, |registry| registry.upsert(entry)).expect("a seeded registry");
+}
+
+// --- import invalidates derived state: shared sentinels (plan 052) ------
+
+/// Seed the destination's derived state — a stamp plus one sentinel in each
+/// disposable directory — the fixture every preflight-refusal test asserts a
+/// *refused* import must leave exactly where it was.
+fn seed_derived_sentinels(data_dir: &Path, data_subdir: &Path) {
+    let cache_dir = data_dir.join("cache");
+    let build_dir = data_dir.join("build");
+    fs::create_dir_all(&cache_dir).expect("a cache dir");
+    fs::create_dir_all(&build_dir).expect("a build dir");
+    fs::write(
+        cache_dir.join("sentinel"),
+        b"derived from the current database",
+    )
+    .expect("a cache sentinel");
+    fs::write(
+        build_dir.join("sentinel"),
+        b"derived from the current database",
+    )
+    .expect("a build sentinel");
+    fs::create_dir_all(data_subdir).expect("a data subdir");
+    lifecycle::write_cache_stamp(
+        data_subdir,
+        &lifecycle::CacheStamp {
+            app_version: "1.2.3".to_string(),
+            snapshot_path: "/apps/demo".to_string(),
+            platform: Platform {
+                php_version: "8.5".to_string(),
+                extensions_hash: "a1b2c3d4".repeat(8),
+            },
+        },
+    )
+    .expect("a cache stamp");
+}
+
+/// The counterpart to [`seed_derived_sentinels`]: every sentinel and the
+/// stamp still present, byte for byte.
+fn assert_derived_state_retained(data_dir: &Path, data_subdir: &Path) {
+    assert_eq!(
+        fs::read(data_dir.join("cache/sentinel")).expect("the cache sentinel"),
+        b"derived from the current database"
+    );
+    assert_eq!(
+        fs::read(data_dir.join("build/sentinel")).expect("the build sentinel"),
+        b"derived from the current database"
+    );
+    assert!(
+        lifecycle::cache_stamp_path(data_subdir).exists(),
+        "a refused import must not discard the destination's stamp"
+    );
 }
 
 /// Every entry's path in the `.tar.gz` at `path`, in archive order — the
@@ -621,6 +674,10 @@ fn importing_an_unregistered_id_refuses() {
 fn importing_a_non_archive_file_is_a_clean_refusal() {
     let (base, paths) = temp_paths();
     seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    seed_derived_sentinels(&data_dir, &data_subdir);
     let not_an_archive = base.path().join("notes.txt");
     fs::write(&not_an_archive, b"hello, this is not a tar.gz").expect("a plain text file");
 
@@ -633,6 +690,7 @@ fn importing_a_non_archive_file_is_a_clean_refusal() {
         ),
         "{error}"
     );
+    assert_derived_state_retained(&data_dir, &data_subdir);
 }
 
 #[test]
@@ -654,6 +712,10 @@ fn an_archive_missing_manifest_json_is_refused() {
 fn importing_refuses_a_foreign_identifier() {
     let (base, paths) = temp_paths();
     seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    seed_derived_sentinels(&data_dir, &data_subdir);
     let archive = base.path().join("backup.tar.gz");
     write_test_archive(
         &archive,
@@ -673,12 +735,17 @@ fn importing_refuses_a_foreign_identifier() {
         !error.to_string().contains("rescue"),
         "a refusal before extraction must not imply data was moved aside"
     );
+    assert_derived_state_retained(&data_dir, &data_subdir);
 }
 
 #[test]
 fn importing_refuses_an_archive_newer_than_the_installed_app_even_with_force() {
     let (base, paths) = temp_paths();
     seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    seed_derived_sentinels(&data_dir, &data_subdir);
     let archive = base.path().join("backup.tar.gz");
     write_test_archive(
         &archive,
@@ -694,15 +761,18 @@ fn importing_refuses_an_archive_newer_than_the_installed_app_even_with_force() {
         ),
         "{error}"
     );
+    assert_derived_state_retained(&data_dir, &data_subdir);
 }
 
 #[test]
 fn importing_over_a_populated_dir_without_force_touches_nothing() {
     let (base, paths) = temp_paths();
     seed_registry(&paths, seeded_entry());
-    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
     fs::create_dir_all(&data_subdir).expect("a data subdir");
     fs::write(data_subdir.join("app.db"), b"existing").expect("an existing database");
+    seed_derived_sentinels(&data_dir, &data_subdir);
     let archive = base.path().join("backup.tar.gz");
     write_test_archive(
         &archive,
@@ -725,15 +795,18 @@ fn importing_over_a_populated_dir_without_force_touches_nothing() {
         fs::read(data_subdir.join("app.db")).expect("untouched"),
         b"existing"
     );
+    assert_derived_state_retained(&data_dir, &data_subdir);
 }
 
 #[test]
 fn declining_the_overwrite_confirmation_touches_nothing() {
     let (base, paths) = temp_paths();
     seed_registry(&paths, seeded_entry());
-    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
     fs::create_dir_all(&data_subdir).expect("a data subdir");
     fs::write(data_subdir.join("app.db"), b"existing").expect("an existing database");
+    seed_derived_sentinels(&data_dir, &data_subdir);
     let archive = base.path().join("backup.tar.gz");
     write_test_archive(
         &archive,
@@ -754,6 +827,7 @@ fn declining_the_overwrite_confirmation_touches_nothing() {
         fs::read(data_subdir.join("app.db")).expect("untouched"),
         b"existing"
     );
+    assert_derived_state_retained(&data_dir, &data_subdir);
     assert!(
         lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "export").is_ok(),
         "a declined confirmation releases its maintenance lease"
@@ -928,6 +1002,7 @@ fn a_live_window_refuses_the_import() {
     seed_registry(&paths, seeded_entry());
     let data_dir = base.path().join("TFSApp/dev.local.demo");
     fs::create_dir_all(&data_dir).expect("a data dir");
+    seed_derived_sentinels(&data_dir, &data_dir.join(DATA_DIR));
     let pid_file = data_dir.join("sidecar.pid");
     let _holder = tfsapp_core::process::try_lock_file(&tfsapp_core::process::lock_path(&pid_file))
         .expect("no I/O error")
@@ -941,6 +1016,7 @@ fn a_live_window_refuses_the_import() {
     let error = run_import(&paths, "demo", &archive, false, true)
         .expect_err("a live window owns this data dir");
     assert!(matches!(error, PortabilityError::Busy { .. }), "{error}");
+    assert_derived_state_retained(&data_dir, &data_dir.join(DATA_DIR));
 }
 
 #[test]
@@ -950,6 +1026,7 @@ fn an_active_run_command_refuses_the_import_naming_the_alias() {
     let data_dir = base.path().join("TFSApp/dev.local.demo");
     let runs_dir = data_dir.join("runs");
     fs::create_dir_all(&runs_dir).expect("a runs dir");
+    seed_derived_sentinels(&data_dir, &data_dir.join(DATA_DIR));
     let entry_path = runs_dir.join("1.lock");
     let _holder = tfsapp_core::process::try_lock_file(&entry_path)
         .expect("no I/O error")
@@ -966,12 +1043,17 @@ fn an_active_run_command_refuses_the_import_naming_the_alias() {
     let message = error.to_string();
     assert!(message.contains("migrate"), "{message}");
     assert!(message.contains("run --stop demo"), "{message}");
+    assert_derived_state_retained(&data_dir, &data_dir.join(DATA_DIR));
 }
 
 #[test]
 fn an_archive_with_a_traversal_entry_is_refused_by_archives_own_checks() {
     let (base, paths) = temp_paths();
     seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    seed_derived_sentinels(&data_dir, &data_subdir);
     let archive = base.path().join("malicious.tar.gz");
     let file = fs::File::create(&archive).expect("create archive file");
     let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
@@ -995,6 +1077,17 @@ fn an_archive_with_a_traversal_entry_is_refused_by_archives_own_checks() {
         "{error}"
     );
     assert!(error.to_string().contains("partially extracted"), "{error}");
+    // The cleanup ran before the extraction that failed, and nothing later
+    // restores what it removed: an extraction failure must not leave the old
+    // derived state servable again.
+    assert!(
+        !data_dir.join("cache").exists() && !data_dir.join("build").exists(),
+        "the cleanup that preceded the failed extraction is not rolled back"
+    );
+    assert!(
+        !lifecycle::cache_stamp_path(&data_subdir).exists(),
+        "the old stamp must not survive a failed extraction either"
+    );
 }
 
 // --- import restores uploads/, rescuing what it replaces by rename
@@ -1283,6 +1376,203 @@ fn an_accepted_import_over_a_destination_with_no_cache_or_stamp_imports_cleanly(
     );
 }
 
+// --- a cleanup failure stops the import before any data changes ---------
+
+/// The destination's persistent state — everything a failed cleanup must
+/// leave exactly where it was: the database, `uploads/`, the version record
+/// and the rollback anchor's three halves.
+fn seed_persistent_state(data_dir: &Path, data_subdir: &Path, app_dir: &Path) {
+    fs::write(data_subdir.join("app.db"), b"the live database").expect("an existing database");
+    let uploads_dir = data_dir.join(UPLOADS_DIR);
+    fs::create_dir_all(&uploads_dir).expect("an uploads dir");
+    fs::write(uploads_dir.join("old.txt"), b"an existing upload").expect("an existing upload");
+    lifecycle::write_data_version(data_subdir, "1.2.3").expect("a version record");
+    lifecycle::write_rollback_anchor(
+        data_subdir,
+        &lifecycle::RollbackAnchor {
+            app_version: "1.1.0".to_string(),
+            source_revision: "sha256:previous".to_string(),
+            created_at: registry::now_timestamp(),
+        },
+    )
+    .expect("a seeded anchor");
+    fs::write(
+        lifecycle::db_snapshot_path(data_subdir, "app.db"),
+        b"pre-update-snapshot",
+    )
+    .expect("a seeded db snapshot");
+    fs::create_dir_all(lifecycle::previous_tree_path(app_dir)).expect("a retained tree");
+}
+
+/// The counterpart to [`seed_persistent_state`], plus the two things that
+/// prove the failure stopped *before* the rescue/replacement boundary: no
+/// rescue dump anywhere, and the disposable directories untouched by any
+/// later phase.
+fn assert_persistent_state_unchanged(data_dir: &Path, data_subdir: &Path, app_dir: &Path) {
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("the database"),
+        b"the live database"
+    );
+    assert_eq!(
+        fs::read(data_dir.join(UPLOADS_DIR).join("old.txt")).expect("the upload"),
+        b"an existing upload"
+    );
+    assert_eq!(
+        lifecycle::read_data_version(data_subdir).expect("the version record"),
+        Some("1.2.3".to_string())
+    );
+    assert!(
+        lifecycle::read_rollback_anchor(data_subdir).is_some(),
+        "the anchor's rollback.json half must be untouched"
+    );
+    assert!(
+        lifecycle::db_snapshot_path(data_subdir, "app.db").is_file(),
+        "the anchor's database-snapshot half must be untouched"
+    );
+    assert!(
+        lifecycle::previous_tree_path(app_dir).is_dir(),
+        "the anchor's retained-tree half must be untouched"
+    );
+    for directory in [data_subdir, data_dir] {
+        assert!(
+            !fs::read_dir(directory)
+                .expect("a readable directory")
+                .any(|entry| {
+                    entry
+                        .expect("a directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".rescue-")
+                }),
+            "rescue and extraction must not have started"
+        );
+    }
+}
+
+#[test]
+fn a_stamp_that_cannot_be_removed_stops_the_import_before_any_data_changes() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    seed_persistent_state(&data_dir, &data_subdir, &app_dir);
+    // Seeded by hand rather than `seed_derived_sentinels`: the fixture here
+    // is a stamp that is a *directory*, which the helper's file-writing
+    // cannot produce. `cache.json` as a non-empty directory makes
+    // `remove_file` fail with EISDIR whatever the privileges, so the failure
+    // is deterministic even when the suite runs as root — permission bits
+    // would not be.
+    fs::create_dir_all(data_dir.join("cache")).expect("a cache dir");
+    fs::create_dir_all(data_dir.join("build")).expect("a build dir");
+    fs::write(
+        data_dir.join("cache/sentinel"),
+        b"derived from the current database",
+    )
+    .expect("a cache sentinel");
+    fs::write(
+        data_dir.join("build/sentinel"),
+        b"derived from the current database",
+    )
+    .expect("a build sentinel");
+    fs::create_dir_all(data_subdir.join("cache.json/unremovable"))
+        .expect("a stamp that cannot be removed");
+
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{DATA_DIR}/app.db"), b"incoming"),
+        ],
+    );
+
+    let error = run_import(&paths, "demo", &archive, true, true)
+        .expect_err("a stamp that cannot be discarded stops the import");
+    assert!(
+        matches!(error, PortabilityError::CacheCleanup { .. }),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("cache.json"), "{message}");
+    assert!(message.contains("before replacing any data"), "{message}");
+    assert_persistent_state_unchanged(&data_dir, &data_subdir, &app_dir);
+    // The stamp removal is the cleanup's first step, so neither disposable
+    // directory has been touched yet either.
+    assert_derived_state_retained(&data_dir, &data_subdir);
+}
+
+#[test]
+fn an_unremovable_cache_directory_stops_the_import_with_the_stamp_already_gone() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    seed_persistent_state(&data_dir, &data_subdir, &app_dir);
+    // `cache` as a regular file: `remove_dir_all` on one fails with ENOTDIR
+    // whatever the privileges — the same root-proof determinism as the
+    // stamp-as-directory trick above, one step later in the cleanup.
+    fs::write(data_dir.join("cache"), b"not a directory")
+        .expect("a cache path that cannot be removed");
+    let build_dir = data_dir.join("build");
+    fs::create_dir_all(&build_dir).expect("a build dir");
+    fs::write(
+        build_dir.join("sentinel"),
+        b"derived from the current database",
+    )
+    .expect("a build sentinel");
+    lifecycle::write_cache_stamp(
+        &data_subdir,
+        &lifecycle::CacheStamp {
+            app_version: "1.2.3".to_string(),
+            snapshot_path: "/apps/demo".to_string(),
+            platform: Platform {
+                php_version: "8.5".to_string(),
+                extensions_hash: "a1b2c3d4".repeat(8),
+            },
+        },
+    )
+    .expect("a cache stamp");
+
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{DATA_DIR}/app.db"), b"incoming"),
+        ],
+    );
+
+    let error = run_import(&paths, "demo", &archive, true, true)
+        .expect_err("an unremovable cache directory stops the import");
+    assert!(
+        matches!(error, PortabilityError::CacheCleanup { .. }),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(data_dir.join("cache").display().to_string().as_str()),
+        "{message}"
+    );
+    assert!(message.contains("before replacing any data"), "{message}");
+    // The stamp was discarded before the directory cleanup failed, and the
+    // failure must not resurrect it: a partial cleanup claiming the old
+    // container is reusable is the one state worse than the error itself.
+    assert!(
+        !lifecycle::cache_stamp_path(&data_subdir).exists(),
+        "the stamp must remain absent once discarded"
+    );
+    assert_eq!(
+        fs::read(build_dir.join("sentinel")).expect("the build sentinel"),
+        b"derived from the current database",
+        "the cleanup stops at its first failure — build/ is left in place"
+    );
+    assert_persistent_state_unchanged(&data_dir, &data_subdir, &app_dir);
+}
+
 // --- import migrates an older archive forward --------------------------
 
 /// A fixture app whose `bin/console` records what it was asked to do —
@@ -1299,7 +1589,8 @@ fn runnable_app_tree(root: &Path, app_version: &str, commands: &str) {
               "identifier": "dev.local.demo",
               "project_name": "demo",
               "app_version": "{app_version}",
-              "commands": {commands}
+              "commands": {commands},
+              "run": {{"read": {{"command": "setting:read"}}}}
             }}"#
         ),
     )
@@ -1311,11 +1602,46 @@ fn runnable_app_tree(root: &Path, app_version: &str, commands: &str) {
         root.join("bin/console"),
         r#"<?php
         $arguments = array_slice($argv, 1);
+        $line = implode(' ', $arguments);
+        $cache_dir = getenv('APP_CACHE_DIR');
+        $build_dir = getenv('APP_BUILD_DIR');
+        // `probe-derived-state`: what a lifecycle command sees of the
+        // destination's disposable state — plan 052's proof that import
+        // cleared it before any application command ran.
+        if (in_array('probe-derived-state', $arguments, true)) {
+            $stamp = dirname($cache_dir) . '/data/cache.json';
+            $line .= ' cache_sentinel=' . (file_exists($cache_dir . '/sentinel') ? 'present' : 'absent')
+                . ' build_sentinel=' . (file_exists($build_dir . '/sentinel') ? 'present' : 'absent')
+                . ' stamp=' . (file_exists($stamp) ? 'present' : 'absent');
+        }
+        // `setting:read`: the value a run command returns, read *through*
+        // the app's own cache — the first run derives and caches it from the
+        // database, every later run serves the cached copy without opening
+        // the database at all.
+        if (in_array('setting:read', $arguments, true)) {
+            $cache_file = $cache_dir . '/derived.setting';
+            if (file_exists($cache_file)) {
+                $value = file_get_contents($cache_file);
+            } else {
+                $database = getenv('DATABASE_URL');
+                $value = file_get_contents(substr($database, strlen('sqlite:///')));
+                file_put_contents($cache_file, $value);
+            }
+            file_put_contents(getenv('APP_LOG_DIR') . '/read.result', $value);
+        }
         file_put_contents(
             getenv('APP_LOG_DIR') . '/hooks.log',
-            implode(' ', $arguments) . "\n",
+            $line . "\n",
             FILE_APPEND
         );
+        // A `warmup-boom` marker in the log directory makes the hub's own
+        // `cache:warmup` fail — the log directory is the one place an
+        // import's cache cleanup cannot reach, so a marker planted before
+        // the import survives to the warm-up it is there to break.
+        if ($arguments && $arguments[0] === 'cache:warmup'
+            && file_exists(getenv('APP_LOG_DIR') . '/warmup-boom')) {
+            exit(1);
+        }
         exit(in_array('boom', $arguments, true) ? 1 : 0);
         "#,
     )
@@ -1358,11 +1684,13 @@ fn an_archive_older_than_the_installed_app_is_migrated_forward_on_import() {
     // event in progress — declared once, and only ever run under
     // `LifecycleEvent::Update`, whichever command decides that is the event.
     // A plain install runs neither; import's own migrate-forward step is
-    // what reaches them here.
+    // what reaches them here. `probe-derived-state` — not a `cache:clear`
+    // that would itself hide a missed cleanup — is what makes the first
+    // application command report the disposable state it ran against.
     runnable_app_tree(
         source.path(),
         "1.3.0",
-        r#"{"pre-update": ["cache:clear"], "post-update": ["about"]}"#,
+        r#"{"pre-update": ["probe-derived-state"], "post-update": ["about"]}"#,
     );
     install::install(
         &paths,
@@ -1376,7 +1704,25 @@ fn an_archive_older_than_the_installed_app_is_migrated_forward_on_import() {
     .expect("the install succeeds")
     .expect("the user did not decline");
 
-    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join("data");
+    // The previous state the migration must not inherit: sentinels in both
+    // disposable directories, plus the stamp the install's own warm-up wrote.
+    fs::write(
+        data_dir.join("cache/sentinel"),
+        b"derived from the previous database",
+    )
+    .expect("a cache sentinel");
+    fs::write(
+        data_dir.join("build/sentinel"),
+        b"derived from the previous database",
+    )
+    .expect("a build sentinel");
+    assert!(
+        lifecycle::cache_stamp_path(&data_subdir).exists(),
+        "the install's warm-up stamped the cache the import must discard"
+    );
+
     let archive = base.path().join("backup.tar.gz");
     write_test_archive(
         &archive,
@@ -1402,17 +1748,41 @@ fn an_archive_older_than_the_installed_app_is_migrated_forward_on_import() {
     let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
     // The hub's own `cache:warmup` (plan 024) closes out the initial install
     // (no declared hooks there, so it is that event's only line) and then the
-    // migrate-forward's own `install::prepare` call.
+    // migrate-forward's own `install::prepare` call — whose first
+    // application command reports exactly what the Overview requires: no
+    // sentinel, no previous stamp, before any hook could have cleared them.
     assert_eq!(
         fs::read_to_string(log).expect("a hook trace"),
-        "cache:warmup --env=prod --no-debug\ncache:clear\nabout\ncache:warmup --env=prod --no-debug\n",
-        "the installed manifest's pre-update then post-update must run over the imported data"
+        "cache:warmup --env=prod --no-debug\n\
+         probe-derived-state cache_sentinel=absent build_sentinel=absent stamp=absent\n\
+         about\n\
+         cache:warmup --env=prod --no-debug\n",
+        "the installed manifest's pre-update then post-update must run over the imported data, \
+         with the previous derived state already gone"
     );
 
     assert_eq!(
         fs::read(data_subdir.join("app.db")).expect("the imported database"),
         b"older-backup",
         "the imported bytes are what the hooks ran against, not a fixture database"
+    );
+
+    // The migrate-forward's own warm-up succeeded, so it wrote a fresh stamp
+    // for the installed version — and the import, already past its cleanup,
+    // must not delete that fresh one on the way out.
+    let stamp: lifecycle::CacheStamp = serde_json::from_str(
+        &fs::read_to_string(lifecycle::cache_stamp_path(&data_subdir)).expect("a fresh stamp"),
+    )
+    .expect("a parseable stamp");
+    assert_eq!(stamp.app_version, "1.3.0");
+    assert_eq!(
+        stamp.snapshot_path,
+        paths
+            .app_dir("demo")
+            .expect("an app dir")
+            .display()
+            .to_string(),
+        "the fresh stamp must vouch for the installed snapshot the warm-up ran from"
     );
 }
 
@@ -1436,8 +1806,25 @@ fn a_failed_forward_migration_leaves_the_archive_version_and_names_the_rescue() 
     .expect("the initial install succeeds")
     .expect("the user did not decline");
 
-    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join("data");
     fs::write(data_subdir.join("app.db"), b"before import").expect("an existing database");
+    // The previous derived state: a failed migration must not leave any of
+    // it behind for a later launch or command to reuse.
+    fs::write(
+        data_dir.join("cache/sentinel"),
+        b"derived from the previous database",
+    )
+    .expect("a cache sentinel");
+    fs::write(
+        data_dir.join("build/sentinel"),
+        b"derived from the previous database",
+    )
+    .expect("a build sentinel");
+    assert!(
+        lifecycle::cache_stamp_path(&data_subdir).exists(),
+        "the install's warm-up stamped the cache the import must discard"
+    );
     let archive = base.path().join("backup.tar.gz");
     write_test_archive(
         &archive,
@@ -1463,5 +1850,174 @@ fn a_failed_forward_migration_leaves_the_archive_version_and_names_the_rescue() 
         lifecycle::read_data_version(&data_subdir).expect("the stamped config"),
         Some("1.2.0".to_string()),
         "the next open must see the unfinished forward migration"
+    );
+    assert!(
+        !data_dir.join("cache/sentinel").exists() && !data_dir.join("build/sentinel").exists(),
+        "the old cache/build sentinels must not survive a failed migration"
+    );
+    assert!(
+        !lifecycle::cache_stamp_path(&data_subdir).exists(),
+        "the old stamp never survives, and a failed migration stamps nothing"
+    );
+}
+
+#[test]
+fn a_failed_warm_up_after_a_forward_migration_warns_without_stamping() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+    runnable_app_tree(source.path(), "1.3.0", r#"{"pre-update": ["about"]}"#);
+    install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the initial install succeeds")
+    .expect("the user did not decline");
+
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join("data");
+    // The marker that makes the fixture's own `cache:warmup` exit 1 — planted
+    // in the log directory, the one place the import's cache cleanup cannot
+    // reach, so it survives to the migrate-forward's closing warm-up.
+    fs::write(data_dir.join("log/warmup-boom"), b"").expect("a warm-up failure marker");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.0")),
+            (&format!("{DATA_DIR}/app.db"), b"older-backup"),
+        ],
+    );
+
+    let proceeded = run_import(&paths, "demo", &archive, true, true)
+        .expect("the hooks succeed; only the closing warm-up fails");
+    assert!(
+        proceeded,
+        "a failed warm-up is a warning, not an import failure"
+    );
+
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("the imported database"),
+        b"older-backup"
+    );
+    assert_eq!(
+        lifecycle::read_data_version(&data_subdir).expect("the stamped config"),
+        Some("1.3.0".to_string()),
+        "the migration itself completed — only its warm-up failed"
+    );
+    assert!(
+        !lifecycle::cache_stamp_path(&data_subdir).exists(),
+        "neither the old stamp nor a fresh one may survive a failed warm-up"
+    );
+}
+
+// --- immediate use: a run command after the import (plan 052) -----------
+
+/// Point `dirs::data_dir()` — and therefore `Paths::resolve()`, the one thing
+/// `run::start` resolves on its own rather than taking as a parameter — at
+/// `path` for the duration of this guard, restoring the previous value (or
+/// its absence) on drop. `make check`'s `--test-threads=1` is what makes
+/// borrowing a process-global variable safe here: nothing else in the test
+/// binary runs concurrently, and the fixture owns the whole window.
+struct RedirectedDataDir {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl RedirectedDataDir {
+    fn point_at(path: &Path) -> Self {
+        let previous = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", path);
+        Self { previous }
+    }
+}
+
+impl Drop for RedirectedDataDir {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(previous) => std::env::set_var("XDG_DATA_HOME", previous),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+}
+
+/// The end-to-end probe the Overview's bug report describes: export database
+/// A, replace it with B, let a declared `run` command derive and cache a
+/// value from B, then import A at the same app version and run the command
+/// again — before any `open`. The command reads *through* its cache, so it
+/// returns A only because the import cleared what B left behind; `Mode::Run`
+/// deliberately clears nothing itself.
+#[test]
+fn a_run_command_after_an_equal_version_import_reads_the_imported_database() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+    runnable_app_tree(source.path(), "1.3.0", "{}");
+    install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the install succeeds")
+    .expect("the user did not decline");
+
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    let read_result = data_dir.join("log/read.result");
+
+    // Database A, exported through the real `run_export`.
+    fs::write(data_subdir.join("app.db"), b"database A").expect("database A");
+    let archive = base.path().join("backup.tar.gz");
+    run_export(&paths, "demo", &archive).expect("export succeeds");
+
+    // Database B takes its place, and the declared `read` alias caches a
+    // value derived from it — through the real `run::start`, bundled
+    // interpreter and all.
+    fs::write(data_subdir.join("app.db"), b"database B").expect("database B");
+    {
+        let _redirected = RedirectedDataDir::point_at(base.path());
+        let code = run::start("demo", "read", &[], false);
+        assert_eq!(code, 0, "the seeding run command succeeds");
+    }
+    assert_eq!(
+        fs::read_to_string(&read_result).expect("the seeded result"),
+        "database B",
+        "the seeding run derived its cache value from B"
+    );
+    assert!(
+        data_dir.join("cache/derived.setting").exists(),
+        "the value is cached exactly where the import's cleanup must find it"
+    );
+
+    // A returns at the same app version, and the command runs again before
+    // any `open` — only the import's own cleanup can keep this reading A.
+    let proceeded = run_import(&paths, "demo", &archive, true, true)
+        .expect("an equal-version restore over a populated data dir, forced");
+    assert!(proceeded);
+    {
+        let _redirected = RedirectedDataDir::point_at(base.path());
+        let code = run::start("demo", "read", &[], false);
+        assert_eq!(code, 0, "the post-import run command succeeds");
+    }
+    assert_eq!(
+        fs::read_to_string(&read_result).expect("the post-import result"),
+        "database A",
+        "the command reads through its cache — it returns A only because the import cleared B's"
+    );
+    assert!(
+        !lifecycle::cache_stamp_path(&data_subdir).exists(),
+        "an equal-version import leaves no stamp behind"
     );
 }
