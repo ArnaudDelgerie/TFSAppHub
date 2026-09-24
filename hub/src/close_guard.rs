@@ -573,6 +573,105 @@ fn total_frontend_guards(entry: &WindowEntry) -> usize {
     entry.guards.values().map(|ids| ids.len()).sum()
 }
 
+// --- the IPC surface --------------------------------------------------------
+//
+// The webview reaches the frontend namespace through three Tauri commands,
+// granted at runtime only when the manifest declares `actions.close_guard.ipc`
+// (`window.rs`'s grant table; the static capability grants nothing). The
+// commands are a thin layer: they resolve the calling window the same way
+// `secrets.rs` does — from Tauri's caller, never from a supplied label — and
+// delegate every decision to the state model above. The core helpers are
+// generic over the runtime so the mock runtime can exercise them; the
+// `#[tauri::command]` wrappers pin the production runtime, exactly like the
+// secret commands.
+
+/// The managed shape: one state per launch, shared by the IPC commands, the
+/// bridge's request threads and `lifecycle`. Created in `open_window` before
+/// any window exists, managed into Tauri before the splash is built, and
+/// handed to `sidecar::start` before PHP is spawned.
+pub type SharedCloseGuards = std::sync::Arc<CloseGuardState>;
+
+/// The error the commands answer when no state backs the calling window —
+/// which cannot happen in a launch that built its windows after managing the
+/// state, and is the honest answer everywhere else.
+const NO_STATE: &str = "unavailable";
+
+/// `close_guard_context`'s answer: the calling window's current document
+/// context, opaque to the app.
+#[derive(Debug, serde::Serialize)]
+pub struct CloseGuardDocument {
+    pub context: String,
+}
+
+use tauri::Manager;
+
+/// The state the calling window's app was launched with, or `None` when this
+/// process never managed one — the "unavailable to app code" rule of the
+/// contract rather than a panic.
+fn state_for_window<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+) -> Option<tauri::State<'_, SharedCloseGuards>> {
+    window.app_handle().try_state::<SharedCloseGuards>()
+}
+
+/// The current document context of the calling window — the one command the
+/// page calls before any other in this group, and the only place the previous
+/// document's guards are erased (see [`CloseGuardState::context`]).
+pub fn context_for_window<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+) -> Result<String, &'static str> {
+    let state = state_for_window(window).ok_or(NO_STATE)?;
+    Ok(state.context(window.label()).as_str().to_string())
+}
+
+/// Register a frontend guard for the document presenting `context` in the
+/// calling window.
+pub fn register_for_window<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+    context: &str,
+    id: &str,
+) -> Result<(), &'static str> {
+    let state = state_for_window(window).ok_or(NO_STATE)?;
+    state
+        .frontend_register(window.label(), &DocumentContext(context.to_string()), id)
+        .map_err(|error| error.code())
+}
+
+/// Remove a frontend guard, harmlessly when absent.
+pub fn remove_for_window<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+    context: &str,
+    id: &str,
+) -> Result<(), &'static str> {
+    let state = state_for_window(window).ok_or(NO_STATE)?;
+    state
+        .frontend_remove(window.label(), &DocumentContext(context.to_string()), id)
+        .map_err(|error| error.code())
+}
+
+#[tauri::command]
+pub fn close_guard_context(window: tauri::Window) -> Result<CloseGuardDocument, &'static str> {
+    context_for_window(&window).map(|context| CloseGuardDocument { context })
+}
+
+#[tauri::command]
+pub fn close_guard_register(
+    window: tauri::Window,
+    context: String,
+    id: String,
+) -> Result<(), &'static str> {
+    register_for_window(&window, &context, &id)
+}
+
+#[tauri::command]
+pub fn close_guard_remove(
+    window: tauri::Window,
+    context: String,
+    id: String,
+) -> Result<(), &'static str> {
+    remove_for_window(&window, &context, &id)
+}
+
 #[cfg(test)]
 #[path = "close_guard_tests.rs"]
 mod tests;

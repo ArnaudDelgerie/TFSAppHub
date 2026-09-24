@@ -426,6 +426,15 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
     let relaunch_origin = app_origin.clone();
     let relaunch_icon_path = identity.icon_path.clone();
 
+    // One guard state per launch, created before the `Builder` so no window —
+    // splash, relaunch or main — and no request thread can exist ahead of it.
+    // It is managed into Tauri in `setup` (before the splash is built, the
+    // earliest a webview could call a command) and handed to `serve` for the
+    // bridge's request threads. Both transports share the one state, while
+    // keeping their own namespaces inside it.
+    let close_guards = std::sync::Arc::new(close_guard::CloseGuardState::new());
+    let relaunch_close_guards = close_guards.clone();
+
     window::register_splash_scheme(tauri::Builder::default(), &spec.app_dir)
         // Registered before every other plugin, per the plugin's own guidance,
         // and after the identity mutation above — which is what makes its key
@@ -451,6 +460,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
                     &launch.url,
                     &launch.product_name,
                     &relaunch_origin,
+                    &relaunch_close_guards,
                 )
                 .and_then(|window| {
                     if let Some(path) = &relaunch_icon_path {
@@ -478,8 +488,16 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             update_check::update_check,
             picker::pick_path,
             picker::save_path,
+            close_guard::close_guard_context,
+            close_guard::close_guard_register,
+            close_guard::close_guard_remove,
         ])
         .setup(move |app| {
+            // `manage` below is the one call here that needs the trait, and
+            // importing it at the top of `open_window` would read as if the
+            // whole function dealt in managed state.
+            use tauri::Manager;
+
             // Greyscale rather than subpixel text antialiasing, for every
             // WebView this process creates. It has to run after Tauri has
             // initialised GTK and before any window exists, because WebKit reads
@@ -495,6 +513,11 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             // sidecar the thread below is about to spawn.
             lifecycle::install_shutdown_on_signal(app.handle());
 
+            // Before the splash is built: the earliest a webview could call a
+            // close-guard command is the splash's own first script run, and
+            // every command resolves this state from the calling window.
+            app.manage(close_guards.clone());
+
             let splash_source =
                 window::resolve_splash_source(&spec.app_dir, spec.manifest.splash_path.as_deref());
             let splash = window::create_splash_window(
@@ -507,6 +530,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
                 ),
                 &app_origin,
                 &splash_source,
+                &close_guards,
             )?;
             if let Some(path) = &identity.icon_path {
                 if let Some(icon) = identity::load_icon(path) {
@@ -526,6 +550,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
                     activity,
                     app_origin,
                     splash_label,
+                    close_guards,
                 );
             });
 
@@ -560,6 +585,7 @@ fn serve(
     activity: Option<lifecycle_gate::ActivityLease>,
     app_origin: window::AppOriginSlot,
     splash_label: String,
+    close_guards: close_guard::SharedCloseGuards,
 ) {
     use tauri::Manager;
 
@@ -671,6 +697,7 @@ fn serve(
         &environment,
         manifest,
         &spec.update,
+        &close_guards,
         liveness_lock,
         serving_lock,
         &app,

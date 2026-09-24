@@ -142,13 +142,32 @@ pub fn classify_navigation(app_origin: Option<&Url>, target: &Url) -> Navigation
 /// answering, which never returns while that same thread is the one waiting
 /// on it. Both events still get one `hub.log` line each, so a launch's log
 /// shows a download was seen and where it landed.
+///
+/// `on_page_load` rotates the window's close-guard document context on every
+/// committed main-frame load (`Started` — wry/WebKitGTK's
+/// `LoadEvent::Committed`, which fires when the new document is created,
+/// before its own scripts can run). `Finished` is deliberately not handled:
+/// erasing guards at load-finished could erase guards the new page registered
+/// during its own startup — the fetch in `close_guard.rs` is the one erase
+/// point. The splash and every relaunch window get the same hook, because the
+/// guard namespaces belong to the document, not to the window that happened
+/// to load it first.
 fn with_window_policy<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
     builder: WebviewWindowBuilder<'a, R, M>,
     app_origin: AppOriginSlot,
+    close_guards: crate::close_guard::SharedCloseGuards,
 ) -> WebviewWindowBuilder<'a, R, M> {
     let new_window_origin = app_origin.clone();
     builder
         .disable_drag_drop_handler()
+        .on_page_load(
+            move |webview, payload| match payload.event() {
+                tauri::webview::PageLoadEvent::Started => {
+                    close_guards.rotate_context(webview.label());
+                }
+                tauri::webview::PageLoadEvent::Finished => {}
+            },
+        )
         .on_download(|_webview, event| {
             match event {
                 DownloadEvent::Requested { url, destination } => {
@@ -221,9 +240,13 @@ pub const PICKER_IPC_GRANT: ActionIpcGrant = ActionIpcGrant {
     capability_identifier: "actions-picker",
     permission: "allow-picker",
 };
+pub const CLOSE_GUARD_IPC_GRANT: ActionIpcGrant = ActionIpcGrant {
+    capability_identifier: "actions-close-guard",
+    permission: "allow-close-guard",
+};
 
 /// The table the launch walks, pairing each group's `ipc` flag with the grant it
-/// activates. A third group is one entry here, not another `if` at the call
+/// activates. A fourth group is one entry here, not another `if` at the call
 /// site — and the pairing is what keeps the groups independent, so one group's
 /// grant can never imply another's.
 pub type ActionIpcGrantEntry = (fn(&crate::manifest::ActionsConfig) -> bool, ActionIpcGrant);
@@ -232,6 +255,7 @@ pub const ACTION_IPC_GRANTS: &[ActionIpcGrantEntry] = &[
     (|actions| actions.secrets.ipc, SECRETS_IPC_GRANT),
     (|actions| actions.update.ipc, UPDATE_IPC_GRANT),
     (|actions| actions.picker.ipc, PICKER_IPC_GRANT),
+    (|actions| actions.close_guard.ipc, CLOSE_GUARD_IPC_GRANT),
 ];
 
 /// The action grants a manifest opted into. Kept separate from Builder setup so
@@ -473,13 +497,14 @@ pub fn create_splash_window<R: tauri::Runtime>(
     fallback_script: &str,
     app_origin: &AppOriginSlot,
     splash_source: &SplashSource,
+    close_guards: &crate::close_guard::SharedCloseGuards,
 ) -> tauri::Result<tauri::WebviewWindow<R>> {
     let mut builder =
         WebviewWindowBuilder::new(app, next_window_label(app), splash_source.webview_url());
     if *splash_source == SplashSource::Fallback {
         builder = builder.initialization_script(fallback_script);
     }
-    with_window_policy(builder, app_origin.clone())
+    with_window_policy(builder, app_origin.clone(), close_guards.clone())
         .title(title)
         .inner_size(1100.0, 760.0)
         .min_inner_size(800.0, 560.0)
@@ -496,6 +521,7 @@ pub fn create_app_window(
     url: &str,
     title: &str,
     app_origin: &AppOriginSlot,
+    close_guards: &crate::close_guard::SharedCloseGuards,
 ) -> tauri::Result<tauri::WebviewWindow> {
     publish_app_origin(app_origin, url);
     with_window_policy(
@@ -505,6 +531,7 @@ pub fn create_app_window(
             WebviewUrl::External(url.parse().expect("a valid local backend URL")),
         ),
         app_origin.clone(),
+        close_guards.clone(),
     )
     .title(title)
     .inner_size(1100.0, 760.0)

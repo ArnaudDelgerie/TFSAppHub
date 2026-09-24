@@ -18,6 +18,17 @@ fn bridge_with_update_context(
     keys: &[&str],
     update_context: Context,
 ) -> Bridge {
+    bridge_with_close_guards(groups, keys, update_context, &fresh_close_guards())
+}
+
+/// A bridge sharing `close_guards` — the shape a test needs whenever it drives
+/// the same state the routes saw, such as committing shutdown before a call.
+fn bridge_with_close_guards(
+    groups: BridgeGroups,
+    keys: &[&str],
+    update_context: Context,
+    close_guards: &crate::close_guard::SharedCloseGuards,
+) -> Bridge {
     let store = new_fake_keyring_store();
     crate::secrets::secrets_set(&store, "openai", "sk-stored".to_string());
     start(
@@ -25,8 +36,13 @@ fn bridge_with_update_context(
         keys.iter().map(|key| key.to_string()).collect(),
         groups,
         update_context,
+        close_guards.clone(),
     )
     .expect("a started bridge")
+}
+
+fn fresh_close_guards() -> crate::close_guard::SharedCloseGuards {
+    std::sync::Arc::new(crate::close_guard::CloseGuardState::new())
 }
 
 /// A release source pointing at `cache_path`, the shape `/update/check`
@@ -48,6 +64,7 @@ fn release_update_context(cache_path: std::path::PathBuf) -> Context {
 const BOTH: BridgeGroups = BridgeGroups {
     secrets: true,
     update: true,
+    close_guard: true,
 };
 
 /// One request, spelled out over a raw socket rather than through an HTTP
@@ -197,6 +214,7 @@ fn a_group_that_is_off_answers_not_found_rather_than_forbidden() {
         BridgeGroups {
             secrets: false,
             update: true,
+            close_guard: true,
         },
         &["openai"],
     );
@@ -311,4 +329,308 @@ fn an_unknown_path_is_a_plain_not_found() {
         request(&bridge, "GET", "/whatever", Some(&token), "").status,
         404
     );
+}
+
+// --- close-guard routes -----------------------------------------------------
+
+#[test]
+fn a_backend_guard_registers_and_removes_over_the_route_pair() {
+    let guards = fresh_close_guards();
+    let bridge = bridge_with_close_guards(BOTH, &[], crate::update_check::Context::Dev, &guards);
+    let token = bridge.token.clone();
+
+    let answer = request(
+        &bridge,
+        "POST",
+        "/close-guard/register",
+        Some(&token),
+        r#"{"id":"export:job-1"}"#,
+    );
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.json()["ok"], true);
+
+    assert!(guards.backend_guards().contains("export:job-1"));
+
+    let answer = request(
+        &bridge,
+        "POST",
+        "/close-guard/remove",
+        Some(&token),
+        r#"{"id":"export:job-1"}"#,
+    );
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.json()["ok"], true);
+
+    assert!(guards.backend_guards().is_empty());
+}
+
+#[test]
+fn a_backend_guard_needs_the_bearer_token() {
+    let bridge = bridge(BOTH, &[]);
+    let token = bridge.token.clone();
+
+    let answer = request(
+        &bridge,
+        "POST",
+        "/close-guard/register",
+        None,
+        r#"{"id":"export:job-1"}"#,
+    );
+    assert_eq!(answer.status, 401);
+    assert_eq!(answer.json()["error"], "unauthorized");
+
+    // The refused request installed nothing.
+    let authorized = request(
+        &bridge,
+        "POST",
+        "/close-guard/register",
+        Some(&token),
+        r#"{"id":"export:job-1"}"#,
+    );
+    assert_eq!(authorized.status, 200);
+}
+
+#[test]
+fn a_declined_close_guard_group_answers_not_found_like_any_other() {
+    let bridge = bridge(
+        BridgeGroups {
+            secrets: true,
+            update: true,
+            close_guard: false,
+        },
+        &[],
+    );
+    let token = bridge.token.clone();
+
+    let answer = request(
+        &bridge,
+        "POST",
+        "/close-guard/register",
+        Some(&token),
+        r#"{"id":"export:job-1"}"#,
+    );
+    assert_eq!(answer.status, 404);
+    assert_eq!(answer.json()["error"], "not_found");
+}
+
+#[test]
+fn a_malformed_guard_body_is_refused_as_invalid() {
+    let bridge = bridge(BOTH, &[]);
+    let token = bridge.token.clone();
+
+    let answer = request(
+        &bridge,
+        "POST",
+        "/close-guard/register",
+        Some(&token),
+        r#"{"not":"the shape"}"#,
+    );
+    assert_eq!(answer.status, 400);
+    assert_eq!(answer.json()["error"], "invalid_body");
+}
+
+#[test]
+fn an_oversized_guard_body_is_refused_before_parsing() {
+    let bridge = bridge(BOTH, &[]);
+    let token = bridge.token.clone();
+    let huge_id = "x".repeat(20 * 1024);
+
+    let answer = request(
+        &bridge,
+        "POST",
+        "/close-guard/register",
+        Some(&token),
+        &format!(r#"{{"id":"{huge_id}"}}"#),
+    );
+    assert_eq!(answer.status, 413);
+}
+
+#[test]
+fn an_invalid_guard_id_is_refused_without_touching_the_namespace() {
+    let bridge = bridge(BOTH, &[]);
+    let token = bridge.token.clone();
+
+    let answer = request(
+        &bridge,
+        "POST",
+        "/close-guard/register",
+        Some(&token),
+        r#"{"id":""}"#,
+    );
+    assert_eq!(answer.status, 400);
+    assert_eq!(answer.json()["error"], "invalid_id");
+
+    // And the too-many tail: the cap is 16, a 17th registration is refused
+    // without evicting any of the standing guards.
+    for index in 0..16 {
+        let answer = request(
+            &bridge,
+            "POST",
+            "/close-guard/register",
+            Some(&token),
+            &format!(r#"{{"id":"export:job-{index}"}}"#),
+        );
+        assert_eq!(answer.status, 200);
+    }
+    let answer = request(
+        &bridge,
+        "POST",
+        "/close-guard/register",
+        Some(&token),
+        r#"{"id":"export:job-16"}"#,
+    );
+    assert_eq!(answer.status, 429);
+    assert_eq!(answer.json()["error"], "too_many_guards");
+}
+
+#[test]
+fn a_registration_after_shutdown_commitment_is_refused_as_closing() {
+    let guards = fresh_close_guards();
+    let bridge = bridge_with_close_guards(BOTH, &[], crate::update_check::Context::Dev, &guards);
+    let token = bridge.token.clone();
+    guards.commit_shutdown();
+
+    let answer = request(
+        &bridge,
+        "POST",
+        "/close-guard/register",
+        Some(&token),
+        r#"{"id":"export:job-1"}"#,
+    );
+    assert_eq!(answer.status, 503);
+    assert_eq!(answer.json()["error"], "closing");
+
+    let answer = request(
+        &bridge,
+        "POST",
+        "/close-guard/remove",
+        Some(&token),
+        r#"{"id":"export:job-1"}"#,
+    );
+    assert_eq!(answer.status, 503);
+    assert_eq!(answer.json()["error"], "closing");
+}
+
+#[test]
+fn concurrent_backend_registrations_through_the_real_routes_end_empty() {
+    let guards = fresh_close_guards();
+    let bridge = bridge_with_close_guards(BOTH, &[], crate::update_check::Context::Dev, &guards);
+    let port = bridge.port;
+    let token = bridge.token.clone();
+
+    // 8 threads each doing register/remove over their own raw socket: the
+    // route pair is what a real worker's `finally` speaks, so that is what
+    // the test speaks too.
+    let mut threads = Vec::new();
+    for worker in 0..8 {
+        let token = token.clone();
+        threads.push(std::thread::spawn(move || {
+            for attempt in 0..5 {
+                let id = format!("export:worker-{worker}:{attempt}");
+                let mut stream = TcpStream::connect(("127.0.0.1", port))
+                    .expect("the bridge accepts connections");
+                let raw = format!(
+                    "POST /close-guard/register HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                     Authorization: Bearer {token}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{{\"id\":\"{id}\"}}",
+                    format!(r#"{{"id":"{id}"}}"#).len()
+                );
+                stream.write_all(raw.as_bytes()).expect("a written request");
+                let mut answer = String::new();
+                stream.read_to_string(&mut answer).expect("a read response");
+                assert!(answer.contains(" 200 "), "registration failed: {answer}");
+
+                let mut stream = TcpStream::connect(("127.0.0.1", port))
+                    .expect("the bridge accepts connections");
+                let raw = format!(
+                    "POST /close-guard/remove HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                     Authorization: Bearer {token}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{{\"id\":\"{id}\"}}",
+                    format!(r#"{{"id":"{id}"}}"#).len()
+                );
+                stream.write_all(raw.as_bytes()).expect("a written request");
+                let mut answer = String::new();
+                stream.read_to_string(&mut answer).expect("a read response");
+                assert!(answer.contains(" 200 "), "removal failed: {answer}");
+            }
+        }));
+    }
+    for thread in threads {
+        thread.join().expect("a worker that finished cleanly");
+    }
+
+    assert!(guards.backend_guards().is_empty());
+}
+
+#[test]
+fn a_close_guard_only_bridge_starts_without_the_other_groups() {
+    // `close_guard.bridge` on its own must be enough to start the bridge and
+    // inject its environment (§7): the group's own routes answer, and the two
+    // groups that stayed off answer 404 like the declined groups they are.
+    let bridge = bridge(
+        BridgeGroups {
+            secrets: false,
+            update: false,
+            close_guard: true,
+        },
+        &[],
+    );
+    let token = bridge.token.clone();
+
+    let answer = request(
+        &bridge,
+        "POST",
+        "/close-guard/register",
+        Some(&token),
+        r#"{"id":"export:job-1"}"#,
+    );
+    assert_eq!(answer.status, 200);
+
+    assert_eq!(
+        request(
+            &bridge,
+            "POST",
+            "/secrets/get",
+            Some(&token),
+            r#"{"key":"openai"}"#
+        )
+        .status,
+        404
+    );
+    assert_eq!(
+        request(&bridge, "GET", "/update/check", Some(&token), "").status,
+        404
+    );
+
+    // The liveness route stays ungated.
+    assert_eq!(
+        request(&bridge, "GET", "/healthz", Some(&token), "").status,
+        200
+    );
+}
+
+#[test]
+fn backend_routes_never_reach_the_frontend_namespace() {
+    let guards = fresh_close_guards();
+    let context = guards.context("main");
+    guards
+        .frontend_register("main", &context, "editor:doc-1")
+        .expect("a registered frontend guard");
+    let bridge = bridge_with_close_guards(BOTH, &[], crate::update_check::Context::Dev, &guards);
+    let token = bridge.token.clone();
+
+    // The id the frontend used is free on the backend route: the namespaces
+    // are separate, so a backend worker can reuse the very same string
+    // without colliding with — or removing — the document's guard.
+    let answer = request(
+        &bridge,
+        "POST",
+        "/close-guard/register",
+        Some(&token),
+        r#"{"id":"editor:doc-1"}"#,
+    );
+    assert_eq!(answer.status, 200);
+
+    assert!(guards.frontend_guards("main").contains("editor:doc-1"));
+    assert!(guards.backend_guards().contains("editor:doc-1"));
 }

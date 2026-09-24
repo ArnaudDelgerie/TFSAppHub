@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-close-guard"
+description = "Allows an app's frontend to reach actions.close_guard over Tauri's own IPC (close_guard_context/close_guard_register/close_guard_remove) — the frontend half of the close guards, scoped to the calling window's current document. The backend half lives on the HTTP bridge instead, when close_guard declares bridge: true. One permission for all three commands, matching the all-or-nothing actions.close_guard.ipc granularity (see CONTRACT.md §7). Granted at runtime, per launch, only when the installed app's own manifest declares it; the static capability grants nothing, and a splash page never receives it — the capability is remote-only, like the other groups'."
+commands.allow = ["close_guard_context", "close_guard_register", "close_guard_remove"]

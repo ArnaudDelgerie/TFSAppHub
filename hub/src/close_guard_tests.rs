@@ -611,3 +611,115 @@ fn the_revision_counts_mutations_without_exposing_contents() {
         "only the real mutations moved it — the no-ops did not"
     );
 }
+
+// --- the IPC surface, through the mock runtime ------------------------------
+//
+// The state model above answers every decision; these exercise the thin
+// window-resolving layer around it, the same way `secrets_tests` does. Two
+// boundaries of the production wiring stay beyond the mock runtime and are
+// plan 055 step 4's native validation: the `on_page_load` rotation hook and
+// `Destroyed` cleanup do not fire on mock windows, so the tests rotate and
+// drop through the state model directly instead.
+
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+
+fn shared_state() -> SharedCloseGuards {
+    std::sync::Arc::new(CloseGuardState::new())
+}
+
+/// A mock app managing `guards`, with one window — the shape a launch's
+/// `open_window` leaves behind.
+fn app_with_window(guards: &SharedCloseGuards) -> tauri::Window<tauri::test::MockRuntime> {
+    let app = tauri::test::mock_app();
+    app.manage(guards.clone());
+    WebviewWindowBuilder::new(&app, "main", WebviewUrl::App("index.html".into()))
+        .build()
+        .expect("a window")
+        .as_ref()
+        .window()
+}
+
+#[test]
+fn a_window_fetches_its_context_then_registers_and_removes_through_it() {
+    let guards = shared_state();
+    let window = app_with_window(&guards);
+
+    let context = context_for_window(&window).expect("a context");
+    register_for_window(&window, &context, "editor:42").expect("registration");
+    assert!(guards.frontend_guards("main").contains("editor:42"));
+
+    remove_for_window(&window, &context, "editor:42").expect("removal");
+    assert!(guards.frontend_guards("main").is_empty());
+}
+
+#[test]
+fn a_stale_document_call_cannot_re_register_after_the_context_rotates() {
+    let guards = shared_state();
+    let window = app_with_window(&guards);
+
+    let old = context_for_window(&window).expect("a context");
+    register_for_window(&window, &old, "editor:42").expect("registration");
+
+    // The rotation the `on_page_load` hook performs on a committed load.
+    guards.rotate_context("main");
+
+    assert_eq!(
+        register_for_window(&window, &old, "editor:42").unwrap_err(),
+        "stale_document"
+    );
+    assert_eq!(
+        remove_for_window(&window, &old, "editor:42").unwrap_err(),
+        "stale_document"
+    );
+    // The successor's own context is the one that reaches the namespace.
+    let fresh = context_for_window(&window).expect("a context");
+    register_for_window(&window, &fresh, "editor:42").expect("registration");
+    assert!(guards.frontend_guards("main").contains("editor:42"));
+}
+
+#[test]
+fn a_window_without_managed_state_is_answered_unavailable() {
+    // The mock app manages nothing here — the shape no real launch has, and
+    // the honest answer for every other caller.
+    let app = tauri::test::mock_app();
+    let window: tauri::Window<tauri::test::MockRuntime> =
+        WebviewWindowBuilder::new(&app, "main", WebviewUrl::App("index.html".into()))
+            .build()
+            .expect("a window")
+            .as_ref()
+            .window();
+
+    assert_eq!(context_for_window(&window).unwrap_err(), "unavailable");
+    assert_eq!(
+        register_for_window(&window, "any-context", "editor:42").unwrap_err(),
+        "unavailable"
+    );
+    assert_eq!(
+        remove_for_window(&window, "any-context", "editor:42").unwrap_err(),
+        "unavailable"
+    );
+}
+
+#[test]
+fn two_apps_states_never_reach_each_other_through_their_windows() {
+    // Each launch manages its own state before its first window; a window is
+    // the whole address, so one app's document can never register into — or
+    // remove from — another app's namespace.
+    let first_guards = shared_state();
+    let second_guards = shared_state();
+    let first = app_with_window(&first_guards);
+    let second = app_with_window(&second_guards);
+
+    let first_context = context_for_window(&first).expect("a context");
+    register_for_window(&first, &first_context, "editor:42").expect("registration");
+    let second_context = context_for_window(&second).expect("a context");
+    register_for_window(&second, &second_context, "editor:42").expect("registration");
+
+    assert!(first_guards.frontend_guards("main").contains("editor:42"));
+    assert!(second_guards.frontend_guards("main").contains("editor:42"));
+
+    // Removing through one window leaves the other app's guard standing.
+    remove_for_window(&first, &first_context, "editor:42").expect("removal");
+    assert!(first_guards.frontend_guards("main").is_empty());
+    assert!(second_guards.frontend_guards("main").contains("editor:42"));
+}

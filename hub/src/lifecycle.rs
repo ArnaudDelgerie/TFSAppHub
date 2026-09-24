@@ -1350,6 +1350,21 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
             std::thread::spawn(move || stop_sidecar_and_exit(&app));
         }
     }
+
+    // A destroyed window's frontend guards cannot survive it: the document
+    // they belong to is gone, and a later window reusing the label
+    // (`main`-`N` gap-filling) is a new owner by the plan's own rule. The
+    // backend namespace is untouched — it belongs to the app instance, not to
+    // a window. This runs for every destruction path, including teardown's
+    // own `destroy()`.
+    if let tauri::WindowEvent::Destroyed = event {
+        if let Some(state) = window
+            .app_handle()
+            .try_state::<crate::close_guard::SharedCloseGuards>()
+        {
+            state.drop_window(window.label());
+        }
+    }
 }
 
 /// Turn a `SIGINT`/`SIGTERM` into the same orderly shutdown as closing the last
