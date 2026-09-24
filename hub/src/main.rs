@@ -446,15 +446,33 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             move |app, _args, _cwd| {
                 use tauri::Manager;
 
-                // A second `open` of an app already running is not an error and
-                // not a no-op: it opens another window on the backend already
-                // up. Before the backend is resolved there is no `Launch` state
-                // yet and this deliberately does nothing — the window on its way
-                // is the one the user is waiting for.
-                let Some(launch) = app.try_state::<sidecar::Launch>() else {
-                    println!("tfsapp-hub: still starting — the window is on its way.");
-                    return;
-                };
+                // A second `open` of an app already running is not an error
+                // and not a no-op: it opens another window on the backend
+                // already up — unless a final shutdown has committed, in
+                // which case no window may be opened on this process again
+                // (plan 055: an arrival after commitment cannot revive the
+                // closing instance; before commitment it changes the
+                // topology and every close decision honours it).
+                let launch_present = app.try_state::<sidecar::Launch>().is_some();
+                let shutdown_committed = app
+                    .try_state::<close_guard::SharedCloseGuards>()
+                    .map(|guards| guards.is_closing())
+                    .unwrap_or(false);
+                match window::second_instance_action(launch_present, shutdown_committed) {
+                    window::SecondInstanceAction::StillStarting => {
+                        println!("tfsapp-hub: still starting — the window is on its way.");
+                        return;
+                    }
+                    window::SecondInstanceAction::ShuttingDown => {
+                        println!(
+                            "tfsapp-hub: this instance is shutting down; the new launch was \
+                             not given a window."
+                        );
+                        return;
+                    }
+                    window::SecondInstanceAction::OpenWindow => {}
+                }
+                let launch = app.state::<sidecar::Launch>();
                 let result = window::create_app_window(
                     app,
                     &launch.url,

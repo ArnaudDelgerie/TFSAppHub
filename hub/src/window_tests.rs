@@ -4,8 +4,8 @@ use tauri::Url;
 
 use super::{
     action_capability_is_local, classify_navigation, declared_action_ipc_grants,
-    next_window_label_among, resolve_splash_source, resolve_within, splash_style, NavigationTarget,
-    SplashSource,
+    next_window_label_among, resolve_splash_source, resolve_within, second_instance_action,
+    splash_style, NavigationTarget, SecondInstanceAction, SplashSource,
 };
 
 fn url(text: &str) -> Url {
@@ -335,5 +335,43 @@ fn a_name_carrying_a_quote_cannot_break_out_of_the_script() {
     assert!(
         script.contains(r#"alert(1); //"#) && script.contains(r#"\""#),
         "the name must arrive quoted, not spliced: {script}"
+    );
+}
+
+// --- second_instance_action (plan 055 step 5) -------------------------------
+//
+// What a second `open` of an already-running app must do, decided from the
+// two facts that matter. Pure, so the topology rules are a unit test rather
+// than a live second instance.
+
+#[test]
+fn a_second_instance_opens_a_window_only_while_the_launch_survives() {
+    assert_eq!(
+        second_instance_action(true, false),
+        SecondInstanceAction::OpenWindow,
+        "a second open of a running app opens another window on its backend"
+    );
+    assert_eq!(
+        second_instance_action(false, false),
+        SecondInstanceAction::StillStarting,
+        "before the backend is resolved, the window the user waits for is \
+         the answer"
+    );
+}
+
+#[test]
+fn a_committed_shutdown_refuses_to_revive_the_closing_instance() {
+    // The shutdown commitment wins over a present launch: a `Launch` state
+    // outlives the moment its process decided to go away, and a window
+    // admitted after the commitment would be a window on a backend about
+    // to stop, opened by the one arrival path that never went through a
+    // closing decision.
+    assert_eq!(
+        second_instance_action(true, true),
+        SecondInstanceAction::ShuttingDown
+    );
+    assert_eq!(
+        second_instance_action(false, true),
+        SecondInstanceAction::ShuttingDown
     );
 }

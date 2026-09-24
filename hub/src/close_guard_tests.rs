@@ -612,6 +612,210 @@ fn the_revision_counts_mutations_without_exposing_contents() {
     );
 }
 
+// --- close commitment and reservations (plan 055 step 5, audit 016) ----------
+//
+// The three rules the audit's first two findings asked for: a close commits
+// in the same critical section as its final check, the commitment reserves
+// the window until its destruction is *observed* (a posted destruction is
+// not an observed one), and the reservation is released only by that
+// observation or by an effect that failed while the window stayed usable.
+
+#[test]
+fn an_unguarded_close_reserves_its_window_until_the_destruction_is_observed() {
+    let state = state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    // Nothing at stake anymore: the close commits at once, and reserves.
+    state
+        .frontend_remove("main", &context, "editor:42")
+        .expect("removal");
+    assert_eq!(state.begin_close("main", false), CloseFlow::Allow);
+    assert_eq!(state.committed_closing_windows(), ids(&["main"]));
+
+    // The committed window's document namespace is closed: the person
+    // already approved closing it, so a guard that appeared now could never
+    // earn its own confirmation.
+    assert_eq!(
+        state.frontend_register("main", &context, "editor:43"),
+        Err(GuardError::Closing)
+    );
+    // A repeated close request is not re-decided: no second dialog, no
+    // `Busy` — the close is already happening.
+    assert_eq!(state.begin_close("main", false), CloseFlow::Allow);
+
+    // The destruction is the one release that matches a destruction
+    // actually happening — and a reused label is a new owner.
+    state.drop_window("main");
+    assert!(state.committed_closing_windows().is_empty());
+    let fresh = state.context("main");
+    state
+        .frontend_register("main", &fresh, "editor:44")
+        .expect("a reused label is a new owner");
+}
+
+#[test]
+fn an_approval_reserves_its_window_until_the_destruction_is_observed() {
+    let state = state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks");
+    };
+
+    assert_eq!(
+        state.resolve_close(&token, true, false),
+        Resolution::Approved {
+            stop_backend: false
+        }
+    );
+    assert_eq!(state.committed_closing_windows(), ids(&["main"]));
+    assert_eq!(
+        state.frontend_register("main", &context, "editor:43"),
+        Err(GuardError::Closing),
+        "the person already approved closing this document"
+    );
+    assert_eq!(
+        state.frontend_remove("main", &context, "editor:42"),
+        Err(GuardError::Closing)
+    );
+
+    // The destruction releases the reservation and the guards together.
+    state.drop_window("main");
+    assert!(state.committed_closing_windows().is_empty());
+}
+
+#[test]
+fn an_unguarded_last_close_commits_shutdown_in_the_same_transition() {
+    // Audit 016, finding 2, the no-initial-guards half: the last-window
+    // close used to authorise the stop and release the mutex without
+    // committing `closing`, so a registration landing in between was
+    // accepted and then ignored by a teardown that revalidates nothing.
+    let state = state();
+    assert_eq!(state.begin_close("main", true), CloseFlow::Allow);
+    assert!(state.is_closing());
+    assert_eq!(
+        state.backend_register("export:1"),
+        Err(GuardError::Closing),
+        "a registration is either before the transition — and then part of \
+         the decision it never prompted, because there was nothing at \
+         stake — or refused, never accepted and ignored"
+    );
+    assert_eq!(state.committed_closing_windows(), ids(&["main"]));
+}
+
+#[test]
+fn an_approved_final_close_commits_shutdown_before_the_effect_runs() {
+    // Audit 016, finding 2, the guarded half: `is_closing()` used to stay
+    // false until the teardown thread ran, leaving a window where a bridge
+    // call received a success for a guard nobody would ever warn about.
+    let state = state();
+    state.backend_register("job:old").expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", true) else {
+        panic!("a guarded close asks");
+    };
+
+    assert_eq!(
+        state.resolve_close(&token, true, true),
+        Resolution::Approved { stop_backend: true }
+    );
+    assert!(
+        state.is_closing(),
+        "the commitment is atomic with the final check"
+    );
+    assert_eq!(state.backend_register("job:new"), Err(GuardError::Closing));
+    assert_eq!(
+        state.backend_remove("job:old"),
+        Err(GuardError::Closing),
+        "the whole namespace is closed once shutdown has committed"
+    );
+}
+
+#[test]
+fn a_failed_close_effect_releases_the_reservation_of_a_usable_window() {
+    let state = state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks");
+    };
+    assert_eq!(
+        state.resolve_close(&token, true, false),
+        Resolution::Approved {
+            stop_backend: false
+        }
+    );
+
+    // The destruction could not even be posted and the window remained
+    // usable: the close is not committed after all.
+    state.release_close("main");
+    assert!(state.committed_closing_windows().is_empty());
+    state
+        .frontend_register("main", &context, "editor:43")
+        .expect("a usable window's document registers again");
+}
+
+#[test]
+fn a_failed_close_effect_never_uncommits_a_final_shutdown() {
+    let state = state();
+    state.backend_register("export:1").expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", true) else {
+        panic!("a guarded close asks");
+    };
+    assert_eq!(
+        state.resolve_close(&token, true, true),
+        Resolution::Approved { stop_backend: true }
+    );
+
+    // Once the final close or a signal has committed a shutdown, every
+    // window is going away: no release may count one back as a survivor.
+    state.release_close("main");
+    assert!(state.is_closing());
+    assert_eq!(state.backend_register("export:2"), Err(GuardError::Closing));
+    assert_eq!(
+        state.begin_close("main", true),
+        CloseFlow::Allow,
+        "a committed shutdown bypasses confirmation on every later close"
+    );
+}
+
+#[test]
+fn a_committed_close_leaves_unrelated_surviving_windows_usable() {
+    let state = state();
+    let main = state.context("main");
+    let second = state.context("main-2");
+    state
+        .frontend_register("main", &main, "editor:42")
+        .expect("registration");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks");
+    };
+    assert_eq!(
+        state.resolve_close(&token, true, false),
+        Resolution::Approved {
+            stop_backend: false
+        }
+    );
+
+    // `main`'s close is committed and its namespace closed; the survivor's
+    // document never noticed and keeps full control of its own guards.
+    assert_eq!(
+        state.frontend_register("main", &main, "editor:43"),
+        Err(GuardError::Closing)
+    );
+    state
+        .frontend_register("main-2", &second, "editor:7")
+        .expect("an unrelated surviving window stays usable");
+    state
+        .frontend_remove("main-2", &second, "editor:7")
+        .expect("and keeps full control of its own guards");
+}
+
 // --- the IPC surface, through the mock runtime ------------------------------
 //
 // The state model above answers every decision; these exercise the thin

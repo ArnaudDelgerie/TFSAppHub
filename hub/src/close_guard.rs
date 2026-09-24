@@ -52,12 +52,35 @@
 //! else's active guard. There is no global clear operation, and nothing is
 //! persisted or exported.
 //!
-//! **Shutdown commitment is one-way.** [`CloseGuardState::commit_shutdown`] is
-//! called once teardown has begun; after it, every registration or removal
-//! answers [`GuardError::Closing`] (an explicit failure, so a job starting
-//! during teardown learns the truth rather than installing a guard nobody will
-//! see) and any pending close decision is invalidated — a termination signal
-//! tears the app down without waiting on a dialog.
+//! **A close commits as one atomic transition, and stays committed until its
+//! destruction is observed.** The final guard check and the commitment are
+//! the same critical section: `begin_close` commits an unguarded close the
+//! moment its check comes back empty, and `resolve_close` commits an approved
+//! one the moment its recheck passes — so a backend registration is either
+//! in the transition's past (and then either covered by the warning or the
+//! cause of a fresh decision) or in its future, where `closing` refuses it;
+//! it can never land between the check and the commitment and be silently
+//! ignored by a teardown that revalidates nothing. A committed close reserves
+//! its window: the window stops counting as a survivor for every later
+//! topology question ([`CloseGuardState::committed_closing_windows`]), its
+//! document can no longer register guards (the person already approved
+//! closing it), and the reservation is released only when the destruction is
+//! observed ([`CloseGuardState::drop_window`]) or when the close's effect
+//! failed while the window remained usable
+//! ([`CloseGuardState::release_close`]).
+//!
+//! **Shutdown commitment is one-way.** [`CloseGuardState::commit_shutdown`]
+//! is the signal's and the fatal-error path's committer; an approved final
+//! close commits the same flag inside `resolve_close`, atomically with its
+//! final check. After it, every registration or removal answers
+//! [`GuardError::Closing`] (an explicit failure, so a job starting during
+//! teardown learns the truth rather than installing a guard nobody will
+//! see) and any pending close decision is invalidated — a termination
+//! signal tears the app down without waiting on a dialog. The commitment is
+//! deliberately separate from the ownership of the teardown execution
+//! (lifecycle's one-shot latch): precommitting the state is what makes a
+//! racing registration honest, and it must never suppress the cleanup it
+//! announced.
 
 // The observability helpers below (`frontend_guards`, `backend_guards`,
 // `revision`, `is_closing`) are read by tests and by step 4's validation
@@ -185,6 +208,14 @@ struct Inner {
     windows: BTreeMap<String, WindowEntry>,
     backend: BTreeSet<String>,
     pending: Option<PendingDecision>,
+    /// The windows whose close is committed but whose destruction has not
+    /// been observed yet — an approved secondary close whose `destroy()` has
+    /// only been posted, or an unguarded close between the default being let
+    /// through and the `Destroyed` event. A reserved window is never a
+    /// survivor for another close's topology question, and its document's
+    /// namespace is closed; `drop_window` is the one release that matches
+    /// the destruction actually happening.
+    committed_closes: BTreeSet<String>,
     closing: bool,
     /// Bumped on every mutation, so callers can log *that* guard state moved
     /// without logging what it holds — the guard IDs themselves stay private.
@@ -309,6 +340,12 @@ impl CloseGuardState {
     /// document presenting `context` in `window`. `window` comes from the IPC
     /// caller, never from the page; `context` is what the page presents back
     /// from [`CloseGuardState::context`].
+    ///
+    /// A window whose close is committed answers [`GuardError::Closing`]:
+    /// the person already approved closing this document, so a guard that
+    /// appeared now could never earn its own confirmation. The equivalent of
+    /// the backend rule — a registration is either in the commitment's past
+    /// or refused, never silently lost.
     pub fn frontend_register(
         &self,
         window: &str,
@@ -317,6 +354,9 @@ impl CloseGuardState {
     ) -> Result<(), GuardError> {
         let mut inner = self.lock();
         if inner.closing {
+            return Err(GuardError::Closing);
+        }
+        if inner.committed_closes.contains(window) {
             return Err(GuardError::Closing);
         }
         validate_guard_id(id)?;
@@ -349,6 +389,11 @@ impl CloseGuardState {
     /// Remove a frontend guard. Removing an absent ID is a success — a task
     /// that finished before its removal call, or an app clearing state it
     /// never set, has nothing to recover from.
+    ///
+    /// A committed close closes the window's namespace as a whole: the guards
+    /// die with the window at its destruction, and a removal racing that is
+    /// refused with [`GuardError::Closing`] rather than acknowledged for a
+    /// document that is already going away.
     pub fn frontend_remove(
         &self,
         window: &str,
@@ -357,6 +402,9 @@ impl CloseGuardState {
     ) -> Result<(), GuardError> {
         let mut inner = self.lock();
         if inner.closing {
+            return Err(GuardError::Closing);
+        }
+        if inner.committed_closes.contains(window) {
             return Err(GuardError::Closing);
         }
         let entry = inner
@@ -405,12 +453,16 @@ impl CloseGuardState {
     }
 
     /// A window was destroyed: every guard it holds goes with it, whatever
-    /// incarnation registered them. A later window reusing the same label
-    /// starts from nothing — and its fresh context means the old window's
-    /// late, in-flight calls cannot touch it (see [`DocumentContext`]).
+    /// incarnation registered them, and its close reservation is released —
+    /// this is the one release that matches a destruction actually
+    /// happening, which is why the reservation is held until here rather
+    /// than until the effect that requested the destruction returned. A
+    /// later window reusing the same label starts from nothing — and its
+    /// fresh context means the old window's late, in-flight calls cannot
+    /// touch it (see [`DocumentContext`]).
     pub fn drop_window(&self, window: &str) {
         let mut inner = self.lock();
-        if inner.windows.remove(window).is_some() {
+        if inner.windows.remove(window).is_some() | inner.committed_closes.remove(window) {
             inner.revision += 1;
         }
         // The pending decision is kept rather than consumed, so its dialog's
@@ -422,6 +474,30 @@ impl CloseGuardState {
                 inner.revision += 1;
             }
         }
+    }
+
+    /// Release a close reservation whose effect failed while the window
+    /// remains usable: the destruction never happened, so the close is not
+    /// committed after all — the window counts as a survivor again and its
+    /// document can register guards. Never uncommits a whole-app shutdown:
+    /// once the final close or a signal has committed one, every window is
+    /// going away and none may be counted back as a survivor.
+    pub fn release_close(&self, window: &str) {
+        let mut inner = self.lock();
+        if inner.closing {
+            return;
+        }
+        if inner.committed_closes.remove(window) {
+            inner.revision += 1;
+        }
+    }
+
+    /// The windows whose close is committed but whose destruction has not
+    /// been observed yet. Topology reads count them as closing, never as
+    /// survivors — two nearly-simultaneous closes must not both conclude
+    /// that the other window will preserve the backend.
+    pub fn committed_closing_windows(&self) -> BTreeSet<String> {
+        self.lock().committed_closes.clone()
     }
 
     /// Every frontend guard `window` still holds, across every incarnation.
@@ -446,6 +522,16 @@ impl CloseGuardState {
     /// `backend_would_stop` is the caller's topology answer — true only when
     /// this close takes the last window and so stops the shared backend; the
     /// backend's guards never make a surviving-window close prompt.
+    ///
+    /// An unguarded close commits right here, atomically with the check that
+    /// found nothing at stake: the window is reserved (it stops counting as
+    /// a survivor for every later close) and, when this close stops the
+    /// backend, shutdown is committed too — so a registration racing this
+    /// close is either part of the decision or refused with `closing`, never
+    /// accepted and then ignored by a teardown that revalidates nothing.
+    /// A window whose close is already committed is not re-decided either: a
+    /// repeated `CloseRequested` must not stack a second dialog or a second
+    /// effect on a close that is already happening.
     pub fn begin_close(&self, window: &str, backend_would_stop: bool) -> CloseFlow {
         let mut inner = self.lock();
         // Teardown already committed: no dialog may stand in its way, and the
@@ -456,6 +542,9 @@ impl CloseGuardState {
         if inner.pending.is_some() {
             return CloseFlow::Busy;
         }
+        if inner.committed_closes.contains(window) {
+            return CloseFlow::Allow;
+        }
         let frontend = frontend_guards_of(&inner, window);
         let backend = if backend_would_stop {
             inner.backend.clone()
@@ -463,6 +552,11 @@ impl CloseGuardState {
             BTreeSet::default()
         };
         if frontend.is_empty() && backend.is_empty() {
+            inner.committed_closes.insert(window.to_string());
+            if backend_would_stop {
+                inner.closing = true;
+            }
+            inner.revision += 1;
             return CloseFlow::Allow;
         }
         let token = fresh_token(&self.counter);
@@ -485,6 +579,14 @@ impl CloseGuardState {
     /// `backend_would_stop_now` is the topology *at answer time* — the caller
     /// rechecks which window is last, because a nearly-simultaneous close of
     /// another window may have changed it.
+    ///
+    /// An approval commits the close in the same critical section as its
+    /// final guard recheck: the window is reserved until its destruction is
+    /// observed, and a close that stops the backend commits shutdown itself —
+    /// the guard recheck and the commitment cannot be interleaved by a
+    /// registration. A refused answer (cancel, dismiss, stale, invalidated)
+    /// or a recheck that finds new stakes commits nothing: the window stays
+    /// open, usable, and counted as the survivor it is.
     pub fn resolve_close(
         &self,
         token: &str,
@@ -519,22 +621,36 @@ impl CloseGuardState {
             if !pending.backend_relevant || !pending.backend.is_superset(&inner.backend) {
                 return Resolution::NeedsFreshDecision;
             }
+            // The final check and the commitment are one transition: every
+            // backend registration is either in this critical section's past
+            // — and so already covered by the warning or already the cause of
+            // the fresh decision above — or in its future, where `closing`
+            // refuses it.
+            inner.closing = true;
+            inner.committed_closes.insert(pending.window.clone());
+            inner.revision += 1;
             return Resolution::Approved { stop_backend: true };
         }
         // The backend no longer stops on this close (another window
         // appeared, or the pending close was for a window that was not the
         // last one to begin with): the approval covers closing this window,
-        // and the backend keeps running.
+        // the backend keeps running, and the window is reserved until its
+        // destruction is observed.
+        inner.committed_closes.insert(pending.window.clone());
+        inner.revision += 1;
         Resolution::Approved {
             stop_backend: false,
         }
     }
 
-    /// Commit shutdown: one-way, set by `lifecycle` before teardown begins.
-    /// Every later guard operation answers [`GuardError::Closing`], and any
-    /// pending decision is invalidated — a signal-initiated shutdown does not
-    /// wait on a dialog, and a dialog answering afterwards is stale by
-    /// construction.
+    /// Commit shutdown: one-way. The signal's and the fatal-error path's
+    /// committer — an approved final close commits the same flag inside
+    /// [`CloseGuardState::resolve_close`], atomically with its final check.
+    /// After it, every guard operation answers [`GuardError::Closing`], and
+    /// any pending decision is invalidated — a signal-initiated shutdown does
+    /// not wait on a dialog, and a dialog answering afterwards is stale by
+    /// construction. The commitment is state only; the teardown execution it
+    /// announces is owned separately, by lifecycle's one-shot latch.
     pub fn commit_shutdown(&self) {
         let mut inner = self.lock();
         inner.closing = true;
@@ -544,11 +660,10 @@ impl CloseGuardState {
         inner.revision += 1;
     }
 
-    /// Whether shutdown has committed. Teardown paths use this to know that
-    /// no further confirmation may be opened.
-    // Test and validation eyes only: no production call site reads the
-    // registry's contents or counters directly.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Whether shutdown has committed. The second-instance handler reads
+    /// this to refuse opening a window on a process that is already going
+    /// away; teardown paths read it to know that no further confirmation
+    /// may be opened.
     pub fn is_closing(&self) -> bool {
         self.lock().closing
     }

@@ -7,14 +7,15 @@ use std::{
 };
 
 use super::{
-    acquire_launch_locks, anchor_state, cache_stamp_path, close_action, close_effect,
-    close_stops_backend, close_warning, copy_rescue_dump_at, data_dir_holder, db_snapshot_path,
-    decide_launch, dialog_is_warranted, discard_db_snapshot, discard_rollback_anchor,
-    lifecycle_decision, on_window_event, prepare_dev_launch, previous_tree_path, probe_run_lock,
-    read_cache_stamp, read_data_version, read_rollback_anchor, rescue_dump_pattern,
-    restore_db_snapshot, rollback_anchor_path, serving_lock_path, snapshot_db, veto_exit,
-    write_cache_stamp, write_data_version, write_rollback_anchor, Anchor, CacheStamp, CacheStatus,
-    CloseAction, CloseEffect, LaunchDecision, LaunchLockError, LifecycleDecisionError,
+    acquire_launch_locks, anchor_state, cache_stamp_path, claim_teardown, close_action,
+    close_effect, close_stops_backend, close_warning, copy_rescue_dump_at, data_dir_holder,
+    db_snapshot_path, decide_launch, dialog_is_warranted, discard_db_snapshot,
+    discard_rollback_anchor, handle_close_answer, handle_close_request, lifecycle_decision,
+    on_window_event, prepare_dev_launch, previous_tree_path, probe_run_lock, read_cache_stamp,
+    read_data_version, read_rollback_anchor, rescue_dump_pattern, restore_db_snapshot,
+    rollback_anchor_path, serving_lock_path, snapshot_db, veto_exit, write_cache_stamp,
+    write_data_version, write_rollback_anchor, Anchor, CacheStamp, CacheStatus, CloseAction,
+    CloseEffect, CloseWorld, LaunchDecision, LaunchLockError, LifecycleDecisionError,
     LifecycleError, LifecycleEvent, RollbackAnchor, RunLockHeld, DB_FILE_NAMES,
 };
 use crate::{registry::Platform, run::format_run_entry};
@@ -1168,4 +1169,403 @@ fn close_stops_backend_counts_windows_and_the_sidecar_on_the_mock_runtime() {
         .expect("another window");
     assert!(!close_stops_backend(app.handle(), "main"));
     assert!(!close_stops_backend(app.handle(), "main-2"));
+}
+
+// --- close commitment coordination (plan 055 step 5, audit 016 findings 1–2) --
+//
+// The production coordinator runs on the event loop against `TauriCloseWorld`;
+// these regressions drive the same coordinator functions with a recording
+// world, so the interleavings assert *effects and ownership* — which window
+// was hidden, which destroyed, how many teardowns — rather than enum
+// mappings alone. A destruction is only *posted* by `destroy`, exactly as in
+// production, and observed exactly where a scenario stages its `Destroyed`
+// event: `observe_destruction`.
+
+use crate::close_guard::GuardError;
+
+/// A bare shared guard state — the shape a launch manages before its first
+/// window.
+fn shared_close_state() -> SharedCloseGuards {
+    std::sync::Arc::new(CloseGuardState::new())
+}
+
+struct RecordedDialog {
+    window: String,
+    token: String,
+    frontend: std::collections::BTreeSet<String>,
+    backend: std::collections::BTreeSet<String>,
+}
+
+struct RecordedWorld {
+    labels: Vec<String>,
+    has_backend: bool,
+    /// The one effect failure the coordinator must recover from: the
+    /// destruction could not even be posted and the window stays usable.
+    fail_destroy: bool,
+    /// The same one-shot claim `stop_sidecar_and_exit` performs on
+    /// `TEARDOWN_IN_FLIGHT`: a second teardown dispatch records nothing,
+    /// because the second arrival returns at the latch.
+    teardown_claimed: bool,
+    effects: Vec<String>,
+    dialogs: Vec<RecordedDialog>,
+}
+
+impl RecordedWorld {
+    /// Two windows on a shared backend — the shape every audit-016
+    /// reproduction starts from.
+    fn two_windows() -> Self {
+        Self {
+            labels: vec!["main".to_string(), "main-2".to_string()],
+            has_backend: true,
+            fail_destroy: false,
+            teardown_claimed: false,
+            effects: vec![],
+            dialogs: vec![],
+        }
+    }
+
+    /// The last window on a shared backend.
+    fn one_window() -> Self {
+        let mut world = Self::two_windows();
+        world.labels.pop();
+        world
+    }
+
+    /// Observe the destruction a scenario approved: the label stops counting
+    /// and the guard state releases the window's reservation and guards —
+    /// what the `Destroyed` event does in production.
+    fn observe_destruction(&mut self, state: &SharedCloseGuards, window: &str) {
+        self.labels.retain(|label| label != window);
+        state.drop_window(window);
+    }
+
+    fn effect_count(&self, effect: &str) -> usize {
+        self.effects
+            .iter()
+            .filter(|recorded| *recorded == effect)
+            .count()
+    }
+}
+
+impl CloseWorld for RecordedWorld {
+    fn window_labels(&self) -> Vec<String> {
+        self.labels.clone()
+    }
+
+    fn has_backend(&self) -> bool {
+        self.has_backend
+    }
+
+    fn hide(&mut self, window: &str) {
+        self.effects.push(format!("hide:{window}"));
+    }
+
+    fn destroy(&mut self, window: &str) -> bool {
+        self.effects.push(format!("destroy:{window}"));
+        !self.fail_destroy
+    }
+
+    fn start_teardown(&mut self) {
+        if self.teardown_claimed {
+            return;
+        }
+        self.teardown_claimed = true;
+        self.effects.push("teardown".to_string());
+    }
+
+    fn open_confirmation(
+        &mut self,
+        window: &str,
+        token: &str,
+        frontend: &std::collections::BTreeSet<String>,
+        backend: &std::collections::BTreeSet<String>,
+    ) {
+        self.dialogs.push(RecordedDialog {
+            window: window.to_string(),
+            token: token.to_string(),
+            frontend: frontend.clone(),
+            backend: backend.clone(),
+        });
+    }
+}
+
+#[test]
+fn an_approved_close_not_yet_destroyed_is_never_a_survivor_for_the_next_close() {
+    // Audit 016, finding 1: A's close was approved and its destruction only
+    // posted; B then closed with a backend guard standing. Counting A as a
+    // survivor let B through without a backend warning, and the backend
+    // stopped with live, unacknowledged work.
+    let state = shared_close_state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    state.backend_register("export:1").expect("registration");
+    let mut world = RecordedWorld::two_windows();
+
+    // A's close: B survives it, so only the dirty document is at stake.
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main"),
+        CloseAction::KeepOpen
+    );
+    assert_eq!(world.dialogs[0].window, "main");
+    assert!(world.dialogs[0].frontend.contains("editor:42"));
+    let a_token = world.dialogs[0].token.clone();
+
+    // The person approves; the destruction is posted, not yet observed.
+    handle_close_answer(&state, &mut world, "main", &a_token, true);
+    assert_eq!(world.effects, ["destroy:main"]);
+
+    // B closes before A's `Destroyed` event: A is committed, so this close
+    // stops the backend — the backend guard is at stake and must be asked
+    // about, never silently outrun.
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main-2"),
+        CloseAction::KeepOpen,
+        "the committed close makes B the last surviving window"
+    );
+    assert_eq!(world.dialogs.len(), 2);
+    assert_eq!(world.dialogs[1].window, "main-2");
+    assert!(world.dialogs[1].backend.contains("export:1"));
+    assert_eq!(world.effect_count("teardown"), 0);
+
+    // Approving B's dialog hides B and tears down exactly once — the
+    // already-approved A never comes back through `CloseRequested`.
+    let b_token = world.dialogs[1].token.clone();
+    handle_close_answer(&state, &mut world, "main-2", &b_token, true);
+    assert_eq!(world.effect_count("hide:main-2"), 1);
+    assert_eq!(world.effect_count("teardown"), 1);
+    assert_eq!(world.effect_count("destroy:main"), 1);
+
+    // Observing both destructions releases both reservations and guards.
+    world.observe_destruction(&state, "main");
+    world.observe_destruction(&state, "main-2");
+    assert!(state.committed_closing_windows().is_empty());
+    assert!(state.frontend_guards("main-2").is_empty());
+}
+
+#[test]
+fn two_nearly_simultaneous_clean_closes_cannot_both_keep_the_backend() {
+    // Audit 016, finding 2's interleaving over the same race as finding 1,
+    // with nothing guarded at all: A's committed close is invisible until
+    // its `Destroyed` event, so B's close must find itself the last one and
+    // take the hide-and-teardown path — and the teardown itself must run
+    // once, whatever B's close repeats after commitment.
+    let state = shared_close_state();
+    let mut world = RecordedWorld::two_windows();
+
+    // A closes cleanly while B survives it: the default close, reserved
+    // until its destruction is observed.
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main"),
+        CloseAction::Default
+    );
+    assert_eq!(
+        state.committed_closing_windows(),
+        ["main".to_string()].into_iter().collect()
+    );
+
+    // B closes before A's `Destroyed` event: A is not a survivor, so this
+    // is the backend-stopping close — it hides B and tears down.
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main-2"),
+        CloseAction::HideAndTearDown
+    );
+    assert!(
+        state.is_closing(),
+        "the unguarded last close commits shutdown"
+    );
+    assert_eq!(
+        state.backend_register("job:new"),
+        Err(GuardError::Closing),
+        "a registration landing after the commitment is refused, never \
+         accepted and ignored by a teardown that revalidates nothing"
+    );
+
+    // A repeated close of the committed window dispatches the same effects;
+    // the one-shot latch keeps them to a single teardown.
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main-2"),
+        CloseAction::HideAndTearDown
+    );
+    assert_eq!(world.effect_count("hide:main-2"), 2);
+    assert_eq!(world.effect_count("teardown"), 1);
+}
+
+#[test]
+fn a_backend_registration_can_no_longer_land_between_the_check_and_the_stop() {
+    // Audit 016, finding 2, the guarded half: the final approval used to
+    // authorise the stop under the mutex and release it without committing
+    // `closing`, so a bridge call in between received a success for a guard
+    // the teardown then ignored.
+    let state = shared_close_state();
+    state.backend_register("job:old").expect("registration");
+    let mut world = RecordedWorld::one_window();
+
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main"),
+        CloseAction::KeepOpen
+    );
+    assert!(world.dialogs[0].backend.contains("job:old"));
+    let token = world.dialogs[0].token.clone();
+
+    handle_close_answer(&state, &mut world, "main", &token, true);
+    assert_eq!(world.effect_count("hide:main"), 1);
+    assert_eq!(world.effect_count("teardown"), 1);
+
+    // The approval committed the shutdown in the same transition as its
+    // final check: a registration landing now is refused, not ignored.
+    assert!(state.is_closing());
+    assert_eq!(state.backend_register("job:new"), Err(GuardError::Closing));
+}
+
+#[test]
+fn a_new_backend_guard_during_confirmation_cannot_be_overlooked() {
+    // A bridge call can register work while a GTK dialog stands — the
+    // application modality stops clicks, not HTTP. The answer must ask
+    // again with a dialog that covers the new guard, never apply the old
+    // approval to new stakes.
+    let state = shared_close_state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    let mut world = RecordedWorld::one_window();
+
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main"),
+        CloseAction::KeepOpen
+    );
+    let first_token = world.dialogs[0].token.clone();
+
+    // The live probe arrives while the dialog stands.
+    state.backend_register("export:live").expect("registration");
+
+    handle_close_answer(&state, &mut world, "main", &first_token, true);
+    assert_eq!(world.dialogs.len(), 2, "the answer asked again");
+    assert!(world.dialogs[1].backend.contains("export:live"));
+    assert!(
+        world.effects.is_empty(),
+        "no hide, no destroy, no teardown came out of the stale approval"
+    );
+
+    // The fresh dialog covers both halves; approving it tears down.
+    let fresh_token = world.dialogs[1].token.clone();
+    handle_close_answer(&state, &mut world, "main", &fresh_token, true);
+    assert_eq!(world.effect_count("hide:main"), 1);
+    assert_eq!(world.effect_count("teardown"), 1);
+}
+
+#[test]
+fn a_destruction_that_cannot_even_be_posted_releases_the_close() {
+    // The plan's recovery rule: an effect that failed while the window
+    // remained usable must not leave every later close stuck behind a
+    // dead reservation.
+    let state = shared_close_state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    state.backend_register("export:1").expect("registration");
+    let mut world = RecordedWorld::two_windows();
+    world.fail_destroy = true;
+
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main"),
+        CloseAction::KeepOpen
+    );
+    let token = world.dialogs[0].token.clone();
+    handle_close_answer(&state, &mut world, "main", &token, true);
+
+    // The destruction failed and the window stayed usable: the close is
+    // not committed after all, and the document registers again.
+    assert!(state.committed_closing_windows().is_empty());
+    state
+        .frontend_register("main", &context, "editor:43")
+        .expect("a usable window's document registers again");
+
+    // A counts as a survivor again: B's close does not stop the backend,
+    // so the backend guard does not make it warn.
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main-2"),
+        CloseAction::Default
+    );
+    assert_eq!(world.effect_count("teardown"), 0);
+}
+
+#[test]
+fn a_window_admitted_before_commitment_changes_the_topology_of_the_answer() {
+    // The last window's close opens a dialog; a second instance opens
+    // another window while it stands. The answer honours the new topology:
+    // the close no longer stops the backend, so no hide, no teardown — and
+    // the approval destroys exactly its own window.
+    let state = shared_close_state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    let mut world = RecordedWorld::one_window();
+
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main"),
+        CloseAction::KeepOpen
+    );
+    let token = world.dialogs[0].token.clone();
+
+    // The second-instance window arrives before the answer commits
+    // anything — the arrival path `second_instance_action` admits.
+    world.labels.push("main-2".to_string());
+    handle_close_answer(&state, &mut world, "main", &token, true);
+
+    assert_eq!(world.effects, ["destroy:main"]);
+    assert!(!state.is_closing(), "the backend now survives this close");
+    assert_eq!(
+        state.committed_closing_windows(),
+        ["main".to_string()].into_iter().collect()
+    );
+}
+
+#[test]
+fn a_cancelled_close_keeps_the_window_usable_and_commits_nothing() {
+    let state = shared_close_state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("registration");
+    let mut world = RecordedWorld::two_windows();
+
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main"),
+        CloseAction::KeepOpen
+    );
+    let token = world.dialogs[0].token.clone();
+
+    handle_close_answer(&state, &mut world, "main", &token, false);
+    assert!(
+        world.effects.is_empty(),
+        "cancellation performs no hide, no destroy, no teardown"
+    );
+    assert!(state.committed_closing_windows().is_empty());
+    state
+        .frontend_register("main", &context, "editor:43")
+        .expect("the window is usable and its document registers again");
+
+    // And the refused close can be asked again afresh.
+    assert_eq!(
+        handle_close_request(&state, &mut world, "main"),
+        CloseAction::KeepOpen
+    );
+    assert_eq!(world.dialogs.len(), 2);
+}
+
+#[test]
+fn the_teardown_latch_admits_exactly_one_owner() {
+    // Audit 016, finding 2's second half: `TEARDOWN_IN_FLIGHT` used to be a
+    // plain store, so an approved final close and a signal arriving
+    // together could both run the teardown. The conditional take is what
+    // keeps the second arrival out.
+    let latch = std::sync::atomic::AtomicBool::new(false);
+    assert!(claim_teardown(&latch));
+    assert!(!claim_teardown(&latch));
+    assert!(!claim_teardown(&latch));
 }

@@ -511,6 +511,45 @@ pub fn create_splash_window<R: tauri::Runtime>(
         .build()
 }
 
+/// What a second-instance arrival — a second `open` of an app this process
+/// is already serving — must do, decided from the two facts that matter:
+/// whether this process has a backend to open a window on, and whether a
+/// final shutdown has committed.
+///
+/// The committed-shutdown arm is plan 055's coordination rule: a window
+/// admitted *before* commitment changes the topology and the close
+/// decisions honour it, but one admitted *after* cannot revive a process
+/// that is already going away — it would be a window on a backend about to
+/// stop, created by the one arrival path that was never asked about a
+/// closing decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondInstanceAction {
+    /// The backend is up: open another window on it.
+    OpenWindow,
+    /// The launch's own window is still on its way — nothing to do, the
+    /// window the user is waiting for is the answer.
+    StillStarting,
+    /// A final shutdown has committed: no window is opened on this process
+    /// again.
+    ShuttingDown,
+}
+
+/// The decision itself, pure so the topology rules are unit tests rather
+/// than live windows. The shutdown commitment wins over a present launch:
+/// a `Launch` state outlives the moment its process decided to go away.
+pub fn second_instance_action(
+    launch_present: bool,
+    shutdown_committed: bool,
+) -> SecondInstanceAction {
+    if shutdown_committed {
+        SecondInstanceAction::ShuttingDown
+    } else if launch_present {
+        SecondInstanceAction::OpenWindow
+    } else {
+        SecondInstanceAction::StillStarting
+    }
+}
+
 /// A further window on an already-running backend — what a second `open` of the
 /// same app resolves to.
 ///
