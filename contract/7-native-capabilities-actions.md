@@ -157,6 +157,25 @@ Tauri's raw IPC as either `invoke("pick_path", { kind: "file" })` or
 value is invalid input and returns an IPC error. A selection resolves to its
 absolute path as a string, and cancellation resolves successfully to `null`.
 
+`kind: "file"` also accepts `filters`, optional and in the same shape as
+`save_path`'s:
+
+```js
+invoke("pick_path", { kind: "file", filters: [{ name: "Markdown", extensions: ["md"] }] })
+invoke("pick_path", { kind: "file", filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }] })
+```
+
+Omitted, `null` and an empty list all mean no application filter — the
+chooser shows every file. With entries, the chooser displays only files
+matching one of them, in the order given and with the first one active, each
+`extensions` entry written without a leading dot — the same native semantics
+as `save_path`. Filters affect what the chooser displays; the selected file
+and its contents remain the app's own to validate. For
+`kind: "directory"`, well-formed filters are ignored rather than refused:
+folders are not selected by extension, and a caller may share one chooser
+options object between both kinds. A wrongly typed filter field is still
+invalid input and returns an IPC error for either kind.
+
 **`save_path`** — "where should this new file go?" The webview calls
 `invoke("save_path", { filters, fileName, directory })`, all three arguments
 optional:

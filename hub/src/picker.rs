@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use tauri_plugin_dialog::{DialogExt, FilePath};
-
 const DIALOG_UNAVAILABLE: &str = "picker_unavailable";
 const PATH_NOT_ABSOLUTE: &str = "picker_path_not_absolute";
 const PATH_NOT_UTF8: &str = "picker_path_not_utf8";
@@ -52,10 +51,17 @@ fn file_path_to_wire(path: Option<FilePath>) -> Result<Option<String>, &'static 
 /// Open the requested native chooser from the calling window and await the
 /// plugin callback without blocking either Tauri's main thread or its IPC
 /// dispatcher.
+///
+/// `filters` restricts what a file chooser displays, using the same entries
+/// and native semantics as `save_path`. It applies to `PickKind::File` only:
+/// folders are not selected by extension, so a well-formed list on a
+/// directory chooser is ignored rather than refused, letting a caller share
+/// one options object between both kinds.
 #[tauri::command]
 pub async fn pick_path(
     window: tauri::Window,
     kind: PickKind,
+    filters: Option<Vec<FileFilter>>,
 ) -> Result<Option<String>, &'static str> {
     let (sender, mut receiver) = tauri::async_runtime::channel(1);
     let reply = move |path| {
@@ -70,6 +76,12 @@ pub async fn pick_path(
     #[cfg(not(desktop))]
     let dialog = window.dialog().file();
 
+    let dialog = if let PickKind::File = kind {
+        with_filters(dialog, filters)
+    } else {
+        dialog
+    };
+
     match kind {
         PickKind::File => dialog.pick_file(reply),
         PickKind::Directory => dialog.pick_folder(reply),
@@ -79,12 +91,26 @@ pub async fn pick_path(
     file_path_to_wire(selected)
 }
 
-/// One `save_path` filter entry: a label and the extensions it offers,
-/// written without a leading dot — `rfd` builds the `*.{ext}` pattern itself.
+/// One `pick_path`/`save_path` filter entry: a label and the extensions it
+/// offers, written without a leading dot — `rfd` builds the `*.{ext}` pattern
+/// itself.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
-pub struct SaveFilter {
+pub struct FileFilter {
     name: String,
     extensions: Vec<String>,
+}
+
+/// Apply each filter entry to the dialog in the order given; the first one
+/// is the one the native chooser opens with.
+fn with_filters<R: tauri::Runtime>(
+    mut dialog: tauri_plugin_dialog::FileDialogBuilder<R>,
+    filters: Option<Vec<FileFilter>>,
+) -> tauri_plugin_dialog::FileDialogBuilder<R> {
+    for filter in filters.into_iter().flatten() {
+        let extensions: Vec<&str> = filter.extensions.iter().map(String::as_str).collect();
+        dialog = dialog.add_filter(filter.name, &extensions);
+    }
+    dialog
 }
 
 /// A present `directory` must be absolute; the dialog does not open on
@@ -107,7 +133,7 @@ fn validate_save_directory(directory: Option<&str>) -> Result<(), &'static str> 
 #[tauri::command]
 pub async fn save_path(
     window: tauri::Window,
-    filters: Option<Vec<SaveFilter>>,
+    filters: Option<Vec<FileFilter>>,
     file_name: Option<String>,
     directory: Option<String>,
 ) -> Result<Option<String>, &'static str> {
@@ -126,10 +152,7 @@ pub async fn save_path(
     #[cfg(not(desktop))]
     let mut dialog = window.dialog().file();
 
-    for filter in filters.into_iter().flatten() {
-        let extensions: Vec<&str> = filter.extensions.iter().map(String::as_str).collect();
-        dialog = dialog.add_filter(filter.name, &extensions);
-    }
+    dialog = with_filters(dialog, filters);
     if let Some(file_name) = file_name {
         dialog = dialog.set_file_name(file_name);
     }
@@ -148,7 +171,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        selected_path_to_wire, validate_save_directory, PickKind, SaveFilter,
+        selected_path_to_wire, validate_save_directory, FileFilter, PickKind,
         DIRECTORY_NOT_ABSOLUTE, PATH_NOT_ABSOLUTE, PATH_NOT_UTF8,
     };
 
@@ -198,17 +221,60 @@ mod tests {
     }
 
     #[test]
-    fn a_save_filter_deserialises_from_the_documented_shape() {
-        let filter: SaveFilter =
+    fn a_filter_deserialises_from_the_documented_shape() {
+        let filter: FileFilter =
             serde_json::from_str(r#"{"name": "Markdown", "extensions": ["md"]}"#).unwrap();
 
         assert_eq!(
             filter,
-            SaveFilter {
+            FileFilter {
                 name: "Markdown".to_string(),
                 extensions: vec!["md".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn a_filter_with_several_extensions_deserialises_in_order() {
+        let filter: FileFilter =
+            serde_json::from_str(r#"{"name": "Images", "extensions": ["png", "jpg", "jpeg"]}"#)
+                .unwrap();
+
+        assert_eq!(
+            filter.extensions,
+            vec!["png".to_string(), "jpg".to_string(), "jpeg".to_string()]
+        );
+    }
+
+    #[test]
+    fn omitted_null_and_empty_filter_lists_all_mean_no_application_filter() {
+        // The command argument is `Option<Vec<FileFilter>>`, so these three
+        // documented request shapes all reach the chooser unfiltered.
+        assert_eq!(
+            serde_json::from_str::<Option<Vec<FileFilter>>>("null").unwrap(),
+            None
+        );
+        assert_eq!(
+            serde_json::from_str::<Option<Vec<FileFilter>>>("[]").unwrap(),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn malformed_filter_types_are_refused_by_deserialisation() {
+        for filters in [
+            r#""md""#,
+            r#""Markdown""#,
+            r#"[{"name": "Markdown"}]"#,
+            r#"[{"name": "Markdown", "extensions": "md"}]"#,
+            r#"[{"name": 1, "extensions": ["md"]}]"#,
+            r#"{"name": "Markdown", "extensions": ["md"]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Option<Vec<FileFilter>>>(filters).is_err(),
+                "{filters}"
+            );
+        }
     }
 
     #[test]
