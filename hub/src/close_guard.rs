@@ -59,10 +59,10 @@
 //! see) and any pending close decision is invalidated — a termination signal
 //! tears the app down without waiting on a dialog.
 
-// Step 1 lands the model with no production consumer yet — step 2 wires it
-// into the IPC commands and the bridge routes, step 3 into the close path.
-// `update_transaction` carried the same marker for the same reason.
-#![allow(dead_code)]
+// The observability helpers below (`frontend_guards`, `backend_guards`,
+// `revision`, `is_closing`) are read by tests and by step 4's validation
+// tooling rather than by the production call sites; they stay public so the
+// state can be inspected without a graphical runtime.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -427,11 +427,17 @@ impl CloseGuardState {
     /// Every frontend guard `window` still holds, across every incarnation.
     /// Conservative on purpose: a previous incarnation whose successor has
     /// not fetched yet is still a close worth warning about.
+    // Test and validation eyes only: no production call site reads the
+    // registry's contents or counters directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn frontend_guards(&self, window: &str) -> BTreeSet<String> {
         frontend_guards_of(&self.lock(), window)
     }
 
     /// Every backend guard this app instance holds.
+    // Test and validation eyes only: no production call site reads the
+    // registry's contents or counters directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn backend_guards(&self) -> BTreeSet<String> {
         self.lock().backend.clone()
     }
@@ -540,6 +546,9 @@ impl CloseGuardState {
 
     /// Whether shutdown has committed. Teardown paths use this to know that
     /// no further confirmation may be opened.
+    // Test and validation eyes only: no production call site reads the
+    // registry's contents or counters directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_closing(&self) -> bool {
         self.lock().closing
     }
@@ -547,6 +556,9 @@ impl CloseGuardState {
     /// The mutation revision — observability and tests. It counts moves, not
     /// contents: a caller can log "guard state changed" without logging what
     /// it holds.
+    // Test and validation eyes only: no production call site reads the
+    // registry's contents or counters directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn revision(&self) -> u64 {
         self.lock().revision
     }

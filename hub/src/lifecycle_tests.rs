@@ -7,14 +7,15 @@ use std::{
 };
 
 use super::{
-    acquire_launch_locks, anchor_state, cache_stamp_path, copy_rescue_dump_at, data_dir_holder,
-    db_snapshot_path, decide_launch, dialog_is_warranted, discard_db_snapshot,
-    discard_rollback_anchor, lifecycle_decision, prepare_dev_launch, previous_tree_path,
-    probe_run_lock, read_cache_stamp, read_data_version, read_rollback_anchor, rescue_dump_pattern,
+    acquire_launch_locks, anchor_state, cache_stamp_path, close_action, close_effect,
+    close_stops_backend, close_warning, copy_rescue_dump_at, data_dir_holder, db_snapshot_path,
+    decide_launch, dialog_is_warranted, discard_db_snapshot, discard_rollback_anchor,
+    lifecycle_decision, on_window_event, prepare_dev_launch, previous_tree_path, probe_run_lock,
+    read_cache_stamp, read_data_version, read_rollback_anchor, rescue_dump_pattern,
     restore_db_snapshot, rollback_anchor_path, serving_lock_path, snapshot_db, veto_exit,
     write_cache_stamp, write_data_version, write_rollback_anchor, Anchor, CacheStamp, CacheStatus,
-    LaunchDecision, LaunchLockError, LifecycleDecisionError, LifecycleError, LifecycleEvent,
-    RollbackAnchor, RunLockHeld, DB_FILE_NAMES,
+    CloseAction, CloseEffect, LaunchDecision, LaunchLockError, LifecycleDecisionError,
+    LifecycleError, LifecycleEvent, RollbackAnchor, RunLockHeld, DB_FILE_NAMES,
 };
 use crate::{registry::Platform, run::format_run_entry};
 
@@ -938,4 +939,233 @@ fn nothing_at_all_reads_as_missing() {
     let app_dir = Path::new("/apps/never-installed");
 
     assert_eq!(anchor_state(data_subdir.path(), app_dir), Anchor::Missing);
+}
+
+// --- close-guard gating (plan 055 step 3) ------------------------------------
+//
+// The decision-to-effect rules, tested at the same level as `veto_exit`: the
+// mappings are pure, and the pieces that need a runtime go through the mock
+// one. What stays beyond every test here — the real dialog, a real hide, a
+// real teardown — is step 4's native validation.
+
+use crate::close_guard::{CloseFlow, CloseGuardState, SharedCloseGuards};
+
+fn guard_state_with_frontend_guard(window: &str, id: &str) -> SharedCloseGuards {
+    let state = std::sync::Arc::new(CloseGuardState::new());
+    let context = state.context(window);
+    state
+        .frontend_register(window, &context, id)
+        .expect("a registered guard");
+    state
+}
+
+#[test]
+fn a_busy_or_confirmed_close_vetoes_the_default_close() {
+    // One decision at a time across the app's windows: a repeated click, or
+    // a second window closing while a dialog stands, lands on `KeepOpen`.
+    // Stacking a second dialog is how two closes both conclude they are the
+    // last one.
+    assert_eq!(close_action(&CloseFlow::Busy, false), CloseAction::KeepOpen);
+    assert_eq!(
+        close_action(
+            &CloseFlow::Confirm {
+                token: "t".to_string(),
+                frontend: Default::default(),
+                backend: Default::default(),
+            },
+            false
+        ),
+        CloseAction::KeepOpen
+    );
+    assert_eq!(
+        close_action(
+            &CloseFlow::Confirm {
+                token: "t".to_string(),
+                frontend: Default::default(),
+                backend: Default::default(),
+            },
+            true
+        ),
+        CloseAction::KeepOpen
+    );
+}
+
+#[test]
+fn an_allowed_close_keeps_todays_behavior() {
+    // Nothing to protect: the last window with a sidecar takes the existing
+    // hide-and-teardown path, a secondary window closes by the default.
+    assert_eq!(
+        close_action(&CloseFlow::Allow, true),
+        CloseAction::HideAndTearDown
+    );
+    assert_eq!(close_action(&CloseFlow::Allow, false), CloseAction::Default);
+}
+
+#[test]
+fn a_cancelled_close_performs_no_hide_destroy_or_stop() {
+    let state = guard_state_with_frontend_guard("main", "editor:42");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks");
+    };
+
+    // Cancel — the dialog's `false`, which Escape and dismiss also answer.
+    assert_eq!(
+        close_effect(state.resolve_close(&token, false, false)),
+        CloseEffect::Nothing
+    );
+    // The guard survives the cancellation; the window stays open with it.
+    assert!(state.frontend_guards("main").contains("editor:42"));
+
+    // The refusals that were never a person's answer at all: a callback
+    // with a token the state never issued, and a decision whose window was
+    // destroyed while its dialog stood.
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks again");
+    };
+    assert_eq!(
+        close_effect(state.resolve_close("never-issued", true, false)),
+        CloseEffect::Nothing
+    );
+    state.drop_window("main");
+    assert_eq!(
+        close_effect(state.resolve_close(&token, true, false)),
+        CloseEffect::Nothing
+    );
+}
+
+#[test]
+fn an_approved_secondary_close_keeps_the_backend_alive() {
+    let state = guard_state_with_frontend_guard("main", "editor:42");
+    state
+        .backend_register("export:job-1")
+        .expect("a backend guard");
+    // `main` is not the last window here, so the backend guards are not at
+    // stake and the backend keeps running through this close.
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("a guarded close asks");
+    };
+
+    let effect = close_effect(state.resolve_close(&token, true, false));
+    assert_eq!(effect, CloseEffect::CloseWindow);
+    // The backend's protection is untouched by closing this window.
+    assert!(state.backend_guards().contains("export:job-1"));
+}
+
+#[test]
+fn an_approved_final_close_tears_down_once() {
+    let state = guard_state_with_frontend_guard("main", "editor:42");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", true) else {
+        panic!("a guarded close asks");
+    };
+
+    assert_eq!(
+        close_effect(state.resolve_close(&token, true, true)),
+        CloseEffect::HideAndTearDown
+    );
+    // The decision was one-time: a repeated or late answer authorises
+    // nothing, so the teardown that already started is the only one.
+    assert_eq!(
+        close_effect(state.resolve_close(&token, true, true)),
+        CloseEffect::Nothing
+    );
+}
+
+#[test]
+fn a_signal_commits_shutdown_and_invalidates_the_pending_approval() {
+    // A termination signal reaches `stop_sidecar_and_exit`, whose first step
+    // is the one-way shutdown commitment — the pending dialog's late answer
+    // goes stale, and mandatory shutdown never waits on a person.
+    let state = guard_state_with_frontend_guard("main", "editor:42");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", true) else {
+        panic!("a guarded close asks");
+    };
+
+    state.commit_shutdown();
+
+    assert_eq!(
+        close_effect(state.resolve_close(&token, true, true)),
+        CloseEffect::Nothing
+    );
+    assert!(state.is_closing());
+}
+
+#[test]
+fn the_three_warnings_are_distinct_and_name_no_guard_ids() {
+    let set = |values: &[&str]| -> std::collections::BTreeSet<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    };
+    let frontend = set(&["editor:42"]);
+    let backend = set(&["export:job-1"]);
+
+    let (frontend_title, frontend_body) = close_warning(&frontend, &set(&[]));
+    let (backend_title, backend_body) = close_warning(&set(&[]), &backend);
+    let (both_title, both_body) = close_warning(&frontend, &backend);
+
+    assert_eq!(frontend_title, "Unsaved changes");
+    assert_eq!(backend_title, "Background work");
+    assert_eq!(both_title, "Unsaved changes and background work");
+    assert_ne!(frontend_body, backend_body);
+    assert_ne!(both_body, frontend_body);
+    assert_ne!(both_body, backend_body);
+
+    // The guard IDs are app-chosen and may name documents or jobs; the
+    // person is told what is at stake, never the identifiers.
+    for body in [frontend_body, backend_body, both_body] {
+        assert!(!body.contains("editor:42"));
+        assert!(!body.contains("export:job-1"));
+    }
+}
+
+#[test]
+fn a_destroyed_window_drops_its_guards_through_the_event_handler() {
+    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+
+    let app = tauri::test::mock_app();
+    let state = guard_state_with_frontend_guard("main", "editor:42");
+    app.manage(state.clone());
+    let window = WebviewWindowBuilder::new(&app, "main", WebviewUrl::App("index.html".into()))
+        .build()
+        .expect("a window")
+        .as_ref()
+        .window();
+
+    on_window_event(&window, &tauri::WindowEvent::Destroyed);
+
+    assert!(state.frontend_guards("main").is_empty());
+}
+
+#[test]
+fn close_stops_backend_counts_windows_and_the_sidecar_on_the_mock_runtime() {
+    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+
+    let app = tauri::test::mock_app();
+    let state = std::sync::Arc::new(CloseGuardState::new());
+    app.manage(state);
+
+    // No sidecar yet — the shape before `serve` finishes. The window only
+    // has to exist for the topology question; nothing is done to it.
+    WebviewWindowBuilder::new(&app, "main", WebviewUrl::App("index.html".into()))
+        .build()
+        .expect("a window");
+    assert!(!close_stops_backend(app.handle(), "main"));
+
+    // The managed sidecar is what makes the last window's close a backend
+    // stop. A minimal one: no server, no workers — `stop` on it is never
+    // called here, only `try_state` finds it.
+    app.manage(std::sync::Mutex::new(crate::sidecar::Sidecar {
+        server: None,
+        workers: vec![],
+        shutting_down: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pid_file: std::path::PathBuf::new(),
+        lock: None,
+        serving: None,
+    }));
+    assert!(close_stops_backend(app.handle(), "main"));
+
+    // A second window keeps the backend alive through either close.
+    WebviewWindowBuilder::new(&app, "main-2", WebviewUrl::App("index.html".into()))
+        .build()
+        .expect("another window");
+    assert!(!close_stops_backend(app.handle(), "main"));
+    assert!(!close_stops_backend(app.handle(), "main-2"));
 }
