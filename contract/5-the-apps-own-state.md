@@ -169,6 +169,18 @@ archive carrying no `uploads/` entries at all, which is every archive written
 before this guarantee existed, simply leaves the destination's `uploads/`
 empty, its previous contents rescued aside exactly as below.
 
+**An accepted import clears the destination's `cache/` and `build/` before
+replacing anything.** The compiled container is *derived* from the database,
+and the stamp that vouches for it compares the app's version, the installed
+path and the PHP platform — never the database itself. An archive restored
+over the same version therefore changes nothing the stamp can see, and without
+this clause the destination would keep serving settings cached from the
+previous database. Import discards the stamp and empties both directories
+before any forward-migration command runs, at equal versions just as much as
+at older ones. The `log/` and `sessions/` halves of the "do not travel" list
+above stay exactly where they were: not travelling and being cleared are two
+different promises, and only the derived pair is cleared.
+
 **The rollback anchor stays asymmetric.** It snapshots `app.db` and nothing
 else, so rolling back to the previous version restores a database that may no
 longer agree with what is on disk in `uploads/` — a row pointing at a file a

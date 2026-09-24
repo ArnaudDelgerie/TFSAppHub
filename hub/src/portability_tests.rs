@@ -1132,6 +1132,157 @@ fn a_pre_049_archive_carrying_no_uploads_prefix_at_all_imports_without_error() {
     );
 }
 
+// --- import invalidates the destination's derived state (plan 052) -----
+
+/// The previous database's derived state, in the shape the launch cache
+/// policy manages: a stamp matching every dimension it compares (the database
+/// is not one of them) and nested sentinels in both disposable directories.
+#[test]
+fn an_equal_version_import_clears_cache_build_and_stamp_before_replacing_data() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    let cache_dir = data_dir.join("cache");
+    let build_dir = data_dir.join("build");
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    fs::write(data_subdir.join("app.db"), b"previous database").expect("an existing database");
+    lifecycle::write_cache_stamp(
+        &data_subdir,
+        &lifecycle::CacheStamp {
+            app_version: "1.2.3".to_string(),
+            snapshot_path: "/apps/demo".to_string(),
+            platform: Platform {
+                php_version: "8.5".to_string(),
+                extensions_hash: "a1b2c3d4".repeat(8),
+            },
+        },
+    )
+    .expect("a stamp that matches on every dimension the launch compares");
+    fs::create_dir_all(cache_dir.join("pooled/container")).expect("a nested cache tree");
+    fs::write(
+        cache_dir.join("pooled/container/ProjectContainer.php"),
+        b"compiled from the previous database",
+    )
+    .expect("a compiled container");
+    fs::create_dir_all(build_dir.join("nested")).expect("a nested build tree");
+    fs::write(
+        build_dir.join("nested/sentinel"),
+        b"derived from the previous database",
+    )
+    .expect("a build sentinel");
+    let uploads_dir = data_dir.join(UPLOADS_DIR);
+    fs::create_dir_all(&uploads_dir).expect("an uploads dir");
+    fs::write(uploads_dir.join("old.txt"), b"old upload").expect("an existing upload");
+    fs::write(
+        data_subdir.join("secrets.json"),
+        br#"{"app_secret":"kept"}"#,
+    )
+    .expect("a plaintext secrets fallback");
+
+    // The same version as the registry entry — exactly the restore that
+    // changes none of the stamp's dimensions, which is why the cleanup cannot
+    // lean on the launch-time comparison and must be the import's own.
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{DATA_DIR}/app.db"), b"imported database"),
+            (&format!("{UPLOADS_DIR}/new.txt"), b"new upload"),
+        ],
+    );
+
+    let proceeded = run_import(&paths, "demo", &archive, true, true)
+        .expect("force unlocks a populated data dir at the same version");
+    assert!(proceeded);
+
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("the imported database"),
+        b"imported database"
+    );
+    assert!(
+        !cache_dir.exists() && !build_dir.exists(),
+        "both disposable directories are gone outright, nested sentinels included"
+    );
+    assert!(
+        !lifecycle::cache_stamp_path(&data_subdir).exists(),
+        "the old stamp must not survive next to the data it no longer vouches for"
+    );
+    assert_eq!(
+        fs::read(uploads_dir.join("new.txt")).expect("the archive's upload"),
+        b"new upload",
+        "uploads replacement is unaffected by the cache cleanup"
+    );
+    let rescue_db = fs::read_dir(&data_subdir)
+        .expect("the data directory")
+        .map(|entry| entry.expect("a directory entry").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("app.db.rescue-"))
+        })
+        .expect("the replaced database, rescue-dumped");
+    assert_eq!(
+        fs::read(rescue_db).expect("the rescued database"),
+        b"previous database"
+    );
+    let rescue_uploads = fs::read_dir(&data_dir)
+        .expect("the data directory")
+        .map(|entry| entry.expect("a directory entry").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("uploads.rescue-"))
+        })
+        .expect("the replaced uploads/ directory, rescue-renamed");
+    assert_eq!(
+        fs::read(rescue_uploads.join("old.txt")).expect("the rescued upload"),
+        b"old upload"
+    );
+    assert_eq!(
+        fs::read_to_string(data_subdir.join("secrets.json")).expect("the secrets fallback"),
+        r#"{"app_secret":"kept"}"#,
+        "the cleanup reaches neither data/ nor the keyring fallback inside it"
+    );
+}
+
+/// A destination with no cache directories and no stamp — a fresh install
+/// that has never been opened — is the ordinary absent-path case, not an
+/// error, and the equal-version path stays independent of bundled PHP.
+#[test]
+fn an_accepted_import_over_a_destination_with_no_cache_or_stamp_imports_cleanly() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    fs::write(data_subdir.join("app.db"), b"previous database").expect("an existing database");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{DATA_DIR}/app.db"), b"imported database"),
+        ],
+    );
+
+    let proceeded = run_import(&paths, "demo", &archive, true, true)
+        .expect("nothing about a missing cache can refuse an accepted import");
+    assert!(proceeded);
+
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("the imported database"),
+        b"imported database"
+    );
+    assert!(
+        !lifecycle::cache_stamp_path(&data_subdir).exists(),
+        "an equal-version import warms nothing and stamps nothing — the next launch rebuilds"
+    );
+    assert!(
+        !data_dir.join("cache").exists() && !data_dir.join("build").exists(),
+        "the cleanup must not recreate what it exists to remove"
+    );
+}
+
 // --- import migrates an older archive forward --------------------------
 
 /// A fixture app whose `bin/console` records what it was asked to do —

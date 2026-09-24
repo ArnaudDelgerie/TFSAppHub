@@ -6,8 +6,9 @@
 //! isolation before the two commands built on it: [`Manifest`], the archive's
 //! only metadata, and [`import_decision`], the whole of what `import` refuses
 //! and why. The commands themselves — the busy guard, the tar/gzip writing
-//! and reading, the confirmation, the rescue dump, the anchor discard, the
-//! forward migration of an archive older than what is installed — are
+//! and reading, the confirmation, the destination cache invalidation, the
+//! rescue dump, the anchor discard, the forward migration of an archive older
+//! than what is installed — are
 //! [`export`] and [`import`], added once the primitives below have their own
 //! tests.
 //!
@@ -597,8 +598,21 @@ fn run_import(
         }
     }
 
-    // The point of no return: everything above only reads. What follows
-    // rescue-dumps what it is about to overwrite, discards the anchor
+    // The disposable-cache boundary — the first thing the import changes, and
+    // the one write that must land before the rescue/replacement boundary
+    // below. The preflight above only reads; this clears the state *derived*
+    // from the database the archive is about to replace, so that neither the
+    // forward migration below nor a command run right after the import can
+    // read a container compiled from the previous database (`Mode::Run` and
+    // `Mode::Install` deliberately clear nothing, and the stamp's three
+    // dimensions do not include the database — the Overview's bug). Strict on
+    // failure, unlike `Mode::Launch`'s best-effort wipe: the error stops the
+    // import here, before the rescue phase, with the database, `uploads/`,
+    // the version record and the rollback anchor all untouched.
+    clear_destination_cache(&data_dir, &data_subdir)?;
+
+    // The rescue/replacement boundary: what follows rescue-dumps what it is
+    // about to overwrite, discards the anchor
     // (an import proceeding has already made it incoherent — see the
     // Overview), and then writes.
     let rescue_path = rescue_dump(&data_subdir)?;
@@ -876,6 +890,56 @@ fn rescue_uploads(data_dir: &Path) -> Result<Option<PathBuf>, PortabilityError> 
     Ok(Some(rescue))
 }
 
+/// The destination's disposable cache directories — the exact pair the launch
+/// cache policy manages (`app_env::resolve`'s `Mode::Launch` wipe), and never
+/// a third: `uploads/` is durable (decision 006) and `log/`/`sessions/` are
+/// the app's own churn, none of them the import's to clear.
+const CACHE_DIR_NAMES: [&str; 2] = ["cache", "build"];
+
+/// Invalidate the destination's derived state before the archive's data
+/// replaces the database it was derived from: discard the cache stamp, then
+/// remove `cache/` and `build/` ([`CACHE_DIR_NAMES`]).
+///
+/// **Why the stamp first:** a partial cleanup must not leave a stamp claiming
+/// the old container is still reusable — `read_cache_stamp` would catch an
+/// emptied `cache/`, but a half-removed one would pass its
+/// `cache_dir_has_entries` check and hand the next launch the leftovers.
+///
+/// **Why here at all:** the stamp compares the app's version, the snapshot
+/// path and the PHP platform, never the database, so an equal-version restore
+/// changes none of them and the previous container would otherwise be reused
+/// against the imported database. `Mode::Run` and `Mode::Install` deliberately
+/// clear nothing later in this pipeline either, so nothing else catches it.
+///
+/// **Strict, unlike `Mode::Launch`'s best-effort wipe:** a directory the
+/// import could not remove is exactly the stale cache this exists to clear, so
+/// the error stops the import before the rescue phase. An absent path counts
+/// as already cleared, and a top-level symlink is removed as the link it is
+/// rather than traversed into whatever it points at.
+fn clear_destination_cache(data_dir: &Path, data_subdir: &Path) -> Result<(), PortabilityError> {
+    lifecycle::discard_cache_stamp(data_subdir).map_err(|source| {
+        PortabilityError::CacheCleanup {
+            path: lifecycle::cache_stamp_path(data_subdir),
+            source,
+        }
+    })?;
+    for name in CACHE_DIR_NAMES {
+        let path = data_dir.join(name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(PortabilityError::CacheCleanup { path, source }),
+        };
+        let removal = if metadata.file_type().is_symlink() {
+            fs::remove_file(&path)
+        } else {
+            fs::remove_dir_all(&path)
+        };
+        removal.map_err(|source| PortabilityError::CacheCleanup { path, source })?;
+    }
+    Ok(())
+}
+
 /// Remove the live database set after [`rescue_dump`] has copied it aside and
 /// before an archive writes its replacement. Extraction only creates files it
 /// carries, so leaving an old WAL or SHM beside an archive that has only the
@@ -964,6 +1028,19 @@ pub enum PortabilityError {
     },
     /// [`import_decision`] refused.
     Refused(ImportRefusal),
+    /// An import stopped while clearing the destination's disposable cache,
+    /// before the rescue/replacement boundary — the one import failure where
+    /// no persistent data has been touched, which is why it is not an
+    /// [`PortabilityError::ImportIncomplete`]: the database, `uploads/`, the
+    /// recorded version and the rollback anchor are all still exactly as the
+    /// preflight found them. What may have changed is the cache cleanup
+    /// itself — the stamp is already discarded and the directories may be
+    /// half-removed — so the message says that rather than claiming nothing
+    /// did.
+    CacheCleanup {
+        path: PathBuf,
+        source: io::Error,
+    },
     /// An import failed after its rescue dump was safely taken. The ordinary
     /// error alone is not enough: the caller also needs to know the state now
     /// left on disk and where the data it replaced can be recovered — both
@@ -1050,6 +1127,14 @@ impl fmt::Display for PortabilityError {
                 path.display()
             ),
             Self::Refused(refusal) => write!(formatter, "{refusal}"),
+            Self::CacheCleanup { path, source } => write!(
+                formatter,
+                "import stopped before replacing any data: clearing the previous cache failed \
+                 at {}: {source}. The cleanup may be partial (the cache stamp is already \
+                 discarded), but the database, uploads/ and the rollback anchor are untouched — \
+                 resolve the error and run the import again.",
+                path.display()
+            ),
             Self::ImportIncomplete {
                 data_subdir,
                 db_rescue_path,
@@ -1097,6 +1182,7 @@ impl std::error::Error for PortabilityError {
             Self::Manifest(error) => Some(error),
             Self::Php(error) => Some(error),
             Self::Io { source, .. } => Some(source),
+            Self::CacheCleanup { source, .. } => Some(source),
             _ => None,
         }
     }
