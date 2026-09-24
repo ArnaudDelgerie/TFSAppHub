@@ -41,6 +41,29 @@ would leave the next launch on `LifecycleDecisionError::Downgrade`, which has
 no recovery path), not a window or `run` command holding the app (nothing to
 override, wait or stop it instead).
 
+**An accepted import clears the destination's `cache/` and `build/` and
+discards its stamp before anything else changes (plan 052).** The stamp
+compares the app's version, the installed path and the PHP platform — never
+the database — so an equal-version restore changes nothing it can see, and
+the container compiled from the previous database would otherwise keep
+serving its stale settings (the Papermark report: theme, language and
+provider configuration read from cache after a same-version restore). The
+cleanup runs past the busy guard, the refusals and the confirmation, still
+under the maintenance lease and before the rescue phase below — the first
+thing the import changes, and the last step that can fail without anything
+persistent having been touched. It is strict, unlike `Mode::Launch`'s
+best-effort wipe: a directory it cannot remove stops the import in its own
+error, naming the path and saying data replacement has not started, because
+`Mode::Run` and `Mode::Install` deliberately clear nothing later and nothing
+else would catch the leftovers. The stamp goes first, so a partial cleanup
+cannot leave a stamp claiming the old container is still reusable. An
+equal-version import leaves no stamp behind and warms nothing — the next
+`open` rebuilds, exactly as it would for any unstamped data directory; an
+older archive migrates forward with the old cache already gone, and the
+fresh stamp its successful warm-up writes survives the import. `log/` and
+`sessions/` are not part of it (§5 keeps the distinction between not
+travelling and being cleared).
+
 **A forced import atomically rescue-copies before it overwrites.** The database
 it is about to replace is copied by `lifecycle::copy_rescue_dump` — the same
 mechanism `rollback` uses for the database it cannot keep — to
