@@ -227,6 +227,24 @@ signalled yet. The hub's run callback vetoes exactly that exit, and only while
 a teardown is in flight, leaving its own `app.exit(0)` as the one thing that
 ends the process.
 
+**A guarded close asks before any of that begins.** An app that declares
+`actions.close_guard` (§7) can mark a document's unsaved work from the webview
+and app-wide background work from PHP; closing a window that carries such a
+mark vetoes the default close and shows one native confirmation, `Cancel` as
+the safe default, before the window is hidden or the backend stopped. Backend
+guards only matter on the close that would stop the shared backend — a clean
+secondary window closes without a word even while jobs run elsewhere. The
+decision machinery lives in `close_guard.rs`, plain state with no GTK in it:
+one pending decision at a time across the app's windows (repeated clicks
+veto rather than stack dialogs), the guards rechecked against the topology at
+answer time (a guard that appeared mid-dialog earns a fresh warning, never a
+stale approval), and the approval consumed the moment it is applied.
+Mandatory shutdown never asks: the first step of every teardown path — the
+approved close itself, a signal, a fatal error — commits shutdown one-way,
+which turns any dialog still standing stale and refuses new guards. Cancelling
+is the null outcome: the window stays visible, the backend keeps serving, the
+guards stay standing. An app that declares nothing sees none of this.
+
 A third lock joins these two once a `run` command exists — see "Running a
 declared command" below for what it answers and how a launch reads it.
 

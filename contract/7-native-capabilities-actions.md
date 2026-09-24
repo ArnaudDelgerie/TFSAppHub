@@ -325,7 +325,28 @@ refuses the `invoke` outright, and a missing or refused bridge route is
 unavailable the same way: app code that probes before use and degrades when
 the answer is no. Declaring the group and getting no error is the only
 success; treat anything else — a refused permission, a 404, no
-`TFS_BRIDGE_URL` at all — as "no guard installed", never as one.
+`TFS_BRIDGE_URL` at all — as "no guard installed", never as one:
+
+```js
+// The document wants protection, but a hub without the group refuses the
+// invoke before any handler runs — degrade, never break:
+try {
+    const { context } = await invoke("close_guard_context");
+    await invoke("close_guard_register", { context, id: `editor:${docId}` });
+} catch {
+    // No guard installed; the app closes the way it always did.
+}
+```
+
+```php
+// PHP's probe is the environment itself: no TFS_BRIDGE_URL means the
+// launch declared no bridge group, so the job runs unguarded rather than
+// treating a missing guard as an installed one.
+if ($bridgeUrl && $bridgeToken) {
+    $bridge->post('/close-guard/register', ['json' => ['id' => $id]]);
+    // ...and only a 200 means the guard exists.
+}
+```
 
 The IPC commands and their exact errors: `close_guard_context` answers
 `{"context": "…"}` for the calling window's current document;
