@@ -99,6 +99,20 @@ three no longer matches, logging which one to `hub.log` before it does:
   stamp is a claim about what was built, not a promise that it is still on
   disk, and a launch must never reuse a container that is not there.
 
+The one thing that invalidates without moving any of the three dimensions is
+`import` — which is why it does not lean on this comparison at all. The
+database a restored archive replaces is not a stamp dimension, so an
+equal-version restore compares clean and would hand the next launch the
+previous database's container, stale settings included. `import` therefore
+clears explicitly, discarding the stamp and emptying both directories itself
+before its rescue phase (`architecture/06`), whether the archive matches the
+installed version or is older. An equal-version import leaves no stamp and
+adds no warm-up of its own: the next `open` rebuilds at the cold-start cost,
+exactly as it does for any data directory that was never stamped. An older
+archive's migrate-forward warm-up may write a fresh stamp for the installed
+version; the import is already past its cleanup by then and leaves that fresh
+one alone.
+
 `Mode::Install`, `Mode::Dev` and `Mode::Run` are untouched by any of this —
 `Mode::Install` always starts from an empty cache by construction, and dev's
 own container invalidates itself on file change (`Mode::Dev` never wipes,

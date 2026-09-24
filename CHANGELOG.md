@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+Restoring a backup no longer keeps settings cached from the previous
+database. `import` now clears the destination's `cache/` and `build/` and
+discards its stamp before replacing anything — including when the archive's
+version matches the installed app's, the one case where the cache stamp's
+comparison could not tell the compiled container it was stale, and the one
+that left a restored app serving the previous database's theme, language
+and provider settings. A `run` command executed right after the import reads
+the imported database too, and an older archive migrates forward without
+the old cache; the fresh cache that migration builds survives the import. A
+cache the import cannot clear stops it before any data is replaced, naming
+the path.
+
 An app declaring `actions.picker.ipc` can now open a native Save As dialog
 (`save_path`), with its own filters, suggested file name, starting directory
 and GTK's own overwrite confirmation, resolving to the path typed or to
