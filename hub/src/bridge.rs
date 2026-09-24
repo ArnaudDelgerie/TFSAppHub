@@ -50,6 +50,7 @@ pub struct Bridge {
 pub struct BridgeGroups {
     pub secrets: bool,
     pub update: bool,
+    pub close_guard: bool,
 }
 
 /// Start the bridge on a free loopback port and return at once; the accept loop
@@ -60,12 +61,16 @@ pub struct BridgeGroups {
 /// the store, it does not change for the life of a launch. `update_context` is
 /// the same `Context` `main::serve` manages for the IPC side — see
 /// `update_check.rs` — cloned once per request so `/update/check` re-reads the
-/// cache fresh, never the socket.
+/// cache fresh, never the socket. `close_guards` is the launch's shared guard
+/// state, cloned once per request: the backend namespace it answers for is
+/// this app instance's and nothing else, so a route can never reach another
+/// transport's namespace, let alone another app's state.
 pub fn start(
     store: SecretStore,
     keys: Vec<String>,
     groups: BridgeGroups,
     update_context: crate::update_check::Context,
+    close_guards: crate::close_guard::SharedCloseGuards,
 ) -> Result<Bridge, Box<dyn std::error::Error>> {
     let server = tiny_http::Server::http("127.0.0.1:0")
         .map_err(|error| format!("Cannot start the actions bridge: {error}"))?;
@@ -82,8 +87,17 @@ pub fn start(
             let token = accept_token.clone();
             let keys = keys.clone();
             let update_context = update_context.clone();
+            let close_guards = close_guards.clone();
             thread::spawn(move || {
-                handle_request(request, &store, &token, &keys, groups, &update_context)
+                handle_request(
+                    request,
+                    &store,
+                    &token,
+                    &keys,
+                    groups,
+                    &update_context,
+                    &close_guards,
+                )
             });
         }
     });
@@ -102,6 +116,11 @@ struct SetSecretRequest {
     value: String,
 }
 
+#[derive(Deserialize)]
+struct GuardRequest {
+    id: String,
+}
+
 fn handle_request(
     mut request: tiny_http::Request,
     store: &SecretStore,
@@ -109,6 +128,7 @@ fn handle_request(
     keys: &[String],
     groups: BridgeGroups,
     update_context: &crate::update_check::Context,
+    close_guards: &crate::close_guard::SharedCloseGuards,
 ) {
     if !is_authorized(&request, token) {
         respond(request, 401, &json!({"error": "unauthorized"}));
@@ -127,6 +147,10 @@ fn handle_request(
         return;
     }
     if url.starts_with("/update/") && !groups.update {
+        respond(request, 404, &json!({"error": "not_found"}));
+        return;
+    }
+    if url.starts_with("/close-guard/") && !groups.close_guard {
         respond(request, 404, &json!({"error": "not_found"}));
         return;
     }
@@ -201,7 +225,50 @@ fn handle_request(
             Err(error) => respond(request, error.status(), &error.body()),
         },
 
+        // The two close-guard routes only change shared state: they never open
+        // a dialog, wait on a person, or hold a lock past the call. Errors come
+        // back as the contract's status/error pairs; nothing logs the id, which
+        // is app-chosen and may name documents or jobs.
+        (Method::Post, "/close-guard/register") => match read_body::<GuardRequest>(&mut request) {
+            Ok(body) => match close_guards.backend_register(&body.id) {
+                Ok(()) => respond(request, 200, &json!({"ok": true})),
+                Err(error) => {
+                    let (status, code) = guard_error_response(&error);
+                    respond(request, status, &json!({ "error": code }));
+                }
+            },
+            Err(error) => respond(request, error.status(), &error.body()),
+        },
+
+        // Removal of an absent id is a plain success — the guard's owner may
+        // not know whether its own removal already happened.
+        (Method::Post, "/close-guard/remove") => match read_body::<GuardRequest>(&mut request) {
+            Ok(body) => match close_guards.backend_remove(&body.id) {
+                Ok(()) => respond(request, 200, &json!({"ok": true})),
+                Err(error) => {
+                    let (status, code) = guard_error_response(&error);
+                    respond(request, status, &json!({ "error": code }));
+                }
+            },
+            Err(error) => respond(request, error.status(), &error.body()),
+        },
+
         _ => respond(request, 404, &json!({"error": "not_found"})),
+    }
+}
+
+/// The contract's status/error pairs for a failed guard operation. The state
+/// model only hands back its own `GuardError`s, so this is the single place
+/// the error tail — 400 `invalid_id`, 429 `too_many_guards`, 503 `closing` —
+/// becomes HTTP. `StaleDocument` cannot reach the backend namespace (there is
+/// no document to be stale about); the defensive 400 keeps that true rather
+/// than asserting it.
+fn guard_error_response(error: &crate::close_guard::GuardError) -> (u16, &'static str) {
+    use crate::close_guard::GuardError;
+    match error {
+        GuardError::InvalidId | GuardError::StaleDocument => (400, error.code()),
+        GuardError::TooManyGuards => (429, error.code()),
+        GuardError::Closing => (503, error.code()),
     }
 }
 

@@ -52,7 +52,8 @@ const FULL: &str = r#"{
   "actions": {
     "secrets": { "ipc": true, "bridge": true, "keys": ["openai", "anthropic"] },
     "update": { "ipc": true, "bridge": true },
-    "picker": { "ipc": true }
+    "picker": { "ipc": true },
+    "close_guard": { "ipc": true, "bridge": true }
   }
 }"#;
 
@@ -86,6 +87,8 @@ fn a_full_manifest_parses_into_typed_values() {
     assert_eq!(manifest.actions.secrets.keys, ["openai", "anthropic"]);
     assert!(manifest.actions.update.bridge);
     assert!(manifest.actions.picker.ipc);
+    assert!(manifest.actions.close_guard.ipc);
+    assert!(manifest.actions.close_guard.bridge);
 
     // `releases_repo` is a known key the hub does not read yet, and
     // `pre-build`/`post-build` are build-machine keys nested under `commands`.
@@ -141,6 +144,52 @@ fn picker_bridge_is_refused_even_when_false() {
         "{error}"
     );
     assert!(error.to_string().contains("no bridge transport"), "{error}");
+}
+
+#[test]
+fn close_guard_is_off_at_every_level_and_neither_transport_implies_the_other() {
+    assert_eq!(
+        parse_ok(MINIMAL).manifest.actions.close_guard,
+        super::CloseGuardActions::default()
+    );
+
+    let bridge_only = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"close_guard": {"bridge": true}}"#,
+    );
+    let close_guard = parse_ok(&bridge_only).manifest.actions.close_guard;
+    assert!(!close_guard.ipc);
+    assert!(close_guard.bridge, "the bridge transport stands alone");
+
+    let ipc_only = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"close_guard": {"ipc": true}}"#,
+    );
+    let close_guard = parse_ok(&ipc_only).manifest.actions.close_guard;
+    assert!(close_guard.ipc);
+    assert!(!close_guard.bridge, "and so does the IPC transport");
+}
+
+#[test]
+fn a_wrongly_typed_close_guard_transport_is_refused() {
+    // The standing rule's corollary: a *known* key with the wrong type is
+    // rejected rather than read as a default, and this group's switches are
+    // exactly the shape a quoted "true" would silently invert.
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"close_guard": {"ipc": "true"}}"#,
+    );
+
+    let error = parse_err(&contents);
+
+    // The same refusal the other groups' switches already get: a *known* key
+    // with the wrong type never reads as its default, and the file and the
+    // offending value are named. The field name itself is the one thing
+    // serde's error does not carry — which is why the top-level
+    // `async_worker` has an explicit check and the nested group switches
+    // never have.
+    assert!(matches!(error, ManifestError::Invalid { .. }));
+    assert!(error.to_string().contains("expected a boolean"), "{error}");
 }
 
 #[test]

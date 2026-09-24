@@ -144,6 +144,37 @@ fn action_ipc_grants_are_default_off_and_picker_is_independent() {
     assert_eq!(grants, [("actions-picker", "allow-picker")]);
 }
 
+#[test]
+fn action_ipc_grants_close_guard_is_independent_of_the_others() {
+    // `close_guard.ipc` alone grants only its own permission: a manifest
+    // declaring it does not hand out secrets, update or picker, and none of
+    // those three hands out close-guard.
+    let mut actions = crate::manifest::ActionsConfig::default();
+    actions.close_guard.ipc = true;
+    let grants: Vec<_> = declared_action_ipc_grants(&actions)
+        .map(|grant| (grant.capability_identifier, grant.permission))
+        .collect();
+
+    assert_eq!(grants, [("actions-close-guard", "allow-close-guard")]);
+
+    actions.secrets.ipc = true;
+    actions.update.ipc = true;
+    actions.picker.ipc = true;
+    let grants: Vec<_> = declared_action_ipc_grants(&actions)
+        .map(|grant| (grant.capability_identifier, grant.permission))
+        .collect();
+
+    assert_eq!(
+        grants,
+        [
+            ("actions-secrets", "allow-secrets"),
+            ("actions-update", "allow-update"),
+            ("actions-picker", "allow-picker"),
+            ("actions-close-guard", "allow-close-guard"),
+        ]
+    );
+}
+
 // --- the splash scheme's path confinement ---------------------------------
 //
 // `resolve_within` is the whole safety argument for plan 025's scheme: one

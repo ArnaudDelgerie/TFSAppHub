@@ -203,6 +203,8 @@ pub struct ActionsConfig {
     pub update: UpdateActions,
     #[serde(default)]
     pub picker: PickerActions,
+    #[serde(default)]
+    pub close_guard: CloseGuardActions,
 }
 
 /// The `secrets` group, per transport. `keys` is a manifest — typo-catching,
@@ -234,6 +236,19 @@ pub struct UpdateActions {
 pub struct PickerActions {
     #[serde(default)]
     pub ipc: bool,
+}
+
+/// The `close_guard` group (plan 055), per transport: both are real, both are
+/// off by default, and neither implies the other. `ipc` is the webview's
+/// register/remove commands for a document's unsaved-work guards; `bridge` is
+/// the authenticated HTTP routes for app-instance backend-work guards. The
+/// two namespaces are separate by construction — see `close_guard.rs`.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq)]
+pub struct CloseGuardActions {
+    #[serde(default)]
+    pub ipc: bool,
+    #[serde(default)]
+    pub bridge: bool,
 }
 
 /// A manifest and whatever the parse wanted to say about it.

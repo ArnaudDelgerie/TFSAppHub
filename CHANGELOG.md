@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+An app can now declare `actions.close_guard` and register close guards from
+either side of itself: the webview marks one document's unsaved work over
+IPC (`close_guard_context`, then `close_guard_register`/`close_guard_remove`
+with that context), PHP marks app-wide background work over the bridge
+(`POST /close-guard/register|remove`). Closing a window whose guards are at
+stake shows one native confirmation — `Cancel` as the safe default, distinct
+text for unsaved changes, background work, or both — before the window is
+hidden or the backend stopped; cancelling keeps the running app exactly as
+it was. Backend guards only weigh on the close that would stop the shared
+backend, one decision is pending at a time across the app's windows, and
+what is at stake is rechecked before an answer is applied, so a guard that
+appears while the dialog stands earns a fresh warning rather than a stale
+approval. Both switches default to off, neither transport can reach the
+other's namespace, and a mandatory shutdown (signal, fatal error) commits
+first and never waits on a person.
+
 An app declaring `actions.picker.ipc` can now restrict what the native file
 chooser shows: `pick_path` accepts the same optional `filters` list as
 `save_path` — one entry per filter, in the order given, the first one

@@ -183,6 +183,7 @@ pub fn start(
     environment: &AppEnvironment,
     manifest: &crate::manifest::Manifest,
     update_context: &crate::update_check::Context,
+    close_guards: &crate::close_guard::SharedCloseGuards,
     lock: Option<fs::File>,
     serving: Option<fs::File>,
     app: &tauri::AppHandle,
@@ -218,15 +219,17 @@ pub fn start(
     // those two variables conditional on a bridge *running*, and
     // present-but-dead would be worse than absent — an app would open a
     // connection to nothing.
-    if actions.secrets.bridge || actions.update.bridge {
+    if actions.secrets.bridge || actions.update.bridge || actions.close_guard.bridge {
         let bridge = crate::bridge::start(
             environment.secret_store.clone(),
             actions.secrets.keys.clone(),
             crate::bridge::BridgeGroups {
                 secrets: actions.secrets.bridge,
                 update: actions.update.bridge,
+                close_guard: actions.close_guard.bridge,
             },
             update_context.clone(),
+            close_guards.clone(),
         )
         .map_err(|error| format!("Cannot start the actions bridge: {error}"))?;
         envs.push((

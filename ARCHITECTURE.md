@@ -60,7 +60,7 @@ deferred rather than pretended away.
 - [Exporting and importing](architecture/06-exporting-and-importing.md) — the curated archive, rescue dumps.
 - [Removing and purging](architecture/07-removing-and-purging.md) — what `remove` leaves, what `purge` deletes.
 - [Publishing a release](architecture/08-publishing-a-release.md) — the publish pipeline, its gates, and `gh`.
-- [Opening an app](architecture/09-opening-an-app.md) — the launch sequence, the sidecar, the splash, teardown.
+- [Opening an app](architecture/09-opening-an-app.md) — the launch sequence, the sidecar, the splash, close guards, teardown.
 - [Running a declared command](architecture/10-running-a-declared-command.md) — `run`, its locks, its concurrency.
 - [The bundled interpreter](architecture/11-the-bundled-interpreter.md) — FrankenPHP, `PHP_BINARY`, revalidation.
 - [The registry, and what a hub update does to installed apps](architecture/12-the-registry.md) — `registry.json`, hub self-update, revalidation.
