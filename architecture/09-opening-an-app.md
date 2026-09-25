@@ -323,6 +323,9 @@ next notification or the receiver's own startup retrieves everything still
 pending. A receiver registers its listener and awaits it before the first
 `open_files_pending` read — that ordering is what covers an arrival racing the
 initial read — and afterwards reads on notification only, never on a timer.
+The listener is registered on the receiver's own `WebviewWindow`, matching the
+hub's one-window emission; a target-less `listen()` would also receive the
+notifications emitted to the app's other windows.
 `open_files_ack` removes a request, idempotently, and only the selected
 window can read or acknowledge its requests; a window closing with requests
 still pending hands them to a surviving eligible window, never to one whose

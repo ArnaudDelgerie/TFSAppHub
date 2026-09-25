@@ -293,19 +293,30 @@ guarantee.
 
 **Subscribe before you read, never poll.** The receiver's whole startup
 sequence is: register the listener, await its registration, then read the
-pending requests once. Registering first is what covers an arrival racing
-the initial read — including one that landed during the splash, which waits
-for the app's first real document. A reload repeats the same sequence, and an
-unregister disposes the listener. After startup the receiver reads only on
-notification; there is no periodic polling. Processing is serialized: while
+pending requests once. The listener is registered on the receiver's own
+window — the hub emits its notification to one window, and only a listener
+registered on that window's `WebviewWindow` receives it (a target-less
+`listen()` registers an `Any` target that also receives the notifications
+emitted to the app's other windows). Registering first is what covers an
+arrival racing the initial read — including one that landed during the
+splash, which waits for the app's first real document. A reload repeats the
+same sequence, and an unregister disposes the listener. After startup the
+receiver reads only on notification; there is no periodic polling.
+Processing is serialized: while
 one read/accept/ack cycle runs, later notifications are coalesced into a
 single follow-up read, so overlapping callbacks neither process one request
 concurrently nor leave a newly arrived one unnoticed.
 
 ```js
-// Once per document, at startup — listener first, read second:
+// Once per document, at startup — listener first, read second, and
+// registered on this window only (getCurrentWebviewWindow() from
+// @tauri-apps/api/webviewWindow; window.__TAURI__.webviewWindow with the
+// global bundle). A target-less listen() registers an Any target that also
+// receives the notifications the hub emits to the app's other windows, so
+// each window would ring every other's bell and read for nothing:
 let running = false, again = false;
-const unlisten = await listen("tfsapp://open-files-pending", () => drain());
+const unlisten = await getCurrentWebviewWindow()
+  .listen("tfsapp://open-files-pending", () => drain());
 
 async function drain() {
   if (running) { again = true; return; }
