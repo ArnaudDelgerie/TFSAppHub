@@ -479,11 +479,12 @@ fn open_window(
 
     // A file-bearing launch enqueues its own batch before the `Builder` exists,
     // so it is waiting in the pre-launch pool before any window — and the
-    // window that becomes the app's first document claims it in `serve`. Only
-    // the instance that holds the launch locks: a hand-off child's queue dies
-    // with it at the single-instance `exit(0)`, and its argv — the same files,
-    // the same order — is delivered by the live instance's own callback
-    // instead, which is the path that owns a queue with a future.
+    // window that becomes the app's first document claims it in `serve`'s
+    // hand-off. Only the instance that holds the launch locks: a hand-off
+    // child's queue dies with it at the single-instance `exit(0)`, and its
+    // argv — the same files, the same order — is delivered by the live
+    // instance's own callback instead, which is the path that owns a queue
+    // with a future.
     if !files.is_empty() && locks.is_some() {
         if open_files::receiver_declared(&spec.manifest) {
             match open_files::validate_batch(&files) {
@@ -529,7 +530,7 @@ fn open_window(
                 // A file-bearing second `open` (plan 056 step 3) is neither:
                 // its argv carries files after `--`, and that arrival is a
                 // delivery to an existing window — during the splash, to the
-                // pre-launch pool the hand-over claim empties — never a
+                // pre-launch pool the hand-off empties — never a
                 // second window. The pinned plugin hands this callback the
                 // second process's whole argv, program name included, so the
                 // same parser that built it reads it back.
@@ -554,11 +555,16 @@ fn open_window(
                 let scheduled = move || {
                     let launch_present = app.try_state::<sidecar::Launch>().is_some();
                     if !arrival.is_empty() {
+                        // The file branch needs no launch snapshot: where the
+                        // arrival goes is decided with the queue itself
+                        // (audit 019, finding 1), so a hand-off racing this
+                        // closure can neither strand the request in a pool
+                        // nothing will drain nor have it refused while the
+                        // first document's navigation is still settling.
                         match open_files::deliver_arrival(
                             &app,
                             &guards,
                             receiver_declared,
-                            launch_present,
                             &arrival,
                         ) {
                             open_files::ArrivalOutcome::Delivered { window: None } => {
@@ -882,6 +888,19 @@ fn serve(
         return;
     };
     window::publish_app_origin(&app_origin, &url);
+    // The open-files hand-off, before the navigation it designates this
+    // window for: the pool of startup arrivals drains into it and — the part
+    // audit 019's finding 1 turns into an invariant — the pool closes, so an
+    // arrival that races this transition lands on the window through the
+    // queue's own in-lock fallback instead of waiting for a drain that
+    // already happened. Notified even though the receiver cannot have
+    // subscribed yet: the notification may well be lost, and the receiver's
+    // own startup read is what actually delivers.
+    let claimed = open_files.handoff_to_first_document(&splash_label);
+    if claimed > 0 {
+        println!("tfsapp-hub: delivering {claimed} file request(s) that arrived during startup.");
+        open_files::notify(&app, &splash_label);
+    }
     if let Err(error) = window.navigate(url.parse().expect("a valid local backend URL")) {
         return lifecycle::fatal_post_setup_error(app, error.to_string());
     }
@@ -890,17 +909,6 @@ fn serve(
         url,
         product_name: identity.product_name,
     });
-
-    // The first app document exists: whatever arrived before it — during the
-    // splash, or while the backend was still booting — belongs to the window
-    // that just navigated. Claimed once, here, and notified only when
-    // something actually moved; the receiver's own startup read would have
-    // retrieved the same requests even without the notification.
-    let claimed = open_files.claim_unassigned(&splash_label);
-    if claimed > 0 {
-        println!("tfsapp-hub: delivering {claimed} file request(s) that arrived during startup.");
-        open_files::notify(&app, &splash_label);
-    }
 
     // Last of all, and only after the app is already running: a slow or
     // offline forge must never delay a launch reaching its window. A no-op

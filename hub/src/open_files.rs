@@ -157,6 +157,14 @@ fn fresh_request_id(counter: &AtomicU64) -> String {
     }
 }
 
+/// Where one live-instance arrival landed: the new request's id, plus the
+/// window that will read it — `None` when it waits in the pre-launch pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrivalPlacement {
+    pub id: String,
+    pub window: Option<String>,
+}
+
 /// One window's half of the queue: its unacknowledged requests, oldest first,
 /// plus the bounded tombstones that keep a repeated ack a success.
 #[derive(Debug, Default)]
@@ -171,6 +179,11 @@ struct Inner {
     /// that landed while the splash was still the only window. The launch
     /// claims them for the window it navigates to the backend.
     unassigned: VecDeque<PendingRequest>,
+    /// The window the launch designated as the app's first document, set
+    /// atomically with the pool drain by [`OpenFilesState::handoff_to_first_document`].
+    /// After that transition an arrival with no eligible window lands on this
+    /// window — never in a pool nothing will drain again (audit 019, finding 1).
+    first_document: Option<String>,
     windows: BTreeMap<String, WindowQueue>,
     /// Focus recency, for target selection: a counter bumped on every focus
     /// event, so the most recently focused window wins and the tie-break is
@@ -231,6 +244,25 @@ impl OpenFilesState {
     /// bounds, refusing with nothing enqueued.
     #[cfg_attr(not(test), allow(dead_code))] // Step 3's CLI and second-instance handoff are its first production callers.
     pub fn enqueue(&self, paths: Vec<String>, target: Option<&str>) -> Result<String, QueueError> {
+        self.enqueue_arrival(paths, target)
+            .map(|placement| placement.id)
+    }
+
+    /// Enqueue one live-instance arrival and answer where it landed: the new
+    /// request's id plus the window that will read it — `None` when it waits
+    /// in the pre-launch pool for the hand-off to claim.
+    ///
+    /// `eligible` is the window [`select_target_window`] found, when it found
+    /// one. When it did not, the destination is decided here, under the same
+    /// lock that owns the pool drain: the designated first document if the
+    /// hand-off already ran, the pool only while it has not. That is the
+    /// one place the two decisions — "where does this arrival go" and "the
+    /// pool is closed" — cannot interleave (audit 019, finding 1).
+    pub fn enqueue_arrival(
+        &self,
+        paths: Vec<String>,
+        eligible: Option<&str>,
+    ) -> Result<ArrivalPlacement, QueueError> {
         let mut inner = self.lock();
         if paths.is_empty() {
             return Err(QueueError::EmptyRequest);
@@ -255,16 +287,21 @@ impl OpenFilesState {
             paths,
             sequence,
         };
-        match target {
+        // Before the hand-off the pool is the right place; after it, this
+        // fallback is what an arrival racing the transition falls to.
+        let target = eligible
+            .map(str::to_string)
+            .or_else(|| inner.first_document.clone());
+        match &target {
             Some(window) => inner
                 .windows
-                .entry(window.to_string())
+                .entry(window.clone())
                 .or_default()
                 .pending
                 .push_back(request),
             None => inner.unassigned.push_back(request),
         }
-        Ok(id)
+        Ok(ArrivalPlacement { id, window: target })
     }
 
     /// The calling window's unacknowledged requests, oldest first. Reading
@@ -306,12 +343,21 @@ impl OpenFilesState {
         }
     }
 
-    /// Move every pre-launch request into `window`'s queue — the launch's
-    /// claim, once the splash window has navigated to the backend and the
-    /// app's first real document exists. Answers how many moved, so the
-    /// caller notifies once, only when there is something to read.
-    pub fn claim_unassigned(&self, window: &str) -> usize {
+    /// The launch's hand-off: the splash window is becoming the app's first
+    /// document, so it is designated as the destination for arrivals that
+    /// find no eligible window, and everything still in the pre-launch pool
+    /// moves to it — one atomic transition. Answers how many pooled requests
+    /// moved, so the caller notifies once, only when there is something to
+    /// read.
+    ///
+    /// This is the boundary audit 019's finding 1 closes: once the pool is
+    /// closed, no arrival can wait in it for a drain that already happened.
+    /// The transition runs before the navigation it designates the window
+    /// for, and [`Self::enqueue_arrival`]'s in-lock fallback covers an
+    /// arrival that read the queue before this lock and enqueues after it.
+    pub fn handoff_to_first_document(&self, window: &str) -> usize {
         let mut inner = self.lock();
+        inner.first_document = Some(window.to_string());
         let moved = inner.unassigned.len();
         if moved == 0 {
             return 0;
@@ -320,6 +366,13 @@ impl OpenFilesState {
         let queue = inner.windows.entry(window.to_string()).or_default();
         queue.pending.extend(drained);
         moved
+    }
+
+    /// The window the launch designated as the app's first document, once the
+    /// hand-off has run — the fallback destination for an arrival that finds
+    /// no eligible window while the first document's navigation is settling.
+    pub fn first_document(&self) -> Option<String> {
+        self.lock().first_document.clone()
     }
 
     /// Transfer a destroyed window's unacknowledged requests to a surviving
@@ -529,7 +582,7 @@ pub fn validate_batch(paths: &[String]) -> Result<(), String> {
 pub enum ArrivalOutcome {
     /// The request is queued: for the window it names — already notified and
     /// presented — or for the app's first document, with the launch's
-    /// hand-over claim doing the notifying.
+    /// hand-off doing the notifying.
     Delivered { window: Option<String> },
     /// Nothing was enqueued; the string is the diagnostic to report.
     Refused(String),
@@ -547,7 +600,6 @@ pub fn deliver_arrival<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     guards: &crate::close_guard::SharedCloseGuards,
     declared: bool,
-    launch_present: bool,
     paths: &[String],
 ) -> ArrivalOutcome {
     if guards.is_closing() {
@@ -563,50 +615,87 @@ pub fn deliver_arrival<R: tauri::Runtime>(
     if let Err(diagnostic) = validate_batch(paths) {
         return ArrivalOutcome::Refused(diagnostic);
     }
-    // The app's first document does not exist yet: the request waits in the
-    // pre-launch pool, and the launch's hand-over claim delivers it. Never a
-    // window here — the splash cannot consume app requests.
-    let target = if launch_present {
-        match select_target_window(app, None) {
-            Some(window) => Some(window),
-            None => {
+    // Where the arrival goes is decided with the queue, not from a launch
+    // snapshot read earlier (audit 019, finding 1). An eligible window wins;
+    // failing that, the designated first document — its navigation may still
+    // be settling, which is exactly the window a startup arrival must reach —
+    // and only while no hand-off has run at all does the pre-launch pool
+    // hold the request. Never a window opened here: the splash cannot
+    // consume app requests.
+    let target = match select_target_window(app, None) {
+        Some(window) => Some(window),
+        None => match designated_target(app, guards) {
+            Designated::Window(window) => Some(window),
+            Designated::Gone => {
                 return ArrivalOutcome::Refused(
                     "no window of this app can receive files right now".to_string(),
                 )
             }
-        }
-    } else {
-        None
+            Designated::NotYet => None,
+        },
     };
-    match enqueue(app, paths, target.as_deref()) {
-        Ok(()) => {
+    match enqueue_arrival(app, paths, target.as_deref()) {
+        Ok(placement) => {
             // Outside the state lock, and only for a request that landed in a
             // window: the pre-launch pool is announced by the launch's
-            // hand-over claim instead.
-            if let Some(window) = &target {
+            // hand-off instead.
+            if let Some(window) = &placement.window {
                 notify(app, window);
                 present_target_window(app, window);
             }
-            ArrivalOutcome::Delivered { window: target }
+            ArrivalOutcome::Delivered {
+                window: placement.window,
+            }
         }
         Err(diagnostic) => ArrivalOutcome::Refused(diagnostic),
     }
 }
 
+/// What the launch's hand-off left to target when no eligible window exists:
+/// the designated first document, that designation gone with its window, or
+/// nothing designated yet — the app's first document does not exist and the
+/// pre-launch pool is the right place.
+enum Designated {
+    Window(String),
+    Gone,
+    NotYet,
+}
+
+fn designated_target<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    guards: &crate::close_guard::SharedCloseGuards,
+) -> Designated {
+    use tauri::Manager;
+    let Some(state) = app.try_state::<SharedOpenFiles>() else {
+        return Designated::NotYet;
+    };
+    match state.first_document() {
+        Some(label) => {
+            let exists = app.get_webview_window(&label).is_some();
+            let committed = guards.committed_closing_windows().contains(&label);
+            if exists && !committed {
+                Designated::Window(label)
+            } else {
+                Designated::Gone
+            }
+        }
+        None => Designated::NotYet,
+    }
+}
+
 /// The last step of an admitted arrival. Answers the diagnostic when the
 /// queue refused — nothing was evicted and nothing was enqueued.
-fn enqueue<R: tauri::Runtime>(
+fn enqueue_arrival<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     paths: &[String],
     target: Option<&str>,
-) -> Result<(), String> {
+) -> Result<ArrivalPlacement, String> {
     use tauri::Manager;
     let state = app
         .try_state::<SharedOpenFiles>()
         .ok_or_else(|| NO_STATE.to_string())?;
     state
-        .enqueue(paths.to_vec(), target)
-        .map(|_| ())
+        .enqueue_arrival(paths.to_vec(), target)
         .map_err(|error| error.to_string())
 }
 

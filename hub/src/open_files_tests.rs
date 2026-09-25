@@ -254,10 +254,29 @@ fn an_arrival_before_any_window_exists_waits_in_the_pool() {
     assert!(queue.pending("main").is_empty(), "no window owns it yet");
     assert_eq!(queue.total_pending(), 1);
 
-    // The launch's claim, once the first app document exists.
-    assert_eq!(queue.claim_unassigned("main"), 1);
+    // The launch's hand-off, once the first app document exists: it claims
+    // the pool and closes it in the same transition.
+    assert_eq!(queue.handoff_to_first_document("main"), 1);
     assert_eq!(queue.pending("main")[0].id, id);
-    assert_eq!(queue.claim_unassigned("main"), 0, "the pool is empty now");
+    assert_eq!(
+        queue.handoff_to_first_document("main"),
+        0,
+        "the pool is empty now"
+    );
+
+    // And once the hand-off has run, no arrival can wait in that pool again:
+    // an enqueue with no eligible window falls to the designated document.
+    let racing = queue
+        .enqueue_arrival(vec!["/tmp/late.md".to_string()], None)
+        .expect("the racing arrival is queued");
+    assert_eq!(racing.window, Some("main".to_string()));
+    assert!(
+        queue
+            .pending("main")
+            .iter()
+            .any(|request| request.id == racing.id),
+        "the racing arrival reached the first document, not the pool"
+    );
 }
 
 #[test]
@@ -591,19 +610,13 @@ fn an_arrival_during_startup_waits_in_the_pre_launch_pool() {
     // No `sidecar::Launch` managed: the app's first document does not exist
     // yet, so the arrival waits rather than targets a window.
     assert_eq!(
-        deliver_arrival(
-            app.handle(),
-            &guards,
-            true,
-            false,
-            std::slice::from_ref(&path)
-        ),
+        deliver_arrival(app.handle(), &guards, true, std::slice::from_ref(&path)),
         ArrivalOutcome::Delivered { window: None },
         "the splash era pools the arrival"
     );
     assert_eq!(queue.total_pending(), 1);
-    // The launch's hand-over claim is what delivers it.
-    assert_eq!(queue.claim_unassigned("main"), 1);
+    // The launch's hand-off is what delivers it.
+    assert_eq!(queue.handoff_to_first_document("main"), 1);
 }
 
 #[test]
@@ -622,7 +635,7 @@ fn an_arrival_on_a_running_app_targets_its_window() {
     std::fs::write(&file, "x").expect("a written file");
     let path = file.display().to_string();
 
-    let outcome = deliver_arrival(app.handle(), &guards, true, true, &[path]);
+    let outcome = deliver_arrival(app.handle(), &guards, true, &[path]);
     assert_eq!(
         outcome,
         ArrivalOutcome::Delivered {
@@ -649,13 +662,7 @@ fn a_committed_shutdown_refuses_an_arrival_without_enqueueing() {
     let file = base.path().join("notes.md");
     std::fs::write(&file, "x").expect("a written file");
 
-    let refused = deliver_arrival(
-        app.handle(),
-        &guards,
-        true,
-        true,
-        &[file.display().to_string()],
-    );
+    let refused = deliver_arrival(app.handle(), &guards, true, &[file.display().to_string()]);
     assert!(
         matches!(refused, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("shutting down")),
         "said {refused:?}"
@@ -674,18 +681,12 @@ fn an_undeclared_receiver_or_invalid_batch_is_refused_before_enqueueing() {
     std::fs::write(&file, "x").expect("a written file");
     let path = file.display().to_string();
 
-    let undeclared = deliver_arrival(
-        app.handle(),
-        &guards,
-        false,
-        true,
-        std::slice::from_ref(&path),
-    );
+    let undeclared = deliver_arrival(app.handle(), &guards, false, std::slice::from_ref(&path));
     assert!(
         matches!(undeclared, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("open_files receiver")),
         "said {undeclared:?}"
     );
-    let invalid = deliver_arrival(app.handle(), &guards, true, true, &["notes.md".to_string()]);
+    let invalid = deliver_arrival(app.handle(), &guards, true, &["notes.md".to_string()]);
     assert!(
         matches!(invalid, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("absolute")),
         "said {invalid:?}"
@@ -696,9 +697,10 @@ fn an_undeclared_receiver_or_invalid_batch_is_refused_before_enqueueing() {
 #[test]
 fn a_running_app_with_no_eligible_window_refuses_the_arrival() {
     let queue = shared_queue();
-    // The app is running (Launch managed) but the only window is committed
-    // closing: there is nowhere to deliver, and the pre-launch pool would
-    // only strand the request behind a claim that already happened.
+    // The app is running (hand-off done, Launch managed) but the only window
+    // is committed closing: there is nowhere to deliver, and the pre-launch
+    // pool would only strand the request behind a hand-off that already
+    // happened.
     let app = app_with_windows(&queue, &["main"]);
     app.manage(crate::sidecar::Launch {
         url: "tauri://localhost".to_string(),
@@ -707,6 +709,7 @@ fn a_running_app_with_no_eligible_window_refuses_the_arrival() {
     let guards: crate::close_guard::SharedCloseGuards =
         std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
     app.manage(guards.clone());
+    assert_eq!(queue.handoff_to_first_document("main"), 0);
     assert_eq!(
         guards.begin_close("main", false),
         crate::close_guard::CloseFlow::Allow
@@ -715,16 +718,42 @@ fn a_running_app_with_no_eligible_window_refuses_the_arrival() {
     let file = base.path().join("notes.md");
     std::fs::write(&file, "x").expect("a written file");
 
-    let refused = deliver_arrival(
-        app.handle(),
-        &guards,
-        true,
-        true,
-        &[file.display().to_string()],
-    );
+    let refused = deliver_arrival(app.handle(), &guards, true, &[file.display().to_string()]);
     assert!(
         matches!(refused, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("no window")),
         "said {refused:?}"
     );
     assert_eq!(queue.total_pending(), 0);
+}
+
+#[test]
+fn an_arrival_while_the_first_document_settles_reaches_it() {
+    let queue = shared_queue();
+    // Audit 019, finding 1's second half: `Launch` is published and the
+    // hand-off has designated the window, but its navigation has not settled
+    // — origin selection finds nothing eligible. The arrival reaches the
+    // designated window instead of being refused.
+    let app = app_with_windows(&queue, &["main"]);
+    app.manage(crate::sidecar::Launch {
+        url: "http://127.0.0.1:8123".to_string(),
+        product_name: "Demo".to_string(),
+    });
+    let guards: crate::close_guard::SharedCloseGuards =
+        std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
+    app.manage(guards.clone());
+    assert_eq!(queue.handoff_to_first_document("main"), 0);
+    let base = tempfile::tempdir().expect("a temp dir");
+    let file = base.path().join("notes.md");
+    std::fs::write(&file, "x").expect("a written file");
+
+    let outcome = deliver_arrival(app.handle(), &guards, true, &[file.display().to_string()]);
+    assert_eq!(
+        outcome,
+        ArrivalOutcome::Delivered {
+            window: Some("main".to_string())
+        },
+        "the designated first document receives while its origin settles"
+    );
+    assert_eq!(queue.pending("main").len(), 1);
+    assert_eq!(queue.total_pending(), 1, "nothing waits in the pool");
 }
