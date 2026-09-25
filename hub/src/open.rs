@@ -84,11 +84,13 @@ pub fn run(id: &str, files: &[String]) -> i32 {
             );
         }
         if !files.is_empty() {
-            if !crate::open_files::receiver_declared(&resolved.manifest) {
+            let receiver = crate::open_files::Receiver::of(&resolved.manifest);
+            if !receiver.declared {
                 return Err(OpenError::NoReceiver { id: id.to_string() });
             }
             let batch = absolute_paths(files)?;
-            crate::open_files::validate_batch(&batch).map_err(OpenError::InvalidBatch)?;
+            crate::open_files::validate_batch(&batch, receiver.directories)
+                .map_err(OpenError::InvalidBatch)?;
             launch(&paths, &resolved, &batch)
         } else {
             launch(&paths, &resolved, &[])

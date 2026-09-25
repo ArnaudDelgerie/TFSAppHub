@@ -135,8 +135,8 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "open",
-        form: "open <id> [-- <file>...]",
-        summary: "Open an installed app's window, optionally handing it local files.",
+        form: "open <id> [-- <path>...]",
+        summary: "Open an installed app's window, optionally handing it local paths — files, or directories the app declared.",
         level: Level::App,
         availability: Availability::Implemented,
     },
@@ -343,9 +343,11 @@ pub enum Command {
     List,
     Open {
         id: String,
-        /// The local files after the `--` separator, in the invocation's own
-        /// order — one batch, one request. Empty means the separator never
-        /// appeared, which is the no-file launch `open` has always been.
+        /// The local paths after the `--` separator, in the invocation's own
+        /// order — one batch, one request: regular files for any receiver,
+        /// plus directories for one that opted into them. Empty means the
+        /// separator never appeared, which is the no-file launch `open` has
+        /// always been.
         files: Vec<String>,
     },
     Dev {
@@ -414,7 +416,7 @@ pub enum Command {
         identifier: String,
         product_name: String,
         icon_path: Option<String>,
-        /// The files a file-bearing `open` handed the child after its own
+        /// The paths a file-bearing `open` handed the child after its own
         /// `--` — already made absolute and validated by the parent that
         /// wrote this argv. Re-validated at the enqueueing boundary.
         files: Vec<String>,
@@ -784,7 +786,7 @@ fn parse_run(args: &[String]) -> Result<Command, UsageError> {
 }
 
 /// The hidden `__open (--id <id> | --project <path>) --identity <identifier>
-/// --name <n> [--icon <p>] [-- <file>...]`.
+/// --name <n> [--icon <p>] [-- <path>...]`.
 ///
 /// `--identity`/`--name` are required, and neither is defaulted: this form is
 /// written by `open <id>` or `dev <path>` and by nothing else, so a missing one

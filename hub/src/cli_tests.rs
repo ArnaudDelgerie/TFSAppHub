@@ -318,7 +318,7 @@ fn a_malformed_invocation_names_the_right_form() {
     let cases = [
         ("open", "open <id>"),
         ("open one two", "open <id>"),
-        ("open -- /tmp/a.md", "open <id> [-- <file>...]"),
+        ("open -- /tmp/a.md", "open <id> [-- <path>...]"),
         ("dev", "dev <local-path>"),
         ("dev one two", "dev <local-path>"),
         ("dev /tmp/demo -- /tmp/a.md", "dev <local-path>"),
