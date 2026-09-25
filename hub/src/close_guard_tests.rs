@@ -818,11 +818,9 @@ fn a_committed_close_leaves_unrelated_surviving_windows_usable() {
 
 // --- document-identity binding (plan 055 step 6, audit 016 finding 3) -------
 //
-// A decision — and the close it commits — belongs to the document
-// incarnation it was decided on. A replacement during a confirmation makes
-// the answer apply to nothing, whatever guard IDs the successor reuses or
-// registers; and a destruction queued for one document is never redirected
-// onto its successor at the effect's application boundary.
+// A pending decision belongs to its document incarnation. Replacement during
+// confirmation invalidates the answer, whatever guards the successor uses.
+// After approval is accepted, the window stays committed to close.
 
 #[test]
 fn a_replacement_during_confirmation_invalidates_even_with_the_same_guard_id() {
@@ -925,12 +923,10 @@ fn a_unchanged_document_never_invalidates_on_its_own_registration() {
 }
 
 #[test]
-fn a_first_context_fetch_is_not_a_replacement_for_a_document_free_decision() {
+fn a_first_context_fetch_reuses_the_identity_of_a_backend_only_decision() {
     // A backend-only decision opens on a window whose page never fetched a
-    // context — no frontend guard, so no document identity was involved.
-    // The page fetching its context *while the dialog stands* is a first
-    // fetch, not a replacement: nothing is invalidated by gaining an
-    // identity that the decision never depended on.
+    // context. The decision creates an identity; fetching it is not a load
+    // or a replacement, and therefore does not invalidate that decision.
     let state = state();
     state.backend_register("export:1").expect("registration");
     let CloseFlow::Confirm { token, .. } = state.begin_close("main", true) else {
@@ -942,137 +938,44 @@ fn a_first_context_fetch_is_not_a_replacement_for_a_document_free_decision() {
         state.resolve_close(&token, true, true),
         Resolution::Approved { stop_backend: true }
     );
-    assert!(state.committed_close_applies("main"));
+    assert!(state.committed_closing_windows().contains("main"));
 }
 
 #[test]
-fn the_queued_close_applies_only_while_its_incarnation_holds() {
-    // The application boundary: the destruction queued for an approved
-    // close may only run while the window still holds the document the
-    // approval was shown about.
-    let state = state();
-    let context = state.context("main");
-    state
-        .frontend_register("main", &context, "editor:42")
-        .expect("registration");
-    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
-        panic!("a guarded close asks");
-    };
-    assert_eq!(
-        state.resolve_close(&token, true, false),
-        Resolution::Approved {
-            stop_backend: false
+fn a_committed_close_survives_document_replacement() {
+    // Both clean and approved closes reserve the window until destruction.
+    for guarded in [false, true] {
+        let state = state();
+        let context = state.context("main");
+        if guarded {
+            state.frontend_register("main", &context, "editor").unwrap();
+            let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+                panic!("a guarded close asks");
+            };
+            assert_eq!(
+                state.resolve_close(&token, true, false),
+                Resolution::Approved {
+                    stop_backend: false
+                }
+            );
+        } else {
+            assert_eq!(state.begin_close("main", false), CloseFlow::Allow);
         }
-    );
-    assert!(state.committed_close_applies("main"));
-
-    // A replacement lands between the answer and the application: the
-    // queued close must not be redirected onto the successor, and the
-    // reservation is released so the window is usable again.
-    state.rotate_context("main");
-    let fresh = state.context("main");
-    assert!(!state.committed_close_applies("main"));
-    assert!(state.committed_closing_windows().is_empty());
-    state
-        .frontend_register("main", &fresh, "editor:43")
-        .expect("the successor's document registers again");
-
-    // And a later legitimate close of the successor starts, and applies,
-    // its own decision.
-    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
-        panic!("a guarded close asks");
-    };
-    assert_eq!(
-        state.resolve_close(&token, true, false),
-        Resolution::Approved {
-            stop_backend: false
-        }
-    );
-    assert!(state.committed_close_applies("main"));
+        state.rotate_context("main");
+        let fresh = state.context("main");
+        assert_eq!(state.committed_closing_windows(), ids(&["main"]));
+        assert_eq!(
+            state.frontend_register("main", &fresh, "new"),
+            Err(GuardError::Closing)
+        );
+        assert_eq!(state.begin_close("main", false), CloseFlow::Allow);
+        state.drop_window("main");
+        assert!(state.committed_closing_windows().is_empty());
+    }
 }
 
 #[test]
-fn a_committed_shutdown_never_releases_a_mismatched_close() {
-    let state = state();
-    let context = state.context("main");
-    state
-        .frontend_register("main", &context, "editor:42")
-        .expect("registration");
-    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
-        panic!("a guarded close asks");
-    };
-    assert_eq!(
-        state.resolve_close(&token, true, false),
-        Resolution::Approved {
-            stop_backend: false
-        }
-    );
-
-    // A signal commits the whole-app shutdown; a replacement that lands
-    // afterwards cannot turn the mismatch into a survivor — every window
-    // is going away.
-    state.commit_shutdown();
-    state.rotate_context("main");
-    assert!(!state.committed_close_applies("main"));
-    assert_eq!(
-        state.committed_closing_windows(),
-        ids(&["main"]),
-        "a committed shutdown releases nothing"
-    );
-    assert!(state.is_closing());
-}
-
-#[test]
-fn a_repeated_close_after_a_replacement_is_decided_fresh() {
-    // The repeated-request rule meets the identity rule: a committed close
-    // keeps absorbing repeated requests while it still addresses the
-    // window's current document — but once that document was replaced,
-    // the next request releases the stale reservation and is decided
-    // fresh, so the close it commits addresses the successor.
-    let state = state();
-    let context = state.context("main");
-    state
-        .frontend_register("main", &context, "editor:42")
-        .expect("registration");
-    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
-        panic!("a guarded close asks");
-    };
-    assert_eq!(
-        state.resolve_close(&token, true, false),
-        Resolution::Approved {
-            stop_backend: false
-        }
-    );
-
-    // While the reservation addresses the current document, a repeated
-    // request is the already-happening close.
-    assert_eq!(state.begin_close("main", false), CloseFlow::Allow);
-    assert!(state.committed_close_applies("main"));
-
-    // The destruction has not been observed yet, and the document is
-    // replaced: the successor's own registrations stay refused — the
-    // window's close is committed, so nothing in it can earn a
-    // confirmation — and the queued effect will never address them.
-    state.rotate_context("main");
-    let fresh = state.context("main");
-    assert_eq!(
-        state.frontend_register("main", &fresh, "editor:43"),
-        Err(GuardError::Closing)
-    );
-    assert!(!state.committed_close_applies("main"));
-
-    // A repeated close request is a fresh decision about the successor,
-    // not the inherited one: nothing is at stake, so it commits cleanly —
-    // and the close it commits addresses the current document.
-    assert_eq!(state.begin_close("main", false), CloseFlow::Allow);
-    assert!(
-        state.committed_close_applies("main"),
-        "the fresh commitment carries the successor's incarnation"
-    );
-}
-
-#[test]
-fn a_destroyed_window_s_reused_label_never_inherits_the_queued_close() {
+fn a_destroyed_window_s_reused_label_never_inherits_the_reservation() {
     let state = state();
     let context = state.context("main");
     state
@@ -1092,7 +995,7 @@ fn a_destroyed_window_s_reused_label_never_inherits_the_queued_close() {
     // a later window takes the same label: the reservation died with the
     // window it was decided on, and the successor owes it nothing.
     state.drop_window("main");
-    assert!(!state.committed_close_applies("main"));
+    assert!(!state.committed_closing_windows().contains("main"));
     let fresh = state.context("main");
     assert_ne!(context, fresh, "a reused label is a new owner");
     state
@@ -1214,4 +1117,19 @@ fn two_apps_states_never_reach_each_other_through_their_windows() {
     remove_for_window(&first, &first_context, "editor:42").expect("removal");
     assert!(first_guards.frontend_guards("main").is_empty());
     assert!(second_guards.frontend_guards("main").contains("editor:42"));
+}
+
+#[test]
+fn a_first_committed_load_invalidates_a_backend_only_decision() {
+    let state = state();
+    state.backend_register("job").unwrap();
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", true) else {
+        panic!("confirmation");
+    };
+    state.rotate_context("main");
+    assert_eq!(
+        state.resolve_close(&token, true, true),
+        Resolution::Invalidated
+    );
+    assert!(!state.is_closing());
 }

@@ -1209,7 +1209,7 @@ struct RecordedWorld {
     /// The native close requests the coordinator posted, awaiting the
     /// `CloseRequested` dispatch that will consume them — what the runtime
     /// hands back through `on_close_requested` in production.
-    pending_requests: Vec<String>,
+    pending_requests: std::collections::VecDeque<String>,
     effects: Vec<String>,
     dialogs: Vec<RecordedDialog>,
 }
@@ -1223,7 +1223,7 @@ impl RecordedWorld {
             has_backend: true,
             fail_request_close: false,
             teardown_claimed: false,
-            pending_requests: vec![],
+            pending_requests: Default::default(),
             effects: vec![],
             dialogs: vec![],
         }
@@ -1256,7 +1256,7 @@ impl RecordedWorld {
     /// `handle_close_request` — the same dispatch that proceeds to the
     /// native destruction when the answer is not a veto.
     fn consume_pending_close(&mut self, state: &SharedCloseGuards) -> Option<CloseAction> {
-        let window = self.pending_requests.pop()?;
+        let window = self.pending_requests.pop_front()?;
         Some(handle_close_request(state, self, &window))
     }
 }
@@ -1279,7 +1279,7 @@ impl CloseWorld for RecordedWorld {
             return false;
         }
         self.effects.push(format!("request-close:{window}"));
-        self.pending_requests.push(window.to_string());
+        self.pending_requests.push_back(window.to_string());
         true
     }
 
@@ -1648,58 +1648,41 @@ fn a_replacement_during_the_dialog_leaves_the_successor_open() {
     assert_eq!(world.dialogs.len(), 2);
 }
 
-// --- the posted close's boundary (plan 055 step 9, audit 017 finding 1) ------
+// --- committed closes (plan 055, simplified step 11) -----------------------
 
 #[test]
-fn a_queued_close_consumed_after_a_replacement_leaves_the_successor_open() {
-    // Audit 017, finding 1's interleaving: the approval posts a native
-    // close request, and a replacement lands between that post and the
-    // `CloseRequested` dispatch that decides it — the same dispatch that
-    // proceeds to the native destruction when it is not vetoed. The stale
-    // approval must close nothing: the successor stays open with its
-    // guards, and a later explicit close earns its own decision.
+fn a_reload_after_approval_keeps_the_close_and_backend_topology_committed() {
     let state = shared_close_state();
     let context = state.context("main");
-    state
-        .frontend_register("main", &context, "editor:42")
-        .expect("registration");
+    state.frontend_register("main", &context, "editor").unwrap();
+    state.backend_register("export").unwrap();
     let mut world = RecordedWorld::two_windows();
-
-    assert_eq!(
-        handle_close_request(&state, &mut world, "main"),
-        CloseAction::KeepOpen
-    );
+    handle_close_request(&state, &mut world, "main");
     let token = world.dialogs[0].token.clone();
-
-    // Approved: the effect is a posted close request, awaiting its dispatch.
     handle_close_answer(&state, &mut world, "main", &token, true);
     assert_eq!(world.effects, ["request-close:main"]);
 
-    // The replacement lands before the request is consumed.
+    // Approval committed the window close. A reload does not turn it back
+    // into a survivor; closing the remaining window must warn about the job.
     state.rotate_context("main");
-    let fresh = state.context("main");
-
-    // The `CloseRequested` dispatch of the posted request: vetoed at the
-    // boundary, the reservation released, nothing closed, no second dialog.
     assert_eq!(
-        world.consume_pending_close(&state),
-        Some(CloseAction::KeepOpen)
-    );
-    assert_eq!(world.dialogs.len(), 1);
-    assert!(world.labels.contains(&"main".to_string()));
-    assert!(state.committed_closing_windows().is_empty());
-
-    // The successor is usable again: it registers, and a later explicit
-    // close earns its own decision.
-    state
-        .frontend_register("main", &fresh, "editor:43")
-        .expect("a usable window's document registers again");
-    assert_eq!(
-        handle_close_request(&state, &mut world, "main"),
+        handle_close_request(&state, &mut world, "main-2"),
         CloseAction::KeepOpen
     );
-    assert_eq!(world.dialogs.len(), 2);
-    assert!(world.dialogs[1].frontend.contains("editor:43"));
+    assert!(world.dialogs[1].backend.contains("export"));
+
+    // The already-approved close proceeds even while that dialog is open.
+    assert_eq!(
+        world.consume_pending_close(&state),
+        Some(CloseAction::Default)
+    );
+    world.observe_destruction(&state, "main");
+    assert_eq!(world.labels, ["main-2"]);
+    assert_eq!(world.effect_count("teardown"), 0);
+    assert!(state.backend_guards().contains("export"));
+    let token = world.dialogs[1].token.clone();
+    handle_close_answer(&state, &mut world, "main-2", &token, false);
+    assert!(!state.is_closing());
 }
 
 #[test]

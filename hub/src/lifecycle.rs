@@ -1361,14 +1361,9 @@ fn stop_sidecar_and_exit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 /// world, so interleavings assert *effects and ownership*, not enum
 /// mappings, with the destruction observed exactly when the test says so.
 ///
-/// The destruction effect is deliberately "post a *close request*, return
-/// true": the hub asks the runtime to close the window the way a person
-/// would, so the `CloseRequested` dispatch — the same one that proceeds to
-/// the native destruction when it is not vetoed — is where the final
-/// authorization happens, and no replacement can slip between that check and
-/// the destruction it gates (audit 017, finding 1). The window is not gone
-/// at the return — the reservation holds until the `Destroyed` event
-/// observes it — which is the very race audit 016's first finding was about.
+/// Approved secondary closes post a native close request. The state already
+/// reserves that window, so the resulting `CloseRequested` proceeds without
+/// another dialog, even if the document reloaded after approval.
 pub trait CloseWorld {
     /// Every window this process currently has, including ones whose close
     /// is committed but whose destruction is not observed yet.
@@ -1377,11 +1372,9 @@ pub trait CloseWorld {
     fn has_backend(&self) -> bool;
     /// Hide a window whose close was approved as the backend-stopping one.
     fn hide(&mut self, window: &str);
-    /// Post the native close request of an approved window — a request the
-    /// runtime hands back through `CloseRequested`, where
-    /// [`crate::close_guard::CloseGuardState::begin_close`] makes the final
-    /// authorization decision. `false` when the request could not even be
-    /// posted and the window remains usable.
+    /// Post the approved window's native close. `CloseRequested` observes
+    /// the existing commitment. Return `false` if posting failed, so the
+    /// window's reservation can be released.
     fn request_close(&mut self, window: &str) -> bool;
     /// Start the orderly teardown off the calling thread.
     fn start_teardown(&mut self);
@@ -1462,19 +1455,8 @@ fn handle_close_request<W: CloseWorld>(
 /// request could not be posted), hide and tear down an approved final one,
 /// or ask again when the warning no longer described what was at stake.
 ///
-/// The incarnation is validated at every boundary a replacement could slip
-/// through (audits 016 finding 3 and 017 finding 1): `resolve_close` refuses
-/// an answer whose decision's document was replaced; the pre-post
-/// [`crate::close_guard::CloseGuardState::committed_close_applies`] check
-/// releases a reservation a replacement already invalidated; and the posted
-/// request itself comes back through `CloseRequested`, where
-/// [`crate::close_guard::CloseGuardState::begin_close`] re-checks the
-/// incarnation in the same runtime dispatch that proceeds to the native
-/// destruction when it is not vetoed — so an already-queued close can never
-/// be redirected onto a successor document that never went through a
-/// decision. The invalidation frees the slot without opening another
-/// dialog: the successor stays open, and a new explicit close request starts
-/// a decision of its own.
+/// Document replacement invalidates a pending answer. After commitment,
+/// closing the window is final; a later document load does not cancel it.
 fn handle_close_answer<W: CloseWorld>(
     state: &crate::close_guard::SharedCloseGuards,
     world: &mut W,
@@ -1485,24 +1467,7 @@ fn handle_close_answer<W: CloseWorld>(
     let stops = close_stops_backend_in(world, state, window);
     match close_effect(state.resolve_close(token, approved, stops)) {
         CloseEffect::Nothing => {}
-        CloseEffect::CloseWindow => {
-            // The pre-post check (the reservation was decided on the window's
-            // incarnation at answer time; nothing can rotate in between on
-            // this dispatch) releases and skips the post when a replacement
-            // already got here. The posted request is a *close*, not a
-            // destroy: the runtime hands it back through `CloseRequested`,
-            // where `begin_close` re-checks the incarnation at the same
-            // dispatch that proceeds to the destruction — the final
-            // authorization boundary (audit 017, finding 1). A request that
-            // cannot be posted releases the reservation, as a destruction
-            // that could not be posted did.
-            if state.committed_close_applies(window) {
-                state.queue_close_request(window);
-                if !world.request_close(window) {
-                    state.release_close(window);
-                }
-            }
-        }
+        CloseEffect::CloseWindow => post_approved_close(state, world, window),
         CloseEffect::HideAndTearDown => {
             world.hide(window);
             world.start_teardown();
@@ -1520,28 +1485,14 @@ fn handle_close_answer<W: CloseWorld>(
                     if stops_now {
                         world.hide(window);
                         world.start_teardown();
-                    } else if state.committed_close_applies(window) {
-                        // The same boundary rule as the `CloseWindow`
-                        // effect: the clean close this branch just committed
-                        // travels as a close request, decided again at the
-                        // `CloseRequested` dispatch that will destroy.
-                        state.queue_close_request(window);
-                        if !world.request_close(window) {
-                            state.release_close(window);
-                        }
+                    } else {
+                        post_approved_close(state, world, window);
                     }
                 }
                 // Another window's decision took the one slot while this
                 // dialog stood. This close stays open with its guards; the
                 // person can close it again once that dialog resolves.
                 CloseFlow::Busy => {}
-                // The hub's own queued request cannot be what `begin_close`
-                // answers here — this branch's window holds the slot the
-                // answer consumed, and its close was never posted. A stale
-                // mark from another window's effect is consumed by that
-                // window's own dispatch; arriving here means exactly that
-                // no request is pending, so there is nothing to apply.
-                CloseFlow::Replaced => {}
                 CloseFlow::Confirm {
                     token,
                     frontend,
@@ -1549,6 +1500,17 @@ fn handle_close_answer<W: CloseWorld>(
                 } => world.open_confirmation(window, &token, &frontend, &backend),
             }
         }
+    }
+}
+
+/// Recover the reservation if posting failed and the window remains usable.
+fn post_approved_close<W: CloseWorld>(
+    state: &crate::close_guard::SharedCloseGuards,
+    world: &mut W,
+    window: &str,
+) {
+    if state.committed_closing_windows().contains(window) && !world.request_close(window) {
+        state.release_close(window);
     }
 }
 
@@ -1654,12 +1616,8 @@ impl<R: tauri::Runtime> CloseWorld for TauriCloseWorld<'_, R> {
         // An absent window is not a failed request: it is already gone,
         // and its `Destroyed` event has already released the reservation.
         match self.app.get_webview_window(window) {
-            // `close()`, not `destroy()`: the request comes back through
-            // `CloseRequested`, where the hub decides it in the same
-            // dispatch that proceeds to the native destruction (audit 017,
-            // finding 1). A `destroy()` would be consumed by the runtime
-            // with no check at all — whatever document the window held by
-            // then would be closed by the old approval.
+            // The handle targets this native window; `begin_close` lets its
+            // committed close proceed without rechecking document identity.
             Some(webview) => webview.close().is_ok(),
             None => true,
         }
@@ -1730,10 +1688,7 @@ fn close_action(flow: &CloseFlow, last_window_with_sidecar: bool) -> CloseAction
     match flow {
         // `Busy`: one decision at a time across the app's windows, or two
         // nearly-simultaneous closes would both conclude they are the last.
-        // `Replaced`: the hub's queued close request arrived for a document
-        // it was never decided on — vetoed at the boundary, the successor
-        // stays open (audit 017, finding 1).
-        CloseFlow::Busy | CloseFlow::Confirm { .. } | CloseFlow::Replaced => CloseAction::KeepOpen,
+        CloseFlow::Busy | CloseFlow::Confirm { .. } => CloseAction::KeepOpen,
         CloseFlow::Allow => {
             if last_window_with_sidecar {
                 CloseAction::HideAndTearDown

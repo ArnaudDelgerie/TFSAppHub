@@ -316,39 +316,27 @@ an answer — a guard that appeared while the dialog was open, or a close that
 became the backend-stopping one, gets a fresh warning rather than a stale
 approval.
 
-**A close commits as one atomic transition, and the commitment reserves its
-window.** The final guard check and the commitment are the same step: a
-registration racing a close is either in the decision's past — covered by the
-warning, or the cause of the fresh one — or in its future, where `closing`
-refuses it. It is never accepted and then ignored by a close that
-revalidates nothing, on either transport. Once a close is committed, its
-window stops counting as a survivor for every other close until its
-destruction is actually observed — so two nearly-simultaneous closes cannot
-both conclude that the other window preserves the backend — and that window's
-document can no longer register or remove guards: the person already approved
-closing it, so a guard that appeared now could never earn its own
-confirmation. A window whose close is committed and whose destruction failed
-while it stayed usable goes back to being an ordinary window; a committed
-whole-app shutdown releases nothing.
+**A close commits together with its final guard check.** A registration
+racing that check is either included in the decision or refused with
+`closing`. Once committed, the window no longer counts as a survivor for
+other closes and cannot register or remove frontend guards. This prevents
+two simultaneous closes from each assuming the other will preserve the
+backend. Destruction releases the reservation; failed posting releases it
+if the window remains usable. Whole-app shutdown is never reversed.
 
-**A decision belongs to the document it was decided on.** The confirmation
-and the close it commits are bound to the window's document incarnation, not
-just its label and the guard IDs the warning named. A page replaced while
-its dialog stands — a reload, a programmatically scheduled navigation — makes
-the answer apply to nothing, whatever guard IDs the successor reuses or
-registers: the successor stays open with its own guards, no second dialog is
-stacked while the first stands, and a new explicit close request starts a
-decision of its own. The same binding holds at the moment the approved close
-is applied: it travels as a native close request, decided again in the very
-dispatch that would proceed to the destruction, so a replacement landing
-between the approval and that dispatch makes the request veto itself rather
-than close the successor — and a window label reused after a destruction is
-a new owner that inherits neither the queued close nor a pending decision.
-An acknowledgement protects subsequent close decisions; it cannot reverse a
-close that already committed. Once shutdown has committed, every register or
-remove — from either transport — answers `closing` explicitly, so a job
-starting during teardown learns the truth instead of installing a guard
-nobody will ever see.
+**Document identity protects a pending decision.** If the document changes
+while its confirmation is open, the answer is invalidated. The new document
+stays open with its own guards, and a fresh close request starts a new
+decision. Destroying a window also invalidates its pending answer; a later
+window reusing its label inherits neither that decision nor its guards.
+
+**An accepted close closes the window.** Once approval passes the final
+checks, a subsequent reload or navigation does not cancel the close. Apps
+must not start new work in that closing window. Close guards warn before
+normal closure; they do not protect against termination signals or every
+possible event between approval and native destruction. Once whole-app
+shutdown commits, registrations and removals on either transport return
+`closing`. Mandatory shutdown never waits for a confirmation answer.
 
 **Unavailable is a result, not an exception.** A hub older than this group
 refuses the `invoke` outright, and a missing or refused bridge route is
@@ -438,4 +426,3 @@ guard namespace is closed for the rest of this process's life.
 
 The bridge never logs the token, a secret value, or the update check's body, on
 success or on failure.
-

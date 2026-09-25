@@ -2,35 +2,19 @@
 
 ## Unreleased
 
-An app can now declare `actions.close_guard` and register close guards from
-either side of itself: the webview marks one document's unsaved work over
-IPC (`close_guard_context`, then `close_guard_register`/`close_guard_remove`
-with that context), PHP marks app-wide background work over the bridge
-(`POST /close-guard/register|remove`). Closing a window whose guards are at
-stake shows one native confirmation — `Cancel` as the safe default, distinct
-text for unsaved changes, background work, or both — before the window is
-hidden or the backend stopped; cancelling keeps the running app exactly as
-it was. Backend guards only weigh on the close that would stop the shared
-backend, one decision is pending at a time across the app's windows, and
-what is at stake is rechecked before an answer is applied, so a guard that
-appears while the dialog stands earns a fresh warning rather than a stale
-approval. A close commits in the same atomic step as its final guard check,
-and the commitment reserves its window until its destruction is actually
-observed — so a registration racing a close is refused with `closing` rather
-than accepted and silently ignored, and two nearly-simultaneous closes
-cannot both count the other window as the survivor that preserves the
-backend. The confirmation and the close it commits belong to the document
-incarnation they were decided on: a page replaced while its dialog stands
-makes the answer apply to nothing, and the successor stays open with its
-own guards — and the approved close itself travels as a native close
-request, rechecked in the very dispatch that would destroy the window, so
-a replacement landing after the answer still cannot close the successor.
-A second `open` of the running app is admitted on the same event loop as
-every close decision: it cannot open a window on an instance whose
-shutdown has committed, and the window it admits is counted by every later
-close decision. Both switches default to off, neither transport can reach the
-other's namespace, and a mandatory shutdown (signal, fatal error) commits
-first, owns a one-shot teardown latch, and never waits on a person.
+An app can now declare `actions.close_guard` and register independent guards
+for unsaved frontend work over IPC and background jobs over the PHP bridge.
+Closing a protected window shows a native confirmation with Cancel as the
+safe default; cancellation keeps the app running. Backend guards warn only
+when closing would stop the shared backend. Both transports default to off.
+
+Guards and window topology are rechecked when confirmation is answered. A
+new relevant guard earns a fresh warning, and a document replaced while the
+dialog is open invalidates the answer. Once approval is accepted, the window
+is committed to close: a later reload does not cancel it. Window reservations
+coordinate simultaneous closes, and normal close/signal teardown has one
+owner. Mandatory shutdown does not wait for confirmation or for an event-loop
+commitment; rare signal/window-creation overlap remains an accepted limitation.
 
 An app declaring `actions.picker.ipc` can now restrict what the native file
 chooser shows: `pick_path` accepts the same optional `filters` list as
