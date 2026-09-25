@@ -233,6 +233,27 @@ fn a_declaring_app_advertises_its_mime_types_and_takes_files() {
 }
 
 #[test]
+fn a_directory_declaration_renders_the_same_entry_shape() {
+    // `inode/directory` is an ordinary MIME value to the renderer: the
+    // manifest's pair rule already guaranteed the receiver opted into
+    // directories, so the entry advertises it beside any file type and keeps
+    // the one `-- %F` launcher form. Whether the file manager offers an
+    // "Open with" entry for a directory is its own behaviour, verified
+    // natively (plan 057 step 3) rather than assumed from this line.
+    let entity = identity("dev.local.tfsapp-test", "TFSApp Test", None);
+
+    let rendered = render(
+        "tfsapp-test",
+        &entity,
+        Path::new("/hub/tfsapp-hub"),
+        &["text/markdown".to_string(), "inode/directory".to_string()],
+    );
+
+    assert!(rendered.contains("MimeType=text/markdown;inode/directory;\n"));
+    assert!(rendered.contains("Exec=\"/hub/tfsapp-hub\" open tfsapp-test -- %F\n"));
+}
+
+#[test]
 fn changing_or_dropping_the_declaration_rewrites_the_entry_whole() {
     let entity = identity("dev.local.tfsapp-test", "TFSApp Test", None);
     let hub = Path::new("/hub/tfsapp-hub");

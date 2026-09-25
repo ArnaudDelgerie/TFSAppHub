@@ -45,7 +45,7 @@ suffix would be destroyed by another app's update.
 | `splash_bg` / `splash_text` | string, `#rgb` or `#rrggbb` | Recolour the cold-start page's background and text without authoring one. Either or both; an unset one keeps the default. |
 | `commands` | object | Lifecycle commands the hub runs around an install or an update — §6. |
 | `run` | object | Named `bin/console` aliases a user can run directly. |
-| `actions` | object | Which native capabilities the app's own code may reach, and over which transport — §7. `actions.picker` and `actions.open_files` are IPC-only: `{ "ipc": true }`. |
+| `actions` | object | Which native capabilities the app's own code may reach, and over which transport — §7. `actions.picker` and `actions.open_files` are IPC-only: `{ "ipc": true }`. `open_files` has one further default-off option, `directories` — see "Declaring file associations" below. |
 | `file_associations` | object | The MIME types this app declares it can open — see "Declaring file associations" below. |
 | `workers` | array of objects | Declares one or more background consumers, each an ordered list of Messenger transports plus an optional copy count — see "Declaring off-window work" below. |
 | `async_worker` | boolean | Sugar for a single worker consuming `async`; refused together with `workers` — see "Declaring off-window work" below. |
@@ -217,16 +217,32 @@ The rules, each of which the hub enforces at parse time:
   `/`, whitespace and control characters. A type the host's MIME database has
   never heard of is still a valid declaration: this is a statement of what the
   *app* can open, not a claim about the host.
+- **Directories are opted into, twice.** A local directory is not a file, and
+  an app that has not asked for directories keeps the file-only behaviour it
+  has always had. The opt-in is
+  `"actions": { "open_files": { "ipc": true, "directories": true } }` — it is
+  what lets the hub deliver a directory path through *any* launch path,
+  including `open <id> -- <path>...`. Putting `inode/directory` in
+  `mime_types` is the separate, advertising half: it is what makes the file
+  manager offer the app for a directory. A manifest that declares
+  `inode/directory` without the receiver and its `directories` option is
+  invalid — a menu entry whose selections would be refused at the launch
+  boundary. And `directories: true` without `ipc: true` is invalid too, for
+  the pair rule's own reason: directories are delivered to the receiver, and
+  this group has no other transport.
 - **A declaration is not a permission.** MIME types are never part of app
   identity (the "One identity, several surfaces" table above), never content
   sniffing, and never a filesystem authorization: which files a running app
   may actually read remains the app's own backend's business, on every path
-  alike — a request the hub delivers names paths; it grants nothing.
+  alike — a request the hub delivers names paths; it grants nothing. A
+  delivered directory path grants no access beyond what the app's backend
+  already has: the hub neither enumerates nor copies its contents.
 
 The hub renders a declaring app's generated desktop entry (see §2's "An
 installed app has a desktop entry") with `MimeType=` from this list and an
 `Exec=` line ending in `-- %F`, so the desktop environment passes the selected
-files as separate local-file arguments. Which app the desktop environment
+paths as separate local-file arguments — the same entry shape for
+`inode/directory` as for any file type. Which app the desktop environment
 *prefers* for a type is the user's own default-application setting — outside
 the manifest, outside this contract.
 

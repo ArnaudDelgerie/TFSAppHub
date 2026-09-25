@@ -264,10 +264,19 @@ pub struct CloseGuardActions {
 /// the delivered paths are consumed by the app's webview, and no PHP process
 /// receives a route or environment value through which it could reach the
 /// pending-request queue. `bridge` is refused, per the picker precedent.
+///
+/// `directories` (plan 057) is the default-off opt-in that lets the hub
+/// deliver existing local directories through any launch path, alongside
+/// regular files. It is a receiving option, not advertising: putting
+/// `inode/directory` in `file_associations.mime_types` is what makes the file
+/// manager offer the app for a directory. A `directories: true` without
+/// `ipc: true` is refused, per the pair rule below.
 #[derive(Deserialize, Default, Debug, Clone, PartialEq)]
 pub struct OpenFilesActions {
     #[serde(default)]
     pub ipc: bool,
+    #[serde(default)]
+    pub directories: bool,
 }
 
 /// The `file_associations` declaration (CONTRACT.md §2, plan 056): the MIME
@@ -473,6 +482,31 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
         );
     }
 
+    // Same rule for the one `actions` group that grew a second key (plan 057):
+    // `actions.open_files.directories` is new enough that a typo
+    // (`"directory"`) is more likely than a deliberate extension, and a typo
+    // here silently disables directory delivery rather than crashing loudly —
+    // which is exactly what a warning is for.
+    if let Some(fields) = object
+        .get("actions")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|actions| actions.get("open_files"))
+        .and_then(serde_json::Value::as_object)
+    {
+        warnings.extend(
+            fields
+                .keys()
+                .filter(|key| key.as_str() != "ipc" && key.as_str() != "directories")
+                .map(|key| {
+                    format!(
+                        "unknown key \"actions.open_files.{key}\" in {} — check for a typo \
+                 (CONTRACT.md §7). It is ignored, not rejected.",
+                        path.display()
+                    )
+                }),
+        );
+    }
+
     let mut manifest: Manifest =
         serde_json::from_value(value).map_err(|error| ManifestError::Invalid {
             path: path.to_path_buf(),
@@ -504,9 +538,10 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
     Ok(Loaded { manifest, warnings })
 }
 
-/// Validate a `file_associations` declaration (CONTRACT.md §2, plan 056).
+/// Validate a `file_associations` declaration and its `open_files` pair
+/// (CONTRACT.md §2/§7, plans 056 and 057).
 ///
-/// Two rules, both about honesty rather than safety in depth:
+/// Three rules, all about honesty rather than safety in depth:
 ///
 /// - **A MIME value is syntax-checked, not existence-checked.** The desktop
 ///   entry's `MimeType=` field is `;`-separated, so a value carrying a
@@ -520,10 +555,36 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
 ///   "Open with" menu whose selections it can never acknowledge, so it is
 ///   refused. The reverse — the capability without any declared type — is
 ///   fine: the CLI can still deliver files to a receiver that deliberately
-///   stays out of the file manager's menus.
+///   stays out of the file manager's menus. `inode/directory` is the one
+///   value with a second requirement: advertising directories also needs the
+///   receiver's `directories` opt-in, because a directory handed to an app
+///   that has not opted in is refused at every launch boundary — a menu entry
+///   whose selections never arrive.
+/// - **The opt-in is a pair member, not a standalone key.**
+///   `actions.open_files.directories: true` without `ipc: true` is invalid:
+///   directories are delivered to the receiver, and there is no receiver
+///   without the one transport this group has.
 fn validate_file_associations(path: &Path, manifest: &Manifest) -> Result<(), ManifestError> {
+    if manifest.actions.open_files.directories && !manifest.actions.open_files.ipc {
+        return Err(ManifestError::DirectoriesWithoutReceiver {
+            path: path.to_path_buf(),
+        });
+    }
+
     if !manifest.file_associations.mime_types.is_empty() && !manifest.actions.open_files.ipc {
         return Err(ManifestError::FileAssociationWithoutReceiver {
+            path: path.to_path_buf(),
+        });
+    }
+
+    if manifest
+        .file_associations
+        .mime_types
+        .iter()
+        .any(|m| m == "inode/directory")
+        && !(manifest.actions.open_files.ipc && manifest.actions.open_files.directories)
+    {
+        return Err(ManifestError::DirectoryMimeWithoutDirectoryOption {
             path: path.to_path_buf(),
         });
     }
@@ -736,6 +797,12 @@ pub enum ManifestError {
     FileAssociationWithoutReceiver {
         path: PathBuf,
     },
+    DirectoriesWithoutReceiver {
+        path: PathBuf,
+    },
+    DirectoryMimeWithoutDirectoryOption {
+        path: PathBuf,
+    },
     FileAssociationsInvalid {
         path: PathBuf,
         detail: String,
@@ -807,6 +874,21 @@ impl fmt::Display for ManifestError {
                  \"actions.open_files\": {{ \"ipc\": true }} — an app advertised in the \
                  \"Open with\" menu must be able to receive the files it is offered \
                  (CONTRACT.md §2).",
+                path.display()
+            ),
+            Self::DirectoriesWithoutReceiver { path } => write!(
+                formatter,
+                "{} declares \"actions.open_files.directories\" without \
+                 \"actions.open_files\": {{ \"ipc\": true }} — directories are delivered \
+                 to the receiver, and this group has no other transport (CONTRACT.md §7).",
+                path.display()
+            ),
+            Self::DirectoryMimeWithoutDirectoryOption { path } => write!(
+                formatter,
+                "{} declares \"inode/directory\" in \"file_associations.mime_types\" without \
+                 \"actions.open_files\": {{ \"ipc\": true, \"directories\": true }} — a \
+                 directory handed to a receiver that has not opted into directories is \
+                 refused at every launch boundary (CONTRACT.md §2).",
                 path.display()
             ),
             Self::FileAssociationsInvalid { path, detail } => write!(
