@@ -272,33 +272,38 @@ guards stay standing. An app that declares nothing sees none of this.
 A third lock joins these two once a `run` command exists — see "Running a
 declared command" below for what it answers and how a launch reads it.
 
-### File requests: `open <id> -- <file>...` and the "Open with" menu
+### File requests: `open <id> -- <path>...` and the "Open with" menu
 
 An app that declares the pair — `file_associations.mime_types` in §2 plus
-`actions.open_files.ipc` in §7 — can be handed local files, either through
-`open <id> -- <file>...` or by choosing it in the desktop environment's
+`actions.open_files.ipc` in §7 — can be handed local paths, either through
+`open <id> -- <path>...` or by choosing it in the desktop environment's
 "Open with" menu (its `.desktop` entry gains `MimeType=` and an `Exec=` ending
 in `-- %F`, the freedesktop field code the environment expands into separate
-local-file arguments; see "Installing"). Apps declaring nothing keep every
+local-file arguments; see "Installing"). Declaring `inode/directory` in the
+MIME list plus the receiver's `directories` opt-in (§2's pair rule) is what
+puts the app in the menu for a directory; apps declaring nothing keep every
 surface they had.
 
 **One invocation is one request**: an opaque id the hub generates, plus the
 ordered path list that invocation carried. Repeating the same open on the same
-file is a new request, always. The whole batch is validated before anything is
-enqueued — every path a local, existing, regular file — and a batch that fails
-is refused whole, naming the offending path, with nothing enqueued. That is not
-a readability promise: deletion, permission changes and unsuitable content
-remain the app's to handle when it opens what it received.
+path is a new request, always. The whole batch is validated before anything is
+enqueued — every path a local, existing, regular file, or an existing local
+directory when the receiver opted into directories (a directory counts as one
+path and is never enumerated; symbolic links are followed, as for files) —
+and a batch that fails is refused whole, naming the offending path, with
+nothing enqueued. That is not a readability promise: deletion, permission
+changes and unsuitable content remain the app's to handle when it opens what
+it received.
 
 The queue lives in the hub process's memory and exists before the splash or
-the backend — a cold start's files are enqueued in the child before any window
+the backend — a cold start's paths are enqueued in the child before any window
 is created, and an arrival during the splash simply waits for the first app
 document. Its lifetime is the process's: a hub crash, a failed startup or
 ordinary exit ends it. Bounds are finite and overflow is loud — at most 64
 pending requests per app, 64 paths per request, refused past either, never
 evicted.
 
-On the CLI, `--` is the separator that makes file operands possible: after it
+On the CLI, `--` is the separator that makes path operands possible: after it
 nothing is a flag, so spaces, Unicode, quotes and option-looking names are one
 argument each, taken verbatim with no shell or URL interpolation. Relative
 paths are normalized against the calling process's working directory before

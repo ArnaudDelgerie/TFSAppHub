@@ -3,13 +3,17 @@
 ## Unreleased
 
 An app can now declare `file_associations.mime_types` plus the
-`actions.open_files` receiver and be handed local files — through
-`tfsapp-hub open <id> -- <file>...` or by choosing the app in the desktop
+`actions.open_files` receiver and be handed local paths — through
+`tfsapp-hub open <id> -- <path>...` or by choosing the app in the desktop
 environment's "Open with" menu, its `.desktop` entry gaining `MimeType=` and
 an `Exec=` ending in `-- %F`. One invocation is one opaque request in an
 in-memory queue that exists before the splash: the whole batch is validated
-first (local existing regular files only, the offending path named on
-refusal), then delivered to the most recently focused eligible window through
+first (every path a local existing regular file, plus existing directories
+when the receiver opts into `actions.open_files.directories` — a directory
+counts as one path, is never enumerated, and `inode/directory` in the MIME
+list is what advertises the app for one in the file manager; the offending
+path named on refusal), then delivered to the most recently focused eligible
+window through
 a path-free `tfsapp://open-files-pending` notification the receiver answers
 with `open_files_pending`/`open_files_ack` — subscribe before the first read,
 then read on notification only. Acknowledgement is idempotent removal and
