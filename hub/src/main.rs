@@ -25,6 +25,7 @@ mod lifecycle_gate;
 mod list;
 mod manifest;
 mod open;
+mod open_files;
 mod paths;
 mod php;
 mod picker;
@@ -435,6 +436,16 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
     let close_guards = std::sync::Arc::new(close_guard::CloseGuardState::new());
     let relaunch_close_guards = close_guards.clone();
 
+    // One pending-request queue per launch, likewise created before the
+    // `Builder` and managed before the splash: it has to exist before any
+    // arrival — a file-bearing launch's own arguments (plan 056 step 3) or a
+    // second-instance handoff — and before any window could read it. Managed
+    // unconditionally, like the close guards: the state is inert until an
+    // enqueue happens, and the enqueueing boundary is what refuses an app
+    // that declared no receiver capability.
+    let open_files = std::sync::Arc::new(open_files::OpenFilesState::new());
+    let serve_open_files = open_files.clone();
+
     window::register_splash_scheme(tauri::Builder::default(), &spec.app_dir)
         // Registered before every other plugin, per the plugin's own guidance,
         // and after the identity mutation above — which is what makes its key
@@ -525,6 +536,8 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             close_guard::close_guard_context,
             close_guard::close_guard_register,
             close_guard::close_guard_remove,
+            open_files::open_files_pending,
+            open_files::open_files_ack,
         ])
         .setup(move |app| {
             // `manage` below is the one call here that needs the trait, and
@@ -551,6 +564,10 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             // close-guard command is the splash's own first script run, and
             // every command resolves this state from the calling window.
             app.manage(close_guards.clone());
+
+            // The open-files queue the same way — before any window exists,
+            // so a startup arrival already has somewhere to land.
+            app.manage(open_files.clone());
 
             let splash_source =
                 window::resolve_splash_source(&spec.app_dir, spec.manifest.splash_path.as_deref());
@@ -585,6 +602,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
                     app_origin,
                     splash_label,
                     close_guards,
+                    serve_open_files,
                 );
             });
 
@@ -620,6 +638,7 @@ fn serve(
     app_origin: window::AppOriginSlot,
     splash_label: String,
     close_guards: close_guard::SharedCloseGuards,
+    open_files: open_files::SharedOpenFiles,
 ) {
     use tauri::Manager;
 
@@ -773,6 +792,17 @@ fn serve(
         url,
         product_name: identity.product_name,
     });
+
+    // The first app document exists: whatever arrived before it — during the
+    // splash, or while the backend was still booting — belongs to the window
+    // that just navigated. Claimed once, here, and notified only when
+    // something actually moved; the receiver's own startup read would have
+    // retrieved the same requests even without the notification.
+    let claimed = open_files.claim_unassigned(&splash_label);
+    if claimed > 0 {
+        println!("tfsapp-hub: delivering {claimed} file request(s) that arrived during startup.");
+        open_files::notify(&app, &splash_label);
+    }
 
     // Last of all, and only after the app is already running: a slow or
     // offline forge must never delay a launch reaching its window. A no-op

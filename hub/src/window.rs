@@ -221,32 +221,48 @@ fn with_window_policy<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
 }
 
 /// One `actions` group's runtime IPC identity: the capability name Tauri's ACL
-/// uses internally, and the permission (declared in `permissions/<group>.toml`)
-/// it grants when the app's manifest turns that group's `ipc` on.
+/// uses internally, the permission (declared in `permissions/<group>.toml`)
+/// it grants when the app's manifest turns that group's `ipc` on, and any
+/// further permissions the group's receiver needs to work at all.
 pub struct ActionIpcGrant {
     capability_identifier: &'static str,
     permission: &'static str,
+    /// Permissions beyond the group's own, granted with it because the
+    /// receiver cannot function without them. The only user today is
+    /// `open_files`: its receiver cannot be notified without listening for
+    /// the hub's Tauri event, so `listen`/`unlisten` travel with the grant —
+    /// never statically, and never to an app that declares nothing.
+    extra_permissions: &'static [&'static str],
 }
 
 pub const SECRETS_IPC_GRANT: ActionIpcGrant = ActionIpcGrant {
     capability_identifier: "actions-secrets",
     permission: "allow-secrets",
+    extra_permissions: &[],
 };
 pub const UPDATE_IPC_GRANT: ActionIpcGrant = ActionIpcGrant {
     capability_identifier: "actions-update",
     permission: "allow-update",
+    extra_permissions: &[],
 };
 pub const PICKER_IPC_GRANT: ActionIpcGrant = ActionIpcGrant {
     capability_identifier: "actions-picker",
     permission: "allow-picker",
+    extra_permissions: &[],
 };
 pub const CLOSE_GUARD_IPC_GRANT: ActionIpcGrant = ActionIpcGrant {
     capability_identifier: "actions-close-guard",
     permission: "allow-close-guard",
+    extra_permissions: &[],
+};
+pub const OPEN_FILES_IPC_GRANT: ActionIpcGrant = ActionIpcGrant {
+    capability_identifier: "actions-open-files",
+    permission: "allow-open-files",
+    extra_permissions: &["core:event:allow-listen", "core:event:allow-unlisten"],
 };
 
 /// The table the launch walks, pairing each group's `ipc` flag with the grant it
-/// activates. A fourth group is one entry here, not another `if` at the call
+/// activates. A further group is one entry here, not another `if` at the call
 /// site — and the pairing is what keeps the groups independent, so one group's
 /// grant can never imply another's.
 pub type ActionIpcGrantEntry = (fn(&crate::manifest::ActionsConfig) -> bool, ActionIpcGrant);
@@ -256,6 +272,7 @@ pub const ACTION_IPC_GRANTS: &[ActionIpcGrantEntry] = &[
     (|actions| actions.update.ipc, UPDATE_IPC_GRANT),
     (|actions| actions.picker.ipc, PICKER_IPC_GRANT),
     (|actions| actions.close_guard.ipc, CLOSE_GUARD_IPC_GRANT),
+    (|actions| actions.open_files.ipc, OPEN_FILES_IPC_GRANT),
 ];
 
 /// The action grants a manifest opted into. Kept separate from Builder setup so
@@ -282,11 +299,20 @@ fn action_capability_is_local() -> bool {
 /// where the app's pages are actually served from — the port is not known when
 /// this is built, hence the wildcard.
 pub fn action_capability(grant: &ActionIpcGrant) -> tauri::ipc::CapabilityBuilder {
-    tauri::ipc::CapabilityBuilder::new(grant.capability_identifier)
+    let capability = tauri::ipc::CapabilityBuilder::new(grant.capability_identifier)
         .window("main*")
         .local(action_capability_is_local())
         .remote("http://127.0.0.1:*".to_string())
-        .permission(grant.permission)
+        .permission(grant.permission);
+    // The receiver's own extras — `open_files`'s event listen/unlisten —
+    // travel with the grant and only with it, so the permission never exists
+    // for an app that declared nothing.
+    grant
+        .extra_permissions
+        .iter()
+        .fold(capability, |capability, permission| {
+            capability.permission(*permission)
+        })
 }
 
 /// The script that dresses the hub's own fallback splash page in the app's
