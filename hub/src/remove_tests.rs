@@ -257,7 +257,7 @@ fn a_remove_takes_the_entry_it_wrote_and_leaves_the_stable_copy_alone() {
     let hub_executable = paths.hub_executable_path();
     fs::create_dir_all(hub_executable.parent().expect("a bin dir")).expect("the hub's own bin dir");
     fs::write(&hub_executable, "not really a binary").expect("the stable hub copy");
-    crate::desktop::write("demo", &identity, &hub_executable, &paths)
+    crate::desktop::write("demo", &identity, &hub_executable, &[], &paths)
         .expect("the entry is written");
     let entry = paths
         .desktop_entry_path(IDENTIFIER)

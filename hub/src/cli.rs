@@ -591,11 +591,15 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             Ok(Command::List)
         }
         "open" => {
-            let (before, after, separated) = split_at_separator(rest);
+            let (before, after) = split_at_separator(rest);
             let mut options = options("open", before, &[], &[])?;
             Ok(Command::Open {
                 id: options.exactly_one("open", "an app id")?,
-                files: operand_batch("open", after, separated)?,
+                // A separator with nothing after it is the no-file form, not
+                // a broken promise: a declaring app's desktop entry ends in
+                // `-- %F`, and a bare menu launch expands `%F` to zero
+                // arguments, leaving exactly that trailing `--`.
+                files: after.to_vec(),
             })
         }
         "dev" => {
@@ -790,7 +794,7 @@ fn parse_run(args: &[String]) -> Result<Command, UsageError> {
 /// [`OpenChildSource`]. Files only travel with `--id`: `dev`'s grammar has no
 /// `--`, and a live session is not a file receiver.
 fn parse_open_child(args: &[String]) -> Result<Command, UsageError> {
-    let (before, after, separated) = split_at_separator(args);
+    let (before, after) = split_at_separator(args);
     let options = options(
         OPEN_CHILD_SUBCOMMAND,
         before,
@@ -815,7 +819,7 @@ fn parse_open_child(args: &[String]) -> Result<Command, UsageError> {
             ))
         }
     };
-    let files = operand_batch(OPEN_CHILD_SUBCOMMAND, after, separated)?;
+    let files = after.to_vec();
     if !files.is_empty() && matches!(source, OpenChildSource::Project(_)) {
         return Err(usage_error(
             OPEN_CHILD_SUBCOMMAND,
@@ -848,28 +852,15 @@ fn parse_open_child(args: &[String]) -> Result<Command, UsageError> {
 /// `__open` share. Everything before it is the hub's grammar; everything
 /// after it is the caller's own operands, taken verbatim — spaces, Unicode,
 /// quotes and option-looking names included — and never read as a flag.
-fn split_at_separator(args: &[String]) -> (&[String], &[String], bool) {
+///
+/// Nothing after it is not a promise broken but a batch the caller did not
+/// have: the desktop entry's `%F` expands to zero arguments on a bare menu
+/// launch, so the caller reads an empty batch as "no files", the same as no
+/// separator at all.
+fn split_at_separator(args: &[String]) -> (&[String], &[String]) {
     match args.iter().position(|argument| argument == "--") {
-        Some(index) => (&args[..index], &args[index + 1..], true),
-        None => (args, &[][..], false),
-    }
-}
-
-/// The operand batch a `--` introduced: at least one path, or the separator
-/// was a promise nothing kept. An empty answer means no separator appeared,
-/// which is the no-file form every command keeps.
-fn operand_batch(
-    name: &'static str,
-    after: &[String],
-    separated: bool,
-) -> Result<Vec<String>, UsageError> {
-    match (separated, after.is_empty()) {
-        (false, _) => Ok(Vec::new()),
-        (true, false) => Ok(after.to_vec()),
-        (true, true) => Err(usage_error(
-            name,
-            format!("{name} needs at least one file after `--`"),
-        )),
+        Some(index) => (&args[..index], &args[index + 1..]),
+        None => (args, &[][..]),
     }
 }
 

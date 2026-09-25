@@ -318,7 +318,6 @@ fn a_malformed_invocation_names_the_right_form() {
     let cases = [
         ("open", "open <id>"),
         ("open one two", "open <id>"),
-        ("open demo --", "open <id> [-- <file>...]"),
         ("open -- /tmp/a.md", "open <id> [-- <file>...]"),
         ("dev", "dev <local-path>"),
         ("dev one two", "dev <local-path>"),
@@ -622,6 +621,16 @@ fn a_file_bearing_open_keeps_its_operands_verbatim() {
             files: vec!["/tmp/my file.md".to_string(), "\"quoted.md\"".to_string()],
         })
     );
+    // A separator with nothing after it is the no-file form: a declaring
+    // app's desktop entry ends in `-- %F`, and a bare menu launch expands
+    // `%F` to zero arguments.
+    assert_eq!(
+        command("open demo --"),
+        Command::Open {
+            id: "demo".to_string(),
+            files: Vec::new(),
+        }
+    );
 }
 
 #[test]
@@ -687,6 +696,14 @@ fn a_second_instance_argv_is_read_back_by_the_same_parser() {
         )),
         Vec::<String>::new(),
         "a no-file child argv is a plain second window"
+    );
+    assert_eq!(
+        second_instance_files(&argv(
+            "__open --id demo --identity dev.local.demo --name Demo --"
+        )),
+        Vec::<String>::new(),
+        "a trailing separator the desktop entry's zero-file %F expansion \
+         leaves behind is still a plain second window"
     );
     assert_eq!(
         second_instance_files(&argv("__open --project /tmp/demo --identity dev.local.demo --name Demo -- /tmp/a.md")),

@@ -281,7 +281,13 @@ pub(crate) fn write_desktop_entry(paths: &Paths, id: &str, manifest: &Manifest, 
     }
 
     let identity = manifest.identity(app_dir);
-    match desktop::write(id, &identity, &paths.hub_executable_path(), paths) {
+    match desktop::write(
+        id,
+        &identity,
+        &paths.hub_executable_path(),
+        &manifest.file_associations.mime_types,
+        paths,
+    ) {
         Ok(path) => println!("Desktop entry: {}", path.display()),
         Err(error) => eprintln!("tfsapp-hub: warning: could not write the desktop entry: {error}"),
     }
