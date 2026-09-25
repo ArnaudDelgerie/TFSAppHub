@@ -529,26 +529,49 @@ pub fn present_target_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, windo
 // child, the child re-validating the argv it was handed, and the live
 // instance's second-instance callback — and they ask the same questions in
 // the same order: does this app declare the receiver at all, and does every
-// path name a local, existing, regular file? The answers are diagnostics,
+// path name a local, existing, regular file — or an existing directory, when
+// the receiver opted into directories? The answers are diagnostics,
 // printed by whoever is in a position to print them, because nothing is
 // enqueued until the whole batch passes.
 
-/// Whether `manifest` declares the receiver a file batch can be delivered
-/// to — `actions.open_files.ipc`, the one transport this group has. A
-/// nonempty `file_associations` declaration is already refused at parse time
-/// without it (CONTRACT.md §2), so this is the single question left at the
-/// boundary.
-pub fn receiver_declared(manifest: &crate::manifest::Manifest) -> bool {
-    manifest.actions.open_files.ipc
+/// The receiver half of `actions.open_files`, resolved once from the
+/// manifest at each enqueueing boundary — the parent `open`, the private
+/// child, and the live instance's second-instance callback all ask the same
+/// two questions through this one type: does this app declare the receiver at
+/// all, and did it opt into receiving directories?
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Receiver {
+    /// `actions.open_files.ipc` — the one transport this group has. A false
+    /// here refuses every batch, files included.
+    pub declared: bool,
+    /// `actions.open_files.directories` — the default-off opt-in that lets a
+    /// directory be delivered through any launch path. A false here refuses
+    /// a directory while leaving regular files unaffected.
+    pub directories: bool,
+}
+
+impl Receiver {
+    /// The receiver a manifest declares. Every boundary resolves this from
+    /// the manifest it already loaded — the installed snapshot, never a
+    /// re-read of the source — so the option never travels through argv or
+    /// the wire.
+    pub fn of(manifest: &crate::manifest::Manifest) -> Self {
+        Self {
+            declared: manifest.actions.open_files.ipc,
+            directories: manifest.actions.open_files.directories,
+        }
+    }
 }
 
 /// Validate a whole incoming batch before anything is enqueued: one
 /// diagnostic for the first path that fails, naming it and why. Local,
-/// existing, regular files only — a declaration of what will be delivered,
-/// never a readability guarantee: deletion, permission changes and
+/// existing, regular files — plus, when the receiver opted in, existing
+/// local directories, which count as one path each and are never
+/// enumerated. A declaration of what will be delivered, never a
+/// readability or lifetime guarantee: deletion, permission changes and
 /// unsuitable content remain the receiver's to handle when it opens what it
-/// accepted.
-pub fn validate_batch(paths: &[String]) -> Result<(), String> {
+/// accepted. Symbolic links are followed, as they are for files.
+pub fn validate_batch(paths: &[String], directories: bool) -> Result<(), String> {
     if paths.len() > MAX_PATHS_PER_REQUEST {
         return Err(format!(
             "a file request may carry at most {MAX_PATHS_PER_REQUEST} paths (CONTRACT.md §7)"
@@ -564,11 +587,18 @@ pub fn validate_batch(paths: &[String]) -> Result<(), String> {
         }
         match std::fs::metadata(file) {
             Err(error) => {
-                return Err(format!("{path} is not an existing local file: {error}"));
+                return Err(format!("{path} is not an existing local path: {error}"));
             }
-            Ok(metadata) if !metadata.is_file() => {
+            Ok(metadata) if metadata.is_dir() && !directories => {
                 return Err(format!(
-                    "{path} is not a regular file — directories and devices are not delivered"
+                    "{path} is a directory — this app did not opt into receiving \
+                     directories (actions.open_files.directories)"
+                ));
+            }
+            Ok(metadata) if !metadata.is_file() && !metadata.is_dir() => {
+                return Err(format!(
+                    "{path} is neither a regular file nor a directory — devices and \
+                     other special files are not delivered"
                 ));
             }
             Ok(_) => {}
@@ -599,7 +629,7 @@ pub enum ArrivalOutcome {
 pub fn deliver_arrival<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     guards: &crate::close_guard::SharedCloseGuards,
-    declared: bool,
+    receiver: Receiver,
     paths: &[String],
 ) -> ArrivalOutcome {
     if guards.is_closing() {
@@ -607,12 +637,12 @@ pub fn deliver_arrival<R: tauri::Runtime>(
             "this instance is shutting down; the file request was discarded with it".to_string(),
         );
     }
-    if !declared {
+    if !receiver.declared {
         return ArrivalOutcome::Refused(
             "this app declares no open_files receiver, so the files were not delivered".to_string(),
         );
     }
-    if let Err(diagnostic) = validate_batch(paths) {
+    if let Err(diagnostic) = validate_batch(paths, receiver.directories) {
         return ArrivalOutcome::Refused(diagnostic);
     }
     // Where the arrival goes is decided with the queue, not from a launch

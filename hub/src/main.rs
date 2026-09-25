@@ -474,20 +474,21 @@ fn open_window(
     // The arrival's other fact, read here before `spec` moves into `setup`:
     // the second-instance callback runs in whatever process is live when the
     // arrival lands, and it is *that* instance's declaration that decides
-    // whether a file-bearing argv can be delivered at all.
-    let relaunch_receiver_declared = open_files::receiver_declared(&spec.manifest);
+    // whether a file-bearing argv can be delivered at all — and whether its
+    // directories opted in, which the batch validation needs the same way.
+    let relaunch_receiver = open_files::Receiver::of(&spec.manifest);
 
     // A file-bearing launch enqueues its own batch before the `Builder` exists,
     // so it is waiting in the pre-launch pool before any window — and the
     // window that becomes the app's first document claims it in `serve`'s
     // hand-off. Only the instance that holds the launch locks: a hand-off
     // child's queue dies with it at the single-instance `exit(0)`, and its
-    // argv — the same files, the same order — is delivered by the live
+    // argv — the same paths, the same order — is delivered by the live
     // instance's own callback instead, which is the path that owns a queue
     // with a future.
     if !files.is_empty() && locks.is_some() {
-        if open_files::receiver_declared(&spec.manifest) {
-            match open_files::validate_batch(&files) {
+        if relaunch_receiver.declared {
+            match open_files::validate_batch(&files, relaunch_receiver.directories) {
                 Ok(()) => {
                     if let Err(error) = open_files.enqueue(files, None) {
                         eprintln!(
@@ -549,7 +550,7 @@ fn open_window(
                 let origin = relaunch_origin.clone();
                 let guards = relaunch_close_guards.clone();
                 let icon_path = relaunch_icon_path.clone();
-                let receiver_declared = relaunch_receiver_declared;
+                let receiver = relaunch_receiver;
                 let arrival = cli::second_instance_files(&args);
                 let scheduler = app.clone();
                 let scheduled = move || {
@@ -561,15 +562,10 @@ fn open_window(
                         // closure can neither strand the request in a pool
                         // nothing will drain nor have it refused while the
                         // first document's navigation is still settling.
-                        match open_files::deliver_arrival(
-                            &app,
-                            &guards,
-                            receiver_declared,
-                            &arrival,
-                        ) {
+                        match open_files::deliver_arrival(&app, &guards, receiver, &arrival) {
                             open_files::ArrivalOutcome::Delivered { window: None } => {
                                 println!(
-                                    "tfsapp-hub: still starting — the files will be delivered \
+                                    "tfsapp-hub: still starting — the paths will be delivered \
                                      when the window is ready."
                                 );
                             }

@@ -243,6 +243,130 @@ fn the_receiver_capability_without_any_declared_type_is_fine() {
 }
 
 #[test]
+fn the_directory_opt_in_is_off_by_default_and_reads_its_three_spellings() {
+    // Omitted, false and true — the option is inert unless spelled, and
+    // never implies `ipc`, which its pair rule below enforces separately.
+    assert!(!parse_ok(MINIMAL).manifest.actions.open_files.directories);
+
+    let explicit_false = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"open_files": {"ipc": true, "directories": false}}"#,
+    );
+    let loaded = parse_ok(&explicit_false);
+    assert!(loaded.manifest.actions.open_files.ipc);
+    assert!(!loaded.manifest.actions.open_files.directories);
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+
+    let opted_in = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"open_files": {"ipc": true, "directories": true}}"#,
+    );
+    let loaded = parse_ok(&opted_in);
+    assert!(loaded.manifest.actions.open_files.ipc);
+    assert!(loaded.manifest.actions.open_files.directories);
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+}
+
+#[test]
+fn the_directory_opt_in_without_the_receiver_is_refused() {
+    // The pair rule's newest member: directories are delivered to the
+    // receiver, and a `directories: true` with no receiver would look like a
+    // grant the launch boundary refuses on every path.
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"open_files": {"directories": true}}"#,
+    );
+
+    let error = parse_err(&contents);
+
+    assert!(matches!(
+        error,
+        ManifestError::DirectoriesWithoutReceiver { .. }
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("\"actions.open_files.directories\""),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("\"actions.open_files\": { \"ipc\": true }"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_directory_mime_declaration_requires_the_directory_opt_in() {
+    // `inode/directory` is the one MIME value with a second requirement:
+    // advertising directories in the file manager without the receiver's
+    // opt-in would offer a menu entry whose selections are refused at every
+    // launch boundary.
+    let without_directories = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"open_files": {"ipc": true}}, "file_associations": {"mime_types": ["inode/directory"]}"#,
+    );
+    let error = parse_err(&without_directories);
+    assert!(matches!(
+        error,
+        ManifestError::DirectoryMimeWithoutDirectoryOption { .. }
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("\"ipc\": true, \"directories\": true"),
+        "{error}"
+    );
+
+    // Without even the receiver, the older pair rule fires first: the list is
+    // nonempty and `ipc` is off, which is the more fundamental refusal.
+    let without_receiver = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "file_associations": {"mime_types": ["inode/directory"]}"#,
+    );
+    assert!(matches!(
+        parse_err(&without_receiver),
+        ManifestError::FileAssociationWithoutReceiver { .. }
+    ));
+
+    // The full opt-in parses, and a mixed declaration keeps both values.
+    let opted_in = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"open_files": {"ipc": true, "directories": true}}, "file_associations": {"mime_types": ["text/markdown", "inode/directory"]}"#,
+    );
+    let loaded = parse_ok(&opted_in);
+    assert!(loaded.manifest.actions.open_files.directories);
+    assert_eq!(
+        loaded.manifest.file_associations.mime_types,
+        ["text/markdown", "inode/directory"]
+    );
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+}
+
+#[test]
+fn an_unknown_open_files_field_warns_and_still_parses() {
+    // The `file_associations` precedent, one level into `actions`: a typo'd
+    // `"directory"` must not stop the app loading, and must not silently
+    // become the opt-in either — a warning names it.
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"open_files": {"ipc": true, "directory": true}}"#,
+    );
+
+    let loaded = parse_ok(&contents);
+
+    assert!(loaded.manifest.actions.open_files.ipc);
+    assert!(!loaded.manifest.actions.open_files.directories);
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+    assert!(
+        loaded.warnings[0].contains("\"actions.open_files.directory\""),
+        "{}",
+        loaded.warnings[0]
+    );
+}
+
+#[test]
 fn malformed_mime_types_are_refused() {
     // Each of these is either not a `type/subtype` pair, or carries a
     // character the generated desktop entry cannot hold safely: `;` is the

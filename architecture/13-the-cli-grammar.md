@@ -19,8 +19,7 @@ the flag, is what the test pins — forwarded arguments are the app's — becaus
 every other host-level flag sits in the same trap the day an app declares an
 alias that takes one.
 
-A second carve-out, the only operand separator in the grammar: `open <id> --
-<file>...` hands local files to the app's declared receiver (§7). Everything
+A second carve-out, the only operand separator in the grammar: `open <id> -- <path>...` hands local paths to the app's declared receiver (§7) — regular files for any receiver, plus directories for one that opted into `actions.open_files.directories`. Everything
 after the `--` is the caller's own operands — verbatim, never a flag, spaces
 and Unicode and option-looking names included — and a separator with nothing
 after it is the no-file form, because a declaring app's desktop entry ends in

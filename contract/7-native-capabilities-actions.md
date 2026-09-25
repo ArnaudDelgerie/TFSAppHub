@@ -221,21 +221,31 @@ mount, or a permission change.
 
 ### `open_files`
 
-Lets the app receive local files a person or the desktop environment hands
-it — through `tfsapp-hub open <id> -- <file>...`, or by choosing the app in
+Lets the app receive local paths a person or the desktop environment hands
+it — through `tfsapp-hub open <id> -- <path>...`, or by choosing the app in
 the desktop environment's "Open with" menu once it declares
-`file_associations` (§2). The hub delivers **paths**; how the app reads or
-displays each file is entirely its own backend's business, and there is no
+`file_associations` (§2). The hub delivers **paths** — regular files, and
+directories for a receiver that opted into them; how the app reads or
+displays each one is entirely its own backend's business, and there is no
 generic file-reading service and no unsolicited navigation route here.
 
-Like `picker`, this group has one transport and one exact manifest shape:
+Like `picker`, this group has one transport and one manifest shape, with
+`directories` optional and off unless spelled:
 
 ```json
-{"open_files": {"ipc": true}}
+{"open_files": {"ipc": true, "directories": true}}
 ```
 
-There is no `bridge` transport, HTTP route, bridge environment variable, or
-PHP permission for this group: a manifest naming `actions.open_files.bridge`
+`ipc` is the transport and required for anything to be delivered;
+`directories` is a default-off option that lets the hub deliver existing
+local directories through any launch path — a CLI invocation included —
+alongside regular files. An app that leaves it off keeps the file-only
+behaviour exactly: a directory handed to it is refused with a diagnostic
+naming the path, whatever delivered the batch. `directories: true` without
+`ipc: true` is invalid, and so is `inode/directory` in
+`file_associations.mime_types` without both — §2's pair rules. There is no
+`bridge` transport, HTTP route, bridge environment variable, or PHP
+permission for this group: a manifest naming `actions.open_files.bridge`
 is invalid. PHP participates only through the app's own backend, once the
 webview has received the paths and accepted them.
 
@@ -244,10 +254,17 @@ webview has received the paths and accepted them.
 generates plus the ordered list of paths that invocation carried. Repeating
 the same open on the same file creates a new request, always. The whole batch
 is validated **before** anything is enqueued: every path must name a local,
-existing, regular file, and a batch that fails validation is refused with an
-explicit diagnostic naming the offending path — nothing is enqueued.
-Validation is not a readability guarantee; deletion, permission changes and
-unsuitable content remain the app's to handle when it opens what it received.
+existing, regular file — or, when the receiver opted into `directories`, an
+existing local directory — and a batch that fails validation is refused with
+an explicit diagnostic naming the offending path — nothing is enqueued. A
+directory counts as one path against the request's path bound; the hub
+neither enumerates nor copies its contents. A mixed file/directory batch is
+admitted only when directories are enabled, and any invalid member refuses
+the whole batch. Symbolic links are followed, exactly as they are for files.
+Validation is not a readability or lifetime guarantee; deletion, permission
+changes, unsuitable content and a directory whose contents changed since
+remain the app's to handle when it opens what it received. A delivered
+directory path grants no access beyond what the app's backend already has.
 
 The queue lives in the hub process's memory and exists before the splash or
 the backend; it is not durable. A hub crash, a failed startup or ordinary

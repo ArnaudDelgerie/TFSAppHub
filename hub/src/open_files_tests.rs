@@ -19,6 +19,15 @@ fn paths_of(requests: &[PendingRequest]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// The receiver of an app that declared `ipc`, opting into directories or
+/// not; `Receiver::default()` spells the undeclared case.
+fn receiver(directories: bool) -> Receiver {
+    Receiver {
+        declared: true,
+        directories,
+    }
+}
+
 // --- enqueue, retained reads, replay ----------------------------------------
 
 #[test]
@@ -567,12 +576,40 @@ fn an_emit_failure_is_diagnosed_and_retains_the_queue() {
 // --- the enqueueing boundary ----------------------------------------------
 
 #[test]
+fn the_receiver_is_resolved_from_the_manifest_pair() {
+    let parse = |actions: &str| {
+        let contents = format!(
+            "{{ \"product_name\": \"T\", \"identifier\": \"dev.local.t\", \
+             \"project_name\": \"t\", \"app_version\": \"0.6.0\", \"actions\": {actions} }}"
+        );
+        let loaded =
+            crate::manifest::parse(std::path::Path::new("/t/tfsapp.config.json"), &contents)
+                .unwrap_or_else(|error| panic!("must parse: {error}"));
+        Receiver::of(&loaded.manifest)
+    };
+
+    // Absent, file-only, directory-opted-in: the two questions every
+    // boundary asks, answered from the manifest each caller already loaded.
+    assert_eq!(parse(r#"{"secrets": {"ipc": true}}"#), Receiver::default());
+    assert_eq!(parse(r#"{"open_files": {"ipc": true}}"#), receiver(false));
+    assert_eq!(
+        parse(r#"{"open_files": {"ipc": true, "directories": true}}"#),
+        receiver(true)
+    );
+}
+
+#[test]
 fn a_batch_of_existing_regular_files_validates() {
     let base = tempfile::tempdir().expect("a temp dir");
-    let file = base.path().join("notes.md");
+    let file = base.path().join("notes résumé.md");
     std::fs::write(&file, "x").expect("a written file");
 
-    validate_batch(&[file.display().to_string()]).expect("an existing regular file validates");
+    // Spaces and Unicode are ordinary path bytes, for either opt-in state —
+    // a receiver that did not opt into directories still takes every file.
+    validate_batch(&[file.display().to_string()], false)
+        .expect("an existing regular file validates");
+    validate_batch(&[file.display().to_string()], true)
+        .expect("a directory receiver still takes files");
 }
 
 #[test]
@@ -583,17 +620,77 @@ fn a_batch_is_validated_whole_before_anything_is_enqueued() {
     let existing = file.display().to_string();
 
     // Each refusal names the offending path and the reason.
-    let relative = validate_batch(&["notes.md".to_string()]).unwrap_err();
+    let relative = validate_batch(&["notes.md".to_string()], false).unwrap_err();
     assert!(
         relative.contains("notes.md") && relative.contains("absolute"),
         "{relative}"
     );
-    let missing = validate_batch(&[base.path().join("gone.md").display().to_string()]).unwrap_err();
+    let missing =
+        validate_batch(&[base.path().join("gone.md").display().to_string()], false).unwrap_err();
     assert!(missing.contains("gone.md"), "{missing}");
-    let directory = validate_batch(&[base.path().display().to_string()]).unwrap_err();
-    assert!(directory.contains("regular file"), "{directory}");
-    let oversized = validate_batch(&vec![existing; MAX_PATHS_PER_REQUEST + 1]).unwrap_err();
+    let directory = validate_batch(&[base.path().display().to_string()], false).unwrap_err();
+    assert!(directory.contains("is a directory"), "{directory}");
+    let oversized = validate_batch(&vec![existing; MAX_PATHS_PER_REQUEST + 1], false).unwrap_err();
     assert!(oversized.contains("at most"), "{oversized}");
+}
+
+#[test]
+fn a_directory_is_admitted_only_for_a_receiver_that_opted_in() {
+    let base = tempfile::tempdir().expect("a temp dir");
+    let file = base.path().join("notes.md");
+    std::fs::write(&file, "x").expect("a written file");
+    let directory = base.path().display().to_string();
+    let mixed = vec![file.display().to_string(), directory.clone()];
+
+    // A file-only receiver refuses the directory, naming it and the opt-in.
+    let refused = validate_batch(std::slice::from_ref(&directory), false).unwrap_err();
+    assert!(
+        refused.contains("is a directory") && refused.contains("directories"),
+        "{refused}"
+    );
+    // A bad member refuses the whole mixed batch: the first failing path is
+    // the diagnostic, and nothing behind it is admitted either.
+    let refused_mixed = validate_batch(&mixed, false).unwrap_err();
+    assert!(refused_mixed.contains("is a directory"), "{refused_mixed}");
+
+    // With the opt-in the same batches validate whole: a directory counts
+    // as one path, and a mixed file/directory batch is ordinary.
+    validate_batch(&[directory], true).expect("an existing directory validates");
+    validate_batch(&mixed, true).expect("a mixed batch validates");
+}
+
+#[test]
+fn special_files_are_refused_whatever_the_opt_in() {
+    // `/dev/null` is a character device: not a regular file, not a
+    // directory, and no receiver opt-in changes that.
+    let refused = validate_batch(&["/dev/null".to_string()], true).unwrap_err();
+    assert!(
+        refused.contains("/dev/null") && refused.contains("neither a regular file nor a directory"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn symlinks_are_followed_for_files_and_directories_alike() {
+    let base = tempfile::tempdir().expect("a temp dir");
+    let file = base.path().join("notes.md");
+    std::fs::write(&file, "x").expect("a written file");
+    let sub = base.path().join("sub");
+    std::fs::create_dir(&sub).expect("a directory");
+    let file_link = base.path().join("file-link.md");
+    std::os::unix::fs::symlink(&file, &file_link).expect("a file symlink");
+    let dir_link = base.path().join("dir-link");
+    std::os::unix::fs::symlink(&sub, &dir_link).expect("a directory symlink");
+
+    // `std::fs::metadata` follows links, as it does for files today: the
+    // link to a file is a file for either receiver, the link to a directory
+    // is a directory — admitted only with the opt-in.
+    validate_batch(&[file_link.display().to_string()], false)
+        .expect("a symlink to a file is a file");
+    let refused = validate_batch(&[dir_link.display().to_string()], false).unwrap_err();
+    assert!(refused.contains("is a directory"), "{refused}");
+    validate_batch(&[dir_link.display().to_string()], true)
+        .expect("a symlink to a directory is a directory");
 }
 
 #[test]
@@ -610,7 +707,12 @@ fn an_arrival_during_startup_waits_in_the_pre_launch_pool() {
     // No `sidecar::Launch` managed: the app's first document does not exist
     // yet, so the arrival waits rather than targets a window.
     assert_eq!(
-        deliver_arrival(app.handle(), &guards, true, std::slice::from_ref(&path)),
+        deliver_arrival(
+            app.handle(),
+            &guards,
+            receiver(false),
+            std::slice::from_ref(&path)
+        ),
         ArrivalOutcome::Delivered { window: None },
         "the splash era pools the arrival"
     );
@@ -635,7 +737,7 @@ fn an_arrival_on_a_running_app_targets_its_window() {
     std::fs::write(&file, "x").expect("a written file");
     let path = file.display().to_string();
 
-    let outcome = deliver_arrival(app.handle(), &guards, true, &[path]);
+    let outcome = deliver_arrival(app.handle(), &guards, receiver(false), &[path]);
     assert_eq!(
         outcome,
         ArrivalOutcome::Delivered {
@@ -651,6 +753,106 @@ fn an_arrival_on_a_running_app_targets_its_window() {
 }
 
 #[test]
+fn a_directory_arrival_is_delivered_to_a_receiver_that_opted_in() {
+    let queue = shared_queue();
+    let app = app_with_windows(&queue, &["main"]);
+    app.manage(crate::sidecar::Launch {
+        url: "tauri://localhost".to_string(),
+        product_name: "Demo".to_string(),
+    });
+    let guards: crate::close_guard::SharedCloseGuards =
+        std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
+    app.manage(guards.clone());
+    let base = tempfile::tempdir().expect("a temp dir");
+    let file = base.path().join("notes.md");
+    std::fs::write(&file, "x").expect("a written file");
+    let mixed = vec![
+        file.display().to_string(),
+        base.path().display().to_string(),
+    ];
+
+    // A mixed file/directory batch is one request to a receiver that opted
+    // in — the directory counts as one path, never enumerated, and the order
+    // is the invocation's own.
+    let outcome = deliver_arrival(app.handle(), &guards, receiver(true), &mixed);
+    assert_eq!(
+        outcome,
+        ArrivalOutcome::Delivered {
+            window: Some("main".to_string())
+        },
+        "the opted-in receiver's window receives the mixed batch"
+    );
+    assert_eq!(
+        paths_of(&queue.pending("main")),
+        vec![mixed],
+        "the directory path is carried verbatim, once, in its batch's order"
+    );
+}
+
+#[test]
+fn a_directory_arrival_is_refused_whole_for_a_file_only_receiver() {
+    let queue = shared_queue();
+    let app = app_with_windows(&queue, &["main"]);
+    app.manage(crate::sidecar::Launch {
+        url: "tauri://localhost".to_string(),
+        product_name: "Demo".to_string(),
+    });
+    let guards: crate::close_guard::SharedCloseGuards =
+        std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
+    app.manage(guards.clone());
+    let base = tempfile::tempdir().expect("a temp dir");
+    let file = base.path().join("notes.md");
+    std::fs::write(&file, "x").expect("a written file");
+    let mixed = vec![
+        file.display().to_string(),
+        base.path().display().to_string(),
+    ];
+
+    // The directory member refuses the whole mixed batch — the valid file in
+    // it is not enqueued either, so the receiver never sees a half-batch.
+    let refused = deliver_arrival(app.handle(), &guards, receiver(false), &mixed);
+    assert!(
+        matches!(refused, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("is a directory")),
+        "said {refused:?}"
+    );
+    assert_eq!(queue.total_pending(), 0, "nothing was enqueued");
+}
+
+#[test]
+fn a_directory_arrival_during_startup_waits_in_the_pre_launch_pool() {
+    let queue = shared_queue();
+    let app = app_with_windows(&queue, &[]);
+    let guards: crate::close_guard::SharedCloseGuards =
+        std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
+    let base = tempfile::tempdir().expect("a temp dir");
+    let directory = base.path().display().to_string();
+
+    // The cold-start path is the same one files take: no eligible window yet,
+    // so the arrival pools and the launch's hand-off claims it.
+    assert_eq!(
+        deliver_arrival(
+            app.handle(),
+            &guards,
+            receiver(true),
+            std::slice::from_ref(&directory)
+        ),
+        ArrivalOutcome::Delivered { window: None },
+        "the splash era pools the directory arrival"
+    );
+    assert_eq!(
+        paths_of(&queue.pending("main")),
+        Vec::<Vec<String>>::new(),
+        "nothing reaches a window before the hand-off"
+    );
+    assert_eq!(queue.handoff_to_first_document("main"), 1);
+    assert_eq!(
+        paths_of(&queue.pending("main")),
+        vec![vec![directory]],
+        "the hand-off delivers the directory path once"
+    );
+}
+
+#[test]
 fn a_committed_shutdown_refuses_an_arrival_without_enqueueing() {
     let queue = shared_queue();
     let app = app_with_windows(&queue, &["main"]);
@@ -662,7 +864,12 @@ fn a_committed_shutdown_refuses_an_arrival_without_enqueueing() {
     let file = base.path().join("notes.md");
     std::fs::write(&file, "x").expect("a written file");
 
-    let refused = deliver_arrival(app.handle(), &guards, true, &[file.display().to_string()]);
+    let refused = deliver_arrival(
+        app.handle(),
+        &guards,
+        receiver(false),
+        &[file.display().to_string()],
+    );
     assert!(
         matches!(refused, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("shutting down")),
         "said {refused:?}"
@@ -681,12 +888,22 @@ fn an_undeclared_receiver_or_invalid_batch_is_refused_before_enqueueing() {
     std::fs::write(&file, "x").expect("a written file");
     let path = file.display().to_string();
 
-    let undeclared = deliver_arrival(app.handle(), &guards, false, std::slice::from_ref(&path));
+    let undeclared = deliver_arrival(
+        app.handle(),
+        &guards,
+        Receiver::default(),
+        std::slice::from_ref(&path),
+    );
     assert!(
         matches!(undeclared, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("open_files receiver")),
         "said {undeclared:?}"
     );
-    let invalid = deliver_arrival(app.handle(), &guards, true, &["notes.md".to_string()]);
+    let invalid = deliver_arrival(
+        app.handle(),
+        &guards,
+        receiver(false),
+        &["notes.md".to_string()],
+    );
     assert!(
         matches!(invalid, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("absolute")),
         "said {invalid:?}"
@@ -718,7 +935,12 @@ fn a_running_app_with_no_eligible_window_refuses_the_arrival() {
     let file = base.path().join("notes.md");
     std::fs::write(&file, "x").expect("a written file");
 
-    let refused = deliver_arrival(app.handle(), &guards, true, &[file.display().to_string()]);
+    let refused = deliver_arrival(
+        app.handle(),
+        &guards,
+        receiver(false),
+        &[file.display().to_string()],
+    );
     assert!(
         matches!(refused, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("no window")),
         "said {refused:?}"
@@ -746,7 +968,12 @@ fn an_arrival_while_the_first_document_settles_reaches_it() {
     let file = base.path().join("notes.md");
     std::fs::write(&file, "x").expect("a written file");
 
-    let outcome = deliver_arrival(app.handle(), &guards, true, &[file.display().to_string()]);
+    let outcome = deliver_arrival(
+        app.handle(),
+        &guards,
+        receiver(false),
+        &[file.display().to_string()],
+    );
     assert_eq!(
         outcome,
         ArrivalOutcome::Delivered {

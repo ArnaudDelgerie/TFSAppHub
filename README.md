@@ -55,8 +55,10 @@ revalidates any installed app whose PHP moved under it the next time it is
 used; `--rollback` undoes that — the previous hub binary and the registry it
 recorded, both back exactly as they were, offline, in under a second. An app
 declaring `file_associations` appears in the file manager's "Open with" menu
-for the types it names, and `open <id> -- <file>...` hands local files to a
-declared receiver — a queue in the hub process, a targeted notification, an
+for the types it names — including `inode/directory`, with the receiver's
+`directories` opt-in — and `open <id> -- <path>...` hands local paths to a
+declared receiver, files for any receiver and directories for one that opted
+in: a queue in the hub process, a targeted notification, an
 explicit acknowledgement; replayable until acknowledged, never durable
 across a crash. Git
 sources are recognised and refused with a message saying so, rather than
