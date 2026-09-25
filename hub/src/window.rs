@@ -511,6 +511,88 @@ pub fn create_splash_window<R: tauri::Runtime>(
         .build()
 }
 
+/// What a second-instance arrival — a second `open` of an app this process
+/// is already serving — must do, decided from the two facts that matter:
+/// whether this process has a backend to open a window on, and whether a
+/// final shutdown has committed.
+///
+/// The committed-shutdown arm is plan 055's coordination rule: a window
+/// admitted *before* commitment changes the topology and the close
+/// decisions honour it, but one admitted *after* cannot revive a process
+/// that is already going away — it would be a window on a backend about to
+/// stop, created by the one arrival path that was never asked about a
+/// closing decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondInstanceAction {
+    /// The backend is up: open another window on it.
+    OpenWindow,
+    /// The launch's own window is still on its way — nothing to do, the
+    /// window the user is waiting for is the answer.
+    StillStarting,
+    /// A final shutdown has committed: no window is opened on this process
+    /// again.
+    ShuttingDown,
+}
+
+/// The decision itself, pure so the topology rules are unit tests rather
+/// than live windows. The shutdown commitment wins over a present launch:
+/// a `Launch` state outlives the moment its process decided to go away.
+pub fn second_instance_action(
+    launch_present: bool,
+    shutdown_committed: bool,
+) -> SecondInstanceAction {
+    if shutdown_committed {
+        SecondInstanceAction::ShuttingDown
+    } else if launch_present {
+        SecondInstanceAction::OpenWindow
+    } else {
+        SecondInstanceAction::StillStarting
+    }
+}
+
+/// What running the second-instance admission unit actually did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecondInstanceOutcome {
+    /// The launch's own window is still on its way; the arrival was given
+    /// nothing but the wait it already had.
+    StillStarting,
+    /// A final shutdown has committed; this process opens no window again.
+    ShuttingDown,
+    /// The window was created on the running backend.
+    WindowOpened,
+    /// The window could not be created; the reason is the caller's to
+    /// report.
+    WindowFailed(String),
+}
+
+/// The second-instance admission unit: everything a second `open` of an
+/// already-running app does, as one piece of work (audit 017, finding 2).
+///
+/// The single-instance plugin invokes its callback from its D-Bus service
+/// thread, which is serialized with nothing — the GTK loop's close decisions
+/// and shutdown commitments can land between any two reads this function's
+/// caller makes. So the caller schedules this whole unit on the event loop
+/// (`run_on_main_thread`) and does nothing else: the shutdown commitment is
+/// re-read *here*, at decision time, and the window is created *here*, in
+/// the same unit — an arrival suspended across a committed shutdown finds
+/// the commitment when it finally runs, and opens nothing; a window admitted
+/// before a commitment is created inside the same serialization every close
+/// decision reads, so no topology can miss it.
+pub fn admit_second_instance_window(
+    guards: &crate::close_guard::CloseGuardState,
+    launch_present: bool,
+    create_window: impl FnOnce() -> Result<(), String>,
+) -> SecondInstanceOutcome {
+    match second_instance_action(launch_present, guards.is_closing()) {
+        SecondInstanceAction::StillStarting => SecondInstanceOutcome::StillStarting,
+        SecondInstanceAction::ShuttingDown => SecondInstanceOutcome::ShuttingDown,
+        SecondInstanceAction::OpenWindow => match create_window() {
+            Ok(()) => SecondInstanceOutcome::WindowOpened,
+            Err(error) => SecondInstanceOutcome::WindowFailed(error),
+        },
+    }
+}
+
 /// A further window on an already-running backend — what a second `open` of the
 /// same app resolves to.
 ///

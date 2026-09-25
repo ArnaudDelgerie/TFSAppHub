@@ -314,11 +314,29 @@ window's confirmation stops the backend. While a decision is pending the
 hub shows one dialog at a time, and rechecks what is at stake before applying
 an answer — a guard that appeared while the dialog was open, or a close that
 became the backend-stopping one, gets a fresh warning rather than a stale
-approval. An acknowledgement protects subsequent close decisions; it cannot
-reverse a close that already committed. Once shutdown has committed, every
-register or remove — from either transport — answers `closing` explicitly,
-so a job starting during teardown learns the truth instead of installing a
-guard nobody will ever see.
+approval.
+
+**A close commits together with its final guard check.** A registration
+racing that check is either included in the decision or refused with
+`closing`. Once committed, the window no longer counts as a survivor for
+other closes and cannot register or remove frontend guards. This prevents
+two simultaneous closes from each assuming the other will preserve the
+backend. Destruction releases the reservation; failed posting releases it
+if the window remains usable. Whole-app shutdown is never reversed.
+
+**Document identity protects a pending decision.** If the document changes
+while its confirmation is open, the answer is invalidated. The new document
+stays open with its own guards, and a fresh close request starts a new
+decision. Destroying a window also invalidates its pending answer; a later
+window reusing its label inherits neither that decision nor its guards.
+
+**An accepted close closes the window.** Once approval passes the final
+checks, a subsequent reload or navigation does not cancel the close. Apps
+must not start new work in that closing window. Close guards warn before
+normal closure; they do not protect against termination signals or every
+possible event between approval and native destruction. Once whole-app
+shutdown commits, registrations and removals on either transport return
+`closing`. Mandatory shutdown never waits for a confirmation answer.
 
 **Unavailable is a result, not an exception.** A hub older than this group
 refuses the `invoke` outright, and a missing or refused bridge route is
@@ -353,8 +371,9 @@ The IPC commands and their exact errors: `close_guard_context` answers
 `close_guard_register` and `close_guard_remove` take `{ context, id }` and
 answer `null` on success. Their error codes, shared with the bridge routes
 where the transport has them: `stale_document` (frontend only), `invalid_id`,
-`too_many_guards`, `closing`, and `unavailable` when no state backs the
-calling window at all.
+`too_many_guards`, `closing` — shutdown has committed, or this window's close
+already has, so the namespace is closed — and `unavailable` when no state backs
+the calling window at all.
 
 ### The bridge wire contract
 
@@ -407,4 +426,3 @@ guard namespace is closed for the rest of this process's life.
 
 The bridge never logs the token, a secret value, or the update check's body, on
 success or on failure.
-

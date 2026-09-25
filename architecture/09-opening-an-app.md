@@ -234,11 +234,35 @@ mark vetoes the default close and shows one native confirmation, `Cancel` as
 the safe default, before the window is hidden or the backend stopped. Backend
 guards only matter on the close that would stop the shared backend — a clean
 secondary window closes without a word even while jobs run elsewhere. The
-decision machinery lives in `close_guard.rs`, plain state with no GTK in it:
-one pending decision at a time across the app's windows (repeated clicks
-veto rather than stack dialogs), the guards rechecked against the topology at
-answer time (a guard that appeared mid-dialog earns a fresh warning, never a
-stale approval), and the approval consumed the moment it is applied.
+decision machinery lives in `close_guard.rs`, plain state with no GTK in it,
+and its effects are coordinated on the event loop: one pending decision at a
+time across the app's windows (repeated clicks veto rather than stack
+dialogs), the guards rechecked against the topology at answer time (a guard
+that appeared mid-dialog earns a fresh warning, never a stale approval), and
+the approval consumed the moment it is applied. The final guard check and the
+close commitment are one atomic transition: a registration racing a close is
+either part of its decision or refused with `closing`, never accepted and
+then ignored by a teardown that revalidates nothing — and a committed close
+reserves its window until destruction or failed posting, so two
+nearly-simultaneous closes cannot both count the other as the survivor that
+preserves the backend. A pending decision belongs to its document: a reload
+while the dialog is open invalidates the answer. Once the final checks accept
+that answer, closing the window is committed and later loads do not reverse
+it. The approved secondary close uses the captured native window handle's
+`close()`; the resulting `CloseRequested` observes the reservation and proceeds
+without another dialog. No native-request token, acknowledgement or submission
+worker is needed.
+
+Second-instance admission and creation run together on the event loop,
+serialized with normal close decisions. Signal and fatal-error cleanup keep
+their independent worker paths so cleanup can start even if GTK is blocked.
+A signal concurrent with window creation may miss that new window in the
+cleanup snapshot; it can remain until process exit and extend the bounded
+window-destruction wait. This residual shutdown race is accepted for this
+local single-user application.
+
+Normal close and signal teardown share a one-shot execution latch. Fatal
+startup errors keep their own cleanup, error dialog and exit status.
 Mandatory shutdown never asks: the first step of every teardown path — the
 approved close itself, a signal, a fatal error — commits shutdown one-way,
 which turns any dialog still standing stale and refuses new guards. Cancelling
@@ -279,4 +303,3 @@ Every window enforces the same classification:
 
 No in-app popup is ever created. An external link belongs in the browser where
 the user has their bookmarks, their sessions and an address bar.
-

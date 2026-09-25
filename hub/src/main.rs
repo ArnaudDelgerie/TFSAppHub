@@ -446,33 +446,67 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             move |app, _args, _cwd| {
                 use tauri::Manager;
 
-                // A second `open` of an app already running is not an error and
-                // not a no-op: it opens another window on the backend already
-                // up. Before the backend is resolved there is no `Launch` state
-                // yet and this deliberately does nothing — the window on its way
-                // is the one the user is waiting for.
-                let Some(launch) = app.try_state::<sidecar::Launch>() else {
-                    println!("tfsapp-hub: still starting — the window is on its way.");
-                    return;
-                };
-                let result = window::create_app_window(
-                    app,
-                    &launch.url,
-                    &launch.product_name,
-                    &relaunch_origin,
-                    &relaunch_close_guards,
-                )
-                .and_then(|window| {
-                    if let Some(path) = &relaunch_icon_path {
-                        if let Some(icon) = identity::load_icon(path) {
-                            window.set_icon(icon)?;
+                // A second `open` of an app already running is not an error
+                // and not a no-op: it opens another window on the backend
+                // already up — unless a final shutdown has committed, in
+                // which case no window may be opened on this process again
+                // (plan 055: an arrival after commitment cannot revive the
+                // closing instance; before commitment it changes the
+                // topology and every close decision honours it).
+                //
+                // This callback runs on the plugin's D-Bus service thread,
+                // serialized with nothing — so it decides nothing here. The
+                // whole admission (launch presence, shutdown re-check,
+                // window creation) is one unit scheduled on the event loop,
+                // where every close decision and commitment also runs: an
+                // arrival suspended across a committed shutdown cannot open
+                // a window on the closing instance (audit 017, finding 2).
+                // A scheduling failure means the loop is gone — the process
+                // is exiting, which is the shutting-down outcome already.
+                let app = app.clone();
+                let origin = relaunch_origin.clone();
+                let guards = relaunch_close_guards.clone();
+                let icon_path = relaunch_icon_path.clone();
+                let scheduler = app.clone();
+                let scheduled = move || {
+                    let launch_present = app.try_state::<sidecar::Launch>().is_some();
+                    let outcome =
+                        window::admit_second_instance_window(&guards, launch_present, || {
+                            let launch = app.state::<sidecar::Launch>();
+                            window::create_app_window(
+                                &app,
+                                &launch.url,
+                                &launch.product_name,
+                                &origin,
+                                &guards,
+                            )
+                            .and_then(|window| {
+                                if let Some(path) = &icon_path {
+                                    if let Some(icon) = identity::load_icon(path) {
+                                        window.set_icon(icon)?;
+                                    }
+                                }
+                                Ok(())
+                            })
+                            .map_err(|error| error.to_string())
+                        });
+                    match outcome {
+                        window::SecondInstanceOutcome::StillStarting => {
+                            println!("tfsapp-hub: still starting — the window is on its way.");
+                        }
+                        window::SecondInstanceOutcome::ShuttingDown => {
+                            println!(
+                                "tfsapp-hub: this instance is shutting down; the new launch \
+                                 was not given a window."
+                            );
+                        }
+                        window::SecondInstanceOutcome::WindowOpened => {}
+                        window::SecondInstanceOutcome::WindowFailed(error) => {
+                            eprintln!("tfsapp-hub: cannot open another window: {error}");
                         }
                     }
-                    Ok(())
-                });
-                if let Err(error) = result {
-                    eprintln!("tfsapp-hub: cannot open another window: {error}");
-                }
+                };
+                let _ = scheduler.run_on_main_thread(scheduled);
             },
         ))
         .plugin(tauri_plugin_dialog::init())

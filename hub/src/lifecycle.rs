@@ -1148,6 +1148,17 @@ pub fn fatal_post_setup_error(app: tauri::AppHandle, message: String) {
     use tauri_plugin_dialog::DialogExt;
 
     std::thread::spawn(move || {
+        use tauri::Manager;
+
+        // Commit shutdown first, exactly as a signal does: a fatal error
+        // invalidates any pending close approval, refuses new guards, and
+        // never lets a dialog's late answer authorise an effect against a
+        // launch that is already failing. The dialog and the exit code below
+        // stay this path's own — error reporting and exit behavior are
+        // unchanged.
+        if let Some(state) = app.try_state::<SharedCloseGuards>() {
+            state.commit_shutdown();
+        }
         stop_sidecar(&app);
         app.dialog()
             .message(&message)
@@ -1215,6 +1226,23 @@ const WINDOW_DESTROY_BUDGET: Duration = Duration::from_secs(2);
 /// route to anything the teardown thread owns.
 static TEARDOWN_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Claim the one teardown this process ever runs. A conditional take, not a
+/// plain store: an approved final close, a termination signal and a repeated
+/// close after commitment can all reach [`stop_sidecar_and_exit`] — the
+/// state commitment they share is idempotent, but the teardown itself must
+/// run exactly once, so the first arrival to flip this latch owns it and
+/// every other one returns at the claim.
+fn claim_teardown(latch: &std::sync::atomic::AtomicBool) -> bool {
+    latch
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+}
 
 /// Whether an `ExitRequested` must be vetoed. Pure, so the one case that
 /// matters is a unit test rather than a live window.
@@ -1301,20 +1329,189 @@ fn destroy_windows<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 fn stop_sidecar_and_exit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     use tauri::Manager;
 
-    // Shutdown commitment, ahead of every teardown step and on every path
-    // that reaches here — the approved last-window close, a termination
-    // signal, a fatal post-setup error. From this line, guard operations
-    // answer `closing` and a confirmation dialog still open when a signal
-    // arrived goes stale: its late answer can authorise nothing. A
-    // mandatory shutdown never waits on a person.
+    // Ownership before anything: exactly one caller — an approved final
+    // close, a termination signal, a repeated close after commitment — runs
+    // the teardown; every other arrival returns at this line. The state
+    // commitment below is deliberately separate from this claim: a close
+    // precommitting shutdown inside `resolve_close` must not suppress its
+    // own cleanup by finding the commitment already set.
+    if !claim_teardown(&TEARDOWN_IN_FLIGHT) {
+        return;
+    }
+
+    // Shutdown commitment — idempotent, and already done when an approved
+    // final close or another teardown path got here first — ahead of every
+    // teardown step and on every path that reaches here. From this line,
+    // guard operations answer `closing` and a confirmation dialog still open
+    // when a signal arrived goes stale: its late answer can authorise
+    // nothing. A mandatory shutdown never waits on a person.
     if let Some(state) = app.try_state::<SharedCloseGuards>() {
         state.commit_shutdown();
     }
-    TEARDOWN_IN_FLIGHT.store(true, std::sync::atomic::Ordering::SeqCst);
     release_serving_claim(app);
     destroy_windows(app);
     stop_sidecar(app);
     app.exit(0);
+}
+
+/// The window and process facts the close coordinator needs, and the effects
+/// it applies — the injectable boundary between the close-decision machinery
+/// and the runtime. Production answers with [`TauriCloseWorld`], backed by
+/// the `AppHandle`; the coordinator's regressions drive it with a recording
+/// world, so interleavings assert *effects and ownership*, not enum
+/// mappings, with the destruction observed exactly when the test says so.
+///
+/// Approved secondary closes post a native close request. The state already
+/// reserves that window, so the resulting `CloseRequested` proceeds without
+/// another dialog, even if the document reloaded after approval.
+pub trait CloseWorld {
+    /// Every window this process currently has, including ones whose close
+    /// is committed but whose destruction is not observed yet.
+    fn window_labels(&self) -> Vec<String>;
+    /// Whether a shared backend exists that a last-window close would stop.
+    fn has_backend(&self) -> bool;
+    /// Hide a window whose close was approved as the backend-stopping one.
+    fn hide(&mut self, window: &str);
+    /// Post the approved window's native close. `CloseRequested` observes
+    /// the existing commitment. Return `false` if posting failed, so the
+    /// window's reservation can be released.
+    fn request_close(&mut self, window: &str) -> bool;
+    /// Start the orderly teardown off the calling thread.
+    fn start_teardown(&mut self);
+    /// Open the one native confirmation for a close that needs asking.
+    fn open_confirmation(
+        &mut self,
+        window: &str,
+        token: &str,
+        frontend: &BTreeSet<String>,
+        backend: &BTreeSet<String>,
+    );
+}
+
+/// The topology rule every close decision runs on: closing `window` stops
+/// the shared backend when one exists to stop and no other window survives
+/// this close — and a window whose close is committed but whose destruction
+/// is not observed yet is *not* a survivor. That last clause is what makes
+/// two nearly-simultaneous closes unable to both conclude that the other
+/// window will preserve the backend (audit 016, finding 1).
+fn close_stops_backend_among(
+    labels: &[String],
+    committed: &BTreeSet<String>,
+    has_backend: bool,
+    window: &str,
+) -> bool {
+    has_backend
+        && !labels
+            .iter()
+            .any(|label| label != window && !committed.contains(label))
+}
+
+/// [`close_stops_backend_among`] over a [`CloseWorld`] and the guard state.
+fn close_stops_backend_in<W: CloseWorld>(
+    world: &W,
+    state: &crate::close_guard::SharedCloseGuards,
+    window: &str,
+) -> bool {
+    close_stops_backend_among(
+        &world.window_labels(),
+        &state.committed_closing_windows(),
+        world.has_backend(),
+        window,
+    )
+}
+
+/// The close-request half of the coordinator: decide, commit, and dispatch
+/// the first effects — vetoed closes open their confirmation, unguarded
+/// backend-stopping closes hide and start the teardown, everything else is
+/// left to the default close. Runs on the event loop in production, so the
+/// topology it reads is serialized with every other window event.
+fn handle_close_request<W: CloseWorld>(
+    state: &crate::close_guard::SharedCloseGuards,
+    world: &mut W,
+    window: &str,
+) -> CloseAction {
+    let stops = close_stops_backend_in(world, state, window);
+    let flow = state.begin_close(window, stops);
+    let action = close_action(&flow, stops);
+    if let CloseFlow::Confirm {
+        token,
+        frontend,
+        backend,
+    } = &flow
+    {
+        world.open_confirmation(window, token, frontend, backend);
+    }
+    if action == CloseAction::HideAndTearDown {
+        world.hide(window);
+        world.start_teardown();
+    }
+    action
+}
+
+/// The dialog-answer half of the coordinator, on the event loop: revalidate
+/// the topology, the guards and the document incarnation, commit the close
+/// or refuse it, and dispatch the effect — post the approved secondary
+/// window's native close request (releasing the reservation when even the
+/// request could not be posted), hide and tear down an approved final one,
+/// or ask again when the warning no longer described what was at stake.
+///
+/// Document replacement invalidates a pending answer. After commitment,
+/// closing the window is final; a later document load does not cancel it.
+fn handle_close_answer<W: CloseWorld>(
+    state: &crate::close_guard::SharedCloseGuards,
+    world: &mut W,
+    window: &str,
+    token: &str,
+    approved: bool,
+) {
+    let stops = close_stops_backend_in(world, state, window);
+    match close_effect(state.resolve_close(token, approved, stops)) {
+        CloseEffect::Nothing => {}
+        CloseEffect::CloseWindow => post_approved_close(state, world, window),
+        CloseEffect::HideAndTearDown => {
+            world.hide(window);
+            world.start_teardown();
+        }
+        CloseEffect::AskAgain => {
+            // The topology is re-read after the failed recheck: the answer
+            // landed on the event loop, and whatever changed since the
+            // question was asked is the reason it is being asked again.
+            let stops_now = close_stops_backend_in(world, state, window);
+            match state.begin_close(window, stops_now) {
+                // The person already approved this close, and everything the
+                // warning covered has since vanished: it closes cleanly, with
+                // the effect the current topology calls for.
+                CloseFlow::Allow => {
+                    if stops_now {
+                        world.hide(window);
+                        world.start_teardown();
+                    } else {
+                        post_approved_close(state, world, window);
+                    }
+                }
+                // Another window's decision took the one slot while this
+                // dialog stood. This close stays open with its guards; the
+                // person can close it again once that dialog resolves.
+                CloseFlow::Busy => {}
+                CloseFlow::Confirm {
+                    token,
+                    frontend,
+                    backend,
+                } => world.open_confirmation(window, &token, &frontend, &backend),
+            }
+        }
+    }
+}
+
+/// Recover the reservation if posting failed and the window remains usable.
+fn post_approved_close<W: CloseWorld>(
+    state: &crate::close_guard::SharedCloseGuards,
+    world: &mut W,
+    window: &str,
+) {
+    if state.committed_closing_windows().contains(window) && !world.request_close(window) {
+        state.release_close(window);
+    }
 }
 
 /// The window-close handler.
@@ -1339,41 +1536,36 @@ fn stop_sidecar_and_exit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 ///
 /// A window closing while others remain closes only itself: the backend belongs
 /// to the app, not to any one of its windows — and the guards of another,
-/// surviving window never make a clean secondary window prompt.
+/// surviving window never make a clean secondary window prompt. This handler
+/// runs on the event loop, so the topology every decision reads is serialized
+/// with the other windows' close requests, their destruction, and a
+/// second-instance arrival.
 pub fn on_window_event<R: tauri::Runtime>(window: &tauri::Window<R>, event: &tauri::WindowEvent) {
     use tauri::Manager;
 
     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
         let app = window.app_handle();
-        let last_window_with_sidecar = close_stops_backend(app, window.label());
-
-        // A launch always manages a guard state before its first window, so
-        // the `None` arm is the shape no real launch has — and teardown needs
-        // it anyway: `begin_close` answers `Allow` once shutdown has
-        // committed, so a mandatory teardown never waits on a dialog.
-        let flow = match app.try_state::<SharedCloseGuards>() {
-            Some(state) => state.begin_close(window.label(), last_window_with_sidecar),
-            None => CloseFlow::Allow,
-        };
-        match close_action(&flow, last_window_with_sidecar) {
-            CloseAction::Default => {}
-            CloseAction::KeepOpen => api.prevent_close(),
-            CloseAction::HideAndTearDown => {
-                api.prevent_close();
-                let _ = window.hide();
-                let app = app.clone();
-                std::thread::spawn(move || stop_sidecar_and_exit(&app));
+        match app.try_state::<SharedCloseGuards>() {
+            Some(state) => {
+                let mut world = TauriCloseWorld { app };
+                let action = handle_close_request(&state, &mut world, window.label());
+                if action != CloseAction::Default {
+                    api.prevent_close();
+                }
             }
-        }
-        if let CloseFlow::Confirm {
-            token,
-            frontend,
-            backend,
-        } = flow
-        {
-            // The close itself is already vetoed above; the window stays
-            // visible, serving and every lock held until the person answers.
-            open_close_confirmation(app, window.label(), token, frontend, backend);
+            // A launch always manages a guard state before its first window,
+            // so this arm is the shape no real launch has — the pre-055
+            // behavior, kept for the same reason `begin_close` needs a
+            // guard-free answer: teardown must never depend on state being
+            // present.
+            None => {
+                if close_stops_backend(app, window.label()) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    let app = app.clone();
+                    std::thread::spawn(move || stop_sidecar_and_exit(&app));
+                }
+            }
         }
     }
 
@@ -1382,7 +1574,8 @@ pub fn on_window_event<R: tauri::Runtime>(window: &tauri::Window<R>, event: &tau
     // (`main`-`N` gap-filling) is a new owner by the plan's own rule. The
     // backend namespace is untouched — it belongs to the app instance, not to
     // a window. This runs for every destruction path, including teardown's
-    // own `destroy()`.
+    // own `destroy()`, and it is also what releases the window's close
+    // reservation: the destruction has now been observed.
     if let tauri::WindowEvent::Destroyed = event {
         if let Some(state) = window
             .app_handle()
@@ -1393,20 +1586,86 @@ pub fn on_window_event<R: tauri::Runtime>(window: &tauri::Window<R>, event: &tau
     }
 }
 
+/// The [`CloseWorld`] production impl, backed by the app handle.
+struct TauriCloseWorld<'a, R: tauri::Runtime> {
+    app: &'a tauri::AppHandle<R>,
+}
+
+impl<R: tauri::Runtime> CloseWorld for TauriCloseWorld<'_, R> {
+    fn window_labels(&self) -> Vec<String> {
+        use tauri::Manager;
+        self.app.webview_windows().into_keys().collect()
+    }
+
+    fn has_backend(&self) -> bool {
+        use tauri::Manager;
+        self.app
+            .try_state::<std::sync::Mutex<crate::sidecar::Sidecar>>()
+            .is_some()
+    }
+
+    fn hide(&mut self, window: &str) {
+        use tauri::Manager;
+        if let Some(webview) = self.app.get_webview_window(window) {
+            let _ = webview.hide();
+        }
+    }
+
+    fn request_close(&mut self, window: &str) -> bool {
+        use tauri::Manager;
+        // An absent window is not a failed request: it is already gone,
+        // and its `Destroyed` event has already released the reservation.
+        match self.app.get_webview_window(window) {
+            // The handle targets this native window; `begin_close` lets its
+            // committed close proceed without rechecking document identity.
+            Some(webview) => webview.close().is_ok(),
+            None => true,
+        }
+    }
+
+    fn start_teardown(&mut self) {
+        let app = self.app.clone();
+        std::thread::spawn(move || stop_sidecar_and_exit(&app));
+    }
+
+    fn open_confirmation(
+        &mut self,
+        window: &str,
+        token: &str,
+        frontend: &BTreeSet<String>,
+        backend: &BTreeSet<String>,
+    ) {
+        open_close_confirmation(
+            self.app,
+            window,
+            token.to_string(),
+            frontend.clone(),
+            backend.clone(),
+        );
+    }
+}
+
 /// Whether closing `window` right now would stop the shared backend: it is
 /// the last window this process has, and there is a sidecar to stop. Asked
 /// fresh at every decision point — the closing window is still open at this
 /// point, so its own label is excluded — because a window opened or closed
-/// between two moments is honoured, never assumed away.
+/// between two moments is honoured, never assumed away. A window whose close
+/// is committed but whose destruction is not observed yet is counted as
+/// closing, never as a survivor.
 fn close_stops_backend<R: tauri::Runtime>(app: &tauri::AppHandle<R>, window: &str) -> bool {
     use tauri::Manager;
 
-    !app.webview_windows()
-        .into_keys()
-        .any(|label| label != window)
-        && app
-            .try_state::<std::sync::Mutex<crate::sidecar::Sidecar>>()
-            .is_some()
+    let committed = app
+        .try_state::<SharedCloseGuards>()
+        .map(|state| state.committed_closing_windows())
+        .unwrap_or_default();
+    close_stops_backend_among(
+        &app.webview_windows().into_keys().collect::<Vec<_>>(),
+        &committed,
+        app.try_state::<std::sync::Mutex<crate::sidecar::Sidecar>>()
+            .is_some(),
+        window,
+    )
 }
 
 /// What `on_window_event` does about the default close, before any dialog is
@@ -1514,6 +1773,11 @@ fn close_warning(
 /// callback, never `blocking_show`, because the caller is the GTK main
 /// thread and blocking here would deadlock before the dialog could ever
 /// paint — the same constraint `fatal_post_setup_error` documents.
+///
+/// The window whose close the decision covers is still open — the close was
+/// vetoed, not performed — so it can parent the dialog. If it is somehow gone
+/// already, the answer will be `Invalidated` and there is nothing left to
+/// ask about.
 fn open_close_confirmation<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     window: &str,
@@ -1524,11 +1788,14 @@ fn open_close_confirmation<R: tauri::Runtime>(
     use tauri::Manager;
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
-    // The decision's window is still open — the close was vetoed, not
-    // performed — so it can parent the dialog. If it is somehow gone
-    // already, the answer will be `Invalidated` and there is nothing left to
-    // ask about.
     let Some(webview) = app.get_webview_window(window) else {
+        // No parent, no dialog — and no slot left occupied behind a decision
+        // nobody can answer: the window's destruction already marked the
+        // pending decision destroyed, so this resolve frees it with the
+        // honest `Invalidated` (or finds a signal already did the same).
+        if let Some(state) = app.try_state::<SharedCloseGuards>() {
+            let _ = state.resolve_close(&token, false, false);
+        }
         return;
     };
     let (title, message) = close_warning(&frontend, &backend);
@@ -1548,10 +1815,12 @@ fn open_close_confirmation<R: tauri::Runtime>(
         .show(move |approved| apply_close_answer(&app, &window, &token, approved));
 }
 
-/// Apply a confirmation dialog's answer — the one close-guard function that
-/// runs on a worker thread rather than the main one. Nothing here blocks on
-/// GTK: window calls post to the event loop, and the teardown spawns its own
-/// thread exactly as the direct last-window close already does.
+/// Apply a confirmation dialog's answer — the one close-guard function the
+/// dialog thread calls. It performs no coordination itself: it hops the
+/// answer to the event loop, where [`handle_close_answer`] reads the final
+/// topology serialized with every other window event — a neighbouring
+/// `CloseRequested`, a `Destroyed`, a second-instance window — commits the
+/// close, and dispatches the effect. Nothing here blocks on GTK.
 fn apply_close_answer<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     window: &str,
@@ -1560,66 +1829,28 @@ fn apply_close_answer<R: tauri::Runtime>(
 ) {
     use tauri::Manager;
 
-    let Some(state) = app.try_state::<SharedCloseGuards>() else {
-        return;
+    let window = window.to_string();
+    let token = token.to_string();
+    let app_after_schedule = app.clone();
+    let scheduled = {
+        let app = app.clone();
+        let token = token.clone();
+        app.clone().run_on_main_thread(move || {
+            let Some(state) = app.try_state::<SharedCloseGuards>() else {
+                return;
+            };
+            let mut world = TauriCloseWorld { app: &app };
+            handle_close_answer(&state, &mut world, &window, &token, approved);
+        })
     };
-    // Topology at answer time: `resolve_close` rechecks the guards in the
-    // same critical section, so a guard that appeared or a window that
-    // opened while the dialog stood is honoured, never assumed away.
-    let stops_backend = close_stops_backend(app, window);
-    match close_effect(state.resolve_close(token, approved, stops_backend)) {
-        CloseEffect::Nothing => {}
-        CloseEffect::CloseWindow => close_window_once(app, window),
-        CloseEffect::HideAndTearDown => hide_and_tear_down(app, window),
-        CloseEffect::AskAgain => match state.begin_close(window, stops_backend) {
-            // The person already approved this close, and everything the
-            // warning covered has since vanished: it closes cleanly, with
-            // the effect the original topology would have had.
-            CloseFlow::Allow => {
-                if stops_backend {
-                    hide_and_tear_down(app, window);
-                } else {
-                    close_window_once(app, window);
-                }
-            }
-            // Another window's decision took the one slot while this dialog
-            // stood. This close stays open with its guards; the person can
-            // close it again once that dialog resolves.
-            CloseFlow::Busy => {}
-            CloseFlow::Confirm {
-                token,
-                frontend,
-                backend,
-            } => open_close_confirmation(app, window, token, frontend, backend),
-        },
+    if scheduled.is_err() {
+        // The event loop is gone — this process is on its way out — but the
+        // one pending slot must not stay occupied behind a dead callback:
+        // resolve as refused, which frees it without committing anything.
+        if let Some(state) = app_after_schedule.try_state::<SharedCloseGuards>() {
+            let _ = state.resolve_close(&token, false, false);
+        }
     }
-}
-
-/// Close one window the person approved closing, once. `destroy()`, never
-/// `close()`: `close()` fires `CloseRequested` again with the guards still
-/// standing, which would ask a second time about a decision already made.
-/// `destroy()` emits `Destroyed` instead, which is what drops this window's
-/// frontend guards.
-fn close_window_once<R: tauri::Runtime>(app: &tauri::AppHandle<R>, window: &str) {
-    use tauri::Manager;
-
-    if let Some(webview) = app.get_webview_window(window) {
-        let _ = webview.destroy();
-    }
-}
-
-/// Hide the window the person approved closing, then tear the app down
-/// off-thread — the same orderly path the unguarded last-window close takes.
-/// `stop_sidecar_and_exit` commits shutdown before its first step, so the
-/// guards can never re-open a dialog against a teardown already running.
-fn hide_and_tear_down<R: tauri::Runtime>(app: &tauri::AppHandle<R>, window: &str) {
-    use tauri::Manager;
-
-    if let Some(webview) = app.get_webview_window(window) {
-        let _ = webview.hide();
-    }
-    let app = app.clone();
-    std::thread::spawn(move || stop_sidecar_and_exit(&app));
 }
 
 /// Turn a `SIGINT`/`SIGTERM` into the same orderly shutdown as closing the last
