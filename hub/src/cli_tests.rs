@@ -1,6 +1,6 @@
 use super::{
-    help_text, parse, Availability, Command, OpenChildSource, RunInvocation, UsageError,
-    NOT_YET_MARKER, SURFACE,
+    help_text, parse, second_instance_files, Availability, Command, OpenChildSource, RunInvocation,
+    UsageError, NOT_YET_MARKER, SURFACE,
 };
 
 /// Every test spells its invocation the way a user types it. Splitting on
@@ -83,7 +83,8 @@ fn bare_words_route_to_an_app() {
     assert_eq!(
         command("open demo"),
         Command::Open {
-            id: "demo".to_string()
+            id: "demo".to_string(),
+            files: Vec::new()
         }
     );
     assert_eq!(
@@ -317,8 +318,11 @@ fn a_malformed_invocation_names_the_right_form() {
     let cases = [
         ("open", "open <id>"),
         ("open one two", "open <id>"),
+        ("open demo --", "open <id> [-- <file>...]"),
+        ("open -- /tmp/a.md", "open <id> [-- <file>...]"),
         ("dev", "dev <local-path>"),
         ("dev one two", "dev <local-path>"),
+        ("dev /tmp/demo -- /tmp/a.md", "dev <local-path>"),
         ("install", "install <source>"),
         ("install ../app --as", "install <source>"),
         ("list --all", "list"),
@@ -446,6 +450,7 @@ fn the_hidden_open_subcommand_stays_reachable_and_unlisted() {
             identifier: "dev.local.demo".to_string(),
             product_name: "Demo".to_string(),
             icon_path: Some("/tmp/demo.png".to_string()),
+            files: Vec::new(),
         }
     );
     // `dev`'s own source, the same form otherwise — one hidden subcommand
@@ -457,6 +462,7 @@ fn the_hidden_open_subcommand_stays_reachable_and_unlisted() {
             identifier: "dev.local.demo".to_string(),
             product_name: "Demo".to_string(),
             icon_path: None,
+            files: Vec::new(),
         }
     );
     // `--identity`/`--name` are required and never defaulted: this form is
@@ -579,5 +585,122 @@ fn the_version_has_one_source_and_it_is_cargo_toml() {
     assert!(
         config.get("version").is_none(),
         "tauri.conf.json must not declare a version — Cargo.toml is the source"
+    );
+}
+
+// --- open's file operands ------------------------------------------------
+
+#[test]
+fn a_file_bearing_open_keeps_its_operands_verbatim() {
+    // The separator is the whole contract: after it, nothing is a flag, so
+    // option-looking names and Unicode are one argument each, in the
+    // invocation's own order — the order the request's paths keep.
+    assert_eq!(
+        command("open demo -- /tmp/a.md --help --résumé.md"),
+        Command::Open {
+            id: "demo".to_string(),
+            files: vec![
+                "/tmp/a.md".to_string(),
+                "--help".to_string(),
+                "--résumé.md".to_string()
+            ],
+        }
+    );
+    // Spaces are argv, not syntax: a path containing them arrives as one
+    // argument and leaves as one path, quotes included.
+    let spaced = [
+        "open".to_string(),
+        "demo".to_string(),
+        "--".to_string(),
+        "/tmp/my file.md".to_string(),
+        "\"quoted.md\"".to_string(),
+    ];
+    assert_eq!(
+        parse(&spaced),
+        Ok(Command::Open {
+            id: "demo".to_string(),
+            files: vec!["/tmp/my file.md".to_string(), "\"quoted.md\"".to_string()],
+        })
+    );
+}
+
+#[test]
+fn help_does_not_win_past_the_operand_separator() {
+    // A file named `--help` is a file; the question `--help` asks has to come
+    // before the caller's own operands start.
+    assert_eq!(
+        command("open demo -- --help"),
+        Command::Open {
+            id: "demo".to_string(),
+            files: vec!["--help".to_string()],
+        }
+    );
+    assert_eq!(
+        command("install ../app --help"),
+        Command::Help,
+        "without a separator, --help keeps winning anywhere"
+    );
+}
+
+#[test]
+fn the_hidden_open_subcommand_carries_the_batch_after_its_separator() {
+    assert_eq!(
+        command("__open --id demo --identity dev.local.demo --name Demo -- /tmp/a.md b.md"),
+        Command::OpenChild {
+            source: OpenChildSource::Id("demo".to_string()),
+            identifier: "dev.local.demo".to_string(),
+            product_name: "Demo".to_string(),
+            icon_path: None,
+            files: vec!["/tmp/a.md".to_string(), "b.md".to_string()],
+        }
+    );
+    // A dev session is not a file receiver: the separator is refused with the
+    // reason, not by silently dropping the operands.
+    let refusal =
+        refusal("__open --project /tmp/demo --identity dev.local.demo --name Demo -- /tmp/a.md");
+    assert!(
+        refusal.message.contains("takes files only with --id"),
+        "said {refusal}"
+    );
+}
+
+#[test]
+fn a_second_instance_argv_is_read_back_by_the_same_parser() {
+    // The pinned plugin hands the live instance the second process's whole
+    // argv, program name included — the same argv the parent wrote, read back
+    // by the same parser.
+    let argv = |line: &str| -> Vec<String> {
+        std::iter::once("/path/to/tfsapp-hub".to_string())
+            .chain(line.split_whitespace().map(str::to_string))
+            .collect()
+    };
+    assert_eq!(
+        second_instance_files(&argv(
+            "__open --id demo --identity dev.local.demo --name Demo -- /tmp/a.md"
+        )),
+        vec!["/tmp/a.md".to_string()],
+        "a file-bearing child argv is an arrival"
+    );
+    assert_eq!(
+        second_instance_files(&argv(
+            "__open --id demo --identity dev.local.demo --name Demo"
+        )),
+        Vec::<String>::new(),
+        "a no-file child argv is a plain second window"
+    );
+    assert_eq!(
+        second_instance_files(&argv("__open --project /tmp/demo --identity dev.local.demo --name Demo -- /tmp/a.md")),
+        Vec::<String>::new(),
+        "a hand-typed dev-with-files argv never parses: the parser refuses it, and the window admission is the fallback"
+    );
+    assert_eq!(
+        second_instance_files(&argv("list")),
+        Vec::<String>::new(),
+        "an argv that is not an __open child is no arrival at all"
+    );
+    assert_eq!(
+        second_instance_files(&[]),
+        Vec::<String>::new(),
+        "an empty argv cannot be an arrival"
     );
 }

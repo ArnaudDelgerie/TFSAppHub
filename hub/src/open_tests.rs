@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use super::{child_args, launch_header, prepare_hub_log, resolve, OpenError};
+use super::{absolute_paths, child_args, launch_header, prepare_hub_log, resolve, OpenError};
 use crate::{
     launch::Source as LaunchSource,
     lifecycle,
@@ -274,7 +274,7 @@ fn the_child_carries_its_identity_in_argv() {
     let app_dir = paths.app_dir("demo").expect("an app dir path");
     snapshot(&app_dir, "dev.local.demo", Some("icon.png"));
 
-    let args = child_args(&resolve(&paths, "demo").expect("a resolvable app"));
+    let args = child_args(&resolve(&paths, "demo").expect("a resolvable app"), &[]);
 
     // Identity before I/O: the child has to apply all of this before anything
     // touches GTK, so everything it needs at that point travels in argv.
@@ -299,7 +299,7 @@ fn an_app_with_no_icon_passes_no_icon_argument() {
     let (_base, paths) = temp_paths();
     ready(&paths, "demo");
 
-    let args = child_args(&resolve(&paths, "demo").expect("a resolvable app"));
+    let args = child_args(&resolve(&paths, "demo").expect("a resolvable app"), &[]);
 
     // Rather than an empty `--icon ""`, which the child would have to tell apart
     // from a path it failed to read.
@@ -404,4 +404,48 @@ fn prepare_hub_log_falls_back_to_inherited_stdio_when_the_dir_cannot_be_created(
     fs::set_permissions(base.path(), perms).unwrap();
 
     assert!(hub_log.is_none());
+}
+
+// --- the file batch -----------------------------------------------------
+
+#[test]
+fn the_child_argv_carries_the_batch_after_the_separator() {
+    let (_base, paths) = temp_paths();
+    ready(&paths, "demo");
+
+    let spec = resolve(&paths, "demo").expect("a resolvable app");
+    let args = child_args(
+        &spec,
+        &["/tmp/one file.md".to_string(), "--help".to_string()],
+    );
+
+    // Distinct arguments after a bare `--`: no quoting, no interpolation —
+    // the separator is what says the rest are paths, and nothing else does.
+    let separator = args.iter().position(|argument| argument == "--").unwrap();
+    assert_eq!(
+        args[separator + 1..],
+        ["/tmp/one file.md".to_string(), "--help".to_string()]
+    );
+    // The separator exists only for a file-bearing launch.
+    let bare = child_args(&spec, &[]);
+    assert!(!bare.iter().any(|argument| argument == "--"));
+}
+
+#[test]
+fn relative_paths_are_made_absolute_against_the_callers_working_directory() {
+    let cwd = std::env::current_dir().expect("a working directory");
+    let batch = absolute_paths(&["/abs/a.md".to_string(), "rel/b.md".to_string()])
+        .expect("the caller's working directory is readable");
+
+    // The absolute path is the caller's own spelling, untouched; the relative
+    // one is read against the cwd this process was invoked from — made
+    // absolute, never canonicalized, so what the request names is what the
+    // caller named.
+    assert_eq!(
+        batch,
+        vec![
+            "/abs/a.md".to_string(),
+            cwd.join("rel/b.md").display().to_string(),
+        ]
+    );
 }

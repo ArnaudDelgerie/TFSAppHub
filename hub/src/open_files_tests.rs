@@ -544,3 +544,187 @@ fn an_emit_failure_is_diagnosed_and_retains_the_queue() {
     notify(app.handle(), "main");
     assert_eq!(queue.pending("main").len(), 1);
 }
+
+// --- the enqueueing boundary ----------------------------------------------
+
+#[test]
+fn a_batch_of_existing_regular_files_validates() {
+    let base = tempfile::tempdir().expect("a temp dir");
+    let file = base.path().join("notes.md");
+    std::fs::write(&file, "x").expect("a written file");
+
+    validate_batch(&[file.display().to_string()]).expect("an existing regular file validates");
+}
+
+#[test]
+fn a_batch_is_validated_whole_before_anything_is_enqueued() {
+    let base = tempfile::tempdir().expect("a temp dir");
+    let file = base.path().join("notes.md");
+    std::fs::write(&file, "x").expect("a written file");
+    let existing = file.display().to_string();
+
+    // Each refusal names the offending path and the reason.
+    let relative = validate_batch(&["notes.md".to_string()]).unwrap_err();
+    assert!(
+        relative.contains("notes.md") && relative.contains("absolute"),
+        "{relative}"
+    );
+    let missing = validate_batch(&[base.path().join("gone.md").display().to_string()]).unwrap_err();
+    assert!(missing.contains("gone.md"), "{missing}");
+    let directory = validate_batch(&[base.path().display().to_string()]).unwrap_err();
+    assert!(directory.contains("regular file"), "{directory}");
+    let oversized = validate_batch(&vec![existing; MAX_PATHS_PER_REQUEST + 1]).unwrap_err();
+    assert!(oversized.contains("at most"), "{oversized}");
+}
+
+#[test]
+fn an_arrival_during_startup_waits_in_the_pre_launch_pool() {
+    let queue = shared_queue();
+    let app = app_with_windows(&queue, &[]);
+    let guards: crate::close_guard::SharedCloseGuards =
+        std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
+    let base = tempfile::tempdir().expect("a temp dir");
+    let file = base.path().join("notes.md");
+    std::fs::write(&file, "x").expect("a written file");
+    let path = file.display().to_string();
+
+    // No `sidecar::Launch` managed: the app's first document does not exist
+    // yet, so the arrival waits rather than targets a window.
+    assert_eq!(
+        deliver_arrival(
+            app.handle(),
+            &guards,
+            true,
+            false,
+            std::slice::from_ref(&path)
+        ),
+        ArrivalOutcome::Delivered { window: None },
+        "the splash era pools the arrival"
+    );
+    assert_eq!(queue.total_pending(), 1);
+    // The launch's hand-over claim is what delivers it.
+    assert_eq!(queue.claim_unassigned("main"), 1);
+}
+
+#[test]
+fn an_arrival_on_a_running_app_targets_its_window() {
+    let queue = shared_queue();
+    let app = app_with_windows(&queue, &["main"]);
+    app.manage(crate::sidecar::Launch {
+        url: "tauri://localhost".to_string(),
+        product_name: "Demo".to_string(),
+    });
+    let guards: crate::close_guard::SharedCloseGuards =
+        std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
+    app.manage(guards.clone());
+    let base = tempfile::tempdir().expect("a temp dir");
+    let file = base.path().join("notes.md");
+    std::fs::write(&file, "x").expect("a written file");
+    let path = file.display().to_string();
+
+    let outcome = deliver_arrival(app.handle(), &guards, true, true, &[path]);
+    assert_eq!(
+        outcome,
+        ArrivalOutcome::Delivered {
+            window: Some("main".to_string())
+        },
+        "the running app's window receives"
+    );
+    assert_eq!(
+        paths_of(&queue.pending("main")),
+        vec![vec![file.display().to_string()]],
+        "despite what select_target_window made of the mock window's origin"
+    );
+}
+
+#[test]
+fn a_committed_shutdown_refuses_an_arrival_without_enqueueing() {
+    let queue = shared_queue();
+    let app = app_with_windows(&queue, &["main"]);
+    let guards: crate::close_guard::SharedCloseGuards =
+        std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
+    app.manage(guards.clone());
+    guards.commit_shutdown();
+    let base = tempfile::tempdir().expect("a temp dir");
+    let file = base.path().join("notes.md");
+    std::fs::write(&file, "x").expect("a written file");
+
+    let refused = deliver_arrival(
+        app.handle(),
+        &guards,
+        true,
+        true,
+        &[file.display().to_string()],
+    );
+    assert!(
+        matches!(refused, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("shutting down")),
+        "said {refused:?}"
+    );
+    assert_eq!(queue.total_pending(), 0, "nothing was enqueued");
+}
+
+#[test]
+fn an_undeclared_receiver_or_invalid_batch_is_refused_before_enqueueing() {
+    let queue = shared_queue();
+    let app = app_with_windows(&queue, &["main"]);
+    let guards: crate::close_guard::SharedCloseGuards =
+        std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
+    let base = tempfile::tempdir().expect("a temp dir");
+    let file = base.path().join("notes.md");
+    std::fs::write(&file, "x").expect("a written file");
+    let path = file.display().to_string();
+
+    let undeclared = deliver_arrival(
+        app.handle(),
+        &guards,
+        false,
+        true,
+        std::slice::from_ref(&path),
+    );
+    assert!(
+        matches!(undeclared, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("open_files receiver")),
+        "said {undeclared:?}"
+    );
+    let invalid = deliver_arrival(app.handle(), &guards, true, true, &["notes.md".to_string()]);
+    assert!(
+        matches!(invalid, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("absolute")),
+        "said {invalid:?}"
+    );
+    assert_eq!(queue.total_pending(), 0, "nothing was enqueued either way");
+}
+
+#[test]
+fn a_running_app_with_no_eligible_window_refuses_the_arrival() {
+    let queue = shared_queue();
+    // The app is running (Launch managed) but the only window is committed
+    // closing: there is nowhere to deliver, and the pre-launch pool would
+    // only strand the request behind a claim that already happened.
+    let app = app_with_windows(&queue, &["main"]);
+    app.manage(crate::sidecar::Launch {
+        url: "tauri://localhost".to_string(),
+        product_name: "Demo".to_string(),
+    });
+    let guards: crate::close_guard::SharedCloseGuards =
+        std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
+    app.manage(guards.clone());
+    assert_eq!(
+        guards.begin_close("main", false),
+        crate::close_guard::CloseFlow::Allow
+    );
+    let base = tempfile::tempdir().expect("a temp dir");
+    let file = base.path().join("notes.md");
+    std::fs::write(&file, "x").expect("a written file");
+
+    let refused = deliver_arrival(
+        app.handle(),
+        &guards,
+        true,
+        true,
+        &[file.display().to_string()],
+    );
+    assert!(
+        matches!(refused, ArrivalOutcome::Refused(ref diagnostic) if diagnostic.contains("no window")),
+        "said {refused:?}"
+    );
+    assert_eq!(queue.total_pending(), 0);
+}

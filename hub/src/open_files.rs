@@ -470,6 +470,146 @@ pub fn present_target_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, windo
     }
 }
 
+// --- the enqueueing boundary ------------------------------------------------
+//
+// Three callers admit batches — the parent `open` before it detaches its
+// child, the child re-validating the argv it was handed, and the live
+// instance's second-instance callback — and they ask the same questions in
+// the same order: does this app declare the receiver at all, and does every
+// path name a local, existing, regular file? The answers are diagnostics,
+// printed by whoever is in a position to print them, because nothing is
+// enqueued until the whole batch passes.
+
+/// Whether `manifest` declares the receiver a file batch can be delivered
+/// to — `actions.open_files.ipc`, the one transport this group has. A
+/// nonempty `file_associations` declaration is already refused at parse time
+/// without it (CONTRACT.md §2), so this is the single question left at the
+/// boundary.
+pub fn receiver_declared(manifest: &crate::manifest::Manifest) -> bool {
+    manifest.actions.open_files.ipc
+}
+
+/// Validate a whole incoming batch before anything is enqueued: one
+/// diagnostic for the first path that fails, naming it and why. Local,
+/// existing, regular files only — a declaration of what will be delivered,
+/// never a readability guarantee: deletion, permission changes and
+/// unsuitable content remain the receiver's to handle when it opens what it
+/// accepted.
+pub fn validate_batch(paths: &[String]) -> Result<(), String> {
+    if paths.len() > MAX_PATHS_PER_REQUEST {
+        return Err(format!(
+            "a file request may carry at most {MAX_PATHS_PER_REQUEST} paths (CONTRACT.md §7)"
+        ));
+    }
+    for path in paths {
+        let file = std::path::Path::new(path);
+        if !file.is_absolute() {
+            return Err(format!(
+                "{path} is not an absolute path — the hub does not reinterpret a relative \
+                 one behind its caller's back"
+            ));
+        }
+        match std::fs::metadata(file) {
+            Err(error) => {
+                return Err(format!("{path} is not an existing local file: {error}"));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(format!(
+                    "{path} is not a regular file — directories and devices are not delivered"
+                ));
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// What one arrival in the live instance came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArrivalOutcome {
+    /// The request is queued: for the window it names — already notified and
+    /// presented — or for the app's first document, with the launch's
+    /// hand-over claim doing the notifying.
+    Delivered { window: Option<String> },
+    /// Nothing was enqueued; the string is the diagnostic to report.
+    Refused(String),
+}
+
+/// One arrival's delivery in the live instance: the whole body of the
+/// single-instance callback's file branch except the scheduling and the
+/// reporting. Runs on the event loop, where every close decision and
+/// commitment also runs, so the shutdown admission it re-reads here is the
+/// boundary the contract names — an arrival suspended across a committed
+/// shutdown finds the commitment when it finally runs, and delivers
+/// nothing. A file-bearing arrival never opens a window; the no-file branch
+/// the caller falls back to is the only one that ever does.
+pub fn deliver_arrival<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    guards: &crate::close_guard::SharedCloseGuards,
+    declared: bool,
+    launch_present: bool,
+    paths: &[String],
+) -> ArrivalOutcome {
+    if guards.is_closing() {
+        return ArrivalOutcome::Refused(
+            "this instance is shutting down; the file request was discarded with it".to_string(),
+        );
+    }
+    if !declared {
+        return ArrivalOutcome::Refused(
+            "this app declares no open_files receiver, so the files were not delivered".to_string(),
+        );
+    }
+    if let Err(diagnostic) = validate_batch(paths) {
+        return ArrivalOutcome::Refused(diagnostic);
+    }
+    // The app's first document does not exist yet: the request waits in the
+    // pre-launch pool, and the launch's hand-over claim delivers it. Never a
+    // window here — the splash cannot consume app requests.
+    let target = if launch_present {
+        match select_target_window(app, None) {
+            Some(window) => Some(window),
+            None => {
+                return ArrivalOutcome::Refused(
+                    "no window of this app can receive files right now".to_string(),
+                )
+            }
+        }
+    } else {
+        None
+    };
+    match enqueue(app, paths, target.as_deref()) {
+        Ok(()) => {
+            // Outside the state lock, and only for a request that landed in a
+            // window: the pre-launch pool is announced by the launch's
+            // hand-over claim instead.
+            if let Some(window) = &target {
+                notify(app, window);
+                present_target_window(app, window);
+            }
+            ArrivalOutcome::Delivered { window: target }
+        }
+        Err(diagnostic) => ArrivalOutcome::Refused(diagnostic),
+    }
+}
+
+/// The last step of an admitted arrival. Answers the diagnostic when the
+/// queue refused — nothing was evicted and nothing was enqueued.
+fn enqueue<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    paths: &[String],
+    target: Option<&str>,
+) -> Result<(), String> {
+    use tauri::Manager;
+    let state = app
+        .try_state::<SharedOpenFiles>()
+        .ok_or_else(|| NO_STATE.to_string())?;
+    state
+        .enqueue(paths.to_vec(), target)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 // --- the IPC receiver -------------------------------------------------------
 //
 // Two Tauri commands, granted at runtime only when the manifest declares

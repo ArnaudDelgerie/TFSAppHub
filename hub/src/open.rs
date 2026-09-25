@@ -59,7 +59,12 @@ use crate::{
 /// and a native dialog too when stderr is not a terminal, because a launch
 /// started from a desktop entry has no terminal for the line to land on (see
 /// this module's doc comment's table).
-pub fn run(id: &str) -> i32 {
+///
+/// A file-bearing invocation refuses *here*, before the child is detached:
+/// the receiver capability is the manifest's promise that the app can ever
+/// acknowledge what it is handed, and a batch that fails validation names the
+/// offending path rather than launching a window the files never reach.
+pub fn run(id: &str, files: &[String]) -> i32 {
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
         Err(error) => {
@@ -78,7 +83,16 @@ pub fn run(id: &str) -> i32 {
                  follow hub.log."
             );
         }
-        launch(&paths, &resolved)
+        if !files.is_empty() {
+            if !crate::open_files::receiver_declared(&resolved.manifest) {
+                return Err(OpenError::NoReceiver { id: id.to_string() });
+            }
+            let batch = absolute_paths(files)?;
+            crate::open_files::validate_batch(&batch).map_err(OpenError::InvalidBatch)?;
+            launch(&paths, &resolved, &batch)
+        } else {
+            launch(&paths, &resolved, &[])
+        }
     });
 
     match launched {
@@ -193,9 +207,14 @@ pub fn resolve(paths: &Paths, id: &str) -> Result<LaunchSpec, OpenError> {
 /// I/O at all. `--id` comes along so the child can resolve the rest of the app
 /// once it is safely past that point.
 ///
+/// A file-bearing invocation appends its batch after a `--` separator: the
+/// paths are already absolute and validated, and they travel as distinct
+/// arguments so spaces, Unicode, quotes and option-looking names survive
+/// verbatim — no shell, no quoting, no interpolation.
+///
 /// Only ever called on a [`Source::Installed`] spec — `resolve` above is this
 /// module's only constructor, and it never builds a `Live` one.
-pub fn child_args(spec: &LaunchSpec) -> Vec<String> {
+pub fn child_args(spec: &LaunchSpec, files: &[String]) -> Vec<String> {
     let mut args = vec![
         OPEN_CHILD_SUBCOMMAND.to_string(),
         "--id".to_string(),
@@ -211,7 +230,31 @@ pub fn child_args(spec: &LaunchSpec) -> Vec<String> {
         args.push("--icon".to_string());
         args.push(icon.display().to_string());
     }
+    if !files.is_empty() {
+        args.push("--".to_string());
+        args.extend(files.iter().cloned());
+    }
     args
+}
+
+/// The batch as the child must see it: every path absolute. A relative path
+/// is read against the *originating caller's* working directory — here, in
+/// the parent, before the child is detached into a context where that cwd no
+/// longer names the person who typed the command. Made absolute, never
+/// canonicalized: the request names what the caller named, symlink and `..`
+/// included.
+fn absolute_paths(files: &[String]) -> Result<Vec<String>, OpenError> {
+    let cwd = std::env::current_dir().map_err(OpenError::NoWorkingDirectory)?;
+    Ok(files
+        .iter()
+        .map(|file| {
+            if std::path::Path::new(file).is_absolute() {
+                file.clone()
+            } else {
+                cwd.join(file).display().to_string()
+            }
+        })
+        .collect())
 }
 
 /// Re-execute this binary as the app's own process, and answer with its pid.
@@ -225,10 +268,10 @@ pub fn child_args(spec: &LaunchSpec) -> Vec<String> {
 /// header marking where this one starts; stdin is nulled. `dev` is the path
 /// where inheritance is still right, because its parent stays in the
 /// foreground and waits for the child.
-fn launch(paths: &Paths, spec: &LaunchSpec) -> Result<u32, OpenError> {
+fn launch(paths: &Paths, spec: &LaunchSpec, files: &[String]) -> Result<u32, OpenError> {
     let executable = std::env::current_exe().map_err(OpenError::NoExecutable)?;
     let mut command = Command::new(&executable);
-    command.args(child_args(spec));
+    command.args(child_args(spec, files));
     tfsapp_core::process::set_own_process_group(&mut command);
 
     let hub_log = prepare_hub_log(paths, &spec.identity.identifier, &mut command);
@@ -358,6 +401,19 @@ pub enum OpenError {
         registered: String,
         declared: String,
     },
+    /// A file-bearing `open` of an app whose manifest declares no
+    /// `actions.open_files` receiver — the files cannot be delivered, so
+    /// nothing is launched at all.
+    NoReceiver {
+        id: String,
+    },
+    /// The originating caller's working directory could not be read, so a
+    /// relative path cannot be made absolute without inventing where it
+    /// came from.
+    NoWorkingDirectory(io::Error),
+    /// A batch that failed whole-batch validation, carrying the diagnostic
+    /// that names the first offending path.
+    InvalidBatch(String),
     NoExecutable(io::Error),
     Unstartable {
         executable: PathBuf,
@@ -399,6 +455,17 @@ impl fmt::Display for OpenError {
                  {declared}. The identifier names the app's data dir, so the hub will not \
                  guess which one you meant: reinstall the app under the identifier you want."
             ),
+            Self::NoReceiver { id } => write!(
+                formatter,
+                "{id} declares no open_files receiver (actions.open_files.ipc in its \
+                 manifest), so the hub cannot hand it files. Open it without `-- <file>...`, \
+                 or have its manifest declare the receiver and reinstall it."
+            ),
+            Self::NoWorkingDirectory(source) => write!(
+                formatter,
+                "cannot read the working directory to resolve a relative path against: {source}"
+            ),
+            Self::InvalidBatch(diagnostic) => write!(formatter, "{diagnostic}"),
             Self::NoExecutable(source) => write!(
                 formatter,
                 "cannot find the hub's own binary to open the app with: {source}"
@@ -416,6 +483,7 @@ impl std::error::Error for OpenError {
             Self::Registry(error) => Some(error),
             Self::Manifest(error) => Some(error),
             Self::Paths(error) => Some(error),
+            Self::NoWorkingDirectory(source) => Some(source),
             Self::NoExecutable(source) => Some(source),
             Self::Unstartable { source, .. } => Some(source),
             _ => None,
