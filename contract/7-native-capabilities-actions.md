@@ -221,14 +221,16 @@ mount, or a permission change.
 
 ### `open_files`
 
-Lets the app receive local files a person or the desktop environment hands
-it — through `tfsapp-hub open <id> -- <file>...`, or by choosing the app in
+Lets the app receive local paths a person or the desktop environment hands
+it — through `tfsapp-hub open <id> -- <path>...`, or by choosing the app in
 the desktop environment's "Open with" menu once it declares
-`file_associations` (§2). The hub delivers **paths**; how the app reads or
-displays each file is entirely its own backend's business, and there is no
+`file_associations` (§2). The hub delivers **paths** — regular files, and
+directories for a receiver that opted into them; how the app reads or
+displays each one is entirely its own backend's business, and there is no
 generic file-reading service and no unsolicited navigation route here.
 
-Like `picker`, this group has one transport and one exact manifest shape:
+Like `picker`, this group has one transport and one manifest shape, with
+`directories` optional and off unless spelled:
 
 ```json
 {"open_files": {"ipc": true, "directories": true}}
