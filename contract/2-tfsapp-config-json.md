@@ -45,7 +45,8 @@ suffix would be destroyed by another app's update.
 | `splash_bg` / `splash_text` | string, `#rgb` or `#rrggbb` | Recolour the cold-start page's background and text without authoring one. Either or both; an unset one keeps the default. |
 | `commands` | object | Lifecycle commands the hub runs around an install or an update — §6. |
 | `run` | object | Named `bin/console` aliases a user can run directly. |
-| `actions` | object | Which native capabilities the app's own code may reach, and over which transport — §7. `actions.picker` is IPC-only: `{ "ipc": true }`. |
+| `actions` | object | Which native capabilities the app's own code may reach, and over which transport — §7. `actions.picker` and `actions.open_files` are IPC-only: `{ "ipc": true }`. |
+| `file_associations` | object | The MIME types this app declares it can open — see "Declaring file associations" below. |
 | `workers` | array of objects | Declares one or more background consumers, each an ordered list of Messenger transports plus an optional copy count — see "Declaring off-window work" below. |
 | `async_worker` | boolean | Sugar for a single worker consuming `async`; refused together with `workers` — see "Declaring off-window work" below. |
 
@@ -189,6 +190,45 @@ one transport, an app using Symfony Scheduler having always needed
 remains, unchanged in meaning, as the one-line spelling for the common case.
 The two paragraphs above are the ones a future change to this shape may not
 touch.
+
+### Declaring file associations
+
+`file_associations` is how an app asks to appear in the desktop environment's
+"Open with" menu for files of a given type:
+
+```json
+{
+  "file_associations": { "mime_types": ["text/markdown", "application/json"] },
+  "actions": { "open_files": { "ipc": true } }
+}
+```
+
+The rules, each of which the hub enforces at parse time:
+
+- **A declaration is a pair, never a lone key.** A nonempty `mime_types`
+  without the `actions.open_files` receiver capability (§7) is refused: an app
+  advertised in a menu whose selections it can never acknowledge would be a
+  promise the manifest cannot keep. The reverse is fine — a receiver with no
+  declared types can still be handed files through `tfsapp-hub open <id> --`
+  (§7) and simply stays out of the file manager's menus.
+- **Syntax is checked, existence is not.** Each entry must be a `type/subtype`
+  pair, each side 1–127 characters from letters, digits and `!#$&^_.+-` — the
+  restricted alphabet that excludes `;` (the desktop entry's field separator),
+  `/`, whitespace and control characters. A type the host's MIME database has
+  never heard of is still a valid declaration: this is a statement of what the
+  *app* can open, not a claim about the host.
+- **A declaration is not a permission.** MIME types are never part of app
+  identity (the "One identity, several surfaces" table above), never content
+  sniffing, and never a filesystem authorization: which files a running app
+  may actually read remains the app's own backend's business, on every path
+  alike — a request the hub delivers names paths; it grants nothing.
+
+The hub renders a declaring app's generated desktop entry (see §2's "An
+installed app has a desktop entry") with `MimeType=` from this list and an
+`Exec=` line ending in `-- %F`, so the desktop environment passes the selected
+files as separate local-file arguments. Which app the desktop environment
+*prefers* for a type is the user's own default-application setting — outside
+the manifest, outside this contract.
 
 ### `run`
 

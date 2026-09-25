@@ -53,8 +53,10 @@ const FULL: &str = r#"{
     "secrets": { "ipc": true, "bridge": true, "keys": ["openai", "anthropic"] },
     "update": { "ipc": true, "bridge": true },
     "picker": { "ipc": true },
-    "close_guard": { "ipc": true, "bridge": true }
-  }
+    "close_guard": { "ipc": true, "bridge": true },
+    "open_files": { "ipc": true }
+  },
+  "file_associations": { "mime_types": ["text/markdown", "application/json"] }
 }"#;
 
 #[test]
@@ -89,6 +91,11 @@ fn a_full_manifest_parses_into_typed_values() {
     assert!(manifest.actions.picker.ipc);
     assert!(manifest.actions.close_guard.ipc);
     assert!(manifest.actions.close_guard.bridge);
+    assert!(manifest.actions.open_files.ipc);
+    assert_eq!(
+        manifest.file_associations.mime_types,
+        ["text/markdown", "application/json"]
+    );
 
     // `releases_repo` is a known key the hub does not read yet, and
     // `pre-build`/`post-build` are build-machine keys nested under `commands`.
@@ -108,6 +115,10 @@ fn a_minimal_manifest_defaults_everything_optional() {
     assert!(manifest.run.is_empty());
     assert_eq!(manifest.commands, super::LifecycleCommands::default());
     assert_eq!(manifest.actions, super::ActionsConfig::default());
+    assert_eq!(
+        manifest.file_associations,
+        super::FileAssociations::default()
+    );
     assert!(loaded.warnings.is_empty());
 }
 
@@ -190,6 +201,185 @@ fn a_wrongly_typed_close_guard_transport_is_refused() {
     // never have.
     assert!(matches!(error, ManifestError::Invalid { .. }));
     assert!(error.to_string().contains("expected a boolean"), "{error}");
+}
+
+#[test]
+fn a_file_associations_declaration_without_the_receiver_capability_is_refused() {
+    // Advertising without being able to receive: the app would appear in the
+    // "Open with" menu for files it can never acknowledge.
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "file_associations": {"mime_types": ["text/markdown"]}"#,
+    );
+
+    let error = parse_err(&contents);
+
+    assert!(matches!(
+        error,
+        ManifestError::FileAssociationWithoutReceiver { .. }
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("\"actions.open_files\": { \"ipc\": true }"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_receiver_capability_without_any_declared_type_is_fine() {
+    // The reverse direction is deliberate: `open <id> -- <file>...` still
+    // delivers to a receiver that stays out of the file manager's menus.
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"open_files": {"ipc": true}}, "file_associations": {"mime_types": []}"#,
+    );
+
+    let loaded = parse_ok(&contents);
+
+    assert!(loaded.manifest.actions.open_files.ipc);
+    assert!(loaded.manifest.file_associations.mime_types.is_empty());
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+}
+
+#[test]
+fn malformed_mime_types_are_refused() {
+    // Each of these is either not a `type/subtype` pair, or carries a
+    // character the generated desktop entry cannot hold safely: `;` is the
+    // `MimeType=` field separator, and whitespace and control characters have
+    // no business in a registered name. Values go through `serde_json` so the
+    // control-character cases reach the parser as values, not as broken JSON.
+    let oversized = format!("a{}/markdown", "a".repeat(127));
+    let invalid = [
+        "textmarkdown",
+        "text/",
+        "/markdown",
+        "/",
+        "text/markdown;extra",
+        "text/markdown extra",
+        "text/markdown\n",
+        "text/mark down",
+        "text//markdown",
+        "choré/markdown",
+        "",
+        oversized.as_str(),
+    ];
+
+    for mime_type in invalid {
+        let contents = format!(
+            r#"{{ "product_name": "TFS App Test", "identifier": "dev.local.tfsapp-test", "project_name": "tfsapp-test", "app_version": "0.6.0", "actions": {{"open_files": {{"ipc": true}}}}, "file_associations": {{"mime_types": [{}]}} }}"#,
+            serde_json::to_string(mime_type).unwrap()
+        );
+
+        let error = parse_err(&contents);
+
+        assert!(
+            matches!(error, ManifestError::FileAssociationsInvalid { .. }),
+            "{mime_type:?}: {error}"
+        );
+        assert!(error.to_string().contains("is invalid"), "{error}");
+    }
+}
+
+#[test]
+fn valid_mime_type_syntax_parses() {
+    // The token alphabet's non-alphanumeric members, a subtype with a `+`
+    // suffix, digits and uppercase are all legal (the registry is
+    // case-insensitive); 127 characters per side is the boundary the invalid
+    // cases above sit just past.
+    let boundary = format!("a{}/{}", "a".repeat(126), "b".repeat(127));
+    let valid = [
+        "text/markdown",
+        "image/svg+xml",
+        "application/vnd.oracle.resource+json",
+        "text/x-rst",
+        "Text/Markdown",
+        "application/x-7z-compressed",
+        boundary.as_str(),
+    ];
+
+    for mime_type in valid {
+        let contents = format!(
+            r#"{{ "product_name": "TFS App Test", "identifier": "dev.local.tfsapp-test", "project_name": "tfsapp-test", "app_version": "0.6.0", "actions": {{"open_files": {{"ipc": true}}}}, "file_associations": {{"mime_types": [{}]}} }}"#,
+            serde_json::to_string(mime_type).unwrap()
+        );
+
+        let loaded = parse_ok(&contents);
+
+        assert_eq!(
+            loaded.manifest.file_associations.mime_types,
+            [mime_type.to_string()],
+            "{mime_type:?}"
+        );
+    }
+}
+
+#[test]
+fn a_wrongly_typed_file_association_is_refused() {
+    // The standing rule's corollary at the new key: a known key with the wrong
+    // type never reads as its default.
+    let not_an_object = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "file_associations": ["text/markdown"]"#,
+    );
+    assert!(matches!(
+        parse_err(&not_an_object),
+        ManifestError::Invalid { .. }
+    ));
+
+    let not_an_array = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"open_files": {"ipc": true}}, "file_associations": {"mime_types": "text/markdown"}"#,
+    );
+    let error = parse_err(&not_an_array);
+    assert!(matches!(error, ManifestError::Invalid { .. }));
+    assert!(error.to_string().contains("expected a sequence"), "{error}");
+}
+
+#[test]
+fn open_files_bridge_is_refused_even_when_false() {
+    // The picker precedent: this group has no bridge transport, so a manifest
+    // spelling one must not look like a grant it never is.
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"open_files": {"ipc": true, "bridge": false}}"#,
+    );
+
+    let error = parse_err(&contents);
+
+    assert!(matches!(
+        error,
+        ManifestError::UnsupportedActionTransport {
+            group: "open_files",
+            transport: "bridge",
+            ..
+        }
+    ));
+    assert!(
+        error.to_string().contains("actions.open_files.bridge"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_unknown_file_associations_field_warns_and_still_parses() {
+    // One level down from the top-level rule, for the same reason: a nested
+    // typo ("mime-types") must not stop the app loading, and must not silently
+    // become a declaration either.
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"open_files": {"ipc": true}}, "file_associations": {"mime-types": ["text/markdown"]}"#,
+    );
+
+    let loaded = parse_ok(&contents);
+
+    assert!(loaded.manifest.file_associations.mime_types.is_empty());
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+    assert!(
+        loaded.warnings[0].contains("\"file_associations.mime-types\""),
+        "{}",
+        loaded.warnings[0]
+    );
 }
 
 #[test]

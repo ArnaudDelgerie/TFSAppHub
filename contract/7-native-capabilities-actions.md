@@ -5,8 +5,9 @@ Not what the user may do — the commands a person types are the host's, and the
 run because that person typed them, which is a different act with different
 consent. This section is about the doors application code can knock on.
 
-There are four capability groups today. `secrets`, `update` and `close_guard`
-may declare either of the two transports; `picker` is deliberately IPC-only:
+There are five capability groups today. `secrets`, `update` and `close_guard`
+may declare either of the two transports; `picker` and `open_files` are
+deliberately IPC-only:
 
 ```json
 {
@@ -14,7 +15,8 @@ may declare either of the two transports; `picker` is deliberately IPC-only:
     "secrets":     { "ipc": false, "bridge": true, "keys": ["openai", "anthropic"] },
     "update":      { "ipc": true,  "bridge": true },
     "picker":      { "ipc": true },
-    "close_guard": { "ipc": true,  "bridge": true }
+    "close_guard": { "ipc": true,  "bridge": true },
+    "open_files":  { "ipc": true }
   }
 }
 ```
@@ -216,6 +218,138 @@ backend or saves it is responsible for that choice. Treat a saved path as
 machine-local configuration, never as exportable application state or a
 promise that it will survive another computer, an OS migration, a missing
 mount, or a permission change.
+
+### `open_files`
+
+Lets the app receive local files a person or the desktop environment hands
+it — through `tfsapp-hub open <id> -- <file>...`, or by choosing the app in
+the desktop environment's "Open with" menu once it declares
+`file_associations` (§2). The hub delivers **paths**; how the app reads or
+displays each file is entirely its own backend's business, and there is no
+generic file-reading service and no unsolicited navigation route here.
+
+Like `picker`, this group has one transport and one exact manifest shape:
+
+```json
+{"open_files": {"ipc": true}}
+```
+
+There is no `bridge` transport, HTTP route, bridge environment variable, or
+PHP permission for this group: a manifest naming `actions.open_files.bridge`
+is invalid. PHP participates only through the app's own backend, once the
+webview has received the paths and accepted them.
+
+**Requests, and their lifetime.** One invocation — one `open` command, one
+"Open with" selection — creates exactly one request: an opaque id the hub
+generates plus the ordered list of paths that invocation carried. Repeating
+the same open on the same file creates a new request, always. The whole batch
+is validated **before** anything is enqueued: every path must name a local,
+existing, regular file, and a batch that fails validation is refused with an
+explicit diagnostic naming the offending path — nothing is enqueued.
+Validation is not a readability guarantee; deletion, permission changes and
+unsuitable content remain the app's to handle when it opens what it received.
+
+The queue lives in the hub process's memory and exists before the splash or
+the backend; it is not durable. A hub crash, a failed startup or ordinary
+process exit ends its lifetime, and so does the app's.
+
+**The wire.** Both commands answer only the calling window — a window can
+never read or acknowledge another window's requests.
+
+```js
+invoke("open_files_pending")
+// → { "requests": [ { "id": "…", "paths": ["/home/…/a.md", "…"] }, … ] },
+//   this window's unacknowledged requests, oldest first. Reading removes nothing.
+invoke("open_files_ack", { id: "…" })
+// → null, once this window has accepted that request.
+```
+
+Errors: `invalid_id` (empty, or over 128 bytes of UTF-8), `unknown_request`
+(the id names no request this window was ever assigned), `unavailable` (the
+group is not declared, or no state backs the calling window at all), and
+`closing` — this window's close or whole-app shutdown has committed.
+
+**Acknowledgement is removal, and it is idempotent.** `open_files_ack`
+removes the request after the app has accepted it; acking the same id again
+succeeds harmlessly, which is what lets a reload replay survive. Delivery is
+replayable until acknowledgement, **not exactly-once**: a reload between the
+app's acceptance and its ack re-exposes the same id, so acceptance must be
+idempotent by request id — on the webview side *and* in whatever PHP work it
+triggers — before the ack is sent.
+
+**Bounds are finite and overflow is loud.** At most **64 pending requests**
+per app, at most **64 paths** per request. Past either bound the hub refuses
+the invocation with a visible diagnostic and enqueues nothing; it never
+evicts a queued request to make room.
+
+**Notification is a bell, not an envelope.** After enqueueing or reassigning a
+request, the hub emits the Tauri event `tfsapp://open-files-pending` to the
+selected window only. The event carries no paths — it only says "call
+`open_files_pending`". The queue remains the source of truth: a notification
+that fails to emit is diagnosed (the requests stay queued) and costs nothing
+but latency, because the next notification — or the receiver's own startup —
+retrieves everything still pending. This is not a durable event-delivery
+guarantee.
+
+**Subscribe before you read, never poll.** The receiver's whole startup
+sequence is: register the listener, await its registration, then read the
+pending requests once. Registering first is what covers an arrival racing
+the initial read — including one that landed during the splash, which waits
+for the app's first real document. A reload repeats the same sequence, and an
+unregister disposes the listener. After startup the receiver reads only on
+notification; there is no periodic polling. Processing is serialized: while
+one read/accept/ack cycle runs, later notifications are coalesced into a
+single follow-up read, so overlapping callbacks neither process one request
+concurrently nor leave a newly arrived one unnoticed.
+
+```js
+// Once per document, at startup — listener first, read second:
+let running = false, again = false;
+const unlisten = await listen("tfsapp://open-files-pending", () => drain());
+
+async function drain() {
+  if (running) { again = true; return; }
+  running = true;
+  try {
+    const { requests } = await invoke("open_files_pending");
+    for (const request of requests) {
+      await acceptOnce(request);   // idempotent by request.id, PHP included
+      await invoke("open_files_ack", { id: request.id });
+    }
+  } finally {
+    running = false;
+    if (again) { again = false; drain(); }  // a notification arrived mid-cycle
+  }
+}
+await drain();
+```
+
+`acceptOnce` is the app's own idempotence boundary: it records the request id
+as accepted — app-side, before any of its own work runs — so a reload that
+replays an already-accepted id selects the already-open document instead of
+duplicating it, and only then acks.
+
+**Which window receives.** A request targets the most recently focused
+eligible window of the app, falling back to a surviving app window when focus
+cannot be determined; the hub raises and unminimizes it best-effort, within
+whatever the window manager allows. An arrival during the splash waits for
+the first app document rather than the splash — the splash origin can never
+consume app requests. A file-bearing invocation never forces navigation,
+never reloads, and never opens a second window for an app that is already
+serving; a plain no-file `open <id>` keeps its existing new-window behaviour
+exactly. If the target window is destroyed while its requests are
+unacknowledged and another eligible window survives, the requests transfer
+to that survivor and it is notified; a window whose close has committed is
+never a target again.
+
+**The one race this group does not close.** A second instance's arguments are
+handed to the running instance through the single-instance machinery, whose
+callback has no application acceptance reply: a request admitted in the narrow
+window where the running instance is already shutting down can be lost with
+it, and the hub does not build a cross-process acknowledgement protocol to
+cover it. Discarded arrivals are diagnosed where they are observable. An app
+that must not lose work reads on every notification and acknowledges promptly;
+everything beyond that is outside this group's guarantee.
 
 ### `close_guard`
 
