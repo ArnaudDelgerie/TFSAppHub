@@ -56,6 +56,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "async_worker",
     "workers",
     "actions",
+    "file_associations",
     "releases_repo",
     "run",
 ];
@@ -127,6 +128,12 @@ pub struct Manifest {
     /// Absent means every group off — read from the manifest, as dev mode does.
     #[serde(default)]
     pub actions: ActionsConfig,
+    /// Local-file associations (CONTRACT.md §2, plan 056): the MIME types this
+    /// app declares it can open. Advertising is not receiving — a nonempty
+    /// list requires the `actions.open_files` receiver capability, checked in
+    /// [`parse`]. Absent or empty is inert.
+    #[serde(default)]
+    pub file_associations: FileAssociations,
     /// Opts into a supervised Messenger worker and a `doctrine://` transport.
     /// Absent is `false`, and a non-boolean is a parse error rather than a
     /// silent `false` — see this module's header. Sugar for a single
@@ -205,6 +212,8 @@ pub struct ActionsConfig {
     pub picker: PickerActions,
     #[serde(default)]
     pub close_guard: CloseGuardActions,
+    #[serde(default)]
+    pub open_files: OpenFilesActions,
 }
 
 /// The `secrets` group, per transport. `keys` is a manifest — typo-catching,
@@ -249,6 +258,27 @@ pub struct CloseGuardActions {
     pub ipc: bool,
     #[serde(default)]
     pub bridge: bool,
+}
+
+/// The `open_files` group (plan 056) is intentionally IPC-only, like `picker`:
+/// the delivered paths are consumed by the app's webview, and no PHP process
+/// receives a route or environment value through which it could reach the
+/// pending-request queue. `bridge` is refused, per the picker precedent.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq)]
+pub struct OpenFilesActions {
+    #[serde(default)]
+    pub ipc: bool,
+}
+
+/// The `file_associations` declaration (CONTRACT.md §2, plan 056): the MIME
+/// types this app asks to be offered for in the desktop environment's
+/// "Open with" menu. A declaration of support, not a content-sniffing or
+/// filesystem authorization rule — the hub does not require the type to exist
+/// in the host's MIME database, and it is never part of app identity.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq)]
+pub struct FileAssociations {
+    #[serde(default)]
+    pub mime_types: Vec<String>,
 }
 
 /// A manifest and whatever the parse wanted to say about it.
@@ -393,6 +423,22 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
         });
     }
 
+    // Same refusal, same reason: `open_files` is IPC-only (CONTRACT.md §7), and
+    // a manifest spelling a bridge member would look like a grant it never is.
+    if object
+        .get("actions")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|actions| actions.get("open_files"))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|open_files| open_files.contains_key("bridge"))
+    {
+        return Err(ManifestError::UnsupportedActionTransport {
+            path: path.to_path_buf(),
+            group: "open_files",
+            transport: "bridge",
+        });
+    }
+
     let mut warnings: Vec<String> = object
         .keys()
         .filter(|key| !KNOWN_KEYS.contains(&key.as_str()))
@@ -404,6 +450,28 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
             )
         })
         .collect();
+
+    // The standing rule, one level down: `file_associations` is new enough that
+    // a nested typo (`"mime-types"`) is more likely than a deliberate
+    // extension, and unlike `commands`'s build-machine keys there is no
+    // established manifest this rule would break.
+    if let Some(fields) = object
+        .get("file_associations")
+        .and_then(serde_json::Value::as_object)
+    {
+        warnings.extend(
+            fields
+                .keys()
+                .filter(|key| key.as_str() != "mime_types")
+                .map(|key| {
+                    format!(
+                        "unknown key \"file_associations.{key}\" in {} — check for a typo \
+                 (CONTRACT.md §2). It is ignored, not rejected.",
+                        path.display()
+                    )
+                }),
+        );
+    }
 
     let mut manifest: Manifest =
         serde_json::from_value(value).map_err(|error| ManifestError::Invalid {
@@ -431,7 +499,68 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
 
     warnings.extend(apply_worker_fallbacks(&mut manifest.workers));
 
+    validate_file_associations(path, &manifest)?;
+
     Ok(Loaded { manifest, warnings })
+}
+
+/// Validate a `file_associations` declaration (CONTRACT.md §2, plan 056).
+///
+/// Two rules, both about honesty rather than safety in depth:
+///
+/// - **A MIME value is syntax-checked, not existence-checked.** The desktop
+///   entry's `MimeType=` field is `;`-separated, so a value carrying a
+///   separator, whitespace or a control character is a desktop-entry injection
+///   rather than a type name; and a value the host's MIME database has never
+///   heard of is still a valid declaration, which is why only the syntax is
+///   enforced. The shape is RFC 6838's `<type>/<subtype>`, each side 1–127
+///   characters from the restricted token alphabet.
+/// - **Advertising requires being able to receive.** A nonempty list without
+///   the `actions.open_files` receiver capability would put the app in an
+///   "Open with" menu whose selections it can never acknowledge, so it is
+///   refused. The reverse — the capability without any declared type — is
+///   fine: the CLI can still deliver files to a receiver that deliberately
+///   stays out of the file manager's menus.
+fn validate_file_associations(path: &Path, manifest: &Manifest) -> Result<(), ManifestError> {
+    if !manifest.file_associations.mime_types.is_empty() && !manifest.actions.open_files.ipc {
+        return Err(ManifestError::FileAssociationWithoutReceiver {
+            path: path.to_path_buf(),
+        });
+    }
+
+    for mime_type in &manifest.file_associations.mime_types {
+        if !is_valid_mime_type(mime_type) {
+            return Err(ManifestError::FileAssociationsInvalid {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "mime_types entry \"{mime_type}\" is not a valid MIME type \
+                     \"type/subtype\" — each side is 1–127 characters from \
+                     letters, digits and !#$&^_.+-, with no separator, \
+                     whitespace or control character (CONTRACT.md §2)."
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// RFC 6838's restricted syntax, conservative where it is permissive: both
+/// sides must be non-empty and at most 127 characters, drawn from the token
+/// alphabet that excludes `;` (the desktop entry's field separator), `/`,
+/// whitespace and every control character. Case is not enforced — the registry
+/// is case-insensitive and the generated entry quotes nothing.
+fn is_valid_mime_type(mime_type: &str) -> bool {
+    let Some((r#type, subtype)) = mime_type.split_once('/') else {
+        return false;
+    };
+    [r#type, subtype]
+        .into_iter()
+        .all(|part| (1..=127).contains(&part.len()) && part.chars().all(is_mime_token_char))
+}
+
+fn is_mime_token_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || "!#$&^_.+-".contains(character)
 }
 
 /// The type checks `serde`'s own error cannot name a field for (this
@@ -604,6 +733,13 @@ pub enum ManifestError {
         path: PathBuf,
         transport: String,
     },
+    FileAssociationWithoutReceiver {
+        path: PathBuf,
+    },
+    FileAssociationsInvalid {
+        path: PathBuf,
+        detail: String,
+    },
     Invalid {
         path: PathBuf,
         detail: String,
@@ -663,6 +799,19 @@ impl fmt::Display for ManifestError {
                 "\"workers\" in {} declares transport \"{transport}\" more than once — two \
                  consumers on one transport is what \"count\" spells, not two declarations \
                  (CONTRACT.md §2).",
+                path.display()
+            ),
+            Self::FileAssociationWithoutReceiver { path } => write!(
+                formatter,
+                "{} declares \"file_associations.mime_types\" without \
+                 \"actions.open_files\": {{ \"ipc\": true }} — an app advertised in the \
+                 \"Open with\" menu must be able to receive the files it is offered \
+                 (CONTRACT.md §2).",
+                path.display()
+            ),
+            Self::FileAssociationsInvalid { path, detail } => write!(
+                formatter,
+                "\"file_associations\" in {} is invalid: {detail} (CONTRACT.md §2).",
                 path.display()
             ),
             Self::Invalid { path, detail } => {

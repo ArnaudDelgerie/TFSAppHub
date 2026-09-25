@@ -25,6 +25,7 @@ mod lifecycle_gate;
 mod list;
 mod manifest;
 mod open;
+mod open_files;
 mod paths;
 mod php;
 mod picker;
@@ -61,7 +62,26 @@ use cli::{
 use identity::Identity;
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Every argument has to be UTF-8, and the hub says so itself rather than
+    // letting `std::env::args` panic on it: a path that is not valid UTF-8
+    // cannot travel through the file-request queue (or the single-instance
+    // hand-off, which serialises argv as strings), and silently changing it
+    // to a lossy spelling would deliver a path nobody asked for.
+    let args: Vec<String> = match std::env::args_os()
+        .skip(1)
+        .map(|argument| argument.into_string())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(args) => args,
+        Err(bad) => {
+            eprintln!(
+                "tfsapp-hub: an argument is not valid UTF-8 ({}); paths must be valid UTF-8 \
+                 to be passed on.",
+                bad.to_string_lossy()
+            );
+            std::process::exit(cli::EXIT_USAGE);
+        }
+    };
     // The context is read here rather than from CARGO_PKG_* so that the
     // version the hub reports is the one baked into tauri.conf.json's package
     // info — the same source `--update` will later compare against a release
@@ -182,7 +202,7 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         Command::List => list::run(),
         // Resolves and re-executes; the window itself belongs to the child this
         // returns from, which is why the parent has an exit code to give at all.
-        Command::Open { id } => open::run(&id),
+        Command::Open { id, files } => open::run(&id, &files),
         // Foreground, unlike `open` — see `dev::run`.
         Command::Dev { path } => dev::run(&path),
         Command::Publish {
@@ -241,6 +261,7 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             identifier,
             product_name,
             icon_path,
+            files,
         } => {
             open_window(
                 source,
@@ -250,6 +271,7 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
                     icon_path: icon_path.map(std::path::PathBuf::from),
                 },
                 context,
+                files,
             );
             EXIT_OK
         }
@@ -258,7 +280,7 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
 
 fn interrupted_app_id(command: &Command) -> Option<&str> {
     match command {
-        Command::Open { id }
+        Command::Open { id, .. }
         | Command::Update { id, .. }
         | Command::Rollback { id, .. }
         | Command::Remove { id, .. }
@@ -387,7 +409,12 @@ struct Launching {
 /// advance far enough to actually paint the splash. Everything slow then happens
 /// off the main thread and ends by navigating that same window to the backend,
 /// so nothing visibly jumps and no second window appears.
-fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::Context) {
+fn open_window(
+    source: OpenChildSource,
+    identity: Identity,
+    mut context: tauri::Context,
+    files: Vec<String>,
+) {
     // Before the `Builder` exists, and so before anything has initialised GTK
     // — the whole point of the module. Everything identity-derived downstream
     // (app id, bus name, single-instance key, WM_CLASS, cookie store) reads
@@ -435,6 +462,52 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
     let close_guards = std::sync::Arc::new(close_guard::CloseGuardState::new());
     let relaunch_close_guards = close_guards.clone();
 
+    // One pending-request queue per launch, likewise created before the
+    // `Builder` and managed before the splash: it has to exist before any
+    // arrival — a file-bearing launch's own arguments (plan 056 step 3) or a
+    // second-instance handoff — and before any window could read it. Managed
+    // unconditionally, like the close guards: the state is inert until an
+    // enqueue happens, and the enqueueing boundary is what refuses an app
+    // that declared no receiver capability.
+    let open_files = std::sync::Arc::new(open_files::OpenFilesState::new());
+    let serve_open_files = open_files.clone();
+    // The arrival's other fact, read here before `spec` moves into `setup`:
+    // the second-instance callback runs in whatever process is live when the
+    // arrival lands, and it is *that* instance's declaration that decides
+    // whether a file-bearing argv can be delivered at all.
+    let relaunch_receiver_declared = open_files::receiver_declared(&spec.manifest);
+
+    // A file-bearing launch enqueues its own batch before the `Builder` exists,
+    // so it is waiting in the pre-launch pool before any window — and the
+    // window that becomes the app's first document claims it in `serve`'s
+    // hand-off. Only the instance that holds the launch locks: a hand-off
+    // child's queue dies with it at the single-instance `exit(0)`, and its
+    // argv — the same files, the same order — is delivered by the live
+    // instance's own callback instead, which is the path that owns a queue
+    // with a future.
+    if !files.is_empty() && locks.is_some() {
+        if open_files::receiver_declared(&spec.manifest) {
+            match open_files::validate_batch(&files) {
+                Ok(()) => {
+                    if let Err(error) = open_files.enqueue(files, None) {
+                        eprintln!(
+                            "tfsapp-hub: warning: the file request was not queued: {error}; \
+                             opening without the files."
+                        );
+                    }
+                }
+                Err(diagnostic) => {
+                    eprintln!("tfsapp-hub: warning: {diagnostic}; opening without the files.");
+                }
+            }
+        } else {
+            eprintln!(
+                "tfsapp-hub: warning: this app declares no open_files receiver; opening \
+                 without the files."
+            );
+        }
+    }
+
     window::register_splash_scheme(tauri::Builder::default(), &spec.app_dir)
         // Registered before every other plugin, per the plugin's own guidance,
         // and after the identity mutation above — which is what makes its key
@@ -443,7 +516,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
         // *this* app reaches the closure below instead of booting a second
         // process against the same data dir.
         .plugin(tauri_plugin_single_instance::init(
-            move |app, _args, _cwd| {
+            move |app, args, _cwd| {
                 use tauri::Manager;
 
                 // A second `open` of an app already running is not an error
@@ -454,22 +527,64 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
                 // closing instance; before commitment it changes the
                 // topology and every close decision honours it).
                 //
+                // A file-bearing second `open` (plan 056 step 3) is neither:
+                // its argv carries files after `--`, and that arrival is a
+                // delivery to an existing window — during the splash, to the
+                // pre-launch pool the hand-off empties — never a
+                // second window. The pinned plugin hands this callback the
+                // second process's whole argv, program name included, so the
+                // same parser that built it reads it back.
+                //
                 // This callback runs on the plugin's D-Bus service thread,
                 // serialized with nothing — so it decides nothing here. The
                 // whole admission (launch presence, shutdown re-check,
-                // window creation) is one unit scheduled on the event loop,
-                // where every close decision and commitment also runs: an
-                // arrival suspended across a committed shutdown cannot open
-                // a window on the closing instance (audit 017, finding 2).
-                // A scheduling failure means the loop is gone — the process
-                // is exiting, which is the shutting-down outcome already.
+                // window creation or file delivery) is one unit scheduled on
+                // the event loop, where every close decision and commitment
+                // also runs: an arrival suspended across a committed shutdown
+                // cannot open a window on the closing instance (audit 017,
+                // finding 2). A scheduling failure means the loop is gone —
+                // the process is exiting, which is the shutting-down
+                // outcome already.
                 let app = app.clone();
                 let origin = relaunch_origin.clone();
                 let guards = relaunch_close_guards.clone();
                 let icon_path = relaunch_icon_path.clone();
+                let receiver_declared = relaunch_receiver_declared;
+                let arrival = cli::second_instance_files(&args);
                 let scheduler = app.clone();
                 let scheduled = move || {
                     let launch_present = app.try_state::<sidecar::Launch>().is_some();
+                    if !arrival.is_empty() {
+                        // The file branch needs no launch snapshot: where the
+                        // arrival goes is decided with the queue itself
+                        // (audit 019, finding 1), so a hand-off racing this
+                        // closure can neither strand the request in a pool
+                        // nothing will drain nor have it refused while the
+                        // first document's navigation is still settling.
+                        match open_files::deliver_arrival(
+                            &app,
+                            &guards,
+                            receiver_declared,
+                            &arrival,
+                        ) {
+                            open_files::ArrivalOutcome::Delivered { window: None } => {
+                                println!(
+                                    "tfsapp-hub: still starting — the files will be delivered \
+                                     when the window is ready."
+                                );
+                            }
+                            open_files::ArrivalOutcome::Delivered { window: Some(_) } => {
+                                println!(
+                                    "tfsapp-hub: delivering the file request to the app's \
+                                     window."
+                                );
+                            }
+                            open_files::ArrivalOutcome::Refused(diagnostic) => {
+                                eprintln!("tfsapp-hub: {diagnostic}");
+                            }
+                        }
+                        return;
+                    }
                     let outcome =
                         window::admit_second_instance_window(&guards, launch_present, || {
                             let launch = app.state::<sidecar::Launch>();
@@ -525,6 +640,8 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             close_guard::close_guard_context,
             close_guard::close_guard_register,
             close_guard::close_guard_remove,
+            open_files::open_files_pending,
+            open_files::open_files_ack,
         ])
         .setup(move |app| {
             // `manage` below is the one call here that needs the trait, and
@@ -551,6 +668,10 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
             // close-guard command is the splash's own first script run, and
             // every command resolves this state from the calling window.
             app.manage(close_guards.clone());
+
+            // The open-files queue the same way — before any window exists,
+            // so a startup arrival already has somewhere to land.
+            app.manage(open_files.clone());
 
             let splash_source =
                 window::resolve_splash_source(&spec.app_dir, spec.manifest.splash_path.as_deref());
@@ -585,6 +706,7 @@ fn open_window(source: OpenChildSource, identity: Identity, mut context: tauri::
                     app_origin,
                     splash_label,
                     close_guards,
+                    serve_open_files,
                 );
             });
 
@@ -620,6 +742,7 @@ fn serve(
     app_origin: window::AppOriginSlot,
     splash_label: String,
     close_guards: close_guard::SharedCloseGuards,
+    open_files: open_files::SharedOpenFiles,
 ) {
     use tauri::Manager;
 
@@ -765,6 +888,19 @@ fn serve(
         return;
     };
     window::publish_app_origin(&app_origin, &url);
+    // The open-files hand-off, before the navigation it designates this
+    // window for: the pool of startup arrivals drains into it and — the part
+    // audit 019's finding 1 turns into an invariant — the pool closes, so an
+    // arrival that races this transition lands on the window through the
+    // queue's own in-lock fallback instead of waiting for a drain that
+    // already happened. Notified even though the receiver cannot have
+    // subscribed yet: the notification may well be lost, and the receiver's
+    // own startup read is what actually delivers.
+    let claimed = open_files.handoff_to_first_document(&splash_label);
+    if claimed > 0 {
+        println!("tfsapp-hub: delivering {claimed} file request(s) that arrived during startup.");
+        open_files::notify(&app, &splash_label);
+    }
     if let Err(error) = window.navigate(url.parse().expect("a valid local backend URL")) {
         return lifecycle::fatal_post_setup_error(app, error.to_string());
     }

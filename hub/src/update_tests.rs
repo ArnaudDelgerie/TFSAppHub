@@ -724,7 +724,7 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
         None,
         None,
         true,
-        true,
+        false,
         "0.1.0",
     )
     .expect("the first install");
@@ -757,8 +757,23 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
         .expect("the entry");
 
     // A developer edits the source without bumping the version — a different
-    // `source_revision`, same `app_version`.
+    // `source_revision`, same `app_version` — and, this time, also gives the
+    // app a file-associations declaration, the thing a resync must not leave
+    // the old desktop entry silent about.
     fs::write(source.path().join("README"), "edited").expect("an edit");
+    fs::write(
+        source.path().join("tfsapp.config.json"),
+        r#"{
+          "product_name": "Demo App",
+          "identifier": "dev.local.demo",
+          "project_name": "demo",
+          "app_version": "0.6.0",
+          "file_associations": { "mime_types": ["text/markdown"] },
+          "actions": { "open_files": { "ipc": true } },
+          "commands": {"pre-update": ["cache:clear"], "post-update": ["about"]}
+        }"#,
+    )
+    .expect("the edited manifest");
 
     update(&paths, "demo", None, true, true, "0.1.0").expect("--force resyncs");
 
@@ -784,6 +799,19 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
         !data_subdir.join("cache.json").exists(),
         "a resync must discard the stamp for the tree it replaced"
     );
+
+    // The resync rewrote the desktop entry from the manifest it just landed:
+    // without that, the association the source now declares would never reach
+    // the desktop, and the app would stay out of "Open with" until some later
+    // install or versioned update happened to rewrite the entry.
+    let entry = fs::read_to_string(
+        paths
+            .desktop_entry_path("dev.local.demo")
+            .expect("a safe identifier"),
+    )
+    .expect("the rewritten entry");
+    assert!(entry.contains("MimeType=text/markdown;\n"));
+    assert!(entry.contains("open demo -- %F"));
 
     let after_registry = registry::load(&paths)
         .expect("a readable registry")

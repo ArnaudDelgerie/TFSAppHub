@@ -68,12 +68,12 @@ configure the infrastructure.**
 ## Table of contents
 
 - [§1 — What an app must provide](contract/1-what-an-app-must-provide.md) — the layout, the manifest, the one HTTP route, and publishing a release.
-- [§2 — `tfsapp.config.json`](contract/2-tfsapp-config-json.md) — the manifest's required and optional fields, identity, semver, workers, `run`.
+- [§2 — `tfsapp.config.json`](contract/2-tfsapp-config-json.md) — the manifest's required and optional fields, identity, semver, workers, `run`, file associations.
 - [§3 — The environment the app runs in](contract/3-the-environment-the-app-runs-in.md) — the environment variables every app process receives.
 - [§4 — The HTTP contract](contract/4-the-http-contract.md) — headers, `/healthz`, the CSP, Mercure authorization, graceful shutdown.
 - [§5 — The app's own state, and what it is isolated from](contract/5-the-apps-own-state.md) — the data directory, `APP_SECRET`, sessions, isolation, export/import.
 - [§6 — Lifecycle](contract/6-lifecycle.md) — the install/update lifecycle commands, the no-overlap guarantee, `run`.
-- [§7 — Native capabilities: `actions`](contract/7-native-capabilities-actions.md) — `secrets`, `update`, `picker`, `close_guard`, and the bridge wire contract.
+- [§7 — Native capabilities: `actions`](contract/7-native-capabilities-actions.md) — `secrets`, `update`, `picker`, `open_files`, `close_guard`, and the bridge wire contract.
 - [§8 — What a host cannot honour, and how you find out](contract/8-what-a-host-cannot-honour.md) — what falls back, and how the app is told.
 - [§9 — Running a project in dev](contract/9-running-a-project-in-dev.md) — `tfsapp-hub dev`: live source, its own identity, its own data.
 

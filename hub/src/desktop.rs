@@ -34,16 +34,36 @@ use crate::{
 
 /// One line of the entry, in the order written — sourced from CONTRACT.md §2's
 /// identity table and from nowhere else.
-pub fn render(id: &str, identity: &Identity, hub_executable: &Path) -> String {
+///
+/// `mime_types` is the `file_associations` declaration passed in on the side,
+/// never part of the `Identity` the window builds from: a declaring app gets
+/// a `MimeType=` line and an `Exec=` ending in `-- %F`, so the desktop
+/// environment offers it in "Open with" and passes the selected files as
+/// separate arguments after the hub's own separator; an app without
+/// associations keeps exactly the entry it has always had. The MIME values
+/// were validated at manifest parse (restricted RFC 6838 alphabet, no `;`,
+/// no whitespace, no control characters), so they are written as they stand.
+pub fn render(
+    id: &str,
+    identity: &Identity,
+    hub_executable: &Path,
+    mime_types: &[String],
+) -> String {
+    let declared = !mime_types.is_empty();
     let mut entry = String::new();
     entry.push_str("[Desktop Entry]\n");
     entry.push_str("Type=Application\n");
     entry.push_str("Version=1.0\n");
     entry.push_str(&format!("Name={}\n", escape_value(&identity.product_name)));
+    // `%F` is a standalone, unquoted field code: the desktop environment
+    // expands it to the selected files as separate local-file arguments —
+    // never resold or re-quoted, exactly what `open <id> --`'s separator
+    // expects to find after it.
     entry.push_str(&format!(
-        "Exec={} open {}\n",
+        "Exec={} open {}{}\n",
         exec_argument(hub_executable),
-        id
+        id,
+        if declared { " -- %F" } else { "" }
     ));
     if let Some(icon) = &identity.icon_path {
         entry.push_str(&format!(
@@ -63,6 +83,13 @@ pub fn render(id: &str, identity: &Identity, hub_executable: &Path) -> String {
         "StartupWMClass={}\n",
         escape_value(&identity.identifier)
     ));
+    if declared {
+        // One trailing `;`, and one between each — the specification's list
+        // form. A declaration of support, not a default-application claim:
+        // which app the desktop *prefers* for a type stays the user's own
+        // setting.
+        entry.push_str(&format!("MimeType={};\n", mime_types.join(";")));
+    }
     entry.push_str(&format!("X-TFSApp-Id={}\n", escape_value(id)));
     entry
 }
@@ -128,6 +155,7 @@ pub fn write(
     id: &str,
     identity: &Identity,
     hub_executable: &Path,
+    mime_types: &[String],
     paths: &Paths,
 ) -> Result<PathBuf, DesktopError> {
     if identity.icon_path.is_none() {
@@ -146,19 +174,26 @@ pub fn write(
 
     fs::create_dir_all(&directory).map_err(io_error(&directory))?;
 
-    let contents = render(id, identity, hub_executable);
+    let contents = render(id, identity, hub_executable, mime_types);
     let temporary = path.with_extension("desktop.tmp");
     fs::write(&temporary, &contents).map_err(io_error(&temporary))?;
     fs::rename(&temporary, &path).map_err(io_error(&path))?;
 
-    // GNOME notices a new file on its own; this call is for the desktops that
-    // cache. Best-effort and quiet: a `.desktop` binary missing from `PATH`
-    // is ordinary, not a reason to fail the write that already succeeded.
-    let _ = Command::new("update-desktop-database")
-        .arg(&directory)
-        .output();
+    refresh_database(&directory);
 
     Ok(path)
+}
+
+/// Ask the desktop's caching layer to re-read the applications directory,
+/// best-effort and quiet: a `.desktop` utility missing from `PATH` is
+/// ordinary, not a reason to fail the write or removal that already
+/// succeeded. The cache it rebuilds — `mimeinfo.cache` — is regenerated from
+/// the directory's own contents, so foreign entries keep their MIME lists
+/// and this hub never edits a default-application preference.
+fn refresh_database(directory: &Path) {
+    let _ = Command::new("update-desktop-database")
+        .arg(directory)
+        .output();
 }
 
 /// What [`remove`] did to an app's entry — the third outcome is the point:
@@ -212,6 +247,9 @@ fn remove_if(
         path: path.clone(),
         source,
     })?;
+    // The cache still advertises the removed entry's MIME types until it is
+    // rebuilt, so a fresh removal refreshes like a write does.
+    refresh_database(&paths.applications_dir());
     Ok(RemovalOutcome::Removed)
 }
 

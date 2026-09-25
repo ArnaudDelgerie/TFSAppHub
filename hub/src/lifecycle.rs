@@ -1569,6 +1569,20 @@ pub fn on_window_event<R: tauri::Runtime>(window: &tauri::Window<R>, event: &tau
         }
     }
 
+    // Focus recency for the open-files target selector: the most recently
+    // focused eligible window is the one a file-bearing arrival is delivered
+    // to, and this is the only place the hub learns focus order. Recorded for
+    // every window, whatever the app declared — focus is a window fact, and
+    // the state stays inert until an enqueue happens.
+    if let tauri::WindowEvent::Focused(true) = event {
+        if let Some(state) = window
+            .app_handle()
+            .try_state::<crate::open_files::SharedOpenFiles>()
+        {
+            state.note_focused(window.label());
+        }
+    }
+
     // A destroyed window's frontend guards cannot survive it: the document
     // they belong to is gone, and a later window reusing the label
     // (`main`-`N` gap-filling) is a new owner by the plan's own rule. The
@@ -1577,11 +1591,35 @@ pub fn on_window_event<R: tauri::Runtime>(window: &tauri::Window<R>, event: &tau
     // own `destroy()`, and it is also what releases the window's close
     // reservation: the destruction has now been observed.
     if let tauri::WindowEvent::Destroyed = event {
-        if let Some(state) = window
-            .app_handle()
-            .try_state::<crate::close_guard::SharedCloseGuards>()
-        {
+        let app = window.app_handle();
+        if let Some(state) = app.try_state::<crate::close_guard::SharedCloseGuards>() {
             state.drop_window(window.label());
+        }
+
+        // Its unacknowledged file requests transfer to a surviving eligible
+        // window, which is then notified; with no eligible survivor — or a
+        // committed shutdown, where no window will consume anything again —
+        // they die with the window. Never a committed-close window: its
+        // namespace closed when its close committed.
+        if let Some(open_files) = app.try_state::<crate::open_files::SharedOpenFiles>() {
+            let shutting_down = app
+                .try_state::<crate::close_guard::SharedCloseGuards>()
+                .is_some_and(|guards| guards.is_closing());
+            let survivor = if shutting_down {
+                None
+            } else {
+                crate::open_files::select_target_window(app, Some(window.label()))
+            };
+            match survivor {
+                Some(survivor) => {
+                    let moved = open_files.reassign(window.label(), &survivor);
+                    if moved > 0 {
+                        crate::open_files::notify(app, &survivor);
+                        crate::open_files::present_target_window(app, &survivor);
+                    }
+                }
+                None => open_files.drop_window(window.label()),
+            }
         }
     }
 }

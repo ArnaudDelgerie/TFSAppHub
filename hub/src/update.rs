@@ -893,6 +893,15 @@ fn resync_only(
         source,
     })?;
 
+    // The same last step `apply` ends with, for the same reason: a resync
+    // re-snapshots the tree, and the manifest it lands can change
+    // `product_name` or `icon_path` — or, with `file_associations`, the
+    // MIME types the entry advertises to the desktop. Leaving the old
+    // entry standing would keep advertising a declaration the new tree no
+    // longer carries; best-effort here too, because the resync itself has
+    // already succeeded.
+    install::write_desktop_entry(paths, &entry.id, manifest, app_dir);
+
     println!("Resynced {} from {}.", entry.id, resolved.root.display());
     Ok(())
 }

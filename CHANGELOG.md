@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+An app can now declare `file_associations.mime_types` plus the
+`actions.open_files` receiver and be handed local files — through
+`tfsapp-hub open <id> -- <file>...` or by choosing the app in the desktop
+environment's "Open with" menu, its `.desktop` entry gaining `MimeType=` and
+an `Exec=` ending in `-- %F`. One invocation is one opaque request in an
+in-memory queue that exists before the splash: the whole batch is validated
+first (local existing regular files only, the offending path named on
+refusal), then delivered to the most recently focused eligible window through
+a path-free `tfsapp://open-files-pending` notification the receiver answers
+with `open_files_pending`/`open_files_ack` — subscribe before the first read,
+then read on notification only. Acknowledgement is idempotent removal and
+delivery is replayable until it happens, so app-side acceptance must be
+idempotent by request id; a reload re-exposes an unacknowledged one. The queue
+is bounded (64 requests, 64 paths, overflow refused loudly, never evicted) and
+not durable: process exit ends its lifetime, and the single-instance
+handoff/shutdown race is diagnosed rather than guaranteed. Apps declaring
+nothing keep every surface they had.
+
 An app can now declare `actions.close_guard` and register independent guards
 for unsaved frontend work over IPC and background jobs over the PHP bridge.
 Closing a protected window shows a native confirmation with Cancel as the

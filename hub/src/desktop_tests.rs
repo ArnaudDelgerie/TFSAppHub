@@ -29,6 +29,7 @@ fn the_rendered_entry_matches_the_specification_field_for_field() {
         "tfsapp-test",
         &entity,
         Path::new("/home/user/.local/share/TFSApp/hub/bin/tfsapp-hub"),
+        &[],
     );
 
     assert_eq!(
@@ -61,7 +62,7 @@ fn name_is_sourced_from_the_manifest_identity_and_nothing_else() {
     let app_dir = Path::new("/opt/apps/labelboard");
     let identity = loaded.manifest.identity(app_dir);
 
-    let rendered = render("labelboard", &identity, Path::new("/hub/tfsapp-hub"));
+    let rendered = render("labelboard", &identity, Path::new("/hub/tfsapp-hub"), &[]);
 
     assert!(rendered.contains("Name=LabelBoard\n"));
     assert_eq!(identity.product_name, "LabelBoard");
@@ -71,7 +72,7 @@ fn name_is_sourced_from_the_manifest_identity_and_nothing_else() {
 fn no_icon_declared_means_no_icon_line() {
     let entity = identity("dev.local.tfsapp-test", "TFSApp Test", None);
 
-    let rendered = render("tfsapp-test", &entity, Path::new("/hub/tfsapp-hub"));
+    let rendered = render("tfsapp-test", &entity, Path::new("/hub/tfsapp-hub"), &[]);
 
     assert!(!rendered.contains("Icon="));
 }
@@ -80,7 +81,7 @@ fn no_icon_declared_means_no_icon_line() {
 fn a_product_name_with_a_quote_and_a_newline_is_escaped_but_not_quoted() {
     let entity = identity("dev.local.tfsapp-test", "The \"Best\" App\nEver", None);
 
-    let rendered = render("tfsapp-test", &entity, Path::new("/hub/tfsapp-hub"));
+    let rendered = render("tfsapp-test", &entity, Path::new("/hub/tfsapp-hub"), &[]);
 
     // The quote survives unescaped — a desktop entry value is not itself
     // quoted, so `"` needs no escaping. The newline must become `\n`, or the
@@ -97,6 +98,7 @@ fn a_hub_path_with_a_space_and_a_percent_is_quoted_and_doubled() {
         "tfsapp-test",
         &entity,
         Path::new("/home/a b/tfsapp hub/tfsapp-hub%"),
+        &[],
     );
 
     assert!(rendered.contains("Exec=\"/home/a b/tfsapp hub/tfsapp-hub%%\" open tfsapp-test\n"));
@@ -106,7 +108,7 @@ fn a_hub_path_with_a_space_and_a_percent_is_quoted_and_doubled() {
 fn the_marker_is_present_and_matches_carries_marker() {
     let entity = identity("dev.local.tfsapp-test", "TFSApp Test", None);
 
-    let rendered = render("tfsapp-test", &entity, Path::new("/hub/tfsapp-hub"));
+    let rendered = render("tfsapp-test", &entity, Path::new("/hub/tfsapp-hub"), &[]);
 
     assert!(rendered.contains("X-TFSApp-Id=tfsapp-test\n"));
     assert!(carries_marker(&rendered, "tfsapp-test"));
@@ -118,8 +120,14 @@ fn write_then_remove_round_trips_and_the_file_is_gone() {
     let (_base, paths) = temp_paths();
     let entity = identity("dev.local.tfsapp-test", "TFSApp Test", None);
 
-    let path = write("tfsapp-test", &entity, Path::new("/hub/tfsapp-hub"), &paths)
-        .expect("the entry is written");
+    let path = write(
+        "tfsapp-test",
+        &entity,
+        Path::new("/hub/tfsapp-hub"),
+        &[],
+        &paths,
+    )
+    .expect("the entry is written");
     assert!(path.is_file());
 
     let outcome =
@@ -169,6 +177,7 @@ fn the_orphan_path_removes_an_entry_carrying_a_different_id() {
         "some-other-id",
         &entity,
         Path::new("/hub/tfsapp-hub"),
+        &[],
         &paths,
     )
     .expect("the entry is written");
@@ -197,4 +206,90 @@ fn the_orphan_path_leaves_an_unmarked_entry_alone() {
 
     assert_eq!(outcome, RemovalOutcome::LeftAlone);
     assert!(path.is_file(), "a foreign entry must survive removal");
+}
+
+// --- file associations (plan 056 step 4) ---------------------------------
+
+#[test]
+fn a_declaring_app_advertises_its_mime_types_and_takes_files() {
+    let entity = identity(
+        "dev.local.tfsapp-test",
+        "TFSApp Test",
+        Some(PathBuf::from("/opt/apps/tfsapp-test/icon.png")),
+    );
+
+    let rendered = render(
+        "tfsapp-test",
+        &entity,
+        Path::new("/hub/tfsapp-hub"),
+        &["text/markdown".to_string(), "application/json".to_string()],
+    );
+
+    // The specification's list form — `;` between entries and one trailing —
+    // and `%F` as a standalone, unquoted field code: the desktop expands it
+    // into separate local-file arguments the hub's own `--` then finds.
+    assert!(rendered.contains("MimeType=text/markdown;application/json;\n"));
+    assert!(rendered.contains("Exec=\"/hub/tfsapp-hub\" open tfsapp-test -- %F\n"));
+}
+
+#[test]
+fn changing_or_dropping_the_declaration_rewrites_the_entry_whole() {
+    let entity = identity("dev.local.tfsapp-test", "TFSApp Test", None);
+    let hub = Path::new("/hub/tfsapp-hub");
+
+    let declaring = render("tfsapp-test", &entity, hub, &["text/markdown".to_string()]);
+    assert!(declaring.contains("MimeType=text/markdown;\n"));
+
+    let redeclared = render(
+        "tfsapp-test",
+        &entity,
+        hub,
+        &["application/json".to_string()],
+    );
+    assert!(redeclared.contains("MimeType=application/json;\n"));
+    assert!(!redeclared.contains("text/markdown"));
+
+    // Dropping the declaration returns exactly the entry an app without
+    // associations has always had: no MimeType line, no `%F`, plain open —
+    // install, update and rollback all rewrite through `write`, so the
+    // previous association leaves no residue behind.
+    let dropped = render("tfsapp-test", &entity, hub, &[]);
+    assert!(!dropped.contains("MimeType="));
+    assert!(!dropped.contains("%F"));
+    assert!(dropped.contains("Exec=\"/hub/tfsapp-hub\" open tfsapp-test\n"));
+}
+
+#[test]
+fn a_declaring_app_entry_passes_desktop_file_validate_when_present() {
+    let entity = identity(
+        "dev.local.tfsapp-test",
+        "TFSApp Test",
+        Some(PathBuf::from("/opt/apps/tfsapp-test/icon.png")),
+    );
+    let rendered = render(
+        "tfsapp-test",
+        &entity,
+        Path::new("/hub/tfsapp-hub"),
+        &["text/markdown".to_string()],
+    );
+
+    let base = tempfile::tempdir().expect("a temp applications dir");
+    let file = base.path().join("dev.local.tfsapp-test.desktop");
+    std::fs::write(&file, rendered).expect("the rendered entry");
+
+    let output = match std::process::Command::new("desktop-file-validate")
+        .arg(&file)
+        .output()
+    {
+        Ok(output) => output,
+        // A best-effort gate: not every host carries the freedesktop tools,
+        // and their absence says nothing about the entry itself.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => panic!("desktop-file-validate could not run: {error}"),
+    };
+    assert!(
+        output.status.success(),
+        "desktop-file-validate said: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

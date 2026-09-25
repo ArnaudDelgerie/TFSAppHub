@@ -272,6 +272,73 @@ guards stay standing. An app that declares nothing sees none of this.
 A third lock joins these two once a `run` command exists — see "Running a
 declared command" below for what it answers and how a launch reads it.
 
+### File requests: `open <id> -- <file>...` and the "Open with" menu
+
+An app that declares the pair — `file_associations.mime_types` in §2 plus
+`actions.open_files.ipc` in §7 — can be handed local files, either through
+`open <id> -- <file>...` or by choosing it in the desktop environment's
+"Open with" menu (its `.desktop` entry gains `MimeType=` and an `Exec=` ending
+in `-- %F`, the freedesktop field code the environment expands into separate
+local-file arguments; see "Installing"). Apps declaring nothing keep every
+surface they had.
+
+**One invocation is one request**: an opaque id the hub generates, plus the
+ordered path list that invocation carried. Repeating the same open on the same
+file is a new request, always. The whole batch is validated before anything is
+enqueued — every path a local, existing, regular file — and a batch that fails
+is refused whole, naming the offending path, with nothing enqueued. That is not
+a readability promise: deletion, permission changes and unsuitable content
+remain the app's to handle when it opens what it received.
+
+The queue lives in the hub process's memory and exists before the splash or
+the backend — a cold start's files are enqueued in the child before any window
+is created, and an arrival during the splash simply waits for the first app
+document. Its lifetime is the process's: a hub crash, a failed startup or
+ordinary exit ends it. Bounds are finite and overflow is loud — at most 64
+pending requests per app, 64 paths per request, refused past either, never
+evicted.
+
+On the CLI, `--` is the separator that makes file operands possible: after it
+nothing is a flag, so spaces, Unicode, quotes and option-looking names are one
+argument each, taken verbatim with no shell or URL interpolation. Relative
+paths are normalized against the calling process's working directory before
+the child is detached, and a separator with nothing after it is the no-file
+form — a bare menu launch of a declaring app expands `%F` to zero arguments
+and leaves exactly that trailing `--`.
+
+A second launch while the app runs is where the single-instance handoff
+earns its keep: the second process's argv reaches the live instance through
+the pinned plugin's callback, and a file-bearing argv is parsed and enqueued
+on the event loop — the same admission boundary a second window goes through —
+instead of being discarded. A no-file argv keeps the new-window behaviour it
+has always had. The request then targets the most recently focused eligible
+window, with a deterministic fallback to a surviving one and a best-effort
+raise; file requests never navigate or reload a page.
+
+**The receiver's half is pull, not push.** After any queue update the hub emits
+one Tauri event, `tfsapp://open-files-pending`, to the selected window only —
+path-free, a bell rather than an envelope. The queue stays the source of
+truth: an emit failure is diagnosed and the requests stay queued, because the
+next notification or the receiver's own startup retrieves everything still
+pending. A receiver registers its listener and awaits it before the first
+`open_files_pending` read — that ordering is what covers an arrival racing the
+initial read — and afterwards reads on notification only, never on a timer.
+The listener is registered on the receiver's own `WebviewWindow`, matching the
+hub's one-window emission; a target-less `listen()` would also receive the
+notifications emitted to the app's other windows.
+`open_files_ack` removes a request, idempotently, and only the selected
+window can read or acknowledge its requests; a window closing with requests
+still pending hands them to a surviving eligible window, never to one whose
+close has committed.
+
+Delivery is replayable until acknowledgement, not exactly-once: a reload
+between the app's acceptance and its ack re-exposes the same id, so acceptance
+must be idempotent by request id on the app's side — the example in §7 is the
+pattern. Two limits are stated rather than papered over: the queue is not
+durable across a crash or shutdown, and the single-instance plugin's callback
+carries no application-acceptance reply, so the narrow handoff/shutdown race
+is diagnosed where observable but not guaranteed delivered.
+
 ### Worker supervision
 
 An app that declares off-window work gets one consumer per declared worker

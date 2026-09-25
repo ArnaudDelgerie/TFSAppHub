@@ -139,3 +139,17 @@ an `ETXTBSY`. It is also what `--update` (`hub_update.rs`) replaces this same
 file with, which is the other reason it lives under the hub's own root
 rather than beside a per-app path.
 
+**A declaring app's entry advertises what it can open.** An app whose manifest
+declares `file_associations.mime_types` (§2) gets two more things in its
+entry: a `MimeType=` line in the specification's list form — `;` between each
+and one trailing — and an `Exec=` ending in `open <id> -- %F`, where `%F` is
+a standalone, unquoted field code the desktop environment expands into
+separate local-file arguments (§7's receiver meets them there). MIME types
+are never part of app identity: they are a declaration of support, not a
+default-application claim, and which app the desktop *prefers* for a type
+stays the user's own setting. The desktop database is refreshed best-effort
+after both a write and a real removal, so the association cache never
+advertises an entry that is gone — and never touches a foreign entry, since
+`update-desktop-database` rebuilds the cache from the directory's own
+contents.
+

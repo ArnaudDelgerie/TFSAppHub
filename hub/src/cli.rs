@@ -135,8 +135,8 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "open",
-        form: "open <id>",
-        summary: "Open an installed app's window.",
+        form: "open <id> [-- <file>...]",
+        summary: "Open an installed app's window, optionally handing it local files.",
         level: Level::App,
         availability: Availability::Implemented,
     },
@@ -343,6 +343,10 @@ pub enum Command {
     List,
     Open {
         id: String,
+        /// The local files after the `--` separator, in the invocation's own
+        /// order — one batch, one request. Empty means the separator never
+        /// appeared, which is the no-file launch `open` has always been.
+        files: Vec<String>,
     },
     Dev {
         path: String,
@@ -410,6 +414,10 @@ pub enum Command {
         identifier: String,
         product_name: String,
         icon_path: Option<String>,
+        /// The files a file-bearing `open` handed the child after its own
+        /// `--` — already made absolute and validated by the parent that
+        /// wrote this argv. Re-validated at the enqueueing boundary.
+        files: Vec<String>,
     },
 }
 
@@ -539,7 +547,14 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     // a question, not asking for an install. The one place it is not the hub's
     // to read is after `run <id> <alias>`, where every remaining word belongs to
     // the app's own command; `parse_run` handles a leading `--help` itself.
-    if first != "run" && args.iter().any(|arg| arg == "--help") {
+    // After a `--` separator the same is true for `open`: a file named
+    // `--help` is a file, and the separator is the only thing that says so.
+    if first != "run"
+        && args
+            .iter()
+            .take_while(|argument| argument.as_str() != "--")
+            .any(|argument| argument == "--help")
+    {
         return Ok(Command::Help);
     }
 
@@ -576,9 +591,15 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             Ok(Command::List)
         }
         "open" => {
-            let mut options = options("open", rest, &[], &[])?;
+            let (before, after) = split_at_separator(rest);
+            let mut options = options("open", before, &[], &[])?;
             Ok(Command::Open {
                 id: options.exactly_one("open", "an app id")?,
+                // A separator with nothing after it is the no-file form, not
+                // a broken promise: a declaring app's desktop entry ends in
+                // `-- %F`, and a bare menu launch expands `%F` to zero
+                // arguments, leaving exactly that trailing `--`.
+                files: after.to_vec(),
             })
         }
         "dev" => {
@@ -763,18 +784,20 @@ fn parse_run(args: &[String]) -> Result<Command, UsageError> {
 }
 
 /// The hidden `__open (--id <id> | --project <path>) --identity <identifier>
-/// --name <n> [--icon <p>]`.
+/// --name <n> [--icon <p>] [-- <file>...]`.
 ///
 /// `--identity`/`--name` are required, and neither is defaulted: this form is
 /// written by `open <id>` or `dev <path>` and by nothing else, so a missing one
 /// is a bug in the parent rather than a user's typo, and quietly filling it in
 /// would hide exactly that. `--icon` stays optional because an app declaring no
 /// icon is ordinary. `--id`/`--project` are exactly-one — see
-/// [`OpenChildSource`].
+/// [`OpenChildSource`]. Files only travel with `--id`: `dev`'s grammar has no
+/// `--`, and a live session is not a file receiver.
 fn parse_open_child(args: &[String]) -> Result<Command, UsageError> {
+    let (before, after) = split_at_separator(args);
     let options = options(
         OPEN_CHILD_SUBCOMMAND,
-        args,
+        before,
         &["--id", "--project", "--identity", "--name", "--icon"],
         &[],
     )?;
@@ -796,6 +819,16 @@ fn parse_open_child(args: &[String]) -> Result<Command, UsageError> {
             ))
         }
     };
+    let files = after.to_vec();
+    if !files.is_empty() && matches!(source, OpenChildSource::Project(_)) {
+        return Err(usage_error(
+            OPEN_CHILD_SUBCOMMAND,
+            format!(
+                "{OPEN_CHILD_SUBCOMMAND} takes files only with --id — a dev session has no \
+                 file receiver"
+            ),
+        ));
+    }
 
     let required = |flag: &str| {
         options.value(flag).ok_or_else(|| {
@@ -811,7 +844,39 @@ fn parse_open_child(args: &[String]) -> Result<Command, UsageError> {
         identifier: required("--identity")?,
         product_name: required("--name")?,
         icon_path: options.value("--icon"),
+        files,
     })
+}
+
+/// The first `--` and what follows it: the operand separator `open` and
+/// `__open` share. Everything before it is the hub's grammar; everything
+/// after it is the caller's own operands, taken verbatim — spaces, Unicode,
+/// quotes and option-looking names included — and never read as a flag.
+///
+/// Nothing after it is not a promise broken but a batch the caller did not
+/// have: the desktop entry's `%F` expands to zero arguments on a bare menu
+/// launch, so the caller reads an empty batch as "no files", the same as no
+/// separator at all.
+fn split_at_separator(args: &[String]) -> (&[String], &[String]) {
+    match args.iter().position(|argument| argument == "--") {
+        Some(index) => (&args[..index], &args[index + 1..]),
+        None => (args, &[][..]),
+    }
+}
+
+/// The files a second instance's argv carries, if any — the single-instance
+/// hand-off's reading of an argv this hub itself wrote. The pinned plugin
+/// hands the live instance the *whole* argv of the second process, program
+/// name included, so this is `parse` on the rest; anything that is not an
+/// `__open` child with files answers empty, and the caller keeps the
+/// no-file behaviour it has always had. A hand-typed argv that does not
+/// parse answers empty for the same reason: the window admission is the
+/// fallback, not a diagnostic the arrival can be lost behind.
+pub fn second_instance_files(argv: &[String]) -> Vec<String> {
+    match parse(&argv[1.min(argv.len())..]) {
+        Ok(Command::OpenChild { files, .. }) => files,
+        _ => Vec::new(),
+    }
 }
 
 /// What [`options`] found: the words that were not flags, the flags that took a
