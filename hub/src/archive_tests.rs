@@ -63,6 +63,23 @@ fn append_symlink(builder: &mut Builder<GzEncoder<fs::File>>, path: &str, target
         .expect("append symlink");
 }
 
+fn append_special(builder: &mut Builder<GzEncoder<fs::File>>, path: &str, kind: EntryType) {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(kind);
+    header.set_size(0);
+    header.set_mode(0o644);
+    header.set_path(path).expect("a valid entry path");
+    if kind == EntryType::Link {
+        header.set_link_name("victim").expect("a link target");
+    } else if kind == EntryType::GNUSparse {
+        header.as_gnu_mut().expect("GNU header").set_real_size(0);
+    }
+    header.set_cksum();
+    builder
+        .append(&header, std::io::empty())
+        .expect("append entry");
+}
+
 /// Append an entry whose path bypasses [`Header::set_path`]'s own
 /// "relative, no `..`" validation — the only way to build a fixture archive
 /// that this crate's *builder* would refuse to write honestly, needed to
@@ -112,6 +129,7 @@ fn a_git_archive_style_pax_global_header_is_ignored() {
         append_pax_global_header(builder);
         append_dir(builder, "demo-1.0.0/");
         append_file(builder, "demo-1.0.0/composer.json", b"{}");
+        append_symlink(builder, "demo-1.0.0/alias.json", "composer.json");
     });
 
     let destination = temp.path().join("out");
@@ -122,6 +140,41 @@ fn a_git_archive_style_pax_global_header_is_ignored() {
         fs::read_to_string(root.join("composer.json")).expect("composer.json on disk"),
         "{}"
     );
+    assert_eq!(
+        fs::read_link(root.join("alias.json")).unwrap(),
+        PathBuf::from("composer.json")
+    );
+}
+
+#[test]
+fn unsupported_entries_are_refused_on_both_extraction_paths() {
+    for (kind, label) in [
+        (EntryType::Link, "hard link"),
+        (EntryType::Fifo, "fifo"),
+        (EntryType::GNUSparse, "sparse file"),
+    ] {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let archive = write_archive(temp.path(), "special.tar.gz", |builder| {
+            append_dir(builder, "data/");
+            append_special(builder, "data/hard", kind);
+        });
+        let out = temp.path().join("out");
+        let error = extract(&archive, &out).expect_err("unsupported entry");
+        assert!(
+            matches!(error, ArchiveError::UnsupportedEntry { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains(label), "{error}");
+        assert!(!out.join("data/hard").exists());
+
+        let prefix_out = temp.path().join("prefix-out");
+        let error = extract_prefix(&archive, "data", &prefix_out).expect_err("unsupported entry");
+        assert!(
+            matches!(error, ArchiveError::UnsupportedEntry { .. }),
+            "{error}"
+        );
+        assert!(!prefix_out.join("hard").exists());
+    }
 }
 
 #[test]
