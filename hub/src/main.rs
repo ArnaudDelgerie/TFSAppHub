@@ -51,6 +51,7 @@ mod update_check;
 mod update_refresh;
 #[allow(dead_code)] // Step 2 wires the persisted protocol into update/resync.
 mod update_transaction;
+mod user_dirs;
 mod version;
 mod window;
 mod worker;

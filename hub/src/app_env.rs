@@ -225,11 +225,12 @@ pub fn resolve(
         mode,
         media_handler_installed,
         crate::secrets::new_store,
+        glib::user_special_dir,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_with_store<F>(
+fn resolve_with_store<F, G>(
     manifest: &Manifest,
     app_dir: &Path,
     identifier: &str,
@@ -237,9 +238,11 @@ fn resolve_with_store<F>(
     mode: Mode,
     media_handler_installed: bool,
     new_store: F,
+    resolve_user_dir: G,
 ) -> Result<AppEnvironment, EnvError>
 where
     F: FnOnce(&str, &Path) -> crate::secrets::SecretStore,
+    G: Fn(glib::UserDirectory) -> Option<PathBuf>,
 {
     let data_dir = state_root.to_path_buf();
     let data_subdir = data_dir.join("data");
@@ -342,7 +345,7 @@ where
         Mode::Install | Mode::Launch(_) | Mode::Run => ("prod", "0"),
     };
 
-    let vars = vec![
+    let mut vars = vec![
         ("APP_ENV", app_env.to_string()),
         ("APP_DEBUG", app_debug.to_string()),
         ("APP_SECRET", app_secret),
@@ -397,6 +400,15 @@ where
     // *running*, and an install starts none. Present-but-dead would be worse
     // than absent — an app would open a connection to nothing.
 
+    // Appended after the canonical list above (decision 008): one
+    // `TFS_USER_<NAME>_DIR` per declared `actions.paths` member GLib actually
+    // resolves, entirely absent otherwise — never an empty string, never a
+    // fallback guess.
+    vars.extend(crate::user_dirs::resolve(
+        &manifest.actions.paths,
+        resolve_user_dir,
+    ));
+
     Ok(AppEnvironment {
         vars,
         data_dir,
@@ -428,6 +440,33 @@ pub fn resolve_with_secret_store_for_test(
         mode,
         media_handler_installed,
         move |_, _| secret_store,
+        glib::user_special_dir,
+    )
+}
+
+/// Test-only `actions.paths` resolver injection, so a test can prove
+/// `TFS_USER_<NAME>_DIR` wiring without depending on the host account's real
+/// `~/.config/user-dirs.dirs` — see `user_dirs.rs`'s own header.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_with_user_dirs_resolver_for_test(
+    manifest: &Manifest,
+    app_dir: &Path,
+    identifier: &str,
+    state_root: &Path,
+    mode: Mode,
+    media_handler_installed: bool,
+    resolve_user_dir: impl Fn(glib::UserDirectory) -> Option<PathBuf>,
+) -> Result<AppEnvironment, EnvError> {
+    resolve_with_store(
+        manifest,
+        app_dir,
+        identifier,
+        state_root,
+        mode,
+        media_handler_installed,
+        crate::secrets::new_store,
+        resolve_user_dir,
     )
 }
 

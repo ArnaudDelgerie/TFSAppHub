@@ -34,6 +34,14 @@ console command. An app cannot tell them apart, and that is deliberate.
 | `PATH` | prefixed so that `php` resolves to that same interpreter | the same |
 | `TFS_BRIDGE_URL` | the loopback bridge's address — **present only when a bridge is running** (§7) | the app's HTTP client |
 | `TFS_BRIDGE_TOKEN` | random hex, regenerated every launch, never persisted; present under the same condition | the app, as a bearer token |
+| `TFS_USER_DESKTOP_DIR` | the resolved `desktop` user directory — **present only when `actions.paths.desktop` is declared and GLib resolves it** (§7) | the app |
+| `TFS_USER_DOCUMENTS_DIR` | same, for `documents` | the app |
+| `TFS_USER_DOWNLOADS_DIR` | same, for `downloads` | the app |
+| `TFS_USER_MUSIC_DIR` | same, for `music` | the app |
+| `TFS_USER_PICTURES_DIR` | same, for `pictures` | the app |
+| `TFS_USER_PUBLIC_SHARE_DIR` | same, for `public_share` | the app |
+| `TFS_USER_TEMPLATES_DIR` | same, for `templates` | the app |
+| `TFS_USER_VIDEOS_DIR` | same, for `videos` | the app |
 
 ### The interpreter is discoverable
 
@@ -157,4 +165,10 @@ way it would on any web page. The AND that produces it is the same shape as
 the other two — the manifest's own declaration on one side, what this launch
 actually managed on the other — so a host that cannot install the grant
 reports `"0"` rather than failing the launch (§8).
+
+Each `TFS_USER_<NAME>_DIR` variable above (§7, decision 008) follows the same
+rule from the other direction: it is present only when its member is declared
+**and** GLib's own `~/.config/user-dirs.dirs` resolution answers a path for
+it. A declared member GLib cannot resolve reports as an absent variable —
+never an empty string and never a guessed fallback path (§8).
 

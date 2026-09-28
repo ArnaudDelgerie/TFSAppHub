@@ -108,3 +108,14 @@ otherwise-granted machine is not this host's to catch at all: it surfaces
 through `getUserMedia()` failing at the point of use, exactly as it would on
 any ordinary web page.
 
+### A declared user directory GLib cannot resolve
+
+The same rule again, for `actions.paths` (§7, decision 008): GLib answers from
+`~/.config/user-dirs.dirs` and its own compiled-in defaults, not from a
+`stat()` call, so a declared member it cannot resolve reports as an absent
+`TFS_USER_<NAME>_DIR` variable (§3) rather than a guessed path built from
+`$HOME`. The reverse case — a path GLib resolves that no longer exists, or is
+not writable — is not caught here either: whether that check ever happens is
+left open (decision 008), and today the variable simply reports GLib's answer
+as-is.
+

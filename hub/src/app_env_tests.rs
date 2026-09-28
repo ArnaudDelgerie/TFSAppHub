@@ -4,7 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{resolve, resolve_with_secret_store_for_test, Mode};
+use super::{
+    resolve, resolve_with_secret_store_for_test, resolve_with_user_dirs_resolver_for_test, Mode,
+};
 use crate::{
     lifecycle::CacheStamp,
     manifest,
@@ -198,6 +200,122 @@ fn media_microphone_is_zero_when_declared_but_the_handler_failed_to_install() {
     .expect("it resolves");
 
     assert_eq!(value(&environment.vars, "TFS_MEDIA_MICROPHONE"), "0");
+}
+
+// --- `TFS_USER_<NAME>_DIR` mirrors declared, resolved `actions.paths`
+// members (decision 008) ---
+
+#[test]
+fn a_declared_and_resolved_paths_member_reports_its_variable() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("paths-declared-and-resolved");
+    let state_root = state_root(&paths, &identifier);
+
+    let environment = resolve_with_user_dirs_resolver_for_test(
+        &manifest_for(
+            &identifier,
+            r#", "actions": {"paths": {"downloads": true}}"#,
+        ),
+        Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
+        Mode::Install,
+        false,
+        |_| Some(PathBuf::from("/home/fake/Downloads")),
+    )
+    .expect("it resolves");
+
+    assert_eq!(
+        value(&environment.vars, "TFS_USER_DOWNLOADS_DIR"),
+        "/home/fake/Downloads"
+    );
+}
+
+#[test]
+fn a_declared_and_unresolved_paths_member_omits_its_variable() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("paths-declared-and-unresolved");
+    let state_root = state_root(&paths, &identifier);
+
+    let environment = resolve_with_user_dirs_resolver_for_test(
+        &manifest_for(
+            &identifier,
+            r#", "actions": {"paths": {"downloads": true}}"#,
+        ),
+        Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
+        Mode::Install,
+        false,
+        |_| None,
+    )
+    .expect("it resolves");
+
+    assert!(
+        !var_names(&environment.vars).contains("TFS_USER_DOWNLOADS_DIR"),
+        "a declared member GLib cannot resolve must report as absent, never empty"
+    );
+}
+
+#[test]
+fn an_undeclared_paths_member_omits_its_variable_even_when_resolvable() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("paths-undeclared");
+    let state_root = state_root(&paths, &identifier);
+
+    let environment = resolve_with_user_dirs_resolver_for_test(
+        &manifest_for(&identifier, ""),
+        Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
+        Mode::Install,
+        false,
+        |_| Some(PathBuf::from("/home/fake/anything")),
+    )
+    .expect("it resolves");
+
+    assert!(!var_names(&environment.vars).contains("TFS_USER_DOWNLOADS_DIR"));
+    assert!(!var_names(&environment.vars).contains("TFS_USER_PICTURES_DIR"));
+}
+
+#[test]
+fn several_declared_paths_members_each_report_independently() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("paths-several-declared");
+    let state_root = state_root(&paths, &identifier);
+
+    let environment = resolve_with_user_dirs_resolver_for_test(
+        &manifest_for(
+            &identifier,
+            r#", "actions": {"paths": {"downloads": true, "pictures": true, "videos": true}}"#,
+        ),
+        Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
+        Mode::Install,
+        false,
+        |directory| match directory {
+            glib::UserDirectory::Downloads => Some(PathBuf::from("/home/fake/Downloads")),
+            glib::UserDirectory::Pictures => None,
+            glib::UserDirectory::Videos => Some(PathBuf::from("/home/fake/Videos")),
+            other => panic!("undeclared member {other:?} must never be looked up"),
+        },
+    )
+    .expect("it resolves");
+
+    assert_eq!(
+        value(&environment.vars, "TFS_USER_DOWNLOADS_DIR"),
+        "/home/fake/Downloads"
+    );
+    assert_eq!(
+        value(&environment.vars, "TFS_USER_VIDEOS_DIR"),
+        "/home/fake/Videos"
+    );
+    assert!(!var_names(&environment.vars).contains("TFS_USER_PICTURES_DIR"));
 }
 
 #[test]
