@@ -244,6 +244,11 @@ pub fn run_entry_file_name(launcher_pid: u32) -> String {
     format!("{launcher_pid}.lock")
 }
 
+/// Parse the launcher's pid from a `runs/` entry name.
+pub fn run_entry_launcher_pid(name: &std::ffi::OsStr) -> Option<u32> {
+    name.to_str()?.strip_suffix(".lock")?.parse().ok()
+}
+
 /// One entry's status once a scanner has tried to flock it and, if that
 /// succeeded, identity-probed the pid its record names — the exact ternary
 /// `../plan/035-the-run-record-outlives-its-flock.md` gave `run.lock` as a
@@ -314,7 +319,7 @@ pub struct ActiveRunEntry {
 /// live launcher or an active orphan is reported; a stale entry is unlinked
 /// on the spot rather than reported — the scan is its own janitor, so every
 /// caller that asks "what's active" also cleans up after whoever left an
-/// entry behind. Never unlinks an entry whose recorded pid is live, which is
+/// entry behind. Never unlinks an entry whose file-name launcher pid is live, which is
 /// what keeps the unlink-versus-flock race closed
 /// (`../decision/005-concurrency-belongs-to-the-alias.md`). A missing
 /// `runs/` directory is nothing running, not an error. The result is sorted
@@ -354,7 +359,13 @@ pub fn scan_runs(data_dir: &Path, identifier: &str) -> std::io::Result<Vec<Activ
                         path,
                     }),
                     RunEntryStatus::Stale => {
-                        let _ = std::fs::remove_file(&path);
+                        let launcher_alive = path
+                            .file_name()
+                            .and_then(run_entry_launcher_pid)
+                            .is_some_and(tfsapp_core::process::process_exists);
+                        if !launcher_alive {
+                            let _ = std::fs::remove_file(&path);
+                        }
                     }
                     RunEntryStatus::LiveLauncher { .. } => {
                         unreachable!("an acquired flock never decides as a live launcher")

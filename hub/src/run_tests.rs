@@ -200,6 +200,59 @@ fn scan_runs_empty_when_the_directory_does_not_exist() {
     );
 }
 
+fn reaped_child_pid() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+#[test]
+fn scan_runs_preserves_empty_entry_named_after_live_launcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs_dir = dir.path().join("runs");
+    std::fs::create_dir(&runs_dir).unwrap();
+    let path = runs_dir.join(run_entry_file_name(std::process::id()));
+    std::fs::write(&path, "").unwrap();
+
+    assert!(scan_runs(dir.path(), "test-identifier").unwrap().is_empty());
+    assert!(path.exists());
+}
+
+#[test]
+fn scan_runs_unlinks_empty_entry_named_after_dead_launcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs_dir = dir.path().join("runs");
+    std::fs::create_dir(&runs_dir).unwrap();
+    let path = runs_dir.join(run_entry_file_name(reaped_child_pid()));
+    std::fs::write(&path, "").unwrap();
+
+    assert!(scan_runs(dir.path(), "test-identifier").unwrap().is_empty());
+    assert!(!path.exists());
+}
+
+#[test]
+fn scan_runs_reports_orphan_even_when_launcher_name_pid_is_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs_dir = dir.path().join("runs");
+    std::fs::create_dir(&runs_dir).unwrap();
+    let identifier = "test-identifier";
+    let path = runs_dir.join(run_entry_file_name(std::process::id()));
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .env("TFS_APP_IDENTIFIER", identifier)
+        .spawn()
+        .unwrap();
+    std::fs::write(&path, format_run_entry("mcp-serve", Some(child.id()))).unwrap();
+
+    let active = scan_runs(dir.path(), identifier).unwrap();
+    assert_eq!(active.len(), 1);
+    assert!(active[0].orphaned);
+    assert_eq!(active[0].pid, Some(child.id()));
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
 #[test]
 fn scan_runs_finds_a_live_launcher_from_its_held_entry() {
     let dir = tempfile::tempdir().unwrap();
@@ -225,7 +278,7 @@ fn scan_runs_finds_an_active_orphan_then_unlinks_it_once_stale() {
     let dir = tempfile::tempdir().unwrap();
     let runs_dir = dir.path().join("runs");
     std::fs::create_dir_all(&runs_dir).unwrap();
-    let entry_path = runs_dir.join("1.lock");
+    let entry_path = runs_dir.join(run_entry_file_name(reaped_child_pid()));
     let identifier = "test-identifier";
     let mut child = spawn_run_entry_holder(&entry_path, identifier);
     let pid = child.id();
@@ -454,6 +507,18 @@ fn parse_run_entry_round_trips_through_format_run_entry() {
 #[test]
 fn run_entry_file_name_is_the_launcher_pid() {
     assert_eq!(run_entry_file_name(4321), "4321.lock");
+    assert_eq!(
+        run_entry_launcher_pid(std::ffi::OsStr::new("4321.lock")),
+        Some(4321)
+    );
+    assert_eq!(
+        run_entry_launcher_pid(std::ffi::OsStr::new("bad.lock")),
+        None
+    );
+    assert_eq!(
+        run_entry_launcher_pid(std::ffi::OsStr::new("4321.txt")),
+        None
+    );
 }
 
 // --- run_entry_status --------------------------------------------------------
