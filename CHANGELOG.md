@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+An app can now declare `actions.media.microphone` and reach the microphone
+through the ordinary web platform — `getUserMedia({audio: true})` on its own
+page, never through IPC or the bridge, which is why the group has neither
+transport (`ipc`/`bridge` are refused under it, like `picker.bridge`).
+Undeclared, the webview keeps WebKitGTK's own default of no capture at all —
+no dialog, nothing to retry. Declared, exactly two WebKit permission
+requests are ever granted, both only on the app's own origin: an audio-only
+capture (a combined audio+video request is refused as a whole) and a
+device-info request, the second needed for `enumerateDevices()` to return
+labels at all. Every other permission kind stays denied, whatever the
+manifest says. `TFS_MEDIA_MICROPHONE` reports what was actually granted on
+this machine, never what was merely declared. No prompt and no
+capture-in-progress indicator ship yet — the declaration, readable before
+install, is the whole of the consent story for now.
+
 An app can now declare `file_associations.mime_types` plus the
 `actions.open_files` receiver and be handed local paths — through
 `tfsapp-hub open <id> -- <path>...` or by choosing the app in the desktop

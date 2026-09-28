@@ -217,3 +217,15 @@ Read per-`identifier` storage as tidiness, not as secrecy.
 [`CONTRACT.md` §5](contract/5-the-apps-own-state.md) states the full guarantee, including the one
 thing the hub *is* strict about: a webview reaches its secret store through the
 window it belongs to and can never name another app's.
+
+### A declared microphone can be captured silently
+
+Declaring `actions.media.microphone` buys a line in a manifest, readable
+before install — it does not buy a runtime prompt or an indicator that a
+capture is in progress; neither ships yet. Refusing the capability outright
+would not close this gap either: an installed app already runs with the
+user's full rights and can reach a microphone through a subprocess with
+nothing declared anywhere, the same trust decision the AppImage comparison
+above already makes. The declared route is the auditable one, not the only
+one — see [decision 007](.project/decision/007-the-microphone-is-a-declared-capability.md)
+for the reasoning and what is honestly still missing.
