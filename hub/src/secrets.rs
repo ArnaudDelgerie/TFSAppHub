@@ -72,6 +72,40 @@ pub const RESERVED_SECRET_KEYS: &[&str] = &[APP_SECRET_ACCOUNT, PROBE_ACCOUNT];
 /// data store.
 pub const MAX_SECRET_VALUE_BYTES: usize = 8192;
 
+/// Why a store operation failed. Its `Display` is what the transports' one
+/// warning line prints, so it names a cause and never a key or a value.
+///
+/// `Keyring` never reaches the line verbatim: the keyring crate's own
+/// `Display` prints the whole `Credential` on `Ambiguous`, which is more than
+/// a log line should ever be trusted with — see the `Display` impl below.
+#[derive(Debug)]
+pub enum StorageError {
+    Keyring(keyring::Error),
+    Io(std::io::Error),
+    /// A `secrets.json` that does not parse. The file is left untouched: a
+    /// write over it would destroy every other secret it holds.
+    Corrupt,
+    /// The keyring did not answer within the store's deadline (plan 068).
+    #[allow(dead_code)] // constructed from step 3's deadline wrapper
+    TimedOut,
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keyring(keyring::Error::Ambiguous(_)) => {
+                write!(f, "the keyring matched more than one entry")
+            }
+            Self::Keyring(error) => write!(f, "keyring: {error}"),
+            Self::Io(error) => write!(f, "io: {error}"),
+            Self::Corrupt => write!(f, "the secrets file does not parse"),
+            Self::TimedOut => write!(f, "the keyring did not answer within its deadline"),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
+
 /// The guard behind every IPC command and every bridge route: a reserved key is
 /// always refused, and anything else must be explicitly declared. `keys` is a
 /// manifest — typo-catching, enumerability, a cap on how many things an app can
@@ -104,10 +138,14 @@ enum Backend {
     /// `APP_SECRET` resolution path can be exercised against a working
     /// "keyring" without one — and without ever writing to a developer's real
     /// login keyring, which is what calling `new_store` in a test would do.
+    /// `failing` is the audit-024 failure mode: every operation returns a
+    /// keyring error, so a store that reports failures can be tested without
+    /// a broken D-Bus.
     #[cfg(test)]
     FakeKeyring {
         service: String,
         entries: FakeKeyring,
+        failing: bool,
     },
 }
 
@@ -127,8 +165,27 @@ impl FakeKeyring {
         SecretStore(Arc::new(Backend::FakeKeyring {
             service: service.to_string(),
             entries: self.clone(),
+            failing: false,
         }))
     }
+
+    /// A store over the same entries that fails every operation, so tests can
+    /// seed through [`Self::store`] and observe what a caller did or did not
+    /// overwrite once the failing view refused everything.
+    pub fn failing_store(&self, service: &str) -> SecretStore {
+        SecretStore(Arc::new(Backend::FakeKeyring {
+            service: service.to_string(),
+            entries: self.clone(),
+            failing: true,
+        }))
+    }
+}
+
+#[cfg(test)]
+fn fake_keyring_failure() -> StorageError {
+    StorageError::Keyring(keyring::Error::NoStorageAccess(
+        "the failing keyring refuses every operation".into(),
+    ))
 }
 
 /// One set/get/delete round trip against the real backend, run once at store
@@ -187,21 +244,27 @@ pub fn keyring_env_value(store: &SecretStore) -> &'static str {
     }
 }
 
-fn read_file_map(path: &Path) -> HashMap<String, String> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| serde_json::from_str(&contents).ok())
-        .unwrap_or_default()
+/// A missing file is an empty map — the first launch's legitimate state.
+/// Anything else the read can do wrong — permissions, I/O, a file that does
+/// not parse — is an `Err`, so callers stop rather than write over it and
+/// destroy every secret it holds.
+fn read_file_map(path: &Path) -> Result<HashMap<String, String>, StorageError> {
+    match fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str(&contents).map_err(|_| StorageError::Corrupt),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(error) => Err(StorageError::Io(error)),
+    }
 }
 
 /// Same-directory temp file plus `rename`, created `0600` directly rather than
 /// written-then-chmodded — so the map is never briefly readable at the umask's
 /// permissions, and a crash mid-write can only leave the old or the new contents
-/// in full.
-fn write_file_map(path: &Path, map: &HashMap<String, String>) {
-    let Ok(contents) = serde_json::to_string(map) else {
-        return;
-    };
+/// in full. Every step propagates: a failed write must be reported as one,
+/// never answered as a success the next launch disproves.
+fn write_file_map(path: &Path, map: &HashMap<String, String>) -> Result<(), StorageError> {
+    // A map of `String`s cannot fail to serialise; `Corrupt` stands in for the
+    // impossible case so the signature still says "never swallowed".
+    let contents = serde_json::to_string(map).map_err(|_| StorageError::Corrupt)?;
     let mut name = path
         .file_name()
         .expect("the secret store path has a file name")
@@ -209,10 +272,12 @@ fn write_file_map(path: &Path, map: &HashMap<String, String>) {
     name.push(".tmp");
     let temporary = path.with_file_name(name);
 
-    let written = create_0600(&temporary).and_then(|mut file| file.write_all(contents.as_bytes()));
-    if written.is_ok() {
-        let _ = fs::rename(&temporary, path);
-    }
+    let mut file = create_0600(&temporary).map_err(StorageError::Io)?;
+    file.write_all(contents.as_bytes())
+        .map_err(StorageError::Io)?;
+    file.sync_all().map_err(StorageError::Io)?;
+    fs::rename(&temporary, path).map_err(StorageError::Io)?;
+    Ok(())
 }
 
 fn create_0600(path: &Path) -> std::io::Result<fs::File> {
@@ -225,80 +290,148 @@ fn create_0600(path: &Path) -> std::io::Result<fs::File> {
         .open(path)
 }
 
-pub fn secrets_has(store: &SecretStore, account: &str) -> bool {
-    match store.0.as_ref() {
-        Backend::Keyring { service } => Entry::new(service, account)
-            .and_then(|entry| entry.get_password())
-            .is_ok(),
-        Backend::File { path, .. } => read_file_map(path).contains_key(account),
-        #[cfg(test)]
-        Backend::FakeKeyring { service, entries } => entries
-            .0
-            .lock()
-            .expect("the secret store is not poisoned")
-            .contains_key(&(service.clone(), account.to_string())),
-    }
-}
-
-pub fn secrets_get(store: &SecretStore, account: &str) -> Option<String> {
-    match store.0.as_ref() {
-        Backend::Keyring { service } => Entry::new(service, account).ok()?.get_password().ok(),
-        Backend::File { path, .. } => read_file_map(path).get(account).cloned(),
-        #[cfg(test)]
-        Backend::FakeKeyring { service, entries } => entries
-            .0
-            .lock()
-            .expect("the secret store is not poisoned")
-            .get(&(service.clone(), account.to_string()))
-            .cloned(),
-    }
-}
-
-pub fn secrets_set(store: &SecretStore, account: &str, value: String) {
+/// `Ok(false)`: a keyring with no entry, or a file with none. `Err`: the
+/// backend could not answer the question — never a silent `false`, which a
+/// caller would read as "there is nothing there".
+pub fn secrets_has(store: &SecretStore, account: &str) -> Result<bool, StorageError> {
     match store.0.as_ref() {
         Backend::Keyring { service } => {
-            if let Ok(entry) = Entry::new(service, account) {
-                let _ = entry.set_password(&value);
+            let entry = Entry::new(service, account).map_err(StorageError::Keyring)?;
+            match entry.get_password() {
+                Ok(_) => Ok(true),
+                Err(keyring::Error::NoEntry) => Ok(false),
+                Err(error) => Err(StorageError::Keyring(error)),
             }
+        }
+        Backend::File { path, .. } => Ok(read_file_map(path)?.contains_key(account)),
+        #[cfg(test)]
+        Backend::FakeKeyring {
+            service,
+            entries,
+            failing,
+        } => {
+            if *failing {
+                return Err(fake_keyring_failure());
+            }
+            Ok(entries
+                .0
+                .lock()
+                .expect("the secret store is not poisoned")
+                .contains_key(&(service.clone(), account.to_string())))
+        }
+    }
+}
+
+/// `Ok(None)`: the keyring reports no entry, or the file does not hold the
+/// key. `Err`: the read itself failed. A keyring `NoEntry` is a plain
+/// absence, never an error — callers could not tell "never set" from
+/// "cannot say" otherwise.
+pub fn secrets_get(store: &SecretStore, account: &str) -> Result<Option<String>, StorageError> {
+    match store.0.as_ref() {
+        Backend::Keyring { service } => {
+            let entry = Entry::new(service, account).map_err(StorageError::Keyring)?;
+            match entry.get_password() {
+                Ok(value) => Ok(Some(value)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(error) => Err(StorageError::Keyring(error)),
+            }
+        }
+        Backend::File { path, .. } => Ok(read_file_map(path)?.get(account).cloned()),
+        #[cfg(test)]
+        Backend::FakeKeyring {
+            service,
+            entries,
+            failing,
+        } => {
+            if *failing {
+                return Err(fake_keyring_failure());
+            }
+            Ok(entries
+                .0
+                .lock()
+                .expect("the secret store is not poisoned")
+                .get(&(service.clone(), account.to_string()))
+                .cloned())
+        }
+    }
+}
+
+/// The write must be reported as it happened: a keyring that refuses, or a
+/// file that cannot be written, is an `Err` — never a silent success the
+/// next launch disproves. In the file backend, a read that fails aborts
+/// before any write: overwriting a file the store could not read would
+/// destroy every other secret it holds.
+pub fn secrets_set(store: &SecretStore, account: &str, value: String) -> Result<(), StorageError> {
+    match store.0.as_ref() {
+        Backend::Keyring { service } => {
+            let entry = Entry::new(service, account).map_err(StorageError::Keyring)?;
+            entry.set_password(&value).map_err(StorageError::Keyring)?;
+            Ok(())
         }
         Backend::File { path, lock } => {
             let _guard = lock.lock().expect("the secrets file lock is not poisoned");
-            let mut map = read_file_map(path);
+            let mut map = read_file_map(path)?;
             map.insert(account.to_string(), value);
-            write_file_map(path, &map);
+            write_file_map(path, &map)
         }
         #[cfg(test)]
-        Backend::FakeKeyring { service, entries } => {
+        Backend::FakeKeyring {
+            service,
+            entries,
+            failing,
+        } => {
+            if *failing {
+                return Err(fake_keyring_failure());
+            }
             entries
                 .0
                 .lock()
                 .expect("the secret store is not poisoned")
                 .insert((service.clone(), account.to_string()), value);
+            Ok(())
         }
     }
 }
 
-pub fn secrets_delete(store: &SecretStore, account: &str) -> bool {
+/// `Ok(false)`: the key was never there — a plain absence, written nowhere.
+/// `Err`: the backend failed, in which case the key must be assumed to still
+/// be there; a token the app believes revoked can no longer survive a failed
+/// delete as though it had been revoked.
+pub fn secrets_delete(store: &SecretStore, account: &str) -> Result<bool, StorageError> {
     match store.0.as_ref() {
-        Backend::Keyring { service } => Entry::new(service, account)
-            .map(|entry| entry.delete_credential().is_ok())
-            .unwrap_or(false),
+        Backend::Keyring { service } => {
+            let entry = Entry::new(service, account).map_err(StorageError::Keyring)?;
+            match entry.delete_credential() {
+                Ok(()) => Ok(true),
+                Err(keyring::Error::NoEntry) => Ok(false),
+                Err(error) => Err(StorageError::Keyring(error)),
+            }
+        }
         Backend::File { path, lock } => {
             let _guard = lock.lock().expect("the secrets file lock is not poisoned");
-            let mut map = read_file_map(path);
+            let mut map = read_file_map(path)?;
             let existed = map.remove(account).is_some();
             if existed {
-                write_file_map(path, &map);
+                write_file_map(path, &map)?;
             }
-            existed
+            Ok(existed)
         }
         #[cfg(test)]
-        Backend::FakeKeyring { service, entries } => entries
-            .0
-            .lock()
-            .expect("the secret store is not poisoned")
-            .remove(&(service.clone(), account.to_string()))
-            .is_some(),
+        Backend::FakeKeyring {
+            service,
+            entries,
+            failing,
+        } => {
+            if *failing {
+                return Err(fake_keyring_failure());
+            }
+            Ok(entries
+                .0
+                .lock()
+                .expect("the secret store is not poisoned")
+                .remove(&(service.clone(), account.to_string()))
+                .is_some())
+        }
     }
 }
 
@@ -307,11 +440,16 @@ pub fn secrets_delete(store: &SecretStore, account: &str) -> bool {
 /// fresh secret is generated and stored.
 ///
 /// The decision itself is `core`'s, with its own tests; this is the plumbing
-/// around it. Every failure — no reachable keyring, a write that will not verify
-/// — falls back to the plaintext file rather than propagating: `APP_SECRET`
-/// resolution must never be the reason an app will not open, because everything
-/// the app signs (CSRF tokens, remember-me cookies) depends on getting *a*
-/// stable value.
+/// around it. Every failure — no reachable keyring, a read that fails, a
+/// write that will not verify — falls back to the plaintext file rather than
+/// propagating: `APP_SECRET` resolution must never be the reason an app will
+/// not open, because everything the app signs (CSRF tokens, remember-me
+/// cookies) depends on getting *a* stable value.
+///
+/// A keyring read that fails short-circuits the decision entirely: the entry
+/// may exist behind the failure, so [`AppSecretAction::Generate`] must not be
+/// consulted and the keyring must not be written to. The existing file is the
+/// only value this launch can trust.
 pub fn resolve_app_secret(
     store: &SecretStore,
     data_subdir: &Path,
@@ -322,7 +460,10 @@ pub fn resolve_app_secret(
 
     let secret_file = data_subdir.join("app.secret");
     let file_value = fs::read_to_string(&secret_file).ok();
-    let keyring_value = secrets_get(store, APP_SECRET_ACCOUNT);
+    let keyring_value = match secrets_get(store, APP_SECRET_ACCOUNT) {
+        Ok(value) => value,
+        Err(_) => return load_or_create_app_secret(data_subdir),
+    };
 
     match app_secret_action(keyring_value.as_deref(), file_value.as_deref()) {
         AppSecretAction::UseKeyring(secret) => {
@@ -332,10 +473,17 @@ pub fn resolve_app_secret(
             Ok(secret)
         }
         AppSecretAction::Migrate(secret) => {
-            secrets_set(store, APP_SECRET_ACCOUNT, secret.clone());
-            if secrets_get(store, APP_SECRET_ACCOUNT).as_deref() == Some(secret.as_str()) {
-                // Security over continuity: the plaintext file goes only once
-                // the keyring write is confirmed, never before.
+            // An `Err` at either the write or the verification falls back to
+            // the file, exactly as a mismatch does: the file is only dropped
+            // once the keyring is confirmed to hold the value.
+            let written = secrets_set(store, APP_SECRET_ACCOUNT, secret.clone()).is_ok();
+            let verified = written
+                && secrets_get(store, APP_SECRET_ACCOUNT)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some(secret.as_str());
+            if verified {
                 let _ = fs::remove_file(&secret_file);
                 Ok(secret)
             } else {
@@ -344,8 +492,14 @@ pub fn resolve_app_secret(
         }
         AppSecretAction::Generate => {
             let secret = tfsapp_core::app_secret::random_secret_hex()?;
-            secrets_set(store, APP_SECRET_ACCOUNT, secret.clone());
-            if secrets_get(store, APP_SECRET_ACCOUNT).as_deref() == Some(secret.as_str()) {
+            let written = secrets_set(store, APP_SECRET_ACCOUNT, secret.clone()).is_ok();
+            let verified = written
+                && secrets_get(store, APP_SECRET_ACCOUNT)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some(secret.as_str());
+            if verified {
                 Ok(secret)
             } else {
                 load_or_create_app_secret(data_subdir)
@@ -358,21 +512,26 @@ pub fn resolve_app_secret(
 /// value — the enumeration CONTRACT.md §2 promises, and the only reliable way an
 /// app can populate a settings screen. Filtered through [`secret_key_allowed`]
 /// like every other entry point, so a reserved key an app listed by mistake does
-/// not appear here either.
+/// not appear here either. The first store error propagates: a settings screen
+/// built on "nothing is set" behind a failing store is worse than no answer.
 #[derive(serde::Serialize, Debug, Clone, PartialEq)]
 pub struct SecretListEntry {
-    key: String,
-    set: bool,
+    pub(crate) key: String,
+    pub(crate) set: bool,
 }
 
-pub fn secret_list_entries(store: &SecretStore, keys: &[String]) -> Vec<SecretListEntry> {
-    keys.iter()
-        .filter(|key| secret_key_allowed(keys, key))
-        .map(|key| SecretListEntry {
+pub fn secret_list_entries(
+    store: &SecretStore,
+    keys: &[String],
+) -> Result<Vec<SecretListEntry>, StorageError> {
+    let mut entries = Vec::new();
+    for key in keys.iter().filter(|key| secret_key_allowed(keys, key)) {
+        entries.push(SecretListEntry {
             key: key.clone(),
-            set: secrets_has(store, key),
-        })
-        .collect()
+            set: secrets_has(store, key)?,
+        });
+    }
+    Ok(entries)
 }
 
 /// The store the window that asked owns.
@@ -406,13 +565,18 @@ pub fn keys_for_window<R: tauri::Runtime>(window: &tauri::Window<R>) -> Vec<Stri
 const KEY_NOT_DECLARED: &str = "key_not_declared";
 const NO_STORE: &str = "unavailable";
 
+// Step 068-1 transitional: the store now reports failures, the transports do
+// not yet — each command maps an `Err` to the answer the old swallowing code
+// gave, so this commit changes no transport. Step 2 replaces every mapping
+// below with `storage_failed`.
+
 #[tauri::command]
 pub fn secret_has(window: tauri::Window, key: String) -> Result<bool, &'static str> {
     let store = store_for_window(&window).ok_or(NO_STORE)?;
     if !secret_key_allowed(&keys_for_window(&window), &key) {
         return Err(KEY_NOT_DECLARED);
     }
-    Ok(secrets_has(&store, &key))
+    Ok(secrets_has(&store, &key).unwrap_or(false))
 }
 
 #[tauri::command]
@@ -421,7 +585,7 @@ pub fn secret_get(window: tauri::Window, key: String) -> Result<Option<String>, 
     if !secret_key_allowed(&keys_for_window(&window), &key) {
         return Err(KEY_NOT_DECLARED);
     }
-    Ok(secrets_get(&store, &key))
+    Ok(secrets_get(&store, &key).ok().flatten())
 }
 
 #[tauri::command]
@@ -433,7 +597,7 @@ pub fn secret_set(window: tauri::Window, key: String, value: String) -> Result<(
     if value.len() > MAX_SECRET_VALUE_BYTES {
         return Err("value_too_large");
     }
-    secrets_set(&store, &key, value);
+    let _ = secrets_set(&store, &key, value);
     Ok(())
 }
 
@@ -443,13 +607,22 @@ pub fn secret_delete(window: tauri::Window, key: String) -> Result<bool, &'stati
     if !secret_key_allowed(&keys_for_window(&window), &key) {
         return Err(KEY_NOT_DECLARED);
     }
-    Ok(secrets_delete(&store, &key))
+    Ok(secrets_delete(&store, &key).unwrap_or(false))
 }
 
 #[tauri::command]
 pub fn secret_list(window: tauri::Window) -> Result<Vec<SecretListEntry>, &'static str> {
     let store = store_for_window(&window).ok_or(NO_STORE)?;
-    Ok(secret_list_entries(&store, &keys_for_window(&window)))
+    let keys = keys_for_window(&window);
+    Ok(secret_list_entries(&store, &keys).unwrap_or_else(|_| {
+        keys.iter()
+            .filter(|key| secret_key_allowed(&keys, key))
+            .map(|key| SecretListEntry {
+                key: key.clone(),
+                set: false,
+            })
+            .collect()
+    }))
 }
 
 #[cfg(test)]

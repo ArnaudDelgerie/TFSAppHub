@@ -30,7 +30,8 @@ fn bridge_with_close_guards(
     close_guards: &crate::close_guard::SharedCloseGuards,
 ) -> Bridge {
     let store = new_fake_keyring_store();
-    crate::secrets::secrets_set(&store, "openai", "sk-stored".to_string());
+    crate::secrets::secrets_set(&store, "openai", "sk-stored".to_string())
+        .expect("the store accepts the write");
     start(
         store,
         keys.iter().map(|key| key.to_string()).collect(),

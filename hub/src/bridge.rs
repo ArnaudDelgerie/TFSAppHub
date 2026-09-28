@@ -166,8 +166,20 @@ fn handle_request(
             respond(request, 200, &body);
         }
 
+        // Step 068-1 transitional: the store reports failures, the bridge does
+        // not yet — each route maps an `Err` to the answer the old swallowing
+        // code gave, so this commit changes no transport. Step 2 replaces every
+        // mapping with `500 storage_failed`.
         (Method::Get, "/secrets/keys") => {
-            let entries = secret_list_entries(store, keys);
+            let entries = secret_list_entries(store, keys).unwrap_or_else(|_| {
+                keys.iter()
+                    .filter(|key| secret_key_allowed(keys, key))
+                    .map(|key| crate::secrets::SecretListEntry {
+                        key: key.clone(),
+                        set: false,
+                    })
+                    .collect()
+            });
             respond(request, 200, &json!({"keys": entries}));
         }
 
@@ -177,7 +189,7 @@ fn handle_request(
                     respond(request, 403, &json!({"error": "key_not_declared"}));
                     return;
                 }
-                let has = secrets_has(store, &body.key);
+                let has = secrets_has(store, &body.key).unwrap_or(false);
                 respond(request, 200, &json!({"has": has}));
             }
             Err(error) => respond(request, error.status(), &error.body()),
@@ -189,7 +201,7 @@ fn handle_request(
                     respond(request, 403, &json!({"error": "key_not_declared"}));
                     return;
                 }
-                match secrets_get(store, &body.key) {
+                match secrets_get(store, &body.key).ok().flatten() {
                     Some(value) => respond(request, 200, &json!({"value": value})),
                     None => respond(request, 404, &json!({"error": "not_found"})),
                 }
@@ -207,7 +219,7 @@ fn handle_request(
                     respond(request, 413, &json!({"error": "value_too_large"}));
                     return;
                 }
-                secrets_set(store, &body.key, body.value);
+                let _ = secrets_set(store, &body.key, body.value);
                 respond(request, 200, &json!({"ok": true}));
             }
             Err(error) => respond(request, error.status(), &error.body()),
@@ -219,7 +231,7 @@ fn handle_request(
                     respond(request, 403, &json!({"error": "key_not_declared"}));
                     return;
                 }
-                let existed = secrets_delete(store, &body.key);
+                let existed = secrets_delete(store, &body.key).unwrap_or(false);
                 respond(request, 200, &json!({"ok": existed}));
             }
             Err(error) => respond(request, error.status(), &error.body()),

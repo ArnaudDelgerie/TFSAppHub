@@ -637,21 +637,29 @@ fn a_purge_with_a_note_deletes_the_declared_accounts() {
 
     let keyring = new_fake_keyring();
     let store = keyring.store(ORPHAN_IDENTIFIER);
-    secrets_set(&store, "openai", "secret".to_string());
-    secrets_set(&store, "undeclared", "keep".to_string());
+    secrets_set(&store, "openai", "secret".to_string()).expect("the store accepts the write");
+    secrets_set(&store, "undeclared", "keep".to_string()).expect("the store accepts the write");
 
     assert!(
         purge_identifier_with_keyring(&paths, ORPHAN_IDENTIFIER, true, |service, account| {
             crate::secrets::secrets_delete(&keyring.store(service), account)
+                .expect("the store answers")
         })
         .expect("it purges")
     );
 
     assert!(
-        secrets_get(&store, "openai").is_none(),
+        secrets_get(&store, "openai")
+            .expect("the store answers")
+            .is_none(),
         "the account this note declared must be gone"
     );
-    assert_eq!(secrets_get(&store, "undeclared").as_deref(), Some("keep"));
+    assert_eq!(
+        secrets_get(&store, "undeclared")
+            .expect("the store answers")
+            .as_deref(),
+        Some("keep")
+    );
 }
 
 /// Registry fixtures, kept out of the tests above so they read as what they are

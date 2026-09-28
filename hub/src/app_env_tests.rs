@@ -874,10 +874,13 @@ fn the_dev_secrets_store_service_carries_the_prefix() {
     // secrets must never resolve to the same keyring entry — the trap the
     // station's own `dev_secrets_service` already solved, carried over here as
     // the whole runtime identity rather than a service string built ad hoc.
-    secrets_set(&environment.secret_store, "probe", "dev-value".to_string());
+    secrets_set(&environment.secret_store, "probe", "dev-value".to_string())
+        .expect("the store accepts the write");
     let installed_store = keyring.store(&bare_identifier);
     assert_ne!(
-        secrets_get(&installed_store, "probe").as_deref(),
+        secrets_get(&installed_store, "probe")
+            .expect("the store answers")
+            .as_deref(),
         Some("dev-value"),
         "a dev session's secret must not be visible under the installed app's own service"
     );
