@@ -497,6 +497,9 @@ fn the_snapshot_refuses_to_write_over_an_existing_tree() {
     app_tree(source.path());
     let installed = destination.path().join("demo");
     fs::create_dir_all(&installed).expect("an occupied destination");
+    // The occupier's own content: a lost race must refuse without touching
+    // the winner's tree, and this marker is what proves it did not.
+    fs::write(installed.join("marker"), b"the winner's tree").expect("the winner's own file");
 
     let error = snapshot(source.path(), &installed).expect_err("it must refuse");
 
@@ -504,6 +507,24 @@ fn the_snapshot_refuses_to_write_over_an_existing_tree() {
         matches!(error, InstallError::DirectoryInTheWay { .. }),
         "{error}"
     );
+    assert_eq!(
+        fs::read(installed.join("marker")).expect("the winner's tree is intact"),
+        b"the winner's tree"
+    );
+}
+
+#[test]
+fn the_snapshot_creates_a_missing_parent_before_claiming_its_target() {
+    // `apps/<id>/` is normally prepared by the hub, but the claim itself must
+    // not depend on that: the parent is created unconditionally, `to` never.
+    let source = tempfile::tempdir().expect("a temp source");
+    let destination = tempfile::tempdir().expect("a temp destination");
+    app_tree(source.path());
+    let installed = destination.path().join("apps").join("demo");
+
+    snapshot(source.path(), &installed).expect("it copies into a fresh parent");
+
+    assert!(installed.join("composer.json").is_file());
 }
 
 // --- lifecycle_event_for_install (plan 016 step 1, CONTRACT.md §6) ---------

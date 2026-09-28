@@ -843,16 +843,42 @@ pub fn validate(root: &Path) -> Result<Validated, InstallError> {
 
 /// Copy `from` into `to`, minus what must not be installed.
 ///
-/// `to` must not exist: an install never merges into a tree it did not write,
-/// because a leftover file from a previous version — a migration, a compiled
-/// container, a route — is indistinguishable from one this version meant to
-/// ship. On any failure the partial copy is removed, so the caller's next
-/// attempt meets a clean root rather than half of the last one.
+/// `to` is **claimed**, not just checked: an atomic `create_dir` makes
+/// exactly one caller the owner, so two installs racing for the same
+/// `apps/<id>/` resolve as winner and refused loser rather than two trees
+/// merging into one directory. The loser refuses with
+/// [`InstallError::DirectoryInTheWay`] *before* any cleanup runs, so it never
+/// touches the winner's tree. An install never merges into a tree it did not
+/// write either way: a leftover file from a previous version — a migration, a
+/// compiled container, a route — is indistinguishable from one this version
+/// meant to ship. On any failure after the claim the partial copy is removed,
+/// so the caller's next attempt meets a clean root rather than half of the
+/// last one.
 pub fn snapshot(from: &Path, to: &Path) -> Result<(), InstallError> {
-    if to.exists() {
-        return Err(InstallError::DirectoryInTheWay {
-            path: to.to_path_buf(),
-        });
+    // Only the parent may be created unconditionally: `to` itself is the
+    // claim, and creating it here would be creating it twice.
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).map_err(|source| InstallError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    match fs::create_dir(to) {
+        Ok(()) => {}
+        // The one loser-of-the-race outcome, and the one refusal that must
+        // not fall through to the cleanup below: whatever occupies `to` is
+        // not this call's tree to remove.
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(InstallError::DirectoryInTheWay {
+                path: to.to_path_buf(),
+            });
+        }
+        Err(source) => {
+            return Err(InstallError::Io {
+                path: to.to_path_buf(),
+                source,
+            });
+        }
     }
 
     let copied = copy_tree(from, to, Path::new(""));
