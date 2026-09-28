@@ -258,8 +258,16 @@ pub(crate) fn install_into(
         updated_at: now,
         unknown: serde_json::Map::new(),
     };
+    // Only a refusal removes the tree. A `Registry` error may come from the
+    // directory fsync *after* the rename landed, with the entry already
+    // registered: removing the tree then would leave an entry with no app.
     if let Err(error) = register(paths, entry, hub_version, &platform) {
-        let _ = fs::remove_dir_all(&app_dir);
+        if matches!(
+            error,
+            InstallError::IdTaken { .. } | InstallError::PortTaken { .. }
+        ) {
+            let _ = fs::remove_dir_all(&app_dir);
+        }
         return Err(error);
     }
 
