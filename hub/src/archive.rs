@@ -41,6 +41,8 @@ use tar::{Archive, EntryType};
 /// extraction, since nothing here merges with existing content.
 pub fn extract(archive_path: &Path, destination: &Path) -> Result<PathBuf, ArchiveError> {
     fs::create_dir_all(destination).map_err(ArchiveError::Io)?;
+    let budget = crate::disk_space::room(destination).map_err(ArchiveError::Io)?;
+    check_payload(archive_path, budget)?;
 
     let file = fs::File::open(archive_path).map_err(ArchiveError::Io)?;
     let mut archive = Archive::new(GzDecoder::new(file));
@@ -103,6 +105,34 @@ pub fn extract(archive_path: &Path, destination: &Path) -> Result<PathBuf, Archi
         Some(name) if saw_nested_entry => Ok(destination.join(name)),
         _ => Err(ArchiveError::NoTopLevelDirectory),
     }
+}
+
+/// Validate paths and entry types, and total the bytes regular entries would write.
+/// This pass does not need the extraction prefix and therefore cannot validate
+/// symlink depth; each extraction path checks that immediately before writing.
+pub fn check_payload(archive_path: &Path, budget: u64) -> Result<u64, ArchiveError> {
+    let file = fs::File::open(archive_path).map_err(ArchiveError::Io)?;
+    let mut archive = Archive::new(GzDecoder::new(file));
+    let mut total = 0_u64;
+    for entry in archive.entries().map_err(ArchiveError::Io)? {
+        let entry = entry.map_err(ArchiveError::Io)?;
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() || kind.is_pax_local_extensions() {
+            continue;
+        }
+        let path = entry.path().map_err(ArchiveError::Io)?.into_owned();
+        check_safe_path(&path)?;
+        check_entry_type(&path, kind)?;
+        if kind.is_file() || kind == EntryType::Continuous {
+            total = total
+                .checked_add(entry.header().size().map_err(ArchiveError::Io)?)
+                .ok_or(ArchiveError::TooLarge { budget })?;
+            if total > budget {
+                return Err(ArchiveError::TooLarge { budget });
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// Extract every entry under `prefix` from the `.tar.gz` at `archive_path`
@@ -269,6 +299,8 @@ pub enum ArchiveError {
     UnsafePath { path: PathBuf },
     /// An entry type which can write outside its path or an unknown type.
     UnsupportedEntry { path: PathBuf, kind: String },
+    /// Declared regular-file payload exceeds the available budget.
+    TooLarge { budget: u64 },
     /// A symlink whose target resolves outside the extraction root.
     UnsafeLink { path: PathBuf },
     /// The archive has no top-level directory: it is empty, or every entry
@@ -292,6 +324,11 @@ impl fmt::Display for ArchiveError {
                 formatter,
                 "refusing to extract {}: unsupported archive entry ({kind})",
                 path.display()
+            ),
+            Self::TooLarge { budget } => write!(
+                formatter,
+                "archive payload exceeds the available {} MiB of room",
+                budget / (1024 * 1024)
             ),
             Self::UnsafeLink { path } => write!(
                 formatter,

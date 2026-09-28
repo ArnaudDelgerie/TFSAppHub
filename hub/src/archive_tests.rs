@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf};
 use flate2::{write::GzEncoder, Compression};
 use tar::{Builder, EntryType, Header};
 
-use super::{extract, extract_prefix, ArchiveError};
+use super::{check_payload, extract, extract_prefix, ArchiveError};
 
 fn write_archive(
     dir: &std::path::Path,
@@ -175,6 +175,44 @@ fn unsupported_entries_are_refused_on_both_extraction_paths() {
         );
         assert!(!prefix_out.join("hard").exists());
     }
+}
+
+#[test]
+fn extract_rejects_an_over_budget_payload_before_writing_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = write_archive(temp.path(), "large.tar.gz", |builder| {
+        append_file(builder, "demo/file", b"123456");
+    });
+    let destination = temp.path().join("out");
+    let error = crate::disk_space::with_available_bytes(crate::disk_space::MARGIN + 5, || {
+        extract(&archive, &destination).expect_err("six bytes exceed the five byte room")
+    });
+    assert!(
+        matches!(error, ArchiveError::TooLarge { budget: 5 }),
+        "{error}"
+    );
+    assert!(!destination.join("demo").exists());
+}
+
+#[test]
+fn a_huge_declared_size_is_refused_without_reading_the_missing_body() {
+    use std::io::Write;
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("truncated.tar.gz");
+    let file = fs::File::create(&archive).unwrap();
+    let mut encoder = GzEncoder::new(file, Compression::fast());
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::Regular);
+    header.set_path("demo/huge").unwrap();
+    header.set_size(1_000_000_000_000);
+    header.set_cksum();
+    encoder.write_all(header.as_bytes()).unwrap();
+    encoder.finish().unwrap();
+    let error = check_payload(&archive, 100).expect_err("header alone exceeds room");
+    assert!(
+        matches!(error, ArchiveError::TooLarge { budget: 100 }),
+        "{error}"
+    );
 }
 
 #[test]

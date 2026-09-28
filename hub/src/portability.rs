@@ -586,6 +586,25 @@ fn run_import(
     )
     .map_err(PortabilityError::Refused)?;
 
+    let room = crate::disk_space::room(&data_dir).map_err(|source| PortabilityError::Io {
+        path: data_dir.clone(),
+        source,
+    })?;
+    let mut live_db_bytes = 0_u64;
+    for name in lifecycle::DB_FILE_NAMES {
+        let path = data_subdir.join(name);
+        match fs::metadata(&path) {
+            Ok(metadata) => live_db_bytes = live_db_bytes.saturating_add(metadata.len()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(PortabilityError::Io { path, source }),
+        }
+    }
+    archive::check_payload(archive_path, room.saturating_sub(live_db_bytes)).map_err(|error| {
+        PortabilityError::Preflight {
+            detail: error.to_string(),
+        }
+    })?;
+
     if populated {
         announce_overwrite(
             id,
@@ -1047,6 +1066,10 @@ pub enum PortabilityError {
         path: PathBuf,
         detail: String,
     },
+    /// A preflight archive check failed before import changed any state.
+    Preflight {
+        detail: String,
+    },
     /// [`import_decision`] refused.
     Refused(ImportRefusal),
     /// An import stopped while clearing the destination's disposable cache,
@@ -1149,6 +1172,10 @@ impl fmt::Display for PortabilityError {
                 "{}: its manifest.json is unreadable ({detail}) — this does not look like an \
                  archive `export` wrote.",
                 path.display()
+            ),
+            Self::Preflight { detail } => write!(
+                formatter,
+                "import refused before changing anything: {detail}"
             ),
             Self::Refused(refusal) => write!(formatter, "{refusal}"),
             Self::CacheCleanup {

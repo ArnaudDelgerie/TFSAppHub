@@ -738,6 +738,58 @@ fn an_oversized_manifest_is_refused_before_touching_the_data_directory() {
 }
 
 #[test]
+fn import_refuses_an_over_budget_payload_before_replacing_any_state() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    fs::create_dir_all(&data_subdir).unwrap();
+    let app_dir = paths.app_dir("demo").unwrap();
+    seed_persistent_state(&data_dir, &data_subdir, &app_dir);
+    seed_derived_sentinels(&data_dir, &data_subdir);
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            ("data/app.db", b"new database"),
+        ],
+    );
+    let error = crate::disk_space::with_available_bytes(crate::disk_space::MARGIN + 20, || {
+        run_import(&paths, "demo", &archive, true, false).expect_err("too little space")
+    });
+    assert!(
+        matches!(error, PortabilityError::Preflight { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("before changing anything"));
+    assert_persistent_state_unchanged(&data_dir, &data_subdir, &app_dir);
+    assert_derived_state_retained(&data_dir, &data_subdir);
+}
+
+#[test]
+fn import_accepts_a_payload_just_inside_the_space_budget() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            ("data/app.db", b"new database"),
+        ],
+    );
+    let payload = crate::archive::check_payload(&archive, u64::MAX).unwrap();
+    let imported =
+        crate::disk_space::with_available_bytes(crate::disk_space::MARGIN + payload + 1, || {
+            run_import(&paths, "demo", &archive, false, true).expect("one spare byte suffices")
+        });
+    assert!(imported);
+    let data_dir = base.path().join("TFSApp/dev.local.demo/data");
+    assert_eq!(fs::read(data_dir.join("app.db")).unwrap(), b"new database");
+}
+
+#[test]
 fn importing_refuses_a_foreign_identifier() {
     let (base, paths) = temp_paths();
     seed_registry(&paths, seeded_entry());
@@ -1102,21 +1154,10 @@ fn an_archive_with_a_traversal_entry_is_refused_by_archives_own_checks() {
     let error = run_import(&paths, "demo", &archive, false, true)
         .expect_err("a traversal entry is refused by archive's own checks");
     assert!(
-        matches!(error, PortabilityError::ImportIncomplete { .. }),
+        matches!(error, PortabilityError::Preflight { .. }),
         "{error}"
     );
-    assert!(error.to_string().contains("partially extracted"), "{error}");
-    // The cleanup ran before the extraction that failed, and nothing later
-    // restores what it removed: an extraction failure must not leave the old
-    // derived state servable again.
-    assert!(
-        !data_dir.join("cache").exists() && !data_dir.join("build").exists(),
-        "the cleanup that preceded the failed extraction is not rolled back"
-    );
-    assert!(
-        !lifecycle::cache_stamp_path(&data_subdir).exists(),
-        "the old stamp must not survive a failed extraction either"
-    );
+    assert_derived_state_retained(&data_dir, &data_subdir);
 }
 
 // --- import restores uploads/, rescuing what it replaces by rename
