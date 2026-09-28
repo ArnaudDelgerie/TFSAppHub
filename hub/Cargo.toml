@@ -74,6 +74,7 @@ serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
 semver.workspace = true
+libc.workspace = true
 # Each pinned Git blob is spooled individually before it is written to the
 # tar stream; this keeps a publication from buffering the source archive.
 tempfile.workspace = true

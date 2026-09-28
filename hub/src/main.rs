@@ -13,6 +13,7 @@ mod close_guard;
 mod crash;
 mod desktop;
 mod dev;
+mod disk_space;
 mod gh;
 mod git;
 mod hub_bin;
