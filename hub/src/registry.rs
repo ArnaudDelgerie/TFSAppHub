@@ -172,6 +172,7 @@ pub enum ReferenceKind {
 #[serde(rename_all = "kebab-case")]
 pub enum SourceKind {
     LocalPath,
+    LocalArchive,
     Release,
 }
 

@@ -1453,3 +1453,106 @@ fn an_install_from_a_remote_release_reaches_ready() {
     assert_eq!(entry.source.reference.as_deref(), Some("v0.6.0"));
     assert_eq!(entry.source.index.as_deref(), Some("github"));
 }
+
+struct ArchiveFixtureBlobs(std::collections::HashMap<String, Vec<u8>>);
+
+impl crate::publish::BlobSource for ArchiveFixtureBlobs {
+    fn copy_blob(
+        &mut self,
+        object: &str,
+        destination: &mut dyn std::io::Write,
+    ) -> Result<u64, crate::git::GitError> {
+        let bytes = &self.0[object];
+        destination.write_all(bytes).unwrap();
+        Ok(bytes.len() as u64)
+    }
+}
+
+fn built_local_release(root: &Path) -> PathBuf {
+    let project = tempfile::tempdir().unwrap();
+    app_tree(project.path());
+    let names = [
+        "tfsapp.config.json",
+        "composer.json",
+        "bin/console",
+        "public/index.php",
+    ];
+    let mut blobs = std::collections::HashMap::new();
+    let entries = names
+        .iter()
+        .map(|name| {
+            let bytes = fs::read(project.path().join(name)).unwrap();
+            blobs.insert((*name).to_string(), bytes);
+            crate::git::TreeEntry {
+                path: PathBuf::from(name),
+                mode: if *name == "bin/console" {
+                    0o100755
+                } else {
+                    0o100644
+                },
+                object_id: (*name).to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    crate::publish::build_archive(
+        &entries,
+        &mut ArchiveFixtureBlobs(blobs),
+        "demo",
+        "0.6.0",
+        root,
+    )
+    .unwrap()
+    .archive_path
+}
+
+#[test]
+fn local_archive_install_records_kind_and_refused_checksum_leaves_no_app() {
+    if !resources_present() {
+        return;
+    }
+    let release = tempfile::tempdir().unwrap();
+    let archive = built_local_release(release.path());
+    let (_base, paths) = temp_paths();
+    let result = super::install(
+        &paths,
+        &archive.display().to_string(),
+        Some("local-demo"),
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .unwrap();
+    assert_eq!(result.as_deref(), Some("local-demo"));
+    let entry = crate::registry::load(&paths)
+        .unwrap()
+        .get("local-demo")
+        .unwrap()
+        .clone();
+    assert_eq!(entry.source.kind, SourceKind::LocalArchive);
+    assert_eq!(
+        entry.source.location,
+        archive.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(entry.source.reference, None);
+    let bytes = fs::read(&archive).unwrap();
+    let mut corrupt = bytes;
+    corrupt[20] ^= 1;
+    fs::write(&archive, corrupt).unwrap();
+    let error = super::install(
+        &paths,
+        &archive.display().to_string(),
+        Some("rejected-demo"),
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("checksum"), "{error}");
+    assert!(crate::registry::load(&paths)
+        .unwrap()
+        .get("rejected-demo")
+        .is_none());
+    assert!(!paths.app_dir("rejected-demo").unwrap().exists());
+}

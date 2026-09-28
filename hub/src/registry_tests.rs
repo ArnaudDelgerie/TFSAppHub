@@ -448,3 +448,23 @@ fn timestamps_are_rfc_3339_in_utc() {
 fn the_platform_prints_short_enough_to_read() {
     assert_eq!(platform().to_string(), "8.5+a1b2c3d4");
 }
+
+#[test]
+fn local_archive_source_round_trips_without_a_selector() {
+    let (_base, paths) = temp_paths();
+    let mut registry = Registry::default();
+    registry.upsert(RegistryEntry {
+        source: Source {
+            kind: SourceKind::LocalArchive,
+            location: "/mnt/release/demo-1.2.0.tar.gz".to_string(),
+            reference: None,
+            reference_kind: None,
+            index: None,
+        },
+        ..entry("demo")
+    });
+    let (raw, json) = saved_json(&paths, &registry);
+    assert_eq!(json["apps"][0]["source"]["kind"], "local-archive");
+    assert!(!raw.contains("reference_kind"));
+    assert_eq!(load(&paths).unwrap(), registry);
+}

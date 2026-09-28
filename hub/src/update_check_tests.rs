@@ -203,3 +203,16 @@ fn an_installed_context_reads_the_cache_fresh_off_disk() {
         }
     );
 }
+
+#[test]
+fn local_archive_has_no_update_feed() {
+    let mut source = local_source();
+    source.kind = crate::registry::SourceKind::LocalArchive;
+    let result = answer(&source, "1.0.0", Some(&cached("v9.9.9")));
+    assert_eq!(
+        result,
+        UpdateCheckResult::Unavailable {
+            reason: REASON_LOCAL_SOURCE.to_string()
+        }
+    );
+}
