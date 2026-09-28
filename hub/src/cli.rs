@@ -122,7 +122,7 @@ pub const SURFACE: &[Spec] = &[
         name: "install",
         form: "install <source> [--as <id>] [--ref <tag>] [--yes] \
                [--no-desktop-entry]",
-        summary: "Install an app from a local directory, release archive or github:owner/repo.",
+        summary: "Install an app from a release archive or github:owner/repo.",
         level: Level::App,
         availability: Availability::Implemented,
     },
