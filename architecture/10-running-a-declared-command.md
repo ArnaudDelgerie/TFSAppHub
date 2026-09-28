@@ -60,6 +60,17 @@ entry. That lets refusals name the alias, and lets `run --stop`/`--replace`
 know what to signal without ever killing a command as a side effect of `open`
 or a data-dir writer.
 
+A `run` launcher creates and locks `runs/<launcher pid>.lock`, writes the
+alias, and only then scans the other entries for rule 2. It excludes its own
+path from the verdict. Whoever takes a lock second sees the first launcher's
+entry, so two non-`concurrent` newcomers cannot both start; if their scans
+cross, both may refuse. After spawning, the launcher appends `\n<child pid>`
+to its alias record without truncating it. A scan never unlinks an unlocked
+entry while the pid in its *file name* is alive, even if its record is empty
+or stale: that entry may have been created just before its flock was taken.
+An identity-proven active orphan is still reported regardless of the
+file-name pid.
+
 ### Forwarding a signal past `Child::wait()`'s own retry
 
 `std::process::Child::wait()` silently retries when the underlying wait is
@@ -86,4 +97,3 @@ preference: a `run` command is an interactive terminal subcommand with the
 terminal's own stdio inherited, and the app it runs beside may or may not
 have a window open at all — nothing about it belongs behind the point where
 Tauri claims the process.
-

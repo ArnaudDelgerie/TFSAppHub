@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Simultaneous `run` starts now claim their own records before checking a
+non-`concurrent` alias's exclusion, so they cannot both launch commands.
+Scans preserve entries named for live launchers, including entries created
+just before their lock is taken. `sidecar.pid` is now replaced through a
+synced temporary file, preserving the previous full pid list if a rewrite
+is interrupted.
+
 `tfsapp-hub repair <id>` is now safe against a kill at any instant of an
 interrupted `update` or forced re-sync, not only right after one of its
 journal writes — the gap between a filesystem change and the journal record
