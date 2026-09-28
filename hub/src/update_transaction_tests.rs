@@ -7,8 +7,8 @@ use crate::{
     registry::{Platform, RegistryEntry, Source, SourceKind, State},
     update::recover_transaction,
     update_transaction::{
-        journal_path, read, retain_tree, snapshot_db, staged_db_path, staged_tree_path, write,
-        Journal, Phase, TransactionKind,
+        finalise_anchor, journal_path, read, retain_tree, snapshot_db, staged_db_path,
+        staged_tree_path, write, Journal, Phase, TransactionKind,
     },
 };
 
@@ -56,6 +56,144 @@ fn seeded_paths() -> (
     fs::write(data_dir.join("data/app.db"), "old-db").unwrap();
     lifecycle::write_data_version(&data_dir.join("data"), &entry.app_version).unwrap();
     (base, paths, entry, data_dir, app_dir)
+}
+
+/// Everything true right before `finalise_anchor` runs: the outgoing entry's
+/// tree and database staged for promotion, a fresh replacement tree and
+/// database already live under `app_dir`/`data_subdir`, and the staged
+/// database members it will promote.
+fn ready_to_finalise() -> (
+    tempfile::TempDir,
+    Paths,
+    RegistryEntry,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Vec<String>,
+) {
+    let (base, paths, entry, data_dir, app_dir) = seeded_paths();
+    let members = snapshot_db(&data_dir.join("data"), &data_dir).unwrap();
+    retain_tree(&app_dir).unwrap();
+    fs::create_dir_all(app_dir.join("public")).unwrap();
+    fs::write(app_dir.join("public/version"), "new").unwrap();
+    fs::write(data_dir.join("data/app.db"), "new-db").unwrap();
+    (base, paths, entry, data_dir, app_dir, members)
+}
+
+fn assert_anchor_complete(
+    entry: &RegistryEntry,
+    data_dir: &std::path::Path,
+    app_dir: &std::path::Path,
+) {
+    let data_subdir = data_dir.join("data");
+    assert!(
+        lifecycle::previous_tree_path(app_dir).is_dir(),
+        "retained tree should be promoted to .previous"
+    );
+    assert_eq!(
+        fs::read_to_string(lifecycle::previous_tree_path(app_dir).join("public/version")).unwrap(),
+        "old"
+    );
+    assert!(
+        lifecycle::db_snapshot_path(&data_subdir, "app.db").is_file(),
+        "database snapshot should be promoted to the public anchor"
+    );
+    assert_eq!(
+        fs::read_to_string(lifecycle::db_snapshot_path(&data_subdir, "app.db")).unwrap(),
+        "old-db"
+    );
+    let anchor = lifecycle::read_rollback_anchor(&data_subdir).expect("a written rollback.json");
+    assert_eq!(anchor.app_version, entry.app_version);
+    assert_eq!(anchor.source_revision, entry.source_revision);
+    assert!(
+        !staged_tree_path(app_dir).is_dir(),
+        "staged tree left behind"
+    );
+    assert!(
+        !staged_db_path(data_dir, "app.db").is_file(),
+        "staged database member left behind"
+    );
+}
+
+#[test]
+fn finalise_anchor_from_a_fresh_start_completes_the_promotion() {
+    let (_base, _paths, entry, data_dir, app_dir, members) = ready_to_finalise();
+    finalise_anchor(
+        &data_dir.join("data"),
+        &data_dir,
+        &app_dir,
+        &entry,
+        &members,
+    )
+    .unwrap();
+    assert_anchor_complete(&entry, &data_dir, &app_dir);
+}
+
+#[test]
+fn finalise_anchor_replays_after_a_kill_between_every_sub_step() {
+    // Sub-step 1: the tree promotion alone, nothing else done yet.
+    {
+        let (_base, _paths, entry, data_dir, app_dir, members) = ready_to_finalise();
+        let previous = lifecycle::previous_tree_path(&app_dir);
+        fs::rename(staged_tree_path(&app_dir), &previous).unwrap();
+        finalise_anchor(
+            &data_dir.join("data"),
+            &data_dir,
+            &app_dir,
+            &entry,
+            &members,
+        )
+        .unwrap();
+        assert_anchor_complete(&entry, &data_dir, &app_dir);
+    }
+    // Sub-step 2: the tree and the database member promoted, rollback.json
+    // not yet written.
+    {
+        let (_base, _paths, entry, data_dir, app_dir, members) = ready_to_finalise();
+        let previous = lifecycle::previous_tree_path(&app_dir);
+        fs::rename(staged_tree_path(&app_dir), &previous).unwrap();
+        let data_subdir = data_dir.join("data");
+        fs::rename(
+            staged_db_path(&data_dir, "app.db"),
+            lifecycle::db_snapshot_path(&data_subdir, "app.db"),
+        )
+        .unwrap();
+        finalise_anchor(&data_subdir, &data_dir, &app_dir, &entry, &members).unwrap();
+        assert_anchor_complete(&entry, &data_dir, &app_dir);
+    }
+    // Sub-step 3: everything already promoted and rollback.json already
+    // written — the ordinary "killed right after success" replay.
+    {
+        let (_base, _paths, entry, data_dir, app_dir, members) = ready_to_finalise();
+        finalise_anchor(
+            &data_dir.join("data"),
+            &data_dir,
+            &app_dir,
+            &entry,
+            &members,
+        )
+        .unwrap();
+        assert_anchor_complete(&entry, &data_dir, &app_dir);
+        let data_subdir = data_dir.join("data");
+        let before = fs::read_to_string(lifecycle::rollback_anchor_path(&data_subdir)).unwrap();
+        finalise_anchor(&data_subdir, &data_dir, &app_dir, &entry, &members).unwrap();
+        let after = fs::read_to_string(lifecycle::rollback_anchor_path(&data_subdir)).unwrap();
+        assert_eq!(before, after, "a second full replay must change nothing");
+        assert_anchor_complete(&entry, &data_dir, &app_dir);
+    }
+}
+
+#[test]
+fn finalise_anchor_reports_a_database_member_missing_from_both_places() {
+    let (_base, _paths, entry, data_dir, app_dir, members) = ready_to_finalise();
+    fs::remove_file(staged_db_path(&data_dir, "app.db")).unwrap();
+    assert!(finalise_anchor(
+        &data_dir.join("data"),
+        &data_dir,
+        &app_dir,
+        &entry,
+        &members
+    )
+    .is_err());
 }
 
 #[test]

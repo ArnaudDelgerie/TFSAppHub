@@ -521,8 +521,13 @@ fn apply(
     }
     transaction.advance(Phase::RegistryCommitted);
     update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
-    if let Err(error) = update_transaction::finalise_anchor(&data_subdir, data_dir, app_dir, entry)
-    {
+    if let Err(error) = update_transaction::finalise_anchor(
+        &data_subdir,
+        data_dir,
+        app_dir,
+        entry,
+        &transaction.database_members,
+    ) {
         return Err(recover_after_failure(
             paths,
             data_dir,
