@@ -585,3 +585,32 @@ fn local_archive_checks_manifest_name_version_and_ref() {
         "{error}"
     );
 }
+
+#[test]
+fn backup_is_identified_before_missing_checksums() {
+    let folder = tempfile::tempdir().unwrap();
+    let backup = folder.path().join("backup.tar.gz");
+    let file = fs::File::create(&backup).unwrap();
+    let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+        file,
+        flate2::Compression::fast(),
+    ));
+    let contents = br#"{"identifier":"dev.local.demo","app_version":"1.2.0","exported_at":"2026-01-01T00:00:00Z"}"#;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(contents.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, "manifest.json", &contents[..])
+        .unwrap();
+    tar.into_inner().unwrap().finish().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let error = resolve(
+        &Origin::LocalArchive(backup),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .unwrap_err();
+    assert!(matches!(error, SourceError::IsABackup { .. }), "{error}");
+    assert!(error.to_string().contains("tfsapp-hub import <id>"));
+}

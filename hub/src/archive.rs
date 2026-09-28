@@ -34,6 +34,22 @@ use std::{
 use flate2::read::GzDecoder;
 use tar::{Archive, EntryType};
 
+/// Return the first content entry without scanning the rest of the archive.
+/// PAX headers are format metadata, not content entries.
+pub fn first_entry(archive_path: &Path) -> Result<Option<PathBuf>, ArchiveError> {
+    let file = fs::File::open(archive_path).map_err(ArchiveError::Io)?;
+    let mut archive = Archive::new(GzDecoder::new(file));
+    for entry in archive.entries().map_err(ArchiveError::Io)? {
+        let entry = entry.map_err(ArchiveError::Io)?;
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() || kind.is_pax_local_extensions() {
+            continue;
+        }
+        return Ok(Some(entry.path().map_err(ArchiveError::Io)?.into_owned()));
+    }
+    Ok(None)
+}
+
 /// Extract the `.tar.gz` at `archive_path` into a fresh directory under
 /// `destination`, and return the path to its single top-level directory.
 ///

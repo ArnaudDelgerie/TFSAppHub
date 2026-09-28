@@ -357,7 +357,9 @@ fn resolve_local_archive(
     if !archive_path.is_file() {
         return Err(SourceError::NotAFile { path: archive_path });
     }
-    // Backup detection is inserted here in step 4, before checking sums.
+    if crate::portability::is_backup(&archive_path) {
+        return Err(SourceError::IsABackup { path: archive_path });
+    }
     let directory = archive_path.parent().expect("canonical file has a parent");
     let sums_path = directory.join(release::SHA256SUMS_ASSET_NAME);
     let sums_text = fs::read_to_string(&sums_path).map_err(|source| match source.kind() {
@@ -480,6 +482,9 @@ pub enum SourceError {
     NotAFile {
         path: PathBuf,
     },
+    IsABackup {
+        path: PathBuf,
+    },
     ChecksumFileMissing {
         directory: PathBuf,
     },
@@ -565,6 +570,7 @@ impl fmt::Display for SourceError {
         match self {
             Self::Missing { path } => write!(formatter, "no such source: {}", path.display()),
             Self::NotAFile { path } => write!(formatter, "{} is not a regular archive file", path.display()),
+            Self::IsABackup { path } => write!(formatter, "{} is a backup written by export — use `tfsapp-hub import <id> {}`", path.display(), path.display()),
             Self::ChecksumFileMissing { directory } => write!(formatter, "no SHA256SUMS.txt beside the archive in {} — an unverified archive cannot be installed", directory.display()),
             Self::ReferenceOnLocalArchive { reference } => write!(formatter, "--ref {reference} cannot select a revision of a local archive — pass the desired archive itself"),
             Self::ArchiveNameMismatch { archive_name, expected } => write!(formatter, "archive {archive_name} does not match its manifest — expected {expected}"),
