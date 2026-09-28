@@ -106,7 +106,15 @@ window or active `run` command makes both `remove <id>` and `remove <id>
 --purge` refuse, so neither can delete the installed tree or its database
 under a process that is using it.
 
-`tfsapp-hub update <id>` owns the update event, and with it the one guarantee
+`tfsapp-hub update <id>` owns the update event. An app installed from a local
+release archive needs `tfsapp-hub update <id> <archive.tar.gz>` each time;
+the archive is supplied explicitly because there is no release feed to query.
+An archive passed to update also replaces any other recorded source kind. The
+registry records the source of the last successful update. `rollback <id>`
+restores the previous version, tree, database and source revision, while the
+recorded source kind remains the one from that update.
+
+With either form, the hub supplies the one guarantee
 this section states on its own behalf rather than an app author's: **an
 update must never leave the app's database between two versions.** It does
 so by snapshotting the database before `pre-update` runs and reverting the

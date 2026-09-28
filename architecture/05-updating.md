@@ -1,7 +1,11 @@
 ## Updating
 
-`update <id> [--ref <tag>] [--force]` re-resolves an app's already recorded
-source and, when it is newer, replaces the installed tree with it —
+`update <id> [<archive.tar.gz>] [--ref <tag>] [--force]` resolves the supplied
+archive, or re-resolves the app's recorded source when none is supplied. An
+app recorded as `local-archive` requires the explicit archive and refuses
+`update <id>` alone with the needed command and last path. A supplied archive
+can replace a forge source; the successful update records that new source.
+When the resolved version is newer, update replaces the installed tree —
 the update event (`CONTRACT.md` §6), and the guarantee `install`'s own
 refusal defers: an update must never leave the app's database between two
 versions.
@@ -14,8 +18,9 @@ prompt and every write. Once held, the registry is reloaded before the source,
 action and data-directory guards are acted on. This prevents a second update
 from removing the first update's `apps/<id>.previous` anchor.
 
-1. Load the registry entry, re-resolve its source (the recorded selector, or
-   `--ref`'s), and validate it exactly as `install` does.
+1. Load the registry entry, resolve the supplied archive or re-resolve its
+   recorded source (with `--ref` when appropriate), and validate it exactly
+   as `install` does. `--ref` with an archive is refused.
 2. Decide the action (`update_decision`) from the same `lifecycle_decision`
    `install`/`open`/`run` all read, applied to the registry's recorded
    `app_version` against the freshly resolved source's own:
@@ -95,6 +100,11 @@ unless all three are present, naming whichever is missing:
 | the pre-update database snapshot | `<data>/data/app.db.pre-update` (+ `-wal`/`-shm` twins) |
 | the outgoing registry state | `<data>/data/rollback.json` (`app_version`, `source_revision`, `created_at`) |
 
+Rollback restores the outgoing version, tree, database and source revision.
+It does not restore the source kind: after a forge-to-archive update and
+rollback, the recorded source remains `local-archive` and the next update
+still requires an explicit archive.
+
 The third half exists because the first two cannot answer what it does:
 `source_revision` is hashed over the *source*, while the retained tree was
 copied with `install`'s own excluded paths — recomputing it from the tree
@@ -137,4 +147,3 @@ snapshot/`rollback.json` it finds in the data directory it is about to write
 into — a data directory a `remove` without `--purge` left behind can
 otherwise carry a stale anchor into an unrelated later install, one that has
 nothing of its own to roll back to.
-

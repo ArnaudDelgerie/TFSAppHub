@@ -5,6 +5,13 @@
 (`portability.rs`, plan 022). Both share a guard and a shape with `install`
 and `update` above rather than inventing their own.
 
+An import reads `manifest.json` at the archive root before touching the data
+directory. If it is absent and exactly one top-level directory directly holds
+`tfsapp.config.json`, the archive is identified as a release and refused with
+`install <path>` or `update <id> <path>` advice. An unrelated tarball keeps the
+ordinary "not written by export" refusal. Conversely, install and update
+recognise export's first `manifest.json` entry and point to `import`.
+
 **The busy guard is the same probe `install` already made private, now
 shared.** `lifecycle::data_dir_holder` — `is_owner_live` on `sidecar.pid`,
 then `lifecycle::probe_run_lock` — moved out of `install.rs` so `export` and

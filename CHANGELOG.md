@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+Apps can now be published to a local folder with `publish <project> --local
+<dir>`. The folder contains a release archive, `SHA256SUMS.txt` and `NOTES.md`.
+`install <archive.tar.gz>` verifies the adjacent checksums, and `update <id>
+<archive.tar.gz>` applies a newer archive. Backups passed to install or update,
+and releases passed to import, now point to the appropriate command.
+
 Two guards audit 020 found checked once, outside the lock that was supposed
 to make them true, now hold under it. Every lifecycle lease holder except
 `repair` re-reads the update journal while it owns its lease, so a command

@@ -1,8 +1,8 @@
 ## 1. What an app must provide
 
 A TFSApp is a Symfony project directory. The hub is pointed at one — a local
-path, or a published release it downloads over HTTPS (see "Publishing a
-release" below) — and that directory must contain:
+path, a local release archive, or a published release it downloads over HTTPS
+(see "Publishing a release" below) — and that directory must contain:
 
 ```
 path/to/project/
@@ -61,13 +61,16 @@ directory belongs to the installed snapshot, and that an update replaces it.
 ### Publishing a release
 
 Everything above is what an app needs to be installed from a local path or a
-clone. **To be installable remotely** —
+clone. It can also be installed from a local release archive. **To be installable remotely** —
 `tfsapp-hub install github:owner/repo` — it needs one more thing: a published
 release. An app that never publishes one is not in breach of anything; it
-stays local-only, installed from a directory or a clone, for as long as its
-author wants.
+stays local-only, installed from a directory, clone or archive, for as long as
+its author wants.
 
-A release is, on the app's own forge repository:
+A release consists of `<project_name>-<app_version>.tar.gz` and a matching
+`SHA256SUMS.txt` beside it, on a forge or in a folder. The checksum is checked
+before extraction, including for `install <archive.tar.gz>`; the archive alone
+cannot be installed. On a forge, the release also has:
 
 - a tag `v<app_version>` — `--ref` selects a release this way, never a branch
   or a commit;
@@ -87,10 +90,18 @@ tree, with the stated exclusions applied before `sha256sum` names the result.
 `tfsapp-hub publish path/to/project` automates exactly this sequence and is the
 convenience, never the requirement.
 
-The convenience needs two things a hand-built release does not: `gh` **and**
-`git`, both installed and authenticated on the **author's own machine** — the
-one command where the hub runs `git`, and only there (decision 003, "the hub
-publishes apps"). The project must be committed and pushed; `publish` proves
-it rather than trusting an asserted tag, and the release lands on whichever
-repository that pushed commit's own remote names.
+For a release without a forge, `tfsapp-hub publish path/to/project --local <dir>`
+writes `<dir>/<project_name>-<app_version>/` with the archive,
+`SHA256SUMS.txt` and `NOTES.md`. The destination directory must exist. This
+mode keeps the manifest, canonical version, clean Git tree, changelog and
+secrets confirmation gates; it does not require an upstream, remote, `gh` or
+an unused forge tag. See decision 009 for the distinction. The release folder
+must not already exist.
 
+Forge publishing needs `git` installed and `gh` installed and authenticated
+on the **author's own machine** — the one command where the hub runs `git`,
+and only there (decision 003, "the hub publishes apps"). The project must be
+committed and pushed; `publish` proves it rather than trusting an asserted
+tag, and the release lands on whichever repository that pushed commit's own
+remote names. Local publishing needs `git` and a clean committed tree, but no
+push or forge authentication.

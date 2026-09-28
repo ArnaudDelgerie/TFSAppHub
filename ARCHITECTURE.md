@@ -36,9 +36,10 @@ ABI surface, and no baseline to get wrong — the question "will this app run on
 this machine?" is answered by Composer's own platform requirements against a PHP
 the hub controls.
 
-**Per-app update is `git fetch`.** An app is source at a pinned ref. Updating it
-is re-resolving that ref and replaying the lifecycle, not rebuilding and
-redistributing a 150 MB binary.
+**Per-app update re-resolves source.** For a forge release, the hub resolves
+the selected tag again; for a local release archive, the user supplies the
+new archive explicitly. Either way it replays the lifecycle without rebuilding
+and redistributing a 150 MB binary.
 
 **N binaries collapse to 1.** The disk win comes from sharing the *binary*, never
 from sharing the process — see "One process per open app" below.

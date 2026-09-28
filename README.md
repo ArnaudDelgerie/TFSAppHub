@@ -30,8 +30,8 @@ below for what that means. If it does not start on your machine, see
 The fragile native half (FrankenPHP, WebKitGTK, the glibc floor) is built once;
 everything added afterwards is pure PHP and has no ABI surface. N binaries
 collapse to 1, `composer install` *is* the compatibility manifest — it runs with
-the very interpreter that will later serve the app — and per-app update falls out
-of `git fetch` for free.
+the very interpreter that will later serve the app — and per-app update
+resolves a new release without rebuilding the native half.
 
 Status: **it is packaged, and it installs, and it opens.** `make build`
 produces a self-contained AppImage from a machine with nothing else built —
@@ -45,7 +45,8 @@ by side stay isolated; `list` and `remove` close the loop, the latter taking
 the entry with it; `run <id> <alias>` runs one of an app's own declared
 `bin/console` commands in the foreground, alongside `run --stop`/
 `run --replace` to release one without a manual `kill`; `update <id>`
-re-resolves an app's own source and replaces the installed version with it,
+re-resolves an app's own source, or `update <id> <archive.tar.gz>` supplies a
+local release explicitly, and replaces the installed version with it,
 snapshotting the database first and reverting code and database together if
 anything fails; `rollback <id>` undoes a successful update afterwards,
 putting the previous source and database back and setting the one being left
