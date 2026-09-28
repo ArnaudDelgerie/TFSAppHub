@@ -10,6 +10,7 @@ mod archive;
 mod bridge;
 mod cli;
 mod close_guard;
+mod crash;
 mod desktop;
 mod dev;
 mod gh;
@@ -616,6 +617,13 @@ fn open_window(
                                     microphone_declared,
                                     origin.clone(),
                                 );
+                                let _ = crash::install_crash_recovery_handler(
+                                    &window,
+                                    guards.clone(),
+                                    launch.product_name.clone(),
+                                    launch.splash_bg.clone(),
+                                    launch.splash_text.clone(),
+                                );
                                 Ok(())
                             })
                             .map_err(|error| error.to_string())
@@ -722,6 +730,13 @@ fn open_window(
                 app_origin.clone(),
             )
             .is_ok();
+            let _ = crash::install_crash_recovery_handler(
+                &splash,
+                close_guards.clone(),
+                identity.product_name.clone(),
+                spec.manifest.splash_bg.clone(),
+                spec.manifest.splash_text.clone(),
+            );
 
             let handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -940,6 +955,8 @@ fn serve(
     app.manage(sidecar::Launch {
         url,
         product_name: identity.product_name,
+        splash_bg: manifest.splash_bg.clone(),
+        splash_text: manifest.splash_text.clone(),
     });
 
     // Last of all, and only after the app is already running: a slow or

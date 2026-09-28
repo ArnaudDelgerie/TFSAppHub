@@ -1133,3 +1133,46 @@ fn a_first_committed_load_invalidates_a_backend_only_decision() {
     );
     assert!(!state.is_closing());
 }
+
+// --- end_document (plan 058, recovering from a dead web process) -----------
+
+#[test]
+fn a_crash_erases_the_dead_document_s_guards_immediately() {
+    let state = state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("the guard registers");
+    assert_eq!(registered(&state, "main"), ids(&["editor:42"]));
+
+    state.end_document("main");
+
+    // Unlike an ordinary committed load, nothing will ever fetch the crash
+    // page's context to trigger the usual successor-proves-itself erasure —
+    // so it has to happen right here, or the guard would block closing the
+    // window forever.
+    assert!(registered(&state, "main").is_empty());
+    assert_eq!(state.begin_close("main", false), CloseFlow::Allow);
+}
+
+#[test]
+fn a_crash_invalidates_a_decision_pending_for_the_old_document() {
+    let state = state();
+    let context = state.context("main");
+    state
+        .frontend_register("main", &context, "editor:42")
+        .expect("the guard registers");
+    let CloseFlow::Confirm { token, .. } = state.begin_close("main", false) else {
+        panic!("confirmation");
+    };
+
+    // The dialog is a separate native window and survives the crash; its
+    // late answer must not authorise anything against a document that is
+    // already gone.
+    state.end_document("main");
+
+    assert_eq!(
+        state.resolve_close(&token, true, false),
+        Resolution::Invalidated
+    );
+}

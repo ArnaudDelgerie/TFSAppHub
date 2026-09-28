@@ -677,6 +677,26 @@ impl CloseGuardState {
         }
     }
 
+    /// A crash ends the document as surely as a navigation does (plan 058):
+    /// assign a fresh context and erase every guard the dead document held
+    /// immediately, rather than waiting for a successor to fetch a context
+    /// that a crash page — which runs no app script — will never ask for.
+    ///
+    /// [`CloseGuardState::rotate_context`] alone is not enough here: an
+    /// ordinary committed load leaves the previous incarnation's guards in
+    /// place until its successor's first [`CloseGuardState::context`] fetch
+    /// proves it is alive (see this module's own header), and a crash page
+    /// never makes that fetch — a guard from the dead document would then
+    /// block closing the window forever. Chaining the two existing
+    /// primitives — rotate, then the very fetch that erases what does not
+    /// match the context it just set — gets the same immediate erasure
+    /// without inventing a second erasure rule the fetch-based one could
+    /// drift from.
+    pub fn end_document(&self, window: &str) {
+        self.rotate_context(window);
+        self.context(window);
+    }
+
     /// Commit shutdown: one-way. The signal's and the fatal-error path's
     /// committer — an approved final close commits the same flag inside
     /// [`CloseGuardState::resolve_close`], atomically with its final check.
