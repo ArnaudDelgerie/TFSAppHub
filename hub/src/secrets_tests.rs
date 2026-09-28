@@ -134,6 +134,90 @@ fn a_corrupt_store_file_is_an_error_and_is_never_written_over() {
 
 // --- the explicit production backend smoke test -------------------------
 
+/// Resume the harness's daemon from a panic as from a pass: the drop guard
+/// runs even when an assertion fails, so a stopped daemon is never left
+/// behind for the next test.
+struct ResumeDaemon(String);
+
+impl Drop for ResumeDaemon {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("kill")
+            .arg("-CONT")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+#[test]
+#[ignore = "requires the private Secret Service from make keyring-integration"]
+fn production_keyring_frozen_service() {
+    // The harness exports the PID of the exact daemon it verified ownership
+    // of. This test refuses to run without it and never guesses a PID, so
+    // the developer's own gnome-keyring-daemon is out of reach by
+    // construction.
+    let pid = std::env::var("TFS_TEST_SECRET_SERVICE_PID")
+        .expect("TFS_TEST_SECRET_SERVICE_PID must name the harness's own daemon");
+
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let service = format!(
+        "test.tfsapp-hub.keyring-integration.frozen.{}",
+        std::process::id()
+    );
+    let store = new_store(&service, directory.path());
+    assert!(
+        is_keyring(&store),
+        "the production store fell back to a file backend; make keyring-integration requires its private Secret Service"
+    );
+
+    let _resume = ResumeDaemon(pid.clone());
+    let stopped = std::process::Command::new("kill")
+        .arg("-STOP")
+        .arg(&pid)
+        .status()
+        .expect("SIGSTOP reaches the harness daemon");
+    assert!(stopped.success(), "the harness daemon must be stoppable");
+
+    // An operation against the frozen service answers an error within the
+    // bound, never a hang. Two shapes reach here: this D-Bus stack answers
+    // org.freedesktop.DBus.Error.NoReply against a stopped peer on its own
+    // (measured ~1.5 s — a `Keyring` error), and the wedges D-Bus does not
+    // time out on its own — the audit-004 locked-service shape — hit the
+    // store's deadline and answer `TimedOut`. Both reach the app as
+    // `storage_failed` (proven against the stalled fake above).
+    let started = Instant::now();
+    let answer = secrets_get(&store, "frozen");
+    let elapsed = started.elapsed();
+    assert!(
+        answer.is_err(),
+        "a frozen Secret Service must not answer ok"
+    );
+    assert!(
+        matches!(
+            answer,
+            Err(StorageError::TimedOut | StorageError::Keyring(_))
+        ),
+        "a frozen Secret Service must answer a store error, not {answer:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(7),
+        "the frozen call must be bounded: {elapsed:?}"
+    );
+
+    // A fresh store on the same frozen service falls back to the file
+    // backend after one bounded probe, not a held launch.
+    let started = Instant::now();
+    let fresh = new_store(&format!("{service}.fresh"), directory.path());
+    let elapsed = started.elapsed();
+    assert!(
+        !is_keyring(&fresh),
+        "a frozen Secret Service must yield the file backend"
+    );
+    assert!(
+        elapsed < Duration::from_secs(7),
+        "the probe must bound the launch: {elapsed:?}"
+    );
+}
+
 #[test]
 #[ignore = "requires the private Secret Service from make keyring-integration"]
 fn production_keyring_round_trip() {
