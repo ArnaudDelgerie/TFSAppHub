@@ -682,10 +682,6 @@ always answers once authorised.
 | `POST /close-guard/register` | `{"id": "…"}` | `200 {"ok": true}` |
 | `POST /close-guard/remove` | `{"id": "…"}` | `200 {"ok": true}` |
 
-A store that fails — or that does not answer within 5 s — answers
-`500 {"error": "storage_failed"}` on all five `/secrets/*` routes, last in the
-order below.
-
 **Errors, in the order they are checked:** `401` unauthorized (before routing) →
 `404 not_found` (the group is off, or the path is unknown — deliberately the same
 answer either way) → `413 payload_too_large` (the whole body exceeds a transport
@@ -693,8 +689,8 @@ cap, before any parsing) → `400 invalid_body` → `403 key_not_declared` (rese
 or not in `keys` — before the store is touched) → `413 value_too_large` on
 `/secrets/set` → `500 {"error": "storage_failed"}` on the five `/secrets/*`
 routes (the store failed, or did not answer within 5 s) → the route's success
-shape. The close-guard routes share the
-front of that order and add their own tail after `invalid_body`:
+shape. The close-guard routes share the front of that order and add their own
+tail after `invalid_body`:
 `400 {"error": "invalid_id"}`, `429 {"error": "too_many_guards"}`,
 `503 {"error": "closing"}` — the last meaning shutdown has committed and the
 guard namespace is closed for the rest of this process's life.

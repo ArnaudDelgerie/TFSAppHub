@@ -411,6 +411,34 @@ where
     with_deadline(deadline, run).unwrap_or(Err(StorageError::TimedOut))
 }
 
+/// One fake operation under the store's deadline, in the fake's mode: refused,
+/// wedged, or `working` run as the real backend would answer it.
+///
+/// `Stalled` waits on a condvar nobody notifies, in a loop so a spurious
+/// wakeup cannot turn a wedged call into an answer. The thread is abandoned
+/// by the deadline wrapper, exactly as a frozen Secret Service's would be.
+#[cfg(test)]
+fn fake_operation<T: Send + 'static>(
+    mode: &FakeMode,
+    deadline: Duration,
+    working: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, StorageError> {
+    let mode = mode.clone();
+    with_store_deadline(deadline, move || match mode {
+        FakeMode::Failing => Err(fake_keyring_failure()),
+        FakeMode::Stalled(stall) => {
+            let (lock, never_notified) = &*stall;
+            let mut guard = lock.lock().expect("the secret store is not poisoned");
+            loop {
+                guard = never_notified
+                    .wait(guard)
+                    .expect("the secret store is not poisoned");
+            }
+        }
+        FakeMode::Working => Ok(working()),
+    })
+}
+
 /// `Ok(false)`: a keyring with no entry, or a file with none. `Err`: the
 /// backend could not answer the question — never a silent `false`, which a
 /// caller would read as "there is nothing there".
@@ -438,26 +466,12 @@ pub fn secrets_has(store: &SecretStore, account: &str) -> Result<bool, StorageEr
         } => {
             let key = (service.clone(), account.to_string());
             let entries = entries.clone();
-            let mode = mode.clone();
-            with_store_deadline(*deadline, move || match mode {
-                FakeMode::Failing => Err(fake_keyring_failure()),
-                FakeMode::Stalled(stall) => {
-                    let (lock, never_notified) = &*stall;
-                    let guard = lock.lock().expect("the secret store is not poisoned");
-                    // Nobody ever notifies: this thread is abandoned by the
-                    // deadline wrapper, on purpose. The lock guard is bound
-                    // only to satisfy the lock lint — `wait` blocks forever
-                    // before it could be dropped.
-                    let (_guard, _timeout) = never_notified
-                        .wait_timeout(guard, std::time::Duration::MAX)
-                        .expect("the secret store is not poisoned");
-                    Ok(false)
-                }
-                FakeMode::Working => Ok(entries
+            fake_operation(mode, *deadline, move || {
+                entries
                     .0
                     .lock()
                     .expect("the secret store is not poisoned")
-                    .contains_key(&key)),
+                    .contains_key(&key)
             })
         }
     }
@@ -491,27 +505,13 @@ pub fn secrets_get(store: &SecretStore, account: &str) -> Result<Option<String>,
         } => {
             let key = (service.clone(), account.to_string());
             let entries = entries.clone();
-            let mode = mode.clone();
-            with_store_deadline(*deadline, move || match mode {
-                FakeMode::Failing => Err(fake_keyring_failure()),
-                FakeMode::Stalled(stall) => {
-                    let (lock, never_notified) = &*stall;
-                    let guard = lock.lock().expect("the secret store is not poisoned");
-                    // Nobody ever notifies: this thread is abandoned by the
-                    // deadline wrapper, on purpose. The lock guard is bound
-                    // only to satisfy the lock lint — `wait` blocks forever
-                    // before it could be dropped.
-                    let (_guard, _timeout) = never_notified
-                        .wait_timeout(guard, std::time::Duration::MAX)
-                        .expect("the secret store is not poisoned");
-                    Ok(None)
-                }
-                FakeMode::Working => Ok(entries
+            fake_operation(mode, *deadline, move || {
+                entries
                     .0
                     .lock()
                     .expect("the secret store is not poisoned")
                     .get(&key)
-                    .cloned()),
+                    .cloned()
             })
         }
     }
@@ -548,29 +548,12 @@ pub fn secrets_set(store: &SecretStore, account: &str, value: String) -> Result<
         } => {
             let key = (service.clone(), account.to_string());
             let entries = entries.clone();
-            let mode = mode.clone();
-            with_store_deadline(*deadline, move || match mode {
-                FakeMode::Failing => Err(fake_keyring_failure()),
-                FakeMode::Stalled(stall) => {
-                    let (lock, never_notified) = &*stall;
-                    let guard = lock.lock().expect("the secret store is not poisoned");
-                    // Nobody ever notifies: this thread is abandoned by the
-                    // deadline wrapper, on purpose. The lock guard is bound
-                    // only to satisfy the lock lint — `wait` blocks forever
-                    // before it could be dropped.
-                    let (_guard, _timeout) = never_notified
-                        .wait_timeout(guard, std::time::Duration::MAX)
-                        .expect("the secret store is not poisoned");
-                    Ok(())
-                }
-                FakeMode::Working => {
-                    entries
-                        .0
-                        .lock()
-                        .expect("the secret store is not poisoned")
-                        .insert(key, value);
-                    Ok(())
-                }
+            fake_operation(mode, *deadline, move || {
+                entries
+                    .0
+                    .lock()
+                    .expect("the secret store is not poisoned")
+                    .insert(key, value);
             })
         }
     }
@@ -612,27 +595,13 @@ pub fn secrets_delete(store: &SecretStore, account: &str) -> Result<bool, Storag
         } => {
             let key = (service.clone(), account.to_string());
             let entries = entries.clone();
-            let mode = mode.clone();
-            with_store_deadline(*deadline, move || match mode {
-                FakeMode::Failing => Err(fake_keyring_failure()),
-                FakeMode::Stalled(stall) => {
-                    let (lock, never_notified) = &*stall;
-                    let guard = lock.lock().expect("the secret store is not poisoned");
-                    // Nobody ever notifies: this thread is abandoned by the
-                    // deadline wrapper, on purpose. The lock guard is bound
-                    // only to satisfy the lock lint — `wait` blocks forever
-                    // before it could be dropped.
-                    let (_guard, _timeout) = never_notified
-                        .wait_timeout(guard, std::time::Duration::MAX)
-                        .expect("the secret store is not poisoned");
-                    Ok(false)
-                }
-                FakeMode::Working => Ok(entries
+            fake_operation(mode, *deadline, move || {
+                entries
                     .0
                     .lock()
                     .expect("the secret store is not poisoned")
                     .remove(&key)
-                    .is_some()),
+                    .is_some()
             })
         }
     }

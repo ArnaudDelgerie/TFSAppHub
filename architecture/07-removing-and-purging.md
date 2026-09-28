@@ -82,10 +82,8 @@ which ever writes one — falls back to the two hub accounts alone and says
 so: `RemovalPlan.keyring_note_found` is what gates that caveat, dropped the
 moment a note answers it. The limit is named, not silently under-purged.
 
-**The keyring line of `purge`'s report can now read `FAILED`.** The per-account
-delete goes through the same deadline wrapper as the runtime store (plan 068),
-and a keyring that refuses or does not answer is an `Err`, printed
-`FAILED (<cause>)` through the same `report()` line as a directory that cannot
-be removed — not folded into "already clean", which now means only a genuine
-absence.
-
+**A keyring delete that fails is reported, not folded into "already clean".**
+Each account's delete runs under the runtime store's deadline
+(`secrets::with_deadline`, plan 068). A keyring that refuses or does not answer
+is printed `FAILED (<cause>)` through the same `report()` line as a directory
+that cannot be removed; "already clean" means only that no entry was there.

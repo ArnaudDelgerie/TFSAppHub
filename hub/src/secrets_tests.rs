@@ -20,9 +20,9 @@ fn file_store(directory: &Path) -> super::SecretStore {
     new_file_store_for_test(directory.join("secrets.json"))
 }
 
-/// Make a directory read-only, and hand back a guard that restores it — the
-/// tempdir's own cleanup needs the write bit back before it can unlink
-/// anything inside.
+/// Make a directory read-only. Pair it with [`writable`] right after the
+/// operation under test, before any assertion: the tempdir's own cleanup needs
+/// the write bit back before it can unlink anything inside.
 fn read_only(directory: &Path) {
     fs::set_permissions(directory, fs::Permissions::from_mode(0o500))
         .expect("the directory permissions change");
