@@ -31,9 +31,11 @@ set -euo pipefail
 #   6. Re-check: the tree must still be clean, HEAD still the pinned revision,
 #      and the chosen build's .source-commit must still read it — otherwise
 #      refuse, publish nothing.
-#   7. Publish: gh release create with the .AppImage, its .versions.txt and
+#   7. Publish: create the releases repo if it does not exist, then
+#      gh release create with the .AppImage, its .versions.txt and
 #      the checksums as assets (GitHub object storage, never committed — the
-#      repo clone stays light). A fresh build (not a reused one) is then
+#      repo clone stays light). Every gh call that writes comes after every
+#      refusal. A fresh build (not a reused one) is then
 #      offered for cleanup — keep on disk by default, or discard all four
 #      files.
 #
@@ -116,14 +118,6 @@ gh auth status >/dev/null 2>&1 \
   || die "gh is not authenticated. Run: gh auth login"
 
 REPO="$RELEASES_REPO"
-if gh repo view "$REPO" >/dev/null 2>&1; then
-  echo "Releases repo: $REPO (exists)"
-else
-  echo "Creating public releases repo $REPO ..."
-  gh repo create "$REPO" --public --add-readme \
-    --description "Downloads and release notes for TFSAppHub." \
-    || die "failed to create $REPO"
-fi
 
 # --- Step 1: version guard --------------------------------------------------
 TAG="v$APP_VERSION"
@@ -151,10 +145,6 @@ CHANGELOG_FILE="$ROOT_DIR/CHANGELOG.md"
 [[ -f "$CHANGELOG_FILE" ]] \
   || die "no CHANGELOG.md found at $CHANGELOG_FILE."
 
-# Bracket expressions rather than backslash escapes throughout: the regex is
-# handed to awk through -v, which would eat the backslashes ("\." is not an
-# awk escape sequence). "." and "+" are the only ERE metacharacters a semver
-# string can contain.
 # Bracket expressions rather than backslash escapes throughout: the regex is
 # handed to awk through -v, which would eat the backslashes ("." is not an
 # awk escape sequence). "." and "+" are the only ERE metacharacters a semver
@@ -258,6 +248,18 @@ if [[ "$recorded_chosen" != "$SHA" ]]; then
 fi
 
 # --- Step 5: publish --------------------------------------------------------
+# Every refusal is now behind us; from here on the script writes outside this
+# machine. The releases repo is created only now — creating it before a later
+# refusal would leave an empty repo behind a failed release.
+if gh repo view "$REPO" >/dev/null 2>&1; then
+  echo "Releases repo: $REPO (exists)"
+else
+  echo "Creating public releases repo $REPO ..."
+  gh repo create "$REPO" --public --add-readme \
+    --description "Downloads and release notes for TFSAppHub." \
+    || die "failed to create $REPO"
+fi
+
 # Release notes are exactly the section extracted by the changelog gate
 # (step 2) — --generate-notes can't work cross-repo, the releases repo has
 # none of this repo's commits.
