@@ -420,9 +420,16 @@ and every other permission type WebKit can ask for (geolocation,
 notification, pointer lock, a media key system, website data access, and
 whatever WebKit adds next) is denied unconditionally, whatever the manifest
 declares. Declaring this group is not a claim that the person consented at
-the moment of capture: there is no runtime prompt and no host-drawn recording
-indicator, and the declaration itself — readable before install — is the
-whole of the consent story.
+the moment of capture: there is no runtime prompt and no indicator beyond
+the window's title, and the declaration itself — readable before install —
+is the whole of the consent story.
+
+A user can revoke the declared microphone per installation —
+`"revoked": {"media": {"microphone": true}}` in the app's own
+`data/config.json` (§5), hand-edited like `port_override` and kept across
+updates, makes every capture request denied with a logged reason and
+`TFS_MEDIA_MICROPHONE` report `0` (§3) — and while a capture really runs,
+the window's title shows it.
 
 **`ipc` and `bridge` are both refused, at parse time, even when set to
 `false`.** This group has neither transport: there is nothing to `invoke()`

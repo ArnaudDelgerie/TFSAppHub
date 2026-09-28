@@ -385,12 +385,20 @@ An app that declares `actions.media.microphone` (§7, decision 007) gets the
 capability at the window, not at the backend: after `create_splash_window` or
 `create_app_window` builds a window, `media::install_permission_handler`
 reaches its webview through `with_webview` and does two things. It writes
-WebKitGTK's `enable-media-stream` setting — only when the manifest declared
-the microphone; left alone otherwise, keeping WebKitGTK's own default of no
-capture at all. And it connects one `permission-request` handler, on **every**
-window regardless of the declaration: wry itself connects none, so an
-undeclared app would otherwise fall through to whatever WebKit's own default
-turns out to be rather than an explicit, logged refusal.
+WebKitGTK's `enable-media-stream` setting — only when the microphone's
+access is `Allowed`; left alone otherwise, keeping WebKitGTK's own default of
+no capture at all. And it connects one `permission-request` handler, on
+**every** window regardless of the access: wry itself connects none, so an
+app without the grant would otherwise fall through to whatever WebKit's own
+default turns out to be rather than an explicit, logged refusal.
+
+The access is one value, computed once per launch where the manifest and the
+data directory are both known (`media::MicrophoneAccess`, pure and
+unit-tested): `Undeclared`, `Revoked` — the manifest declares the microphone
+but this installation's `data/config.json` switches it off (§5) — or
+`Allowed`. A revoked microphone follows the undeclared rule exactly:
+`enable-media-stream` is not written either, so the app meets the platform
+with no capture at all, and `TFS_MEDIA_MICROPHONE` reports `0` (§3).
 
 The handler's decision is pure and unit-tested (`media::decide`): a
 `UserMediaPermissionRequest` is allowed only when it is for an audio device
@@ -398,7 +406,7 @@ and not a video device (WebKit grants a combined request wholly or not at
 all), a `DeviceInfoPermissionRequest` is allowed under the same two
 conditions — without it `enumerateDevices()` returns no labels — and every
 other permission kind is denied outright. Both conditions have to hold: the
-manifest declared the microphone, **and** the requesting page is the app's own
+microphone's access is `Allowed`, **and** the requesting page is the app's own
 origin at the moment of the request, read from the webview's current URI and
 compared against the published `AppOriginSlot` with the same `same_origin`
 `window.rs` already uses for navigation. Before that slot is published — the
@@ -410,12 +418,28 @@ splash window covers the app's whole first life — a further window from a
 second `open` (`window::create_app_window`) gets its own install, on the same
 terms. The closure reports on a channel whether it really wrote the setting
 and connected the handler, and `serve` waits up to 2 s for that report before
-resolving the environment — never from the main thread, which is the thread
-the closure itself needs — so `TFS_MEDIA_MICROPHONE` says what actually
-happened, not what was scheduled.
+resolving the environment — only when the access is `Allowed`; anything else
+resolves the environment without waiting, `TFS_MEDIA_MICROPHONE=0` already
+settled — and never from the main thread, which is the thread the closure
+itself needs — so `TFS_MEDIA_MICROPHONE` says what actually happened, not
+what was scheduled.
+
+**A running capture is visible in the window's title.** Only on a window
+whose access is `Allowed` does the same closure connect two more signals,
+both before the grant report is sent. `microphone-capture-state-notify` fires
+on every state change and sets the toplevel's title from
+`media::capture_title` (pure and unit-tested): `Microphone on — <product
+name>` while a capture is active, `Microphone muted — <product name>` while
+it is muted, the plain product name once it stops, with one `hub.log` line
+per change. Under Wayland the title is written to the `gtk::HeaderBar` tao
+builds into the window as well as to the window itself, because that header
+bar's title is a snapshot `gtk_window_set_title` cannot reach. And a second
+`web-process-terminated` handler — the same signal `crash.rs` already owns,
+touching nothing of the crash page — puts the plain name back, so a web
+process dying mid-capture cannot leave the indicator stuck.
 
 Every denied `UserMediaPermissionRequest` is logged to `hub.log` with its
-reason (undeclared, wrong origin, or video asked for) — `DeviceInfoPermissionRequest`
+reason (revoked, undeclared, wrong origin, or video asked for) — `DeviceInfoPermissionRequest`
 and every other kind are denied silently, the same as any other navigation
 refused outside this group.
 

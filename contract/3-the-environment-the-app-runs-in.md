@@ -164,7 +164,11 @@ device answers is exactly what `getUserMedia()` itself already fails on, the
 way it would on any web page. The AND that produces it is the same shape as
 the other two — the manifest's own declaration on one side, what this launch
 actually managed on the other — so a host that cannot install the grant
-reports `"0"` rather than failing the launch (§8).
+reports `"0"` rather than failing the launch (§8). The same AND makes a
+locally revoked microphone read `"0"`: a microphone declared in the manifest
+but switched off in this installation's `data/config.json` (§7) counts as
+not granted, so the variable reports `"0"` although the manifest declares
+it — the launch side refusing, not the declaration side lying.
 
 Each `TFS_USER_<NAME>_DIR` variable above (§7, decision 008) follows the same
 rule from the other direction: it is present only when its member is declared

@@ -411,22 +411,47 @@ fn prepare(source: &OpenChildSource, identity: &Identity) -> Launching {
         ),
     };
 
+    // The launch's one microphone value (plan 070): the manifest's
+    // declaration ANDed with this installation's `data/config.json`
+    // revocation, read in both launch sources — a dev launch's
+    // `data/config.json` normally does not exist, which reads as "not
+    // revoked". Everything downstream (the splash's grant, every later
+    // window's grant, `serve`'s wait for the grant report) reads this
+    // instead of re-deriving the declaration, so a revocation and a
+    // missing declaration reach the platform and `hub.log` with the same
+    // single value they will be answered with.
+    let microphone_access = media::MicrophoneAccess::of(
+        spec.manifest.actions.media.microphone,
+        lifecycle::read_microphone_revoked(&data_subdir),
+    );
+    if microphone_access == media::MicrophoneAccess::Revoked {
+        eprintln!(
+            "tfsapp-hub: the microphone is declared but revoked in {}; \
+             TFS_MEDIA_MICROPHONE=0",
+            lifecycle::data_config_path(&data_subdir).display()
+        );
+    }
+
     Launching {
         paths,
         spec,
         locks,
         activity,
+        microphone_access,
     }
 }
 
 /// What the guards leave for the launch itself: where the app is, what it
 /// declares, and the locks proving this process is its live instance
-/// ([`lifecycle::LaunchLocks`]).
+/// ([`lifecycle::LaunchLocks`]). `microphone_access` is the one value the
+/// whole launch's microphone story reads (plan 070): computed once here, it
+/// drives the splash's grant, every later window's grant, and `serve`'s wait.
 struct Launching {
     paths: paths::Paths,
     spec: launch::LaunchSpec,
     locks: Option<lifecycle::LaunchLocks>,
     activity: Option<lifecycle_gate::ActivityLease>,
+    microphone_access: media::MicrophoneAccess,
 }
 
 /// Open the app installed as `id`, under `identity`.
@@ -460,6 +485,7 @@ fn open_window(
         spec,
         locks,
         activity,
+        microphone_access,
     } = prepare(&source, &identity);
 
     // The app's `actions` groups, granted at runtime, before `Builder` — the
@@ -508,9 +534,9 @@ fn open_window(
     let relaunch_receiver = open_files::Receiver::of(&spec.manifest);
     // Read here for the same reason: a further window on an already-running
     // backend goes through `create_app_window`, never through `serve`, so its
-    // own media grant has to be decided from this instance's declaration
+    // own media grant has to be decided from this instance's access value
     // before `spec` moves into `setup`.
-    let relaunch_microphone_declared = spec.manifest.actions.media.microphone;
+    let relaunch_microphone_access = microphone_access;
 
     // A file-bearing launch enqueues its own batch before the `Builder` exists,
     // so it is waiting in the pre-launch pool before any window — and the
@@ -585,7 +611,7 @@ fn open_window(
                 let guards = relaunch_close_guards.clone();
                 let icon_path = relaunch_icon_path.clone();
                 let receiver = relaunch_receiver;
-                let microphone_declared = relaunch_microphone_declared;
+                let microphone_access = relaunch_microphone_access;
                 let arrival = cli::second_instance_files(&args);
                 let scheduler = app.clone();
                 let scheduled = move || {
@@ -641,7 +667,8 @@ fn open_window(
                                 // for the sidecar this backend is serving.
                                 let _ = media::install_permission_handler(
                                     &window,
-                                    microphone_declared,
+                                    launch.product_name.clone(),
+                                    microphone_access,
                                     origin.clone(),
                                 );
                                 let _ = crash::install_crash_recovery_handler(
@@ -756,7 +783,8 @@ fn open_window(
             // wait learned, never what the manifest asked for (§3).
             let media_grant_report = media::install_permission_handler(
                 &splash,
-                spec.manifest.actions.media.microphone,
+                identity.product_name.clone(),
+                microphone_access,
                 app_origin.clone(),
             )
             .ok();
@@ -785,6 +813,7 @@ fn open_window(
                     splash_label,
                     close_guards,
                     serve_open_files,
+                    microphone_access,
                     media_grant_report,
                 );
             });
@@ -822,6 +851,7 @@ fn serve(
     splash_label: String,
     close_guards: close_guard::SharedCloseGuards,
     open_files: open_files::SharedOpenFiles,
+    microphone_access: media::MicrophoneAccess,
     media_grant_report: Option<std::sync::mpsc::Receiver<bool>>,
 ) {
     use tauri::Manager;
@@ -905,13 +935,14 @@ fn serve(
         launch::Source::Live => app_env::Mode::Dev,
     };
     // `serve` runs off the main thread, so it may block — and this is the
-    // one place that does: the grant's report is waited for only when the
-    // manifest declares the microphone, never longer than the deadline, and
-    // never from the main thread (the `setup` closure and the
-    // second-instance callback share the thread the `with_webview` closure
-    // itself needs). An undeclared app waits for nothing; its report, if
-    // the closure ever sends one, is dropped unread.
-    let microphone_granted = if manifest.actions.media.microphone {
+    // one place that does: the grant's report is waited for only when this
+    // launch's microphone is `Allowed` (plan 070 — an undeclared or revoked
+    // app has nothing being granted, so it waits for nothing and its
+    // report, if the closure ever sends one, is dropped unread), never
+    // longer than the deadline, and never from the main thread (the `setup`
+    // closure and the second-instance callback share the thread the
+    // `with_webview` closure itself needs).
+    let microphone_granted = if microphone_access == media::MicrophoneAccess::Allowed {
         media::await_grant(media_grant_report, media::MICROPHONE_GRANT_DEADLINE)
     } else {
         false

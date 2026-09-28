@@ -8,7 +8,9 @@
     app.db          the SQLite database DATABASE_URL points at
     app.secret      APP_SECRET in plaintext — only on a machine with no keyring
     secrets.json    the app's declared secrets (§7), same condition
-    config.json     which version last wrote all of this
+    config.json     which version last wrote all of this, plus the hand-edited
+                    keys the host never writes on its own: port_override (§8)
+                    and revoked (§7)
   cache/            APP_CACHE_DIR — may be emptied at any launch (§3)
   build/            APP_BUILD_DIR — same
   log/              APP_LOG_DIR — persists, rotated

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+The microphone can now be switched off per installation, and a running capture
+is visible in the window's title. `"revoked": {"media": {"microphone":
+true}}` in an app's `data/config.json` — hand-edited, like `port_override`,
+and kept across updates — makes the hub deny every capture request with a
+logged reason and report `TFS_MEDIA_MICROPHONE=0` although the manifest
+declares the microphone; a `config.json` that does not parse fails closed.
+While a capture runs, the title reads `Microphone on — <product name>`
+(`Microphone muted — <product name>` while muted) and returns to the plain
+name when it stops or the web process dies mid-capture; under Wayland the
+indicator also writes tao's header bar, whose title a plain `set_title`
+cannot reach.
+
 A web process killed before its window's first page ever committed now gets
 the crash page too: the Reload link targets the URL the window was created
 with (the splash's own URL, or the bundled fallback's), so an early engine

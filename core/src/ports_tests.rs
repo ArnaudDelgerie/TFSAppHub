@@ -94,3 +94,34 @@ fn check_packaged_port_errors_naming_port_and_config_json_when_resolved_port_is_
     assert!(message.contains("port_override"));
     assert!(message.contains(&data_subdir.path().join("config.json").display().to_string()));
 }
+
+// --- `DataConfig`'s `revoked` key (plan 070 step 1) --------------------------
+
+#[test]
+fn a_data_config_with_nothing_revoked_serializes_without_the_key() {
+    // `revoked` is hand-edited exactly like `port_override`: absent by
+    // default, and a hub that merely records a version must write the file
+    // as if the key had never been invented.
+    let config = DataConfig {
+        version: "1.0.0".to_string(),
+        port_override: None,
+        revoked: Revoked::default(),
+    };
+    let written = serde_json::to_string(&config).unwrap();
+    assert!(!written.contains("revoked"), "no key written: {written}");
+}
+
+#[test]
+fn a_revoked_microphone_round_trips_through_the_key() {
+    let config = DataConfig {
+        version: "1.0.0".to_string(),
+        port_override: None,
+        revoked: Revoked {
+            media: RevokedMedia { microphone: true },
+        },
+    };
+    let written = serde_json::to_string(&config).unwrap();
+    assert!(written.contains("revoked"), "the key is written: {written}");
+    let read_back: DataConfig = serde_json::from_str(&written).unwrap();
+    assert!(read_back.revoked.media.microphone);
+}
