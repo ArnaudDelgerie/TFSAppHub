@@ -1,16 +1,29 @@
 use std::{fs, path::Path};
 
 use super::{
-    discard_resync_aside, discard_tree, repair_at, repair_required, restore_tree,
-    resync_aside_path, resync_snapshot, retain_tree, revert, test_stop, update, update_decision,
-    UpdateAction, UpdateError, UpdateRefusal,
+    discard_resync_aside, discard_tree, repair_at, restore_tree, resync_aside_path,
+    resync_snapshot, retain_tree, revert, test_stop, update, update_decision, UpdateAction,
+    UpdateError, UpdateRefusal,
 };
 use crate::{
     lifecycle::{previous_tree_path, read_rollback_anchor},
     lifecycle_gate,
     paths::Paths,
     registry::{self, Platform, RegistryEntry, Source, SourceKind, State},
+    update_transaction,
 };
+
+/// Whether the journal is still there — `update::repair_required`'s own
+/// check, inlined here since plan 064 moved the guard into `lifecycle_gate`
+/// and deleted the shared fence.
+fn journal_present(paths: &Paths) -> bool {
+    let installed = registry::load(paths).expect("a readable registry");
+    let entry = installed.get("demo").expect("the seeded entry");
+    let data_dir = paths.app_data_dir(&entry.identifier).expect("a data dir");
+    update_transaction::read(&data_dir)
+        .expect("a readable journal")
+        .is_some()
+}
 
 fn version(text: &str) -> semver::Version {
     semver::Version::parse(text).expect("a semver version")
@@ -914,10 +927,10 @@ fn a_killed_apply_reverts_to_the_outgoing_version_before_registry_commit() {
         test_stop::disarm();
         assert!(result.is_err(), "{point}: the stop point should have fired");
 
-        assert!(repair_required(&paths, "demo").unwrap(), "{point}");
+        assert!(journal_present(&paths), "{point}");
         repair_at(&paths, "demo", true).unwrap_or_else(|error| panic!("{point}: {error}"));
 
-        assert!(!repair_required(&paths, "demo").unwrap(), "{point}");
+        assert!(!journal_present(&paths), "{point}");
         assert!(
             !app_dir.join("README").exists(),
             "{point}: the outgoing tree must be live again"
@@ -962,10 +975,10 @@ fn a_killed_apply_finishes_forward_from_registry_commit_on() {
         test_stop::disarm();
         assert!(result.is_err(), "{point}: the stop point should have fired");
 
-        assert!(repair_required(&paths, "demo").unwrap(), "{point}");
+        assert!(journal_present(&paths), "{point}");
         repair_at(&paths, "demo", true).unwrap_or_else(|error| panic!("{point}: {error}"));
 
-        assert!(!repair_required(&paths, "demo").unwrap(), "{point}");
+        assert!(!journal_present(&paths), "{point}");
         assert!(
             app_dir.join("README").exists(),
             "{point}: the update already happened — the new tree stays live"
@@ -1066,10 +1079,10 @@ fn a_killed_resync_reverts_to_the_outgoing_source_before_registry_commit() {
         test_stop::disarm();
         assert!(result.is_err(), "{point}: the stop point should have fired");
 
-        assert!(repair_required(&paths, "demo").unwrap(), "{point}");
+        assert!(journal_present(&paths), "{point}");
         repair_at(&paths, "demo", true).unwrap_or_else(|error| panic!("{point}: {error}"));
 
-        assert!(!repair_required(&paths, "demo").unwrap(), "{point}");
+        assert!(!journal_present(&paths), "{point}");
         assert!(
             !app_dir.join("README").exists(),
             "{point}: the outgoing tree must be live again"
@@ -1108,10 +1121,10 @@ fn a_killed_resync_finishes_forward_from_registry_commit_on() {
         test_stop::disarm();
         assert!(result.is_err(), "{point}: the stop point should have fired");
 
-        assert!(repair_required(&paths, "demo").unwrap(), "{point}");
+        assert!(journal_present(&paths), "{point}");
         repair_at(&paths, "demo", true).unwrap_or_else(|error| panic!("{point}: {error}"));
 
-        assert!(!repair_required(&paths, "demo").unwrap(), "{point}");
+        assert!(!journal_present(&paths), "{point}");
         assert!(
             app_dir.join("README").exists(),
             "{point}: the resync already happened — the new tree stays live"

@@ -1,10 +1,13 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, path::PathBuf};
 
-use super::{rollback, RollbackError};
+use super::{
+    marker_path, rollback, write_marker, RollbackError, RollbackMarker, MARKER_FORMAT_VERSION,
+};
 use crate::{
     lifecycle::{self, RollbackAnchor},
     paths::Paths,
     registry::{self, Platform, RegistryEntry, Source, SourceKind, State},
+    update::test_stop,
 };
 
 fn temp_paths() -> (tempfile::TempDir, Paths) {
@@ -345,4 +348,147 @@ fn a_rollback_leaves_a_stale_cache_stamp_that_mismatches_the_restored_version() 
         }
         other => panic!("expected a mismatch on the stale stamp's app_version, got {other:?}"),
     }
+}
+
+// --- interrupted rollbacks, resumed by running the command again --------
+
+/// Every boundary a kill can strike between two of `finish`'s steps, from
+/// the marker's own write to the last discard before its removal.
+const ROLLBACK_STOP_POINTS: [&str; 7] = [
+    "rollback_marked",
+    "rollback_db_restored",
+    "rollback_tree_removed",
+    "rollback_tree_restored",
+    "rollback_version_written",
+    "rollback_registry_written",
+    "rollback_anchor_discarded",
+];
+
+/// Install at `0.6.0`, update to `0.7.0`, then write post-update database
+/// bytes — the exact state `a_successful_update_can_be_rolled_back_end_to_end`
+/// starts its rollback from, factored so the stop-point test below can have
+/// one per boundary.
+fn updated_for_rollback_stop() -> (tempfile::TempDir, Paths, PathBuf) {
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+
+    runnable_app_tree(source.path(), "0.6.0", "{}");
+    crate::install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the first install");
+
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::write(data_subdir.join("app.db"), b"pre-update-bytes").expect("a seeded database");
+
+    runnable_app_tree(source.path(), "0.7.0", "{}");
+    crate::update::update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
+
+    // Data written after the update, which the rollback must set aside
+    // rather than silently drop.
+    fs::write(data_subdir.join("app.db"), b"post-update-bytes").expect("post-update writes");
+
+    (base, paths, data_subdir)
+}
+
+#[test]
+fn a_killed_rollback_is_refused_by_every_other_command_and_finished_by_rerunning_it() {
+    if !resources_present() {
+        return;
+    }
+    for point in ROLLBACK_STOP_POINTS {
+        let (base, paths, data_subdir) = updated_for_rollback_stop();
+        let app_dir = paths.app_dir("demo").expect("an app dir");
+        let data_dir = base.path().join("TFSApp/dev.local.demo");
+
+        test_stop::arm(point);
+        let result = rollback(&paths, "demo", true);
+        test_stop::disarm();
+        assert!(result.is_err(), "{point}: the stop point should have fired");
+
+        // The marker refuses every operation but rollback — including the
+        // two a user might try to escape with.
+        for operation in ["export", "repair"] {
+            match crate::lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", operation) {
+                Err(crate::lifecycle_gate::GateError::RollbackRequired { .. }) => {}
+                Err(other) => panic!("{point}: {operation} must be refused, not {other}"),
+                Ok(_) => panic!("{point}: the marker must refuse the {operation}"),
+            }
+        }
+
+        // Resumed with no prompt: `false` proves none is asked, since the
+        // first run was already confirmed and there is nothing to go back
+        // to.
+        assert!(
+            rollback(&paths, "demo", false)
+                .unwrap_or_else(|error| panic!("{point}: the resume failed: {error}")),
+            "{point}: the resume must report success"
+        );
+
+        // The same end state as an uninterrupted rollback.
+        assert!(
+            fs::read_to_string(app_dir.join("tfsapp.config.json"))
+                .expect("the restored manifest")
+                .contains("0.6.0"),
+            "{point}: the tree's own manifest must show the restored version"
+        );
+        assert_eq!(
+            fs::read(data_subdir.join("app.db")).expect("the restored database"),
+            b"pre-update-bytes",
+            "{point}: the restored database"
+        );
+        assert_eq!(
+            lifecycle::read_data_version(&data_subdir).expect("a readable record"),
+            Some("0.6.0".to_string()),
+            "{point}: data/config.json must show the restored version"
+        );
+        let entry = registry::load(&paths)
+            .expect("a readable registry")
+            .get("demo")
+            .cloned()
+            .expect("the entry survives");
+        assert_eq!(entry.app_version, "0.6.0", "{point}");
+
+        // Nothing of the interruption or the anchor remains.
+        assert!(!marker_path(&data_dir).exists(), "{point}");
+        assert!(
+            !lifecycle::db_snapshot_path(&data_subdir, "app.db").exists(),
+            "{point}"
+        );
+        assert!(
+            !lifecycle::rollback_anchor_path(&data_subdir).exists(),
+            "{point}"
+        );
+        assert!(!lifecycle::previous_tree_path(&app_dir).exists(), "{point}");
+    }
+}
+
+#[test]
+fn a_marker_with_neither_tree_left_reports_the_lost_tree_and_keeps_the_marker() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry("/dev/null"));
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    fs::create_dir_all(&data_dir).expect("a data dir");
+    write_marker(
+        &data_dir,
+        &RollbackMarker {
+            format_version: MARKER_FORMAT_VERSION,
+            target_version: "0.6.0".to_string(),
+            source_revision: "sha256:previous".to_string(),
+            rescue_path: None,
+        },
+    )
+    .expect("a seeded marker");
+
+    let error = rollback(&paths, "demo", true).expect_err("neither tree exists");
+    assert!(matches!(error, RollbackError::TreeLost { .. }), "{error}");
+    // The marker stays: the situation is still nameable, and the refusal
+    // still names the command that owns it.
+    assert!(marker_path(&data_dir).exists());
 }

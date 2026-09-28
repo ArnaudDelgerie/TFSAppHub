@@ -1156,20 +1156,6 @@ fn repair_at(paths: &Paths, id: &str, assume_yes: bool) -> Result<bool, UpdateEr
     Ok(true)
 }
 
-/// A cheap, shared fence for ordinary commands. The journal is checked before
-/// command-specific filesystem diagnostics can mistake an interrupted swap
-/// for a missing installation.
-pub(crate) fn repair_required(paths: &Paths, id: &str) -> Result<bool, UpdateError> {
-    let installed = registry::load(paths)?;
-    let Some(entry) = installed.get(id) else {
-        return Ok(false);
-    };
-    let data_dir = paths.app_data_dir(&entry.identifier)?;
-    Ok(update_transaction::read(&data_dir)
-        .map_err(transaction_error)?
-        .is_some())
-}
-
 /// Everything that can stop an update, in one type so the command has one
 /// place to print from.
 #[derive(Debug)]

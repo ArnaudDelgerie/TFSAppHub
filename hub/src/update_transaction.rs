@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::{lifecycle, registry::RegistryEntry};
@@ -132,10 +133,18 @@ pub fn staged_tree_path(app_dir: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-pub fn write(data_dir: &Path, journal: &Journal) -> Result<(), JournalError> {
-    let target = journal_path(data_dir);
+/// The one durable write every interrupted-operation record shares — the
+/// update journal, the import intent, the rollback marker: a same-directory
+/// temp file, written and fsynced, `rename`d into place, then the directory
+/// itself fsynced so the rename is durable too (plan 064).
+pub(crate) fn write_record<T: Serialize>(
+    data_dir: &Path,
+    file_name: &str,
+    value: &T,
+) -> Result<(), JournalError> {
+    let target = data_dir.join(file_name);
     let temp = target.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(journal).map_err(|error| JournalError::Malformed {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| JournalError::Malformed {
         path: target.clone(),
         detail: error.to_string(),
     })?;
@@ -164,21 +173,37 @@ pub fn write(data_dir: &Path, journal: &Journal) -> Result<(), JournalError> {
         })
 }
 
-pub fn read(data_dir: &Path) -> Result<Option<Journal>, JournalError> {
-    let path = journal_path(data_dir);
+/// The matching read: absent is `Ok(None)`, unreadable or unparseable is an
+/// error. Format versions are *not* checked here — each record type checks
+/// its own.
+pub(crate) fn read_record<T: DeserializeOwned>(
+    data_dir: &Path,
+    file_name: &str,
+) -> Result<Option<T>, JournalError> {
+    let path = data_dir.join(file_name);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(JournalError::Io { path, source }),
     };
-    let journal: Journal =
-        serde_json::from_str(&text).map_err(|error| JournalError::Malformed {
-            path: path.clone(),
-            detail: error.to_string(),
-        })?;
+    let record: T = serde_json::from_str(&text).map_err(|error| JournalError::Malformed {
+        path: path.clone(),
+        detail: error.to_string(),
+    })?;
+    Ok(Some(record))
+}
+
+pub fn write(data_dir: &Path, journal: &Journal) -> Result<(), JournalError> {
+    write_record(data_dir, JOURNAL_FILE, journal)
+}
+
+pub fn read(data_dir: &Path) -> Result<Option<Journal>, JournalError> {
+    let Some(journal): Option<Journal> = read_record(data_dir, JOURNAL_FILE)? else {
+        return Ok(None);
+    };
     if journal.format_version != FORMAT_VERSION {
         return Err(JournalError::Malformed {
-            path,
+            path: journal_path(data_dir),
             detail: format!(
                 "unsupported transaction format version {}",
                 journal.format_version

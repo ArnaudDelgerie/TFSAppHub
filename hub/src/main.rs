@@ -128,28 +128,22 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
     }
 
     // An early, advisory diagnostic only: it answers before any lease is
-    // taken, so an `update` can still write a journal after it and before the
-    // command below runs. The authoritative check is the one every lease
-    // holder runs under its lease in `lifecycle_gate` — this one exists for
-    // the commands whose first act would otherwise misreport: `open`'s parent
-    // and `run` resolve the app tree before any lease, and an update killed
-    // with its tree set aside would show up there as a missing installation
-    // instead of "run repair". A lease holder refused under the gate gets the
-    // same message this prints, with no `tfsapp-hub:` prefix of its own.
+    // taken, so an interrupted command can still write its record after it
+    // and before the command below runs. The authoritative check is the one
+    // every lease holder runs under its lease in `lifecycle_gate` — this one
+    // exists for the commands whose first act would otherwise misreport:
+    // `open`'s parent and `run` resolve the app tree before any lease, and
+    // an update killed with its tree set aside would show up there as a
+    // missing installation instead of "run repair". A lease holder refused
+    // under the gate gets the same message this prints, with no
+    // `tfsapp-hub:` prefix of its own.
     if let Some(id) = interrupted_app_id(&command) {
         if let Ok(paths) = paths::Paths::resolve() {
-            match update::repair_required(&paths, id) {
-                Ok(true) => {
-                    eprintln!(
-                        "tfsapp-hub: {id} has an interrupted update; run `tfsapp-hub repair {id} --yes` first."
-                    );
-                    return cli::EXIT_FAILED;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    eprintln!("tfsapp-hub: cannot inspect the update journal for {id}: {error}");
-                    return cli::EXIT_FAILED;
-                }
+            if let Ok(Some(refusal)) =
+                lifecycle_gate::interruption(&paths, id, interrupted_operation(&command))
+            {
+                eprintln!("tfsapp-hub: {refusal}");
+                return cli::EXIT_FAILED;
             }
         }
     }
@@ -306,6 +300,24 @@ fn interrupted_app_id(command: &Command) -> Option<&str> {
             source: OpenChildSource::Id(id),
             ..
         } => Some(id),
+        _ => None,
+    }
+}
+
+/// The maintenance operation the dispatched command will ask the gate for,
+/// or `None` for the activity commands (`open`, `run`) — the same name
+/// `refuse_if_interrupted` matches its exemptions against, so a `repair`
+/// that may pass a journal and a `rollback` that may pass a marker are
+/// recognised here exactly as they are under the lease.
+fn interrupted_operation(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::Update { .. } => Some("update"),
+        Command::Rollback { .. } => Some("rollback"),
+        Command::Remove { .. } => Some("remove"),
+        Command::Export { .. } => Some("export"),
+        Command::Import { .. } => Some("import"),
+        // Activity holders run no named operation; the gate's activity
+        // check passes `None` for exactly these.
         _ => None,
     }
 }
