@@ -874,6 +874,85 @@ fn an_archive_missing_manifest_json_is_refused() {
 }
 
 #[test]
+fn exported_backup_refuses_install_and_update_before_mutation() {
+    let (base, paths) = temp_paths();
+    let entry = seeded_entry();
+    seed_registry(&paths, entry.clone());
+    let backup = base.path().join("backup.tar.gz");
+    run_export(&paths, "demo", &backup).unwrap();
+    assert!(super::is_backup(&backup));
+
+    let install_error = install::install(
+        &paths,
+        &backup.display().to_string(),
+        Some("backup-copy"),
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .unwrap_err();
+    assert!(
+        install_error.to_string().contains("tfsapp-hub import <id>"),
+        "{install_error}"
+    );
+    assert!(registry::load(&paths).unwrap().get("backup-copy").is_none());
+    assert!(!paths.app_dir("backup-copy").unwrap().exists());
+
+    let update_error =
+        update::update(&paths, "demo", Some(&backup), None, false, true, "0.1.0").unwrap_err();
+    assert!(
+        update_error.to_string().contains("tfsapp-hub import <id>"),
+        "{update_error}"
+    );
+    assert_eq!(registry::load(&paths).unwrap().get("demo"), Some(&entry));
+}
+
+struct ReleaseManifestBlob(Vec<u8>);
+
+impl crate::publish::BlobSource for ReleaseManifestBlob {
+    fn copy_blob(
+        &mut self,
+        _: &str,
+        destination: &mut dyn io::Write,
+    ) -> Result<u64, crate::git::GitError> {
+        destination.write_all(&self.0).unwrap();
+        Ok(self.0.len() as u64)
+    }
+}
+
+#[test]
+fn importing_a_release_names_install_and_preserves_data() {
+    let (base, paths) = temp_paths();
+    let entry = seeded_entry();
+    seed_registry(&paths, entry.clone());
+    let data_dir = paths.app_data_dir(&entry.identifier).unwrap();
+    fs::create_dir_all(data_dir.join(DATA_DIR)).unwrap();
+    fs::write(data_dir.join(DATA_DIR).join("app.db"), b"original").unwrap();
+    let tree = vec![crate::git::TreeEntry {
+        path: "tfsapp.config.json".into(),
+        mode: 0o100644,
+        object_id: "manifest".into(),
+    }];
+    let release = crate::publish::build_archive(
+        &tree,
+        &mut ReleaseManifestBlob(br#"{"product_name":"Demo","identifier":"dev.local.demo","project_name":"demo","app_version":"1.2.3"}"#.to_vec()),
+        "demo", "1.2.3", base.path(),
+    ).unwrap().archive_path;
+    let error = run_import(&paths, "demo", &release, false, true).unwrap_err();
+    assert!(
+        matches!(error, PortabilityError::IsARelease { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("tfsapp-hub install"));
+    assert_eq!(
+        fs::read(data_dir.join(DATA_DIR).join("app.db")).unwrap(),
+        b"original"
+    );
+    assert_eq!(registry::load(&paths).unwrap().get("demo"), Some(&entry));
+}
+
+#[test]
 fn an_oversized_manifest_is_refused_before_touching_the_data_directory() {
     let (base, paths) = temp_paths();
     seed_registry(&paths, seeded_entry());

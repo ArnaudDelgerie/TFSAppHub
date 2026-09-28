@@ -122,7 +122,7 @@ pub const SURFACE: &[Spec] = &[
         name: "install",
         form: "install <source> [--as <id>] [--ref <tag>] [--yes] \
                [--no-desktop-entry]",
-        summary: "Install an app from a local directory or github:owner/repo.",
+        summary: "Install an app from a local directory, release archive or github:owner/repo.",
         level: Level::App,
         availability: Availability::Implemented,
     },
@@ -155,14 +155,14 @@ pub const SURFACE: &[Spec] = &[
     // for the same reason: the subject is a source, not an installed app.
     Spec {
         name: "publish",
-        form: "publish <local-path> [--repo owner/repo] [--yes]",
-        summary: "Publish a release from a project's working tree, via gh.",
+        form: "publish <local-path> [--repo owner/repo | --local <dir>] [--yes]",
+        summary: "Publish a release to GitHub or a local directory.",
         level: Level::App,
         availability: Availability::Implemented,
     },
     Spec {
         name: "update",
-        form: "update <id> [--ref <tag>] [--force] [--yes]",
+        form: "update <id> [<archive.tar.gz>] [--ref <tag>] [--force] [--yes]",
         summary: "Re-resolve an app's source and update it.",
         level: Level::App,
         availability: Availability::Implemented,
@@ -358,6 +358,7 @@ pub enum Command {
         /// `--repo owner/repo`: selects the release repository; otherwise the
         /// project's git remote is used.
         repo: Option<String>,
+        local: Option<String>,
         /// `--yes`: skips the confirmation before `gh release create` runs.
         /// The `actions.secrets.ipc` gate (CONTRACT.md §7) is a separate
         /// question with no `--yes` escape of its own.
@@ -365,6 +366,7 @@ pub enum Command {
     },
     Update {
         id: String,
+        archive: Option<String>,
         reference: Option<String>,
         force: bool,
         /// `--yes`: skip the confirmation. `update` runs the app's own PHP —
@@ -611,17 +613,44 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             })
         }
         "publish" => {
-            let mut options = options("publish", rest, &["--repo"], &["--yes", "-y"])?;
+            let mut options = options("publish", rest, &["--repo", "--local"], &["--yes", "-y"])?;
+            let repo = options.value("--repo");
+            let local = options.value("--local");
+            if repo.is_some() && local.is_some() {
+                return Err(usage_error(
+                    "publish",
+                    "--repo and --local cannot be used together".to_string(),
+                ));
+            }
             Ok(Command::Publish {
                 path: options.exactly_one("publish", "a project path")?,
-                repo: options.value("--repo"),
+                repo,
+                local,
                 assume_yes: options.assume_yes(),
             })
         }
         "update" => {
             let mut options = options("update", rest, &["--ref"], &["--force", "--yes", "-y"])?;
+            if options.positionals.is_empty() || options.positionals.len() > 2 {
+                return Err(usage_error(
+                    "update",
+                    "update needs an app id and optionally one archive".to_string(),
+                ));
+            }
+            let id = options.positionals.remove(0);
+            let archive = options.positionals.pop();
+            if archive
+                .as_ref()
+                .is_some_and(|path| !path.ends_with(".tar.gz"))
+            {
+                return Err(usage_error(
+                    "update",
+                    "the second argument must be an <archive.tar.gz>".to_string(),
+                ));
+            }
             Ok(Command::Update {
-                id: options.exactly_one("update", "an app id")?,
+                id,
+                archive,
                 reference: options.value("--ref"),
                 force: options.flag("--force"),
                 assume_yes: options.assume_yes(),

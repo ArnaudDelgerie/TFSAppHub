@@ -939,9 +939,28 @@ fn read_manifest(archive_path: &Path) -> Result<Manifest, PortabilityError> {
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
     let entries = archive.entries().map_err(io_error)?;
 
+    let mut top_level = std::collections::HashSet::new();
+    let mut release_root = None;
     for entry in entries {
         let entry = entry.map_err(io_error)?;
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() || kind.is_pax_local_extensions() {
+            continue;
+        }
         let path = entry.path().map_err(io_error)?.into_owned();
+        let mut components = path.components();
+        if let Some(std::path::Component::Normal(root)) = components.next() {
+            top_level.insert(root.to_os_string());
+            if components.next()
+                == Some(std::path::Component::Normal(std::ffi::OsStr::new(
+                    "tfsapp.config.json",
+                )))
+                && components.next().is_none()
+                && kind.is_file()
+            {
+                release_root = Some(root.to_os_string());
+            }
+        }
         if path != Path::new(MANIFEST_FILE) {
             continue;
         }
@@ -965,9 +984,21 @@ fn read_manifest(archive_path: &Path) -> Result<Manifest, PortabilityError> {
         });
     }
 
-    Err(PortabilityError::NoManifest {
-        path: archive_path.to_path_buf(),
-    })
+    if top_level.len() == 1 && release_root.is_some_and(|root| top_level.contains(&root)) {
+        Err(PortabilityError::IsARelease {
+            path: archive_path.to_path_buf(),
+        })
+    } else {
+        Err(PortabilityError::NoManifest {
+            path: archive_path.to_path_buf(),
+        })
+    }
+}
+
+/// `export` appends `manifest.json` before every data member, so inspecting
+/// the first content entry is enough to distinguish its backup from a release.
+pub(crate) fn is_backup(path: &Path) -> bool {
+    matches!(archive::first_entry(path), Ok(Some(first)) if first == Path::new(MANIFEST_FILE))
 }
 
 /// Say what overwriting is about to cost, in the terms the user will have to
@@ -1108,6 +1139,9 @@ pub enum PortabilityError {
     NoManifest {
         path: PathBuf,
     },
+    IsARelease {
+        path: PathBuf,
+    },
     /// `manifest.json` exists but is not readable as a [`Manifest`], or its
     /// `app_version` does not parse as semver.
     MalformedManifest {
@@ -1225,6 +1259,14 @@ impl fmt::Display for PortabilityError {
                 formatter,
                 "{}: no manifest.json at its root — this does not look like an archive \
                  `export` wrote.",
+                path.display()
+            ),
+            Self::IsARelease { path } => write!(
+                formatter,
+                "{} is a release archive — use `tfsapp-hub install {}` (or \
+                 `tfsapp-hub update <id> {}` for an installed app)",
+                path.display(),
+                path.display(),
                 path.display()
             ),
             Self::MalformedManifest { path, detail } => write!(

@@ -279,10 +279,11 @@ which named the forge repository an app's release lived on for the archived
 per-app packaging route, and may still sit in manifests written against it.
 The hub accepts it silently and does nothing with it — deliberately, not for
 lack of a use: `tfsapp-hub update <id>` resolves what its own registry
-recorded at install time, never a location read out of the source it is about
-to replace. A manifest that could redirect its own future updates would let
+recorded at install or the last update, while `update <id> <archive.tar.gz>`
+uses an explicit user-supplied archive. Neither reads a location out of the
+source it is about to replace. A manifest that could redirect its own future updates would let
 one good release permanently steer every machine that ever installed it. Only
-what the hub itself wrote may steer a fetch; an app asks about its own updates
+what the hub itself wrote or the user explicitly supplies may steer a fetch; an app asks about its own updates
 through §7, and how an update is *applied* belongs to the host.
 
 `tfsapp-hub publish` reads nothing more out of it than `update` does: the
@@ -291,4 +292,3 @@ git remote, never from the manifest, so a stale `releases_repo` — naming a
 downloads repository this route retired — cannot steer a publish either. The
 key is accepted and read by nothing, on every path alike; an author who finds
 one in an old manifest can take it as inert, not as a setting to update.
-

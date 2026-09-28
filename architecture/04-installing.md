@@ -4,8 +4,9 @@
 open. In order:
 
 1. Resolve the source to a directory. A local path is used as it stands; a
-   release source (`github:owner/repo`) is downloaded, verified and extracted
-   into scratch space — see "Resolving a release" below.
+   local `.tar.gz` archive is verified and extracted into scratch space, while
+   a forge release (`github:owner/repo`) is downloaded first — see the release
+   resolution below.
 2. Read and validate the manifest. Missing required fields, a wrong type on a
    known key, or a non-canonical `app_version` all stop here, naming the file and
    the field. An unknown key warns and does not stop anything.
@@ -127,6 +128,19 @@ guarantee:
 Nothing about `apps/<id>/` is touched until all four have succeeded — a
 refusal at any point leaves scratch removed by the caller and the app root
 exactly as it was.
+
+### Resolving a local archive
+
+`source::resolve` canonicalises the `.tar.gz` path and requires a regular file.
+It first reads the archive's first non-PAX entry: `manifest.json` marks an
+`export` backup and is refused with `import <id> <path>` advice. It then
+requires `SHA256SUMS.txt` in the same directory, hashes the archive and checks
+the line named by its file name before extracting anything. The shared
+extraction and manifest checks require one safe top-level tree, a canonical
+version and an archive name matching `<project_name>-<app_version>.tar.gz`.
+`--ref` cannot select a revision of a local archive. The registry records
+`local-archive` and its canonical path, which is informational: later updates
+must name a new archive explicitly.
 
 **No sidecar runs during an install.** Lifecycle commands get the full
 environment and a real database, on a terminal where a failure is legible — but

@@ -68,7 +68,10 @@ pub fn answer(
     app_version: &str,
     cached: Option<&update_cache::CachedRelease>,
 ) -> UpdateCheckResult {
-    if source.kind == registry::SourceKind::LocalPath {
+    if matches!(
+        source.kind,
+        registry::SourceKind::LocalPath | registry::SourceKind::LocalArchive
+    ) {
         return unavailable(REASON_LOCAL_SOURCE);
     }
 

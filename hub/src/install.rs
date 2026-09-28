@@ -382,6 +382,11 @@ fn announce(
                 resolved.source.location
             );
         }
+    } else if resolved.source.kind == SourceKind::LocalArchive {
+        println!(
+            "  archive   {} — checksum verified against SHA256SUMS.txt",
+            resolved.source.location
+        );
     }
     println!("  into      {}", app_dir.display());
     println!(

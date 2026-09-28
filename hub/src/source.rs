@@ -86,7 +86,7 @@ pub fn current_revision(source: &Source) -> Revision {
         // This is not a gap step 4 fills in: it is the boundary this
         // function exists to hold, and [`resolve`] is the only half of this
         // module that may ever open a socket.
-        SourceKind::Release => Revision::Unreachable,
+        SourceKind::Release | SourceKind::LocalArchive => Revision::Unreachable,
     }
 }
 
@@ -100,6 +100,7 @@ pub fn current_revision(source: &Source) -> Revision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     LocalPath(PathBuf),
+    LocalArchive(PathBuf),
     /// A repository to fetch a release of. `index` names how it was found —
     /// `"github"`, the forge acting as its own index today — so a later,
     /// curated index has somewhere to record its own name instead
@@ -143,6 +144,9 @@ pub fn classify(spec: &str) -> Origin {
             index: Some("github".to_string()),
             repo,
         };
+    }
+    if spec.ends_with(".tar.gz") {
+        return Origin::LocalArchive(PathBuf::from(spec));
     }
     Origin::LocalPath(PathBuf::from(spec))
 }
@@ -228,6 +232,7 @@ pub fn resolve(
     base_url: &str,
 ) -> Result<Resolved, SourceError> {
     match origin {
+        Origin::LocalArchive(path) => resolve_local_archive(path, reference, scratch),
         Origin::LocalPath(path) => {
             if let Some(reference) = reference {
                 return Err(SourceError::ReferenceOnLocalPath {
@@ -300,61 +305,18 @@ fn resolve_release(
 
     let checksums = release::parse_sha256sums(&release::fetch_text(assets.checksums_url)?);
     let actual = release::sha256_file(&archive_path)?;
-    match release::verify(&checksums, assets.archive_name, &actual) {
-        release::VerifyOutcome::Match => {}
-        release::VerifyOutcome::Mismatch { expected, actual } => {
-            return Err(SourceError::ChecksumMismatch {
-                archive_name: assets.archive_name.to_string(),
-                expected,
-                actual,
-            });
-        }
-        release::VerifyOutcome::MissingEntry => {
-            return Err(SourceError::ChecksumMissing {
-                archive_name: assets.archive_name.to_string(),
-            });
-        }
-    }
+    check_checksum(&checksums, assets.archive_name, &actual)?;
 
     let root = archive::extract(&archive_path, &scratch.join("extracted"))?;
-    // The archive name's project-name half cannot be known until this point.
-    // Do not report manifest warnings here: `install` loads it again once the
-    // source is accepted, and remains the one user-facing warning path.
-    let manifest = manifest::load(&root).map_err(|source| SourceError::ReleaseManifest {
-        tag: release.tag_name.clone(),
-        archive_name: assets.archive_name.to_string(),
-        source,
-    })?;
     let version = assets
         .version
         .as_ref()
         .expect("resolve_assets always returns the parsed app-release tag version");
-    let manifest_version =
-        version::parse_app_version(&manifest.manifest.app_version).map_err(|_| {
-            SourceError::ManifestVersionNotCanonical {
-                tag: release.tag_name.clone(),
-                archive_name: assets.archive_name.to_string(),
-                manifest_version: manifest.manifest.app_version.clone(),
-            }
-        })?;
-    if manifest_version != *version {
-        return Err(SourceError::ManifestVersionMismatch {
-            tag: release.tag_name.clone(),
-            archive_name: assets.archive_name.to_string(),
-            manifest_version: manifest.manifest.app_version,
-        });
-    }
-    let archive_project_name = assets
-        .archive_name
-        .strip_suffix(&format!("-{version}.tar.gz"))
-        .expect("resolve_assets accepted only an archive matching the tag");
-    if manifest.manifest.project_name != archive_project_name {
-        return Err(SourceError::ManifestProjectNameMismatch {
-            tag: release.tag_name.clone(),
-            archive_name: assets.archive_name.to_string(),
-            manifest_project_name: manifest.manifest.project_name,
-        });
-    }
+    check_archive_manifest(
+        &root,
+        assets.archive_name,
+        Some((&release.tag_name, version)),
+    )?;
     let revision = tree_hash(&root).map_err(|source| SourceError::Unreadable {
         path: root.clone(),
         source,
@@ -373,6 +335,146 @@ fn resolve_release(
     })
 }
 
+fn resolve_local_archive(
+    path: &Path,
+    reference: Option<&str>,
+    scratch: &Path,
+) -> Result<Resolved, SourceError> {
+    if let Some(reference) = reference {
+        return Err(SourceError::ReferenceOnLocalArchive {
+            reference: reference.to_string(),
+        });
+    }
+    let archive_path = fs::canonicalize(path).map_err(|source| match source.kind() {
+        io::ErrorKind::NotFound => SourceError::Missing {
+            path: path.to_path_buf(),
+        },
+        _ => SourceError::Unreadable {
+            path: path.to_path_buf(),
+            source,
+        },
+    })?;
+    if !archive_path.is_file() {
+        return Err(SourceError::NotAFile { path: archive_path });
+    }
+    if crate::portability::is_backup(&archive_path) {
+        return Err(SourceError::IsABackup { path: archive_path });
+    }
+    let directory = archive_path.parent().expect("canonical file has a parent");
+    let sums_path = directory.join(release::SHA256SUMS_ASSET_NAME);
+    let sums_text = fs::read_to_string(&sums_path).map_err(|source| match source.kind() {
+        io::ErrorKind::NotFound => SourceError::ChecksumFileMissing {
+            directory: directory.to_path_buf(),
+        },
+        _ => SourceError::Unreadable {
+            path: sums_path.clone(),
+            source,
+        },
+    })?;
+    // Canonicalising resolved any symlink, so the name checked against
+    // `SHA256SUMS.txt` is the real file's — which the classified spelling
+    // no longer guarantees to be UTF-8, nor even to end in `.tar.gz`.
+    let archive_name = archive_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| SourceError::NotAFile {
+            path: archive_path.clone(),
+        })?;
+    let checksums = release::parse_sha256sums(&sums_text);
+    let actual = release::sha256_file(&archive_path)?;
+    check_checksum(&checksums, archive_name, &actual)?;
+    let root = archive::extract(&archive_path, &scratch.join("extracted"))?;
+    check_archive_manifest(&root, archive_name, None)?;
+    let revision = tree_hash(&root).map_err(|source| SourceError::Unreadable {
+        path: root.clone(),
+        source,
+    })?;
+    Ok(Resolved {
+        source: Source {
+            kind: SourceKind::LocalArchive,
+            location: archive_path.display().to_string(),
+            reference: None,
+            reference_kind: None,
+            index: None,
+        },
+        root,
+        revision,
+    })
+}
+
+fn check_checksum(
+    checksums: &std::collections::HashMap<String, String>,
+    archive_name: &str,
+    actual: &str,
+) -> Result<(), SourceError> {
+    match release::verify(checksums, archive_name, actual) {
+        release::VerifyOutcome::Match => Ok(()),
+        release::VerifyOutcome::Mismatch { expected, actual } => {
+            Err(SourceError::ChecksumMismatch {
+                archive_name: archive_name.to_string(),
+                expected,
+                actual,
+            })
+        }
+        release::VerifyOutcome::MissingEntry => Err(SourceError::ChecksumMissing {
+            archive_name: archive_name.to_string(),
+        }),
+    }
+}
+
+/// Check the extracted app identity against the release's name and, for a
+/// forge release, its tag. The local name is derived from the manifest itself.
+fn check_archive_manifest(
+    root: &Path,
+    archive_name: &str,
+    tagged: Option<(&str, &semver::Version)>,
+) -> Result<(), SourceError> {
+    let tag = tagged.map_or("local archive", |(tag, _)| tag);
+    let manifest = manifest::load(root).map_err(|source| SourceError::ReleaseManifest {
+        tag: tag.to_string(),
+        archive_name: archive_name.to_string(),
+        source,
+    })?;
+    let manifest_version =
+        version::parse_app_version(&manifest.manifest.app_version).map_err(|_| {
+            SourceError::ManifestVersionNotCanonical {
+                tag: tag.to_string(),
+                archive_name: archive_name.to_string(),
+                manifest_version: manifest.manifest.app_version.clone(),
+            }
+        })?;
+    if let Some((_, version)) = tagged {
+        if manifest_version != *version {
+            return Err(SourceError::ManifestVersionMismatch {
+                tag: tag.to_string(),
+                archive_name: archive_name.to_string(),
+                manifest_version: manifest.manifest.app_version,
+            });
+        }
+    }
+    let expected_name = format!(
+        "{}-{}.tar.gz",
+        manifest.manifest.project_name, manifest_version
+    );
+    if archive_name != expected_name && tagged.is_none() {
+        return Err(SourceError::ArchiveNameMismatch {
+            archive_name: archive_name.to_string(),
+            expected: expected_name,
+        });
+    }
+    let archive_project_name = archive_name
+        .strip_suffix(&format!("-{manifest_version}.tar.gz"))
+        .unwrap_or("");
+    if manifest.manifest.project_name != archive_project_name {
+        return Err(SourceError::ManifestProjectNameMismatch {
+            tag: tag.to_string(),
+            archive_name: archive_name.to_string(),
+            manifest_project_name: manifest.manifest.project_name,
+        });
+    }
+    Ok(())
+}
+
 /// Why a source could not be turned into a directory.
 #[derive(Debug)]
 pub enum SourceError {
@@ -381,6 +483,22 @@ pub enum SourceError {
     },
     NotADirectory {
         path: PathBuf,
+    },
+    NotAFile {
+        path: PathBuf,
+    },
+    IsABackup {
+        path: PathBuf,
+    },
+    ChecksumFileMissing {
+        directory: PathBuf,
+    },
+    ReferenceOnLocalArchive {
+        reference: String,
+    },
+    ArchiveNameMismatch {
+        archive_name: String,
+        expected: String,
     },
     Unreadable {
         path: PathBuf,
@@ -455,7 +573,36 @@ pub enum SourceError {
 impl fmt::Display for SourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing { path } => write!(formatter, "no such directory: {}", path.display()),
+            Self::Missing { path } => write!(formatter, "no such source: {}", path.display()),
+            Self::NotAFile { path } => write!(
+                formatter,
+                "{} is not a regular archive file with a UTF-8 name",
+                path.display()
+            ),
+            Self::IsABackup { path } => write!(
+                formatter,
+                "{} is a backup written by export — use `tfsapp-hub import <id> {}`",
+                path.display(),
+                path.display()
+            ),
+            Self::ChecksumFileMissing { directory } => write!(
+                formatter,
+                "no SHA256SUMS.txt beside the archive in {} — an unverified archive \
+                 cannot be installed",
+                directory.display()
+            ),
+            Self::ReferenceOnLocalArchive { reference } => write!(
+                formatter,
+                "--ref {reference} cannot select a revision of a local archive — pass the \
+                 desired archive itself"
+            ),
+            Self::ArchiveNameMismatch {
+                archive_name,
+                expected,
+            } => write!(
+                formatter,
+                "archive {archive_name} does not match its manifest — expected {expected}"
+            ),
             Self::NotADirectory { path } => write!(
                 formatter,
                 "{} is not a directory — a local source is the project root, the \
@@ -484,7 +631,7 @@ impl fmt::Display for SourceError {
             } => write!(
                 formatter,
                 "{archive_name} does not match the checksum SHA256SUMS.txt carries for it \
-                 (expected {expected}, got {actual}) — the download may be corrupted or \
+                 (expected {expected}, got {actual}) — the archive may be corrupted or \
                  tampered with. Nothing was installed."
             ),
             Self::ChecksumMissing { archive_name } => write!(

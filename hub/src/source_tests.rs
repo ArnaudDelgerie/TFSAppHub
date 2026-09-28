@@ -448,3 +448,191 @@ fn a_source_that_cannot_be_installed_says_which_kind_of_problem_it_is() {
         "{error}"
     );
 }
+
+struct FixtureBlobs(Vec<u8>);
+
+impl crate::publish::BlobSource for FixtureBlobs {
+    fn copy_blob(
+        &mut self,
+        _: &str,
+        destination: &mut dyn std::io::Write,
+    ) -> Result<u64, crate::git::GitError> {
+        destination.write_all(&self.0).unwrap();
+        Ok(self.0.len() as u64)
+    }
+}
+
+fn local_archive_fixture(manifest: &str) -> tempfile::TempDir {
+    let folder = tempfile::tempdir().unwrap();
+    let entries = vec![crate::git::TreeEntry {
+        path: PathBuf::from("tfsapp.config.json"),
+        mode: 0o100644,
+        object_id: "manifest".to_string(),
+    }];
+    crate::publish::build_archive(
+        &entries,
+        &mut FixtureBlobs(manifest.as_bytes().to_vec()),
+        "demo",
+        "1.2.0",
+        folder.path(),
+    )
+    .unwrap();
+    folder
+}
+
+#[test]
+fn local_archive_classifies_and_resolves_with_canonical_location() {
+    let folder = local_archive_fixture(&remote_manifest("1.2.0", "demo"));
+    let archive = folder.path().join("demo-1.2.0.tar.gz");
+    assert_eq!(
+        classify(&archive.display().to_string()),
+        Origin::LocalArchive(archive.clone())
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let resolved = resolve(
+        &classify(&archive.display().to_string()),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .unwrap();
+    assert_eq!(resolved.source.kind, SourceKind::LocalArchive);
+    assert_eq!(
+        resolved.source.location,
+        archive.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(resolved.source.reference, None);
+    assert_eq!(resolved.source.index, None);
+    assert_eq!(resolved.revision, tree_hash(&resolved.root).unwrap());
+    assert_eq!(current_revision(&resolved.source), Revision::Unreachable);
+}
+
+#[test]
+fn local_archive_refuses_missing_sums_mismatch_and_missing_entry() {
+    let folder = local_archive_fixture(&remote_manifest("1.2.0", "demo"));
+    let archive = folder.path().join("demo-1.2.0.tar.gz");
+    let scratch = tempfile::tempdir().unwrap();
+    let wrong_name = folder.path().join("renamed.tar.gz");
+    fs::copy(&archive, &wrong_name).unwrap();
+    let error = resolve(
+        &Origin::LocalArchive(wrong_name),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, SourceError::ChecksumMissing { .. }),
+        "{error}"
+    );
+    let mut bytes = fs::read(&archive).unwrap();
+    bytes[20] ^= 1;
+    fs::write(&archive, bytes).unwrap();
+    let error = resolve(
+        &Origin::LocalArchive(archive.clone()),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, SourceError::ChecksumMismatch { .. }),
+        "{error}"
+    );
+    fs::remove_file(folder.path().join("SHA256SUMS.txt")).unwrap();
+    let error = resolve(
+        &Origin::LocalArchive(archive),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, SourceError::ChecksumFileMissing { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_local_archive_symlink_to_a_non_utf8_name_is_refused_not_a_panic() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let folder = local_archive_fixture(&remote_manifest("1.2.0", "demo"));
+    let target = folder
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"demo-\xff.tar.gz"));
+    fs::rename(folder.path().join("demo-1.2.0.tar.gz"), &target).unwrap();
+    let link = folder.path().join("link.tar.gz");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let error = resolve(
+        &Origin::LocalArchive(link),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .unwrap_err();
+    assert!(matches!(error, SourceError::NotAFile { .. }), "{error}");
+}
+
+#[test]
+fn local_archive_checks_manifest_name_version_and_ref() {
+    let scratch = tempfile::tempdir().unwrap();
+    for (version, name) in [("1.3.0", "demo"), ("1.2.0", "other")] {
+        let folder = local_archive_fixture(&remote_manifest(version, name));
+        let archive = folder.path().join("demo-1.2.0.tar.gz");
+        let error = resolve(
+            &Origin::LocalArchive(archive),
+            None,
+            scratch.path(),
+            UNUSED_BASE_URL,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, SourceError::ArchiveNameMismatch { .. }),
+            "{error}"
+        );
+    }
+    let folder = local_archive_fixture(&remote_manifest("1.2.0", "demo"));
+    let archive = folder.path().join("demo-1.2.0.tar.gz");
+    let error = resolve(
+        &Origin::LocalArchive(archive),
+        Some("v1.2.0"),
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, SourceError::ReferenceOnLocalArchive { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn backup_is_identified_before_missing_checksums() {
+    let folder = tempfile::tempdir().unwrap();
+    let backup = folder.path().join("backup.tar.gz");
+    let file = fs::File::create(&backup).unwrap();
+    let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+        file,
+        flate2::Compression::fast(),
+    ));
+    let contents = br#"{"identifier":"dev.local.demo","app_version":"1.2.0","exported_at":"2026-01-01T00:00:00Z"}"#;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(contents.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, "manifest.json", &contents[..])
+        .unwrap();
+    tar.into_inner().unwrap().finish().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let error = resolve(
+        &Origin::LocalArchive(backup),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .unwrap_err();
+    assert!(matches!(error, SourceError::IsABackup { .. }), "{error}");
+    assert!(error.to_string().contains("tfsapp-hub import <id>"));
+}

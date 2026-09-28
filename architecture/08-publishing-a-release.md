@@ -1,6 +1,6 @@
 ## Publishing a release
 
-`publish path/to/project [--repo owner/repo]` is `git.rs`/`gh.rs`'s pair
+`publish path/to/project [--repo owner/repo | --local <dir>]` is `git.rs`/`gh.rs`'s pair
 (`publish.rs`), and the mirror image of "Resolving a release" above: that
 path downloads and verifies an archive a release already carries; this one
 builds the archive and hands it to the one call that makes a release exist.
@@ -50,3 +50,19 @@ state, it never runs a command that changes it. `publish` is reachable from
 no bridge route, no IPC command and no manifest key; an app never triggers
 its own publish.
 
+### Local publication
+
+`--local <dir>` selects a directory that must already exist, and cannot be
+combined with `--repo`. The local snapshot pins `HEAD` after checking the
+project root and clean worktree; it does not inspect an upstream or remote.
+The manifest and canonical version gates (1–2), changelog notes gate (7) and
+secrets confirmation (8) still run. Forge reachability gates (5–6) and `gh`
+gates (9–11) do not; instead, an existing `<name>-<version>` folder is
+refused. No `gh` command is used.
+
+The archive and sums are built in a hidden temporary directory inside
+`<dir>`. `NOTES.md` holds the changelog section followed by the pinned commit
+SHA. All three files are fsynced. After the announcement and confirmation,
+the temporary directory is renamed to `<dir>/<name>-<version>` and `<dir>` is
+fsynced. A refusal or decline removes the temporary directory. The project
+tree is never written.

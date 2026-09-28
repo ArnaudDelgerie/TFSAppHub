@@ -44,6 +44,12 @@ pub struct LocalGates {
     blobs: BlobReader,
 }
 
+#[derive(Clone, Copy)]
+pub enum PublishTarget<'a> {
+    Forge(Option<&'a str>),
+    Local,
+}
+
 impl fmt::Debug for LocalGates {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -68,10 +74,10 @@ impl fmt::Debug for LocalGates {
 /// [`publish_into`], run only once every gate here has passed.
 pub fn run_local_gates(
     project_path: &Path,
-    repo: Option<&str>,
+    target: PublishTarget<'_>,
     git: &Git,
 ) -> Result<LocalGates, PublishError> {
-    if let Some(repo) = repo {
+    if let PublishTarget::Forge(Some(repo)) = target {
         if !is_owner_repo_shape(repo) {
             return Err(PublishError::InvalidRepoShape {
                 repo: repo.to_string(),
@@ -86,7 +92,10 @@ pub fn run_local_gates(
     let author_manifest = manifest::load(project_path)?;
     validate_version(&author_manifest.manifest, &manifest_path)?;
 
-    let snapshot = git.snapshot(project_path, repo)?;
+    let snapshot = match target {
+        PublishTarget::Forge(repo) => git.snapshot(project_path, repo)?,
+        PublishTarget::Local => git.local_snapshot(project_path)?,
+    };
     let entries = git.tree_entries(project_path, &snapshot)?;
     let mut blobs = git.blob_reader(project_path)?;
     let manifest_bytes = pinned_file(&entries, &mut blobs, MANIFEST_FILE)?.ok_or_else(|| {
@@ -377,7 +386,22 @@ fn excluded_from_archive(path: &Path) -> bool {
 
 /// `tfsapp-hub publish <local-path>` — resolve `Paths`, run the pipeline into
 /// the hub's own scratch directory, and turn the result into an exit code.
-pub fn run(project_path: &str, repo: Option<&str>, assume_yes: bool) -> i32 {
+pub fn run(project_path: &str, repo: Option<&str>, local: Option<&str>, assume_yes: bool) -> i32 {
+    if let Some(out_dir) = local {
+        return match publish_local(
+            Path::new(project_path),
+            Path::new(out_dir),
+            assume_yes,
+            &Git::new(),
+        ) {
+            Ok(true) => EXIT_OK,
+            Ok(false) => EXIT_FAILED,
+            Err(error) => {
+                eprintln!("tfsapp-hub: {error}");
+                EXIT_FAILED
+            }
+        };
+    }
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
         Err(error) => {
@@ -440,13 +464,18 @@ fn publish_into(
     git: &Git,
     gh: &Gh,
 ) -> Result<bool, PublishError> {
-    let mut gates = run_local_gates(project_path, repo, git)?;
+    let mut gates = run_local_gates(project_path, PublishTarget::Forge(repo), git)?;
+    let repository = gates
+        .commit
+        .repo
+        .as_deref()
+        .expect("forge snapshot has repository");
     let manifest = &gates.loaded.manifest;
     let tag = format!("v{}", manifest.app_version);
 
     gh.ensure_installed()?;
     gh.ensure_authenticated()?;
-    gh.ensure_no_existing_release(&gates.commit.repo, &tag)?;
+    gh.ensure_no_existing_release(repository, &tag)?;
 
     let assets = build_archive(
         &gates.entries,
@@ -468,7 +497,7 @@ fn publish_into(
     }
 
     let url = gh.create_release(
-        &gates.commit.repo,
+        repository,
         &tag,
         &notes_path,
         &gates.commit.sha,
@@ -477,14 +506,113 @@ fn publish_into(
         &assets.sums_path,
     )?;
 
-    println!("Published {tag} on {}", gates.commit.repo);
+    println!("Published {tag} on {repository}");
     println!("  {url}");
     println!();
     println!(
         "Users install it with: tfsapp-hub install github:{}",
-        gates.commit.repo
+        repository
     );
 
+    Ok(true)
+}
+
+/// Build a release on the destination filesystem, then expose it with one rename.
+pub(crate) fn publish_local(
+    project_path: &Path,
+    out_dir: &Path,
+    assume_yes: bool,
+    git: &Git,
+) -> Result<bool, PublishError> {
+    if !out_dir.is_dir() {
+        return Err(PublishError::OutputDirMissing {
+            path: out_dir.to_path_buf(),
+        });
+    }
+    let mut gates = run_local_gates(project_path, PublishTarget::Local, git)?;
+    let manifest = &gates.loaded.manifest;
+    let folder = out_dir.join(format!(
+        "{}-{}",
+        manifest.project_name, manifest.app_version
+    ));
+    if folder.exists() {
+        return Err(PublishError::LocalReleaseExists { path: folder });
+    }
+    let temporary = tempfile::Builder::new()
+        .prefix(".tfsapp-release-")
+        .tempdir_in(out_dir)
+        .map_err(|source| PublishError::Io {
+            path: out_dir.to_path_buf(),
+            source,
+        })?;
+    let assets = build_archive(
+        &gates.entries,
+        &mut gates.blobs,
+        &manifest.project_name,
+        &manifest.app_version,
+        temporary.path(),
+    )?;
+    let notes_path = temporary.path().join("NOTES.md");
+    let notes = format!(
+        "{}\n\nBuilt from commit {}\n",
+        gates.notes, gates.commit.sha
+    );
+    fs::write(&notes_path, &notes).map_err(|source| PublishError::Io {
+        path: notes_path.clone(),
+        source,
+    })?;
+    for file in [&assets.archive_path, &assets.sums_path, &notes_path] {
+        fs::File::open(file)
+            .and_then(|handle| handle.sync_all())
+            .map_err(|source| PublishError::Io {
+                path: file.to_path_buf(),
+                source,
+            })?;
+    }
+    fs::File::open(temporary.path())
+        .and_then(|handle| handle.sync_all())
+        .map_err(|source| PublishError::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+
+    println!(
+        "Commit      {} (branch {})",
+        gates.commit.sha, gates.commit.branch
+    );
+    println!("Destination {}", folder.display());
+    println!(
+        "Archive     {} ({} bytes)",
+        assets.archive_name, assets.archive_size
+    );
+    println!("  sha256    {}", assets.sha256);
+    println!("Notes:\n{notes}");
+    if !prompt::confirmed(assume_yes) {
+        println!("Aborted — nothing was published.");
+        return Ok(false);
+    }
+    // The target was checked before building; recheck after confirmation too.
+    if folder.exists() {
+        return Err(PublishError::LocalReleaseExists { path: folder });
+    }
+    fs::rename(temporary.path(), &folder).map_err(|source| PublishError::Io {
+        path: folder.clone(),
+        source,
+    })?;
+    // The directory now lives under its final name; the guard must not try
+    // to remove the old one on drop.
+    let _ = temporary.keep();
+    fs::File::open(out_dir)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|source| PublishError::Io {
+            path: out_dir.to_path_buf(),
+            source,
+        })?;
+    println!("Published {}", folder.display());
+    println!(
+        "Install it with: tfsapp-hub install {}",
+        folder.join(&assets.archive_name).display()
+    );
     Ok(true)
 }
 
@@ -493,7 +621,14 @@ fn publish_into(
 /// Names the repository, branch and commit the Git gate proved is on the
 /// forge. Every displayed release input was read from that pinned commit.
 fn announce(gates: &LocalGates, tag: &str, assets: &Assets) {
-    println!("Repository  {}", gates.commit.repo);
+    println!(
+        "Repository  {}",
+        gates
+            .commit
+            .repo
+            .as_deref()
+            .expect("forge snapshot has repository")
+    );
     println!(
         "Commit      {} (branch {})",
         &gates.commit.sha[..gates.commit.sha.len().min(12)],
@@ -610,6 +745,12 @@ fn confirm_ipc_secrets(manifest: &Manifest) -> Result<(), PublishError> {
 /// Everything gates 1–11 can refuse over.
 #[derive(Debug)]
 pub enum PublishError {
+    OutputDirMissing {
+        path: PathBuf,
+    },
+    LocalReleaseExists {
+        path: PathBuf,
+    },
     Manifest(ManifestError),
     /// `app_version` does not parse as canonical semver.
     UnusableVersion {
@@ -661,6 +802,16 @@ pub enum PublishError {
 impl fmt::Display for PublishError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::OutputDirMissing { path } => write!(
+                formatter,
+                "output directory {} must already exist and be a directory.",
+                path.display()
+            ),
+            Self::LocalReleaseExists { path } => write!(
+                formatter,
+                "local release {} already exists — bump app_version before publishing again.",
+                path.display()
+            ),
             Self::Manifest(error) => write!(formatter, "{error}"),
             Self::UnusableVersion {
                 path,

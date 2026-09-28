@@ -227,7 +227,8 @@ fn a_successful_update_can_be_rolled_back_end_to_end() {
     fs::write(data_subdir.join("app.db"), b"pre-update-bytes").expect("a seeded database");
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
-    crate::update::update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
+    crate::update::update(&paths, "demo", None, None, false, true, "0.1.0")
+        .expect("the update applies");
 
     // Data written after the update, which the rollback must set aside
     // rather than silently drop.
@@ -317,7 +318,8 @@ fn a_rollback_leaves_a_stale_cache_stamp_that_mismatches_the_restored_version() 
     fs::write(data_subdir.join("app.db"), b"pre-update-bytes").expect("a seeded database");
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
-    crate::update::update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
+    crate::update::update(&paths, "demo", None, None, false, true, "0.1.0")
+        .expect("the update applies");
 
     assert!(rollback(&paths, "demo", true).expect("it rolls back"));
 
@@ -388,7 +390,8 @@ fn updated_for_rollback_stop() -> (tempfile::TempDir, Paths, PathBuf) {
     fs::write(data_subdir.join("app.db"), b"pre-update-bytes").expect("a seeded database");
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
-    crate::update::update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
+    crate::update::update(&paths, "demo", None, None, false, true, "0.1.0")
+        .expect("the update applies");
 
     // Data written after the update, which the rollback must set aside
     // rather than silently drop.
@@ -491,4 +494,97 @@ fn a_marker_with_neither_tree_left_reports_the_lost_tree_and_keeps_the_marker() 
     // The marker stays: the situation is still nameable, and the refusal
     // still names the command that owns it.
     assert!(marker_path(&data_dir).exists());
+}
+
+struct RollbackBlobs(std::collections::HashMap<String, Vec<u8>>);
+
+impl crate::publish::BlobSource for RollbackBlobs {
+    fn copy_blob(
+        &mut self,
+        object: &str,
+        destination: &mut dyn std::io::Write,
+    ) -> Result<u64, crate::git::GitError> {
+        let bytes = &self.0[object];
+        destination.write_all(bytes).unwrap();
+        Ok(bytes.len() as u64)
+    }
+}
+
+#[test]
+fn rollback_after_forge_to_archive_keeps_archive_source_kind() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().unwrap();
+    runnable_app_tree(source.path(), "0.6.0", "{}");
+    let (_base, paths) = temp_paths();
+    crate::install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .unwrap();
+    registry::update(&paths, |registry| {
+        let entry = registry
+            .apps
+            .iter_mut()
+            .find(|entry| entry.id == "demo")
+            .unwrap();
+        entry.source.kind = SourceKind::Release;
+        entry.source.location = "example/demo".to_string();
+        entry.source.reference = Some("v0.6.0".to_string());
+        entry.source.reference_kind = Some(crate::registry::ReferenceKind::Tag);
+        entry.source.index = Some("github".to_string());
+    })
+    .unwrap();
+    let data_dir = paths.app_data_dir("dev.local.demo").unwrap().join("data");
+    fs::write(data_dir.join("app.db"), b"pre-update-bytes").unwrap();
+    runnable_app_tree(source.path(), "0.7.0", "{}");
+    let names = [
+        "tfsapp.config.json",
+        "composer.json",
+        "bin/console",
+        "public/index.php",
+    ];
+    let mut blobs = std::collections::HashMap::new();
+    let entries = names
+        .iter()
+        .map(|name| {
+            blobs.insert(
+                (*name).to_string(),
+                fs::read(source.path().join(name)).unwrap(),
+            );
+            crate::git::TreeEntry {
+                path: PathBuf::from(name),
+                mode: 0o100644,
+                object_id: (*name).to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let folder = tempfile::tempdir().unwrap();
+    let archive = crate::publish::build_archive(
+        &entries,
+        &mut RollbackBlobs(blobs),
+        "demo",
+        "0.7.0",
+        folder.path(),
+    )
+    .unwrap()
+    .archive_path;
+    assert!(
+        crate::update::update(&paths, "demo", Some(&archive), None, false, true, "0.1.0").unwrap()
+    );
+    assert!(rollback(&paths, "demo", true).unwrap());
+    let entry = registry::load(&paths).unwrap().get("demo").unwrap().clone();
+    assert_eq!(entry.app_version, "0.6.0");
+    assert_eq!(entry.source.kind, SourceKind::LocalArchive);
+    assert!(
+        fs::read_to_string(paths.app_dir("demo").unwrap().join("tfsapp.config.json"))
+            .unwrap()
+            .contains("0.6.0")
+    );
 }

@@ -98,6 +98,7 @@ fn bare_words_route_to_an_app() {
         Command::Publish {
             path: "../TFSAppTest".to_string(),
             repo: None,
+            local: None,
             assume_yes: false,
         }
     );
@@ -106,6 +107,7 @@ fn bare_words_route_to_an_app() {
         Command::Publish {
             path: "../TFSAppTest".to_string(),
             repo: Some("owner/repo".to_string()),
+            local: None,
             assume_yes: true,
         }
     );
@@ -113,6 +115,7 @@ fn bare_words_route_to_an_app() {
         command("update demo"),
         Command::Update {
             id: "demo".to_string(),
+            archive: None,
             reference: None,
             force: false,
             assume_yes: false,
@@ -122,6 +125,7 @@ fn bare_words_route_to_an_app() {
         command("update demo --ref main --force --yes"),
         Command::Update {
             id: "demo".to_string(),
+            archive: None,
             reference: Some("main".to_string()),
             force: true,
             assume_yes: true,
@@ -720,4 +724,52 @@ fn a_second_instance_argv_is_read_back_by_the_same_parser() {
         Vec::<String>::new(),
         "an empty argv cannot be an arrival"
     );
+}
+
+#[test]
+fn publish_local_form_and_conflicting_destinations() {
+    assert_eq!(
+        command("publish ../project --local /mnt/releases --yes"),
+        Command::Publish {
+            path: "../project".to_string(),
+            repo: None,
+            local: Some("/mnt/releases".to_string()),
+            assume_yes: true,
+        }
+    );
+    let error = super::parse(
+        &[
+            "publish",
+            "../project",
+            "--repo",
+            "owner/repo",
+            "--local",
+            "/tmp",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("--repo and --local"));
+}
+
+#[test]
+fn update_accepts_optional_archive_and_rejects_other_second_word() {
+    assert_eq!(
+        command("update demo /mnt/releases/demo-0.7.0.tar.gz --yes"),
+        Command::Update {
+            id: "demo".to_string(),
+            archive: Some("/mnt/releases/demo-0.7.0.tar.gz".to_string()),
+            reference: None,
+            force: false,
+            assume_yes: true,
+        }
+    );
+    let args = ["update", "demo", "some-directory"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let error = super::parse(&args).unwrap_err();
+    assert!(error.to_string().contains("<archive.tar.gz>"));
 }
