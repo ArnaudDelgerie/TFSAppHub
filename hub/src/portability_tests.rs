@@ -339,6 +339,38 @@ fn a_held_maintenance_lease_refuses_export_before_it_creates_the_archive() {
 }
 
 #[test]
+fn an_interrupted_update_refuses_export_under_the_lease_not_only_at_dispatch() {
+    // Audit 020's own scenario: an `update` won the lease after the dispatch
+    // check ran, wrote its journal and died. `run_export` called directly —
+    // past `dispatch` — must still refuse, because the gate re-reads the
+    // journal once it owns the lease.
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let target = base.path().join("backup.tar.gz");
+    let data_dir = paths
+        .app_data_dir("dev.local.demo")
+        .expect("the app's data dir");
+    fs::create_dir_all(&data_dir).expect("the app's data dir");
+    let journal = crate::update_transaction::Journal::prepared(
+        crate::update_transaction::TransactionKind::Apply,
+        seeded_entry(),
+    );
+    crate::update_transaction::write(&data_dir, &journal).expect("a journal to refuse over");
+
+    let error = run_export(&paths, "demo", &target)
+        .expect_err("a journal under the lease must refuse the export");
+
+    assert!(matches!(error, PortabilityError::Gate(_)), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("run `tfsapp-hub repair demo --yes` first"),
+        "{error}"
+    );
+    assert!(!target.exists(), "a refused export leaves no archive");
+}
+
+#[test]
 fn exporting_never_overwrites_an_existing_target() {
     let (base, paths) = temp_paths();
     seed_registry(&paths, seeded_entry());
