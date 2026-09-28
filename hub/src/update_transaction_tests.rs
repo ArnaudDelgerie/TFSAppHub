@@ -227,6 +227,72 @@ fn recovery_obeys_each_durable_phase_without_guessing() {
 }
 
 #[test]
+fn a_tree_retained_before_its_phase_is_durable_is_renamed_back() {
+    // Simulates a kill right after `retain_tree`'s rename but before the
+    // journal write that would have advanced to `TreeRetained`, for every
+    // phase/kind combination that boundary can occur at.
+    for (phase, kind) in [
+        (Phase::Prepared, TransactionKind::Apply),
+        (Phase::SnapshotComplete, TransactionKind::Apply),
+        (Phase::Prepared, TransactionKind::ResyncOnly),
+    ] {
+        let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+        let mut journal = Journal::prepared(kind, entry.clone());
+        if phase == Phase::SnapshotComplete {
+            journal.database_members = snapshot_db(&data_dir.join("data"), &data_dir).unwrap();
+            journal.advance(Phase::SnapshotComplete);
+        }
+        retain_tree(&app_dir).unwrap();
+        write(&data_dir, &journal).unwrap();
+
+        let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+        assert!(outcome.is_complete(), "{phase:?}/{kind:?}: {outcome:?}");
+        assert!(app_dir.is_dir(), "{phase:?}/{kind:?}");
+        assert!(!staged_tree_path(&app_dir).is_dir(), "{phase:?}/{kind:?}");
+        assert_eq!(
+            fs::read_to_string(app_dir.join("public/version")).unwrap(),
+            "old",
+            "{phase:?}/{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn a_stale_retained_tree_left_over_from_an_earlier_attempt_is_discarded() {
+    // The current transaction never reached `retain_tree` (`app_dir` is
+    // still present), but a leftover staged tree from an earlier, unrelated
+    // interruption sits beside it. `app_dir` is authoritative; the leftover
+    // is discarded, not swapped in.
+    let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+    let journal = Journal::prepared(TransactionKind::Apply, entry);
+    let staged = staged_tree_path(&app_dir);
+    fs::create_dir_all(staged.join("public")).unwrap();
+    fs::write(staged.join("public/version"), "leftover").unwrap();
+    write(&data_dir, &journal).unwrap();
+
+    let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+    assert!(outcome.is_complete(), "{outcome:?}");
+    assert!(app_dir.is_dir());
+    assert!(!staged.is_dir());
+    assert_eq!(
+        fs::read_to_string(app_dir.join("public/version")).unwrap(),
+        "old"
+    );
+}
+
+#[test]
+fn neither_a_live_nor_a_retained_tree_keeps_the_journal_and_names_the_path() {
+    let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+    let journal = Journal::prepared(TransactionKind::Apply, entry);
+    fs::remove_dir_all(&app_dir).unwrap();
+    write(&data_dir, &journal).unwrap();
+
+    let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+    assert!(!outcome.is_complete());
+    assert!(read(&data_dir).unwrap().is_some());
+}
+
+#[test]
 fn journal_round_trip_tolerates_unknown_fields() {
     let dir = tempfile::tempdir().unwrap();
     let mut journal = Journal::prepared(TransactionKind::Apply, entry());

@@ -603,6 +603,47 @@ pub(crate) fn recover_transaction(
                 | Phase::RegistryCommitted
         );
 
+    // `retain_tree`'s rename is the one mutation that can have happened
+    // without yet being durable at these two phases (`apply`/`resync_only`
+    // write `Prepared` before it, `SnapshotComplete` — Apply only — right
+    // before it too). What it did is visible on disk: `app_dir` is either
+    // still there (the rename never ran) or it is not (it ran and the
+    // journal did not catch up). Never inferred as a phase, only observed as
+    // the one step this phase allows next.
+    if matches!(transaction.phase, Phase::Prepared | Phase::SnapshotComplete) {
+        let staged = update_transaction::staged_tree_path(app_dir);
+        match (app_dir.is_dir(), staged.is_dir()) {
+            (false, true) => {
+                outcome.record(
+                    "tree swap-back",
+                    staged.clone(),
+                    fs::rename(&staged, app_dir),
+                );
+            }
+            (true, true) => {
+                // The rename never happened this attempt; `staged` is a
+                // leftover from an earlier interrupted transaction and
+                // `app_dir` is authoritative.
+                outcome.record(
+                    "stale retained tree discard",
+                    staged.clone(),
+                    remove_dir_if_present(&staged),
+                );
+            }
+            (false, false) => {
+                outcome.record(
+                    "tree",
+                    app_dir.to_path_buf(),
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "neither the live tree nor a retained one exists",
+                    )),
+                );
+            }
+            (true, false) => {}
+        }
+    }
+
     if snapshot_is_authoritative {
         for name in lifecycle::DB_FILE_NAMES {
             let live = data_subdir.join(name);
