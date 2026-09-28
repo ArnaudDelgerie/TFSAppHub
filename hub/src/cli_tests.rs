@@ -98,6 +98,7 @@ fn bare_words_route_to_an_app() {
         Command::Publish {
             path: "../TFSAppTest".to_string(),
             repo: None,
+            local: None,
             assume_yes: false,
         }
     );
@@ -106,6 +107,7 @@ fn bare_words_route_to_an_app() {
         Command::Publish {
             path: "../TFSAppTest".to_string(),
             repo: Some("owner/repo".to_string()),
+            local: None,
             assume_yes: true,
         }
     );
@@ -720,4 +722,32 @@ fn a_second_instance_argv_is_read_back_by_the_same_parser() {
         Vec::<String>::new(),
         "an empty argv cannot be an arrival"
     );
+}
+
+#[test]
+fn publish_local_form_and_conflicting_destinations() {
+    assert_eq!(
+        command("publish ../project --local /mnt/releases --yes"),
+        Command::Publish {
+            path: "../project".to_string(),
+            repo: None,
+            local: Some("/mnt/releases".to_string()),
+            assume_yes: true,
+        }
+    );
+    let error = super::parse(
+        &[
+            "publish",
+            "../project",
+            "--repo",
+            "owner/repo",
+            "--local",
+            "/tmp",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("--repo and --local"));
 }

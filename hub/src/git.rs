@@ -239,7 +239,7 @@ impl Git {
         Ok(Commit {
             branch: status.branch,
             sha,
-            repo,
+            repo: Some(repo),
         })
     }
 
@@ -261,6 +261,25 @@ impl Git {
         self.upstream_contains(project, &commit.sha, &upstream)?;
         Ok(Snapshot {
             commit,
+            project_prefix: self.project_prefix(project)?,
+        })
+    }
+
+    /// Pin HEAD of a clean local work tree without consulting an upstream or remote.
+    pub fn local_snapshot(&self, project: &Path) -> Result<Snapshot, GitError> {
+        self.repo_root(project)?;
+        let status = self.status(project)?;
+        if !status.dirty_paths.is_empty() {
+            return Err(GitError::Dirty {
+                paths: status.dirty_paths,
+            });
+        }
+        Ok(Snapshot {
+            commit: Commit {
+                branch: status.branch,
+                sha: self.head_sha(project)?,
+                repo: None,
+            },
             project_prefix: self.project_prefix(project)?,
         })
     }
@@ -351,7 +370,7 @@ pub struct Status {
 pub struct Commit {
     pub branch: String,
     pub sha: String,
-    pub repo: String,
+    pub repo: Option<String>,
 }
 
 /// The immutable commit and project root selected by [`Git::snapshot`].

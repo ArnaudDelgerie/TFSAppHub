@@ -10,7 +10,7 @@ use std::{
 
 use super::{
     build_archive, changelog_section, excluded_from_archive, is_owner_repo_shape, publish,
-    run_local_gates, BlobSource, PublishError,
+    publish_local, run_local_gates, BlobSource, PublishError, PublishTarget,
 };
 use crate::{
     archive,
@@ -152,8 +152,9 @@ fn every_gate_passes_and_resolves_the_repo_from_the_upstream_remote() {
     let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
     let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
 
-    let gates = run_local_gates(project.path(), None, &git).expect("every gate to pass");
-    assert_eq!(gates.commit.repo, "owner/repo");
+    let gates = run_local_gates(project.path(), PublishTarget::Forge(None), &git)
+        .expect("every gate to pass");
+    assert_eq!(gates.commit.repo.as_deref(), Some("owner/repo"));
     assert_eq!(gates.commit.branch, "main");
     assert_eq!(gates.commit.sha, "deadbeefcafe1234");
     assert_eq!(gates.notes, "Added the frobnicator.\nFixed the widget.");
@@ -168,9 +169,13 @@ fn a_repo_flag_overrides_the_resolved_remote() {
     let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
     let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
 
-    let gates = run_local_gates(project.path(), Some("other-owner/other-repo"), &git)
-        .expect("every gate to pass");
-    assert_eq!(gates.commit.repo, "other-owner/other-repo");
+    let gates = run_local_gates(
+        project.path(),
+        PublishTarget::Forge(Some("other-owner/other-repo")),
+        &git,
+    )
+    .expect("every gate to pass");
+    assert_eq!(gates.commit.repo.as_deref(), Some("other-owner/other-repo"));
 }
 
 #[test]
@@ -188,8 +193,9 @@ fn a_stale_releases_repo_in_the_manifest_is_ignored() {
     let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
     let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
 
-    let gates = run_local_gates(project.path(), None, &git).expect("every gate to pass");
-    assert_eq!(gates.commit.repo, "owner/repo");
+    let gates = run_local_gates(project.path(), PublishTarget::Forge(None), &git)
+        .expect("every gate to pass");
+    assert_eq!(gates.commit.repo.as_deref(), Some("owner/repo"));
 }
 
 #[test]
@@ -203,7 +209,12 @@ fn a_missing_pinned_manifest_is_refused() {
     );
     let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
     let git = Git::at(write_fake(scripts.path(), "git", &body));
-    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
+    let error = run_local_gates(
+        project.path(),
+        PublishTarget::Forge(Some("owner/repo")),
+        &git,
+    )
+    .unwrap_err();
     assert!(matches!(error, PublishError::Manifest(_)), "{error}");
 }
 
@@ -217,7 +228,12 @@ fn a_non_semver_app_version_is_refused_naming_the_value_and_the_field() {
         GIT_CLEAN_AND_PUSHED.replace("\"app_version\":\"1.2.0\"", "\"app_version\":\"v1.2\"");
     let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
     let git = Git::at(write_fake(scripts.path(), "git", &body));
-    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
+    let error = run_local_gates(
+        project.path(),
+        PublishTarget::Forge(Some("owner/repo")),
+        &git,
+    )
+    .unwrap_err();
     match &error {
         PublishError::UnusableVersion { version, .. } => assert_eq!(version, "v1.2"),
         other => panic!("expected UnusableVersion, got {other}"),
@@ -232,8 +248,12 @@ fn suffixed_app_versions_are_refused_before_git_is_called() {
         let project = tempfile::tempdir().expect("a temp project dir");
         write_manifest(project.path(), version, "");
 
-        let error = run_local_gates(project.path(), Some("owner/repo"), &git_never_called())
-            .expect_err("a suffixed app version is refused before Git");
+        let error = run_local_gates(
+            project.path(),
+            PublishTarget::Forge(Some("owner/repo")),
+            &git_never_called(),
+        )
+        .expect_err("a suffixed app version is refused before Git");
         assert!(
             matches!(error, PublishError::UnusableVersion { .. }),
             "{error}"
@@ -253,8 +273,12 @@ fn a_malformed_repo_flag_is_refused_before_git_is_ever_called() {
     write_manifest(project.path(), "1.2.0", "");
     write_changelog(project.path(), CHANGELOG);
 
-    let error =
-        run_local_gates(project.path(), Some("not-a-repo"), &git_never_called()).unwrap_err();
+    let error = run_local_gates(
+        project.path(),
+        PublishTarget::Forge(Some("not-a-repo")),
+        &git_never_called(),
+    )
+    .unwrap_err();
     match &error {
         PublishError::InvalidRepoShape { repo } => assert_eq!(repo, "not-a-repo"),
         other => panic!("expected InvalidRepoShape, got {other}"),
@@ -285,7 +309,12 @@ exit 1
 "#,
     ));
 
-    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
+    let error = run_local_gates(
+        project.path(),
+        PublishTarget::Forge(Some("owner/repo")),
+        &git,
+    )
+    .unwrap_err();
     match &error {
         PublishError::Git(GitError::Dirty { paths }) => {
             assert_eq!(paths, &["src/App.php"]);
@@ -318,7 +347,12 @@ exit 1
 "#,
     ));
 
-    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
+    let error = run_local_gates(
+        project.path(),
+        PublishTarget::Forge(Some("owner/repo")),
+        &git,
+    )
+    .unwrap_err();
     assert!(
         matches!(error, PublishError::Git(GitError::NoUpstream { .. })),
         "{error}"
@@ -338,7 +372,12 @@ fn a_missing_changelog_file_is_refused() {
     );
     let git = Git::at(write_fake(scripts.path(), "git", &body));
 
-    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
+    let error = run_local_gates(
+        project.path(),
+        PublishTarget::Forge(Some("owner/repo")),
+        &git,
+    )
+    .unwrap_err();
     assert!(
         matches!(error, PublishError::MissingChangelog { .. }),
         "{error}"
@@ -356,7 +395,12 @@ fn a_changelog_with_no_matching_heading_is_refused() {
         GIT_CLEAN_AND_PUSHED.replace("\"app_version\":\"1.2.0\"", "\"app_version\":\"1.3.0\"");
     let git = Git::at(write_fake(scripts.path(), "git", &body));
 
-    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
+    let error = run_local_gates(
+        project.path(),
+        PublishTarget::Forge(Some("owner/repo")),
+        &git,
+    )
+    .unwrap_err();
     match &error {
         PublishError::MissingChangelogEntry { version, .. } => assert_eq!(version, "1.3.0"),
         other => panic!("expected MissingChangelogEntry, got {other}"),
@@ -419,7 +463,12 @@ fn ipc_on_and_undeclinable_in_a_test_refuses_the_gate() {
     );
     let git = Git::at(write_fake(scripts.path(), "git", &body));
 
-    let error = run_local_gates(project.path(), Some("owner/repo"), &git).unwrap_err();
+    let error = run_local_gates(
+        project.path(),
+        PublishTarget::Forge(Some("owner/repo")),
+        &git,
+    )
+    .unwrap_err();
     assert!(matches!(error, PublishError::IpcNotConfirmed), "{error}");
 }
 
@@ -436,8 +485,12 @@ fn ipc_off_or_bridge_only_never_asks() {
     let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
     let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
 
-    run_local_gates(project.path(), Some("owner/repo"), &git)
-        .expect("bridge-only must not trip the ipc gate");
+    run_local_gates(
+        project.path(),
+        PublishTarget::Forge(Some("owner/repo")),
+        &git,
+    )
+    .expect("bridge-only must not trip the ipc gate");
 }
 
 fn write_source_files(root: &Path) {
@@ -1207,4 +1260,64 @@ fn an_escaping_symlink_refuses_after_every_gh_gate_and_still_leaves_no_scratch_b
     );
     assert!(!paths.scratch_dir().exists());
     assert!(!argv_log(gh_scripts.path()).contains("release create"));
+}
+
+#[test]
+fn local_publish_from_unpushed_commit_is_atomic_and_verifiable() {
+    let project = tempfile::tempdir().unwrap();
+    publishable_project(project.path(), "1.2.0");
+    let scripts = tempfile::tempdir().unwrap();
+    let body = GIT_CLEAN_AND_PUSHED.replace("## main...origin/main", "## main");
+    let git = Git::at(write_fake(scripts.path(), "git", &body));
+    let out = tempfile::tempdir().unwrap();
+    assert!(publish_local(project.path(), out.path(), true, &git).unwrap());
+    let folder = out.path().join("demo-1.2.0");
+    let mut names: Vec<_> = fs::read_dir(&folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["NOTES.md", "SHA256SUMS.txt", "demo-1.2.0.tar.gz"]);
+    let archive = folder.join("demo-1.2.0.tar.gz");
+    let sums =
+        release::parse_sha256sums(&fs::read_to_string(folder.join("SHA256SUMS.txt")).unwrap());
+    let actual = release::sha256_file(&archive).unwrap();
+    assert!(matches!(
+        release::verify(&sums, "demo-1.2.0.tar.gz", &actual),
+        release::VerifyOutcome::Match
+    ));
+    assert!(fs::read_to_string(folder.join("NOTES.md"))
+        .unwrap()
+        .ends_with("Built from commit deadbeefcafe1234\n"));
+    let before = fs::read(&archive).unwrap();
+    assert!(matches!(
+        publish_local(project.path(), out.path(), true, &git),
+        Err(PublishError::LocalReleaseExists { .. })
+    ));
+    assert_eq!(fs::read(&archive).unwrap(), before);
+}
+
+#[test]
+fn local_publish_refuses_dirty_or_missing_destination_and_cleans_up_on_decline() {
+    let project = tempfile::tempdir().unwrap();
+    publishable_project(project.path(), "1.2.0");
+    let scripts = tempfile::tempdir().unwrap();
+    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+    let out = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        publish_local(project.path(), &out.path().join("missing"), true, &git),
+        Err(PublishError::OutputDirMissing { .. })
+    ));
+    assert!(!publish_local(project.path(), out.path(), false, &git).unwrap());
+    assert_eq!(fs::read_dir(out.path()).unwrap().count(), 0);
+    let dirty = GIT_CLEAN_AND_PUSHED.replace(
+        "printf '## main...origin/main\\n'",
+        "printf '## main...origin/main\\n M src/main.php\\n'",
+    );
+    let dirty_git = Git::at(write_fake(scripts.path(), "dirty-git", &dirty));
+    assert!(matches!(
+        publish_local(project.path(), out.path(), true, &dirty_git),
+        Err(PublishError::Git(GitError::Dirty { .. }))
+    ));
+    assert_eq!(fs::read_dir(out.path()).unwrap().count(), 0);
 }

@@ -155,8 +155,8 @@ pub const SURFACE: &[Spec] = &[
     // for the same reason: the subject is a source, not an installed app.
     Spec {
         name: "publish",
-        form: "publish <local-path> [--repo owner/repo] [--yes]",
-        summary: "Publish a release from a project's working tree, via gh.",
+        form: "publish <local-path> [--repo owner/repo | --local <dir>] [--yes]",
+        summary: "Publish a release to GitHub or a local directory.",
         level: Level::App,
         availability: Availability::Implemented,
     },
@@ -358,6 +358,7 @@ pub enum Command {
         /// `--repo owner/repo`: selects the release repository; otherwise the
         /// project's git remote is used.
         repo: Option<String>,
+        local: Option<String>,
         /// `--yes`: skips the confirmation before `gh release create` runs.
         /// The `actions.secrets.ipc` gate (CONTRACT.md §7) is a separate
         /// question with no `--yes` escape of its own.
@@ -611,10 +612,19 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             })
         }
         "publish" => {
-            let mut options = options("publish", rest, &["--repo"], &["--yes", "-y"])?;
+            let mut options = options("publish", rest, &["--repo", "--local"], &["--yes", "-y"])?;
+            let repo = options.value("--repo");
+            let local = options.value("--local");
+            if repo.is_some() && local.is_some() {
+                return Err(usage_error(
+                    "publish",
+                    "--repo and --local cannot be used together".to_string(),
+                ));
+            }
             Ok(Command::Publish {
                 path: options.exactly_one("publish", "a project path")?,
-                repo: options.value("--repo"),
+                repo,
+                local,
                 assume_yes: options.assume_yes(),
             })
         }

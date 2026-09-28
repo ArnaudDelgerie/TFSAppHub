@@ -198,7 +198,7 @@ exit 1
     let commit = git
         .ensure_pushed(Path::new("/repo"), None)
         .expect("being behind alone must not refuse");
-    assert_eq!(commit.repo, "ArnaudDelgerie/TFSAppDemo");
+    assert_eq!(commit.repo.as_deref(), Some("ArnaudDelgerie/TFSAppDemo"));
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn a_clean_pushed_tree_resolves_the_repo_from_an_https_remote() {
         .expect("a clean, pushed tree must pass every gate");
     assert_eq!(commit.branch, "main");
     assert_eq!(commit.sha, "abc123deadbeef");
-    assert_eq!(commit.repo, "ArnaudDelgerie/TFSAppDemo");
+    assert_eq!(commit.repo.as_deref(), Some("ArnaudDelgerie/TFSAppDemo"));
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn a_clean_pushed_tree_resolves_the_repo_from_an_ssh_remote() {
     let commit = git
         .ensure_pushed(Path::new("/repo/app"), None)
         .expect("the scp-like remote spelling must resolve just as well");
-    assert_eq!(commit.repo, "ArnaudDelgerie/TFSAppDemo");
+    assert_eq!(commit.repo.as_deref(), Some("ArnaudDelgerie/TFSAppDemo"));
 }
 
 #[test]
@@ -242,7 +242,7 @@ fn an_explicit_repo_wins_and_the_remote_is_never_read() {
     let commit = git
         .ensure_pushed(Path::new("/repo/app"), Some("someone-else/other-repo"))
         .expect("an explicit --repo needs no remote lookup at all");
-    assert_eq!(commit.repo, "someone-else/other-repo");
+    assert_eq!(commit.repo.as_deref(), Some("someone-else/other-repo"));
     assert!(
         !argv_log(scripts.path()).contains("remote"),
         "the remote must never be read once --repo is given"

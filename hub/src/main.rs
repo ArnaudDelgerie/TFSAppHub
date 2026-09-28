@@ -216,8 +216,9 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         Command::Publish {
             path,
             repo,
+            local,
             assume_yes,
-        } => publish::run(&path, repo.as_deref(), assume_yes),
+        } => publish::run(&path, repo.as_deref(), local.as_deref(), assume_yes),
         Command::Update {
             id,
             reference,
