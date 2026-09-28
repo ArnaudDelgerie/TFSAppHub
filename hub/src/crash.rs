@@ -31,8 +31,9 @@
 //! way back. Clicking it is an ordinary link navigation, so it goes through
 //! the very same `classify_navigation`/`on_page_load` machinery as any other
 //! load, with no separate reload path to keep in sync with those (the
-//! creation URL is one `classify_navigation` already lets through, whichever
-//! side of the hand-over it is asked on). There is deliberately no automatic
+//! creation URL is one `classify_navigation` already lets through at the only
+//! moment it can be used, before that window's first page committed). There is
+//! deliberately no automatic
 //! reload: whatever crashed the process may crash again on the same input,
 //! so the user's click is what breaks that loop.
 

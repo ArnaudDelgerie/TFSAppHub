@@ -53,15 +53,19 @@ pub const MICROPHONE_GRANT_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Wait for the closure's report, off the main thread only. `None` is the
 /// dispatch failure case — the closure was never even scheduled, so there is
-/// nothing to wait for and nothing to warn about beyond what the caller
-/// already knows. A report answers whatever it said; a timeout or a closed
-/// channel answers `false`, with the one `hub.log` line that says so —
+/// nothing to wait for. A report answers whatever it said; no report — never
+/// scheduled, timed out, or a closed channel — answers `false`, with the one
+/// `hub.log` line that says so —
 /// `TFS_MEDIA_MICROPHONE` mirrors what was actually granted (decision 007
 /// §5), so an unconfirmed grant counts as no grant at all.
 pub fn await_grant(receiver: Option<Receiver<bool>>, deadline: Duration) -> bool {
     use std::sync::mpsc::RecvTimeoutError;
 
     let Some(receiver) = receiver else {
+        eprintln!(
+            "tfsapp-hub: warning: the microphone grant could not be scheduled; \
+             TFS_MEDIA_MICROPHONE=0"
+        );
         return false;
     };
     match receiver.recv_timeout(deadline) {
