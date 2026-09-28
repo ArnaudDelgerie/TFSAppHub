@@ -6,6 +6,16 @@
 //! box with no D-Bus Secret Service running. CONTRACT.md §6, ported from the
 //! station.
 //!
+//! Failures are reported, never swallowed. Every store operation answers a
+//! `Result`, and the transports turn an `Err` into `storage_failed` instead of
+//! a plausible success — a delete that failed must not read back as "already
+//! clean", and a corrupt fallback file must not be overwritten by the next
+//! write. And every keyring call — the startup probe included — runs under one
+//! deadline, `KEYRING_DEADLINE`, because the Secret Service is a separate
+//! process reached over D-Bus and one that stops answering would otherwise
+//! hold the launch or a request forever. `with_deadline` leaves the blocked
+//! thread behind on purpose; its comment says why that is the right trade.
+//!
 //! **The store is resolved from the calling window, never from an argument.**
 //! This is the hard rule of plan 007 and the one genuinely new risk the hub
 //! creates. The station gets its `identifier` from being a one-app process and

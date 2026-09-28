@@ -68,6 +68,14 @@ signs CSRF tokens, signed URIs and remember-me cookies (§5) — and the
 keyring-availability probe's own account can never be reached over either
 transport, whatever `keys` says.
 
+**A store failure is an error, never a success.** An operation the store fails
+— a keyring error, an unreadable or corrupt fallback file — or that does not
+complete within 5 s answers `storage_failed` on IPC and
+`500 {"error": "storage_failed"}` on the bridge, after the declared-key and
+size checks, so an app can tell "not set" from "could not be reached". The
+hub's own log carries one warning line per failure naming the cause, never the
+key or the value.
+
 **Neither transport is safer; the choice is a real trade-off.**
 
 | | protects | exposes |
@@ -674,12 +682,18 @@ always answers once authorised.
 | `POST /close-guard/register` | `{"id": "…"}` | `200 {"ok": true}` |
 | `POST /close-guard/remove` | `{"id": "…"}` | `200 {"ok": true}` |
 
+A store that fails — or that does not answer within 5 s — answers
+`500 {"error": "storage_failed"}` on all five `/secrets/*` routes, last in the
+order below.
+
 **Errors, in the order they are checked:** `401` unauthorized (before routing) →
 `404 not_found` (the group is off, or the path is unknown — deliberately the same
 answer either way) → `413 payload_too_large` (the whole body exceeds a transport
 cap, before any parsing) → `400 invalid_body` → `403 key_not_declared` (reserved,
 or not in `keys` — before the store is touched) → `413 value_too_large` on
-`/secrets/set` → the route's success shape. The close-guard routes share the
+`/secrets/set` → `500 {"error": "storage_failed"}` on the five `/secrets/*`
+routes (the store failed, or did not answer within 5 s) → the route's success
+shape. The close-guard routes share the
 front of that order and add their own tail after `invalid_body`:
 `400 {"error": "invalid_id"}`, `429 {"error": "too_many_guards"}`,
 `503 {"error": "closing"}` — the last meaning shutdown has committed and the
