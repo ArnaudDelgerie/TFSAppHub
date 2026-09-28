@@ -67,7 +67,12 @@ from removing the first update's `apps/<id>.previous` anchor.
    staged tree) until it is complete, so `rollback <id>` can then undo it.
    Either way, running `repair` a second time changes nothing. A malformed or
    future journal also refuses safely. Interrupted imports and rollbacks have
-   no such recovery protocol.
+   no such recovery protocol. And the refusal is not a race the hub leaves to
+   luck: every maintenance and activity lease holder except `repair` re-reads
+   the journal once it owns its lease, so a command that wins its lease after
+   an `update` wrote its journal still refuses, naming `repair`. The
+   dispatch-side check that answers before any command runs is only the early
+   message; the one under the lease is authoritative.
 
 `ResyncOnly` has no lifecycle event and rotates no anchor of its own, in
 either direction: before its registry write, repair restores the outgoing

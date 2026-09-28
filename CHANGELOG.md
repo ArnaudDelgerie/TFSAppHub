@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+Two guards audit 020 found checked once, outside the lock that was supposed
+to make them true, now hold under it. Every lifecycle lease holder except
+`repair` re-reads the update journal while it owns its lease, so a command
+that wins its lease after an `update` left a journal behind refuses and names
+`tfsapp-hub repair <id> --yes` instead of running over the interrupted state.
+An install claims `apps/<id>/` atomically and re-checks the app's `id` and
+pinned port under the registry's own lock, so two installs with different
+identifiers can no longer land on one directory, one registry entry or one
+port; a refusal there removes the copied tree and keeps the data directory.
+
 Archive extraction now refuses hard links, devices, fifos, sparse files and
 other unsupported entry types. Release downloads, extraction and imports
 check available disk space before writing large payloads; imports also cap
