@@ -82,6 +82,57 @@ pub fn await_grant(receiver: Option<Receiver<bool>>, deadline: Duration) -> bool
     }
 }
 
+/// The state of this window's microphone capture, WebKitGTK's own
+/// `MediaCaptureState` reduced to what [`capture_title`] needs. A local
+/// three-variant enum on purpose: the platform type needs a running
+/// WebKitGTK to construct, and the mapping is one function at the wiring's
+/// single point ([`capture_state_of`]) rather than a test dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureState {
+    /// No capture is held — also the answer for any platform value this
+    /// enum does not name yet.
+    None,
+    /// A capture stream is live.
+    Active,
+    /// A capture is held but muted.
+    Muted,
+}
+
+/// The window title for a capture state (plan 070): the visible half of
+/// decision 007's weakest point, bought back. A running capture reads
+/// `Microphone on — <product name>`, a muted one says so, and any stop —
+/// including a dead web process — returns the plain product name.
+pub fn capture_title(product_name: &str, state: CaptureState) -> String {
+    match state {
+        CaptureState::Active => format!("Microphone on — {product_name}"),
+        CaptureState::Muted => format!("Microphone muted — {product_name}"),
+        CaptureState::None => product_name.to_string(),
+    }
+}
+
+/// Map the platform's capture state onto [`CaptureState`]. The only place
+/// `webkit2gtk::MediaCaptureState` is named outside the handler itself.
+fn capture_state_of(state: webkit2gtk::MediaCaptureState) -> CaptureState {
+    match state {
+        webkit2gtk::MediaCaptureState::Active => CaptureState::Active,
+        webkit2gtk::MediaCaptureState::Muted => CaptureState::Muted,
+        // `None`, the hidden `__Unknown`, and anything a newer WebKit adds
+        // that this enum has not named yet: no capture this window knows how
+        // to describe.
+        _ => CaptureState::None,
+    }
+}
+
+/// The toplevel GTK window this webview lives in, which is where a title
+/// can be set at all. Not unit-tested: constructing a real webview needs
+/// the running WebKitGTK the pure functions above exist to keep out.
+fn toplevel_gtk_window(webview: &webkit2gtk::WebView) -> Option<gtk::Window> {
+    use gtk::prelude::WidgetExt;
+    use webkit2gtk::glib::Cast;
+
+    webview.toplevel()?.downcast::<gtk::Window>().ok()
+}
+
 /// What WebKit is asking to authorize, reduced to what [`decide`] needs to
 /// know. `Other` covers every permission kind this group does not name:
 /// geolocation, notification, pointer lock, a media key system, website data
@@ -208,15 +259,21 @@ fn classify_request(request: &webkit2gtk::PermissionRequest) -> MediaPermissionK
     }
 }
 
-/// Install this window's media grant: the `enable-media-stream` setting when
-/// the microphone is [`MicrophoneAccess::Allowed`], and the
-/// `permission-request` handler unconditionally (plan 050 step 2, plan 070
-/// step 1). Called after every window `create_splash_window` and
-/// `create_app_window` build, on both the splash and every later window —
-/// the splash and the app share one webview (`architecture/09`), so this is
-/// what keeps a page that is not yet the app's own origin from ever getting a
-/// grant, and what turns wry's absent-handler default into an explicit,
-/// logged deny for an app that declared nothing or had it revoked.
+/// Install this window's media grant and, with it, the capture indicator:
+/// the `enable-media-stream` setting when the microphone is
+/// [`MicrophoneAccess::Allowed`], the `permission-request` handler
+/// unconditionally (plan 050 step 2, plan 070 step 1), and — on a window
+/// whose grant really applied — the title handlers of plan 070 step 2.
+/// Called after every window `create_splash_window` and `create_app_window`
+/// build, on both the splash and every later window — the splash and the
+/// app share one webview (`architecture/09`), so this is what keeps a page
+/// that is not yet the app's own origin from ever getting a grant, and what
+/// turns wry's absent-handler default into an explicit, logged deny for an
+/// app that declared nothing or had it revoked.
+///
+/// `product_name` is the same title the window was created with, so the
+/// indicator's plain form is exactly the pre-capture title: a capture
+/// prefixes it, any stop — including a dead web process — restores it.
 ///
 /// Returns whatever `WebviewWindow::with_webview`'s dispatch returned, with
 /// the receiver the closure will report on. `Ok` means the closure was
@@ -234,6 +291,7 @@ fn classify_request(request: &webkit2gtk::PermissionRequest) -> MediaPermissionK
 /// dropped — the backend it joins already has its environment.
 pub fn install_permission_handler<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
+    product_name: String,
     access: MicrophoneAccess,
     app_origin: AppOriginSlot,
 ) -> tauri::Result<Receiver<bool>> {
@@ -280,7 +338,45 @@ pub fn install_permission_handler<R: tauri::Runtime>(
             }
             true
         });
-        // Sent once, after the handler is connected — the grant is only
+        // The indicator (plan 070 step 2) — only on a window whose grant
+        // really applied: an undeclared or revoked app never holds a
+        // capture, so handlers here would be ones that can only ever say
+        // "stopped". The title is set from the live state, not from the
+        // notify event's timing, so even a capture already running before
+        // this closure executes is read correctly.
+        if granted {
+            let capture_product_name = product_name.clone();
+            webview.connect_microphone_capture_state_notify(move |webview| {
+                use gtk::prelude::GtkWindowExt;
+
+                let state = capture_state_of(webview.microphone_capture_state());
+                if let Some(window) = toplevel_gtk_window(webview) {
+                    window.set_title(&capture_title(&capture_product_name, state));
+                }
+                eprintln!(
+                    "tfsapp-hub: microphone capture: {}",
+                    match state {
+                        CaptureState::Active => "active",
+                        CaptureState::Muted => "muted",
+                        CaptureState::None => "stopped",
+                    }
+                );
+            });
+            // A second handler on the same signal `crash.rs` already owns:
+            // this one never touches the crash page, only the title — a web
+            // process dying mid-capture is the one path the notify handler
+            // cannot report, and without this the indicator would outlive
+            // the page it was reporting on.
+            let plain_product_name = product_name;
+            webview.connect_web_process_terminated(move |webview, _reason| {
+                use gtk::prelude::GtkWindowExt;
+
+                if let Some(window) = toplevel_gtk_window(webview) {
+                    window.set_title(&plain_product_name);
+                }
+            });
+        }
+        // Sent once, after everything is connected — the grant is only
         // whole when both halves are. A send error means the receiver is
         // gone (the window closed before the closure ran, or the caller
         // never waited): there is nobody left to tell.

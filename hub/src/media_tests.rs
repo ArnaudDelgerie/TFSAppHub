@@ -2,8 +2,8 @@ use std::sync::mpsc::sync_channel;
 use std::time::Duration;
 
 use super::{
-    await_grant, decide, page_is_app_origin, user_media_denial_reason, MediaPermissionKind,
-    MicrophoneAccess,
+    await_grant, capture_title, decide, page_is_app_origin, user_media_denial_reason, CaptureState,
+    MediaPermissionKind, MicrophoneAccess,
 };
 use tauri::Url;
 
@@ -206,6 +206,34 @@ fn a_revoked_microphone_has_its_own_denial_reason() {
     assert_eq!(
         user_media_denial_reason(MicrophoneAccess::Revoked, true, true, false),
         "the microphone is revoked in data/config.json"
+    );
+}
+
+// --- `capture_title` (plan 070 step 2) ---------------------------------------
+
+#[test]
+fn an_active_capture_titles_the_window_with_the_product_name() {
+    assert_eq!(
+        capture_title("TFS App Test", CaptureState::Active),
+        "Microphone on — TFS App Test"
+    );
+}
+
+#[test]
+fn a_muted_capture_says_so_in_the_title() {
+    assert_eq!(
+        capture_title("TFS App Test", CaptureState::Muted),
+        "Microphone muted — TFS App Test"
+    );
+}
+
+#[test]
+fn no_capture_leaves_the_plain_product_name() {
+    // The same string the window was created with — the indicator's whole
+    // job is to return to it on any stop.
+    assert_eq!(
+        capture_title("TFS App Test", CaptureState::None),
+        "TFS App Test"
     );
 }
 

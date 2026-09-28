@@ -667,6 +667,7 @@ fn open_window(
                                 // for the sidecar this backend is serving.
                                 let _ = media::install_permission_handler(
                                     &window,
+                                    launch.product_name.clone(),
                                     microphone_access,
                                     origin.clone(),
                                 );
@@ -780,9 +781,13 @@ fn open_window(
             // on, so blocking here could only deadlock. `serve` waits, off
             // the main thread, and `TFS_MEDIA_MICROPHONE` reports what that
             // wait learned, never what the manifest asked for (§3).
-            let media_grant_report =
-                media::install_permission_handler(&splash, microphone_access, app_origin.clone())
-                    .ok();
+            let media_grant_report = media::install_permission_handler(
+                &splash,
+                identity.product_name.clone(),
+                microphone_access,
+                app_origin.clone(),
+            )
+            .ok();
             let _ = crash::install_crash_recovery_handler(
                 &splash,
                 close_guards.clone(),
