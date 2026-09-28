@@ -80,7 +80,7 @@ APP_VERSION="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "$CARGO_TO
 [[ -n "$APP_VERSION" ]] \
   || die "could not read a \"version\" line from $CARGO_TOML"
 
-# --- Provenance: clean, pushed, pinned ---------------------------------------
+# --- Step 1: provenance — clean, pushed, pinned ------------------------------
 # Local and cheapest first, before any gh call: a release ties its notes, its
 # tag and its binary to one known revision of this tree, the way the app
 # publish path pins a pushed commit. A dirty tree or an unpushed HEAD is
@@ -119,7 +119,7 @@ gh auth status >/dev/null 2>&1 \
 
 REPO="$RELEASES_REPO"
 
-# --- Step 1: version guard --------------------------------------------------
+# --- Step 2: version guard --------------------------------------------------
 TAG="v$APP_VERSION"
 
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
@@ -127,7 +127,7 @@ if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
 fi
 echo "Releasing $TAG"
 
-# --- Step 2: changelog gate --------------------------------------------------
+# --- Step 3: changelog gate --------------------------------------------------
 # Hard prerequisite: CHANGELOG.md must exist at the repo root and carry a
 # level-2 heading for $APP_VERSION. The version has to come from a known,
 # predictable place — but not in one single spelling: "## 1.2.0", "## v1.2.0"
@@ -146,7 +146,7 @@ CHANGELOG_FILE="$ROOT_DIR/CHANGELOG.md"
   || die "no CHANGELOG.md found at $CHANGELOG_FILE."
 
 # Bracket expressions rather than backslash escapes throughout: the regex is
-# handed to awk through -v, which would eat the backslashes ("." is not an
+# handed to awk through -v, which would eat the backslashes ("\." is not an
 # awk escape sequence). "." and "+" are the only ERE metacharacters a semver
 # string can contain. The heading itself is a closed list of three spellings
 # and no others — "## 1.2.0", "## v1.2.0", "## [1.2.0]" — each optionally
@@ -175,7 +175,7 @@ awk -v heading_re="$HEADING_RE" '
 # from; it signs nothing.
 printf '\nBuilt from %s@%s\n' "$REPO_SLUG" "$SHA" >>"$NOTES_FILE"
 
-# --- Step 3: build (or reuse) ------------------------------------------------
+# --- Step 4: build (or reuse) ------------------------------------------------
 OUTPUT_DIR="$ROOT_DIR/target/release/bundle/appimage"
 shopt -s nullglob
 existing=("$OUTPUT_DIR/TFSAppHub_${APP_VERSION}_"*.AppImage)
@@ -214,7 +214,7 @@ if [[ -z "${APPIMAGE:-}" ]]; then
   APPIMAGE="${appimage[0]}"
 fi
 
-# --- Step 4: checksums ------------------------------------------------------
+# --- Step 5: checksums ------------------------------------------------------
 # The compatibility record the build wrote beside the AppImage — the file a
 # user downloads from the same release to read its glibc floor (see README
 # "It does not start"). A release without it is undiagnosable, so a missing
@@ -231,7 +231,7 @@ SUMS="$OUTPUT_DIR/SHA256SUMS.txt"
 echo "Checksums:"
 cat "$SUMS"
 
-# --- Re-check before publishing ----------------------------------------------
+# --- Step 6: re-check before publishing --------------------------------------
 # The build ran with the tree live on disk; nothing may have moved it between
 # the provenance gate and now. Anything that did means the artifact no longer
 # corresponds to $SHA — refuse rather than publish.
@@ -247,7 +247,7 @@ if [[ "$recorded_chosen" != "$SHA" ]]; then
   die "the tree moved during the build — nothing published."
 fi
 
-# --- Step 5: publish --------------------------------------------------------
+# --- Step 7: publish --------------------------------------------------------
 # Every refusal is now behind us; from here on the script writes outside this
 # machine. The releases repo is created only now — creating it before a later
 # refusal would leave an empty repo behind a failed release.
@@ -261,7 +261,7 @@ else
 fi
 
 # Release notes are exactly the section extracted by the changelog gate
-# (step 2) — --generate-notes can't work cross-repo, the releases repo has
+# (step 3) — --generate-notes can't work cross-repo, the releases repo has
 # none of this repo's commits.
 gh release create "$TAG" \
   --repo "$REPO" \
