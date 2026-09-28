@@ -444,12 +444,14 @@ fn apply(
             path: data_subdir.clone(),
             source,
         })?;
+    stop_at("snapshot_complete")?;
     transaction.advance(Phase::SnapshotComplete);
     update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
     update_transaction::retain_tree(app_dir).map_err(|source| UpdateError::Io {
         path: app_dir.to_path_buf(),
         source,
     })?;
+    stop_at("tree_retained")?;
     transaction.advance(Phase::TreeRetained);
     update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
 
@@ -462,6 +464,7 @@ fn apply(
             error,
         ));
     }
+    stop_at("replacement_installed")?;
     transaction.advance(Phase::ReplacementInstalled);
     update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
 
@@ -488,6 +491,7 @@ fn apply(
             error,
         ));
     }
+    stop_at("lifecycle_complete")?;
     transaction.advance(Phase::LifecycleComplete);
     update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
 
@@ -519,24 +523,29 @@ fn apply(
             error,
         ));
     }
+    stop_at("registry_committed")?;
     transaction.advance(Phase::RegistryCommitted);
     update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
-    if let Err(error) = update_transaction::finalise_anchor(&data_subdir, data_dir, app_dir, entry)
-    {
-        return Err(recover_after_failure(
-            paths,
-            data_dir,
-            app_dir,
-            &transaction,
-            error,
-        ));
+    // The update itself is now committed — the registry names the new
+    // version. Nothing from here runs any of the app's own code, so there is
+    // nothing left to revert in 041's sense; a failure past this point is
+    // reported for `repair` to finish, never unwound.
+    if let Err(error) = update_transaction::finalise_anchor(
+        &data_subdir,
+        data_dir,
+        app_dir,
+        entry,
+        &transaction.database_members,
+    ) {
+        return Err(committed_needs_repair(id, &manifest.app_version, error));
     }
+    stop_at("anchor_finalised")?;
     transaction.advance(Phase::AnchorFinalised);
-    update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
-    update_transaction::discard(data_dir).map_err(|source| UpdateError::Io {
-        path: data_dir.to_path_buf(),
-        source,
-    })?;
+    update_transaction::write(data_dir, &transaction)
+        .map_err(|error| committed_needs_repair(id, &manifest.app_version, error))?;
+    stop_at("journal_discarded")?;
+    update_transaction::discard(data_dir)
+        .map_err(|error| committed_needs_repair(id, &manifest.app_version, error))?;
 
     install::write_desktop_entry(paths, id, manifest, app_dir);
     println!("Updated {id} to {}.", manifest.app_version);
@@ -550,6 +559,19 @@ fn transaction_error(error: update_transaction::JournalError) -> UpdateError {
             path: PathBuf::from("update transaction"),
             source: io::Error::other(other.to_string()),
         },
+    }
+}
+
+/// The one error a failure past `RegistryCommitted` can produce: the update
+/// or resync itself already happened, only its rollback-point promotion did
+/// not finish in this process. `repair <id>` is what finishes it — nothing
+/// here is reverted, per the Overview's argument that nothing durable is
+/// left to fail in that sense once the registry names the new version.
+fn committed_needs_repair(id: &str, version: &str, error: impl std::fmt::Display) -> UpdateError {
+    UpdateError::CommittedNeedsRepair {
+        id: id.to_string(),
+        version: version.to_string(),
+        detail: error.to_string(),
     }
 }
 
@@ -584,14 +606,14 @@ pub(crate) fn recover_transaction(
         );
         return outcome;
     }
+    if transaction.phase == Phase::RegistryCommitted {
+        return complete_forward(paths, data_dir, app_dir, transaction);
+    }
 
     let data_subdir = data_dir.join("data");
     let tree_is_authoritative = matches!(
         transaction.phase,
-        Phase::TreeRetained
-            | Phase::ReplacementInstalled
-            | Phase::LifecycleComplete
-            | Phase::RegistryCommitted
+        Phase::TreeRetained | Phase::ReplacementInstalled | Phase::LifecycleComplete
     );
     let snapshot_is_authoritative = transaction.kind == TransactionKind::Apply
         && matches!(
@@ -600,8 +622,48 @@ pub(crate) fn recover_transaction(
                 | Phase::TreeRetained
                 | Phase::ReplacementInstalled
                 | Phase::LifecycleComplete
-                | Phase::RegistryCommitted
         );
+
+    // `retain_tree`'s rename is the one mutation that can have happened
+    // without yet being durable at these two phases (`apply`/`resync_only`
+    // write `Prepared` before it, `SnapshotComplete` — Apply only — right
+    // before it too). What it did is visible on disk: `app_dir` is either
+    // still there (the rename never ran) or it is not (it ran and the
+    // journal did not catch up). Never inferred as a phase, only observed as
+    // the one step this phase allows next.
+    if matches!(transaction.phase, Phase::Prepared | Phase::SnapshotComplete) {
+        let staged = update_transaction::staged_tree_path(app_dir);
+        match (app_dir.is_dir(), staged.is_dir()) {
+            (false, true) => {
+                outcome.record(
+                    "tree swap-back",
+                    staged.clone(),
+                    fs::rename(&staged, app_dir),
+                );
+            }
+            (true, true) => {
+                // The rename never happened this attempt; `staged` is a
+                // leftover from an earlier interrupted transaction and
+                // `app_dir` is authoritative.
+                outcome.record(
+                    "stale retained tree discard",
+                    staged.clone(),
+                    remove_dir_if_present(&staged),
+                );
+            }
+            (false, false) => {
+                outcome.record(
+                    "tree",
+                    app_dir.to_path_buf(),
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "neither the live tree nor a retained one exists",
+                    )),
+                );
+            }
+            (true, false) => {}
+        }
+    }
 
     if snapshot_is_authoritative {
         for name in lifecycle::DB_FILE_NAMES {
@@ -688,6 +750,84 @@ pub(crate) fn recover_transaction(
         );
     }
     outcome
+}
+
+/// `RegistryCommitted`'s recovery: the update itself already happened — the
+/// registry names the new version — so there is nothing left to decide, only
+/// the anchor promotion to finish. `Apply` replays [`update_transaction::finalise_anchor`];
+/// `ResyncOnly`, which promotes no anchor, replays its own
+/// [`update_transaction::discard_tree`]. Both are idempotent, so a kill during
+/// this very completion is itself safe to retry. Every step is reported the
+/// same path-by-path way the outgoing revert above is.
+fn complete_forward(
+    paths: &Paths,
+    data_dir: &Path,
+    app_dir: &Path,
+    transaction: &Journal,
+) -> RevertOutcome {
+    let mut outcome = RevertOutcome::default();
+    let data_subdir = data_dir.join("data");
+
+    match transaction.kind {
+        TransactionKind::Apply => {
+            outcome.record(
+                "anchor finalisation",
+                app_dir.to_path_buf(),
+                update_transaction::finalise_anchor(
+                    &data_subdir,
+                    data_dir,
+                    app_dir,
+                    &transaction.outgoing,
+                    &transaction.database_members,
+                ),
+            );
+        }
+        TransactionKind::ResyncOnly => {
+            outcome.record(
+                "staged tree discard",
+                update_transaction::staged_tree_path(app_dir),
+                update_transaction::discard_tree(app_dir),
+            );
+        }
+    }
+    if !outcome.is_complete() {
+        return outcome;
+    }
+
+    let mut finalised = transaction.clone();
+    finalised.advance(Phase::AnchorFinalised);
+    outcome.record(
+        "transaction phase advance",
+        update_transaction::journal_path(data_dir),
+        update_transaction::write(data_dir, &finalised)
+            .map_err(|error| io::Error::other(error.to_string())),
+    );
+    if !outcome.is_complete() {
+        return outcome;
+    }
+
+    outcome.record(
+        "transaction cleanup",
+        data_dir.to_path_buf(),
+        update_transaction::discard(data_dir),
+    );
+    if outcome.is_complete() {
+        rewrite_desktop_entry_best_effort(paths, &transaction.outgoing.id, app_dir);
+    }
+    outcome
+}
+
+/// Reload the manifest from the now-committed tree and rewrite the desktop
+/// entry from it, the same best-effort step `apply`'s own success path ends
+/// with. A manifest that fails to re-parse here is a warning, never a reason
+/// to leave the journal in place over what is otherwise a complete recovery.
+fn rewrite_desktop_entry_best_effort(paths: &Paths, id: &str, app_dir: &Path) {
+    match crate::manifest::load(app_dir) {
+        Ok(loaded) => install::write_desktop_entry(paths, id, &loaded.manifest, app_dir),
+        Err(error) => {
+            eprintln!("tfsapp-hub: warning: could not refresh the desktop entry for {id}: {error}")
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -814,6 +954,7 @@ fn resync_only(
         path: app_dir.to_path_buf(),
         source,
     })?;
+    stop_at("tree_retained")?;
     transaction.advance(Phase::TreeRetained);
     update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
     if let Err(error) = install::snapshot(&resolved.root, app_dir) {
@@ -825,6 +966,7 @@ fn resync_only(
             error,
         ));
     }
+    stop_at("replacement_installed")?;
     transaction.advance(Phase::ReplacementInstalled);
     update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
     let environment = app_env::resolve(
@@ -883,18 +1025,21 @@ fn resync_only(
             error,
         ));
     }
+    stop_at("registry_committed")?;
     transaction.advance(Phase::RegistryCommitted);
     update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
-    update_transaction::discard_tree(app_dir).map_err(|source| UpdateError::Io {
-        path: app_dir.to_path_buf(),
-        source,
-    })?;
+    // The resync itself is now committed — the registry names the resolved
+    // revision. As in `apply`, nothing past this point is reverted; a
+    // failure is reported for `repair` to finish.
+    update_transaction::discard_tree(app_dir)
+        .map_err(|error| committed_needs_repair(&entry.id, &manifest.app_version, error))?;
+    stop_at("anchor_finalised")?;
     transaction.advance(Phase::AnchorFinalised);
-    update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
-    update_transaction::discard(&state_root).map_err(|source| UpdateError::Io {
-        path: state_root.clone(),
-        source,
-    })?;
+    update_transaction::write(&state_root, &transaction)
+        .map_err(|error| committed_needs_repair(&entry.id, &manifest.app_version, error))?;
+    stop_at("journal_discarded")?;
+    update_transaction::discard(&state_root)
+        .map_err(|error| committed_needs_repair(&entry.id, &manifest.app_version, error))?;
 
     // The same last step `apply` ends with, for the same reason: a resync
     // re-snapshots the tree, and the manifest it lands can change
@@ -952,14 +1097,32 @@ fn repair_at(paths: &Paths, id: &str, assume_yes: bool) -> Result<bool, UpdateEr
         });
     }
     let app_dir = paths.app_dir(id)?;
-    println!(
-        "Repairing {id}: this restores the interrupted {} attempt to {}.",
-        match journal.kind {
-            TransactionKind::Apply => "update",
-            TransactionKind::ResyncOnly => "re-sync",
-        },
-        journal.outgoing.app_version
+    // From `RegistryCommitted` on, the update or resync already happened —
+    // `entry.app_version` already names it — and repair only finishes the
+    // rollback-point promotion; before it, repair reverts to the outgoing
+    // version instead (the Overview's reopened forward-completion decision).
+    let forward = matches!(
+        journal.phase,
+        Phase::RegistryCommitted | Phase::AnchorFinalised
     );
+    match (forward, journal.kind) {
+        (true, TransactionKind::Apply) => println!(
+            "Repairing {id}: this finishes the update to {}: records {} as its rollback point.",
+            entry.app_version, journal.outgoing.app_version
+        ),
+        (true, TransactionKind::ResyncOnly) => println!(
+            "Repairing {id}: this finishes the re-sync to {}.",
+            entry.app_version
+        ),
+        (false, kind) => println!(
+            "Repairing {id}: this restores the interrupted {} attempt to {}.",
+            match kind {
+                TransactionKind::Apply => "update",
+                TransactionKind::ResyncOnly => "re-sync",
+            },
+            journal.outgoing.app_version
+        ),
+    }
     if !prompt::confirmed(assume_yes) {
         println!("Aborted — nothing was changed.");
         return Ok(false);
@@ -967,11 +1130,29 @@ fn repair_at(paths: &Paths, id: &str, assume_yes: bool) -> Result<bool, UpdateEr
     let outcome = recover_transaction(paths, &data_dir, &app_dir, &journal);
     if !outcome.is_complete() {
         return Err(UpdateError::Reverted {
-            detail: "repair could not restore every outgoing path.".into(),
+            detail: if forward {
+                "repair could not finish the update.".into()
+            } else {
+                "repair could not restore every outgoing path.".into()
+            },
             outcome,
         });
     }
-    println!("Repaired {id} to {}.", journal.outgoing.app_version);
+    match (forward, journal.kind) {
+        (true, TransactionKind::Apply) => {
+            println!(
+                "Repaired {id}: finished the update to {}.",
+                entry.app_version
+            )
+        }
+        (true, TransactionKind::ResyncOnly) => {
+            println!(
+                "Repaired {id}: finished the re-sync to {}.",
+                entry.app_version
+            )
+        }
+        (false, _) => println!("Repaired {id} to {}.", journal.outgoing.app_version),
+    }
     Ok(true)
 }
 
@@ -1021,6 +1202,14 @@ pub enum UpdateError {
     },
     JournalMismatch {
         path: PathBuf,
+    },
+    /// The update or resync is already committed — the registry names the
+    /// new version — but its rollback-point promotion failed in this same
+    /// process. Never reverted; `repair <id>` finishes it.
+    CommittedNeedsRepair {
+        id: String,
+        version: String,
+        detail: String,
     },
     /// The source is exactly what is already installed.
     Equal {
@@ -1095,6 +1284,15 @@ impl fmt::Display for UpdateError {
                 formatter,
                 "{} does not describe this installed app — refusing to repair it.",
                 path.display()
+            ),
+            Self::CommittedNeedsRepair {
+                id,
+                version,
+                detail,
+            } => write!(
+                formatter,
+                "{id} is committed to {version}: {detail} Its rollback point is not \
+                 finalised — `tfsapp-hub repair {id}` finishes it."
             ),
             Self::Equal { id, version } => write!(
                 formatter,
@@ -1213,6 +1411,50 @@ impl From<GateError> for UpdateError {
     fn from(error: GateError) -> Self {
         Self::Gate(error)
     }
+}
+
+/// A deterministic stand-in for killing the process right after a named
+/// mutation and before the journal write that would record it — the same
+/// boundary a real kill leaves the journal at, without needing to actually
+/// spawn and signal a child process. Test-only: in a normal build `stop_at`
+/// always returns `Ok(())` and the thread-local it would read does not exist.
+#[cfg(test)]
+pub(crate) mod test_stop {
+    use std::cell::Cell;
+
+    thread_local! {
+        static POINT: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
+
+    /// Arm the named boundary for the next `apply`/`resync_only` call on this
+    /// thread. Names match the ones passed to `stop_at` in this module.
+    pub(crate) fn arm(point: &'static str) {
+        POINT.with(|cell| cell.set(Some(point)));
+    }
+
+    pub(crate) fn disarm() {
+        POINT.with(|cell| cell.set(None));
+    }
+
+    pub(crate) fn hit(point: &'static str) -> bool {
+        POINT.with(|cell| cell.get() == Some(point))
+    }
+}
+
+#[cfg(test)]
+fn stop_at(point: &'static str) -> Result<(), UpdateError> {
+    if test_stop::hit(point) {
+        return Err(UpdateError::Io {
+            path: PathBuf::from(format!("test stop point: {point}")),
+            source: io::Error::other("simulated kill"),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn stop_at(_point: &'static str) -> Result<(), UpdateError> {
+    Ok(())
 }
 
 #[cfg(test)]

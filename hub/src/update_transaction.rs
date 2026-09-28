@@ -17,6 +17,22 @@ pub const FORMAT_VERSION: u32 = 1;
 const JOURNAL_FILE: &str = "update-transaction.json";
 const STAGING_DIR: &str = ".update-transaction";
 
+/// The deterministic kill stand-in `update::stop_at` uses, shared here so
+/// `finalise_anchor`'s own sub-steps (reached through a real `apply` as well
+/// as directly) can be stopped at without a second thread-local.
+#[cfg(test)]
+fn stop_at(point: &'static str) -> io::Result<()> {
+    if crate::update::test_stop::hit(point) {
+        return Err(io::Error::other(format!("test stop point: {point}")));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn stop_at(_point: &'static str) -> io::Result<()> {
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransactionKind {
@@ -180,7 +196,8 @@ pub fn snapshot_db(data_subdir: &Path, data_dir: &Path) -> io::Result<Vec<String
         let source = data_subdir.join(name);
         let target = staged_db_path(data_dir, name);
         if source.is_file() {
-            fs::copy(source, target)?;
+            fs::copy(&source, &target)?;
+            fs::File::open(&target)?.sync_all()?;
             members.push(name.to_string());
         } else {
             let _ = fs::remove_file(target);
@@ -197,33 +214,72 @@ pub fn retain_tree(app_dir: &Path) -> io::Result<()> {
     fs::File::open(app_dir.parent().expect("an app dir has a parent"))?.sync_all()
 }
 
+/// Promote a retained transaction to the ordinary public rollback anchor.
+/// Replayable: each step is guarded by the presence of its own source, so a
+/// kill between any two of them and a second call once it already finished
+/// both reach the same end state rather than erroring or re-destroying what
+/// the first call already promoted.
+///
+/// 1. While the staged tree still exists, the promotion has not happened yet
+///    this attempt: discard the old public anchor's database snapshot and
+///    `rollback.json`, remove the old `.previous` tree, and rename the
+///    staged tree onto it. Guarding the whole step on the staged tree is what
+///    stops a replay from discarding the anchor this same call just wrote.
+/// 2. For each member `database_members` (the journal's own record, not a
+///    fresh probe of [`lifecycle::DB_FILE_NAMES`]) says was snapshotted:
+///    rename its staged copy to the public snapshot path if the staged copy
+///    is still there, or leave it alone if the public copy is already there
+///    (an earlier call already renamed it). Neither existing is an error.
+/// 3. Write `rollback.json`, skipped when it already names this same
+///    outgoing version — the ordinary case on a replay after full success.
+/// 4. Sync `data/` and `apps/`.
 pub fn finalise_anchor(
     data_subdir: &Path,
     data_dir: &Path,
     app_dir: &Path,
     entry: &RegistryEntry,
+    database_members: &[String],
 ) -> io::Result<()> {
-    lifecycle::discard_db_snapshot(data_subdir);
-    lifecycle::discard_rollback_anchor(data_subdir);
-    let previous = lifecycle::previous_tree_path(app_dir);
-    let _ = fs::remove_dir_all(&previous);
-    fs::rename(staged_tree_path(app_dir), &previous)?;
-    for name in lifecycle::DB_FILE_NAMES {
+    let staged_tree = staged_tree_path(app_dir);
+    if staged_tree.is_dir() {
+        lifecycle::discard_db_snapshot(data_subdir);
+        lifecycle::discard_rollback_anchor(data_subdir);
+        let previous = lifecycle::previous_tree_path(app_dir);
+        let _ = fs::remove_dir_all(&previous);
+        fs::rename(&staged_tree, &previous)?;
+    }
+    stop_at("finalise_tree_promoted")?;
+
+    for name in database_members {
         let staged = staged_db_path(data_dir, name);
         let public = lifecycle::db_snapshot_path(data_subdir, name);
         if staged.is_file() {
-            fs::rename(staged, public)?;
+            fs::rename(&staged, &public)?;
+        } else if !public.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("database member {name} is neither staged nor already promoted"),
+            ));
         }
     }
-    lifecycle::write_rollback_anchor(
-        data_subdir,
-        &lifecycle::RollbackAnchor {
-            app_version: entry.app_version.clone(),
-            source_revision: entry.source_revision.clone(),
-            created_at: crate::registry::now_timestamp(),
-        },
-    )
-    .map_err(|error| io::Error::other(error.to_string()))?;
+    stop_at("finalise_members_promoted")?;
+
+    let already_finalised = lifecycle::read_rollback_anchor(data_subdir).is_some_and(|anchor| {
+        anchor.app_version == entry.app_version && anchor.source_revision == entry.source_revision
+    });
+    if !already_finalised {
+        lifecycle::write_rollback_anchor(
+            data_subdir,
+            &lifecycle::RollbackAnchor {
+                app_version: entry.app_version.clone(),
+                source_revision: entry.source_revision.clone(),
+                created_at: crate::registry::now_timestamp(),
+            },
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    }
+    stop_at("finalise_rollback_written")?;
+
     fs::File::open(data_subdir)?.sync_all()?;
     fs::File::open(app_dir.parent().expect("an app dir has a parent"))?.sync_all()
 }

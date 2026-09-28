@@ -1,8 +1,9 @@
 use std::{fs, path::Path};
 
 use super::{
-    discard_resync_aside, discard_tree, restore_tree, resync_aside_path, resync_snapshot,
-    retain_tree, revert, update, update_decision, UpdateAction, UpdateError, UpdateRefusal,
+    discard_resync_aside, discard_tree, repair_at, repair_required, restore_tree,
+    resync_aside_path, resync_snapshot, retain_tree, revert, test_stop, update, update_decision,
+    UpdateAction, UpdateError, UpdateRefusal,
 };
 use crate::{
     lifecycle::{previous_tree_path, read_rollback_anchor},
@@ -823,6 +824,317 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
         after_registry.source_revision, before_registry.source_revision,
         "a resync must still catch the source's own change"
     );
+}
+
+// --- kill-safe transaction boundaries (plan 060) ----------------------------
+//
+// Each boundary here is a real `update` run stopped, via a `#[cfg(test)]`
+// hook in `apply`/`resync_only` themselves, at the exact instant a mutation
+// has happened but the journal write recording it has not — the two audited
+// critical windows (`hub/src/update.rs`'s `retain_tree`/`finalise_anchor`
+// calls) plus every other such boundary the real pipeline has. `repair`'s own
+// behaviour, not a hand-built fixture, is what is under test.
+
+/// An installed `0.6.0` app with a seeded database and a resolvable `0.7.0`
+/// source, ready for a killed `apply`. The new tree carries a `README` the
+/// outgoing one never had — the cheap, already-proven (the resync test above)
+/// way to tell which tree is live without inspecting `tfsapp.config.json`.
+fn seeded_for_apply_kill() -> (
+    tempfile::TempDir,
+    Paths,
+    tempfile::TempDir,
+    std::path::PathBuf,
+) {
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+
+    runnable_app_tree(
+        source.path(),
+        "0.6.0",
+        r#"{"pre-install": [], "post-install": []}"#,
+    );
+    crate::install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the first install");
+
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+    fs::write(data_subdir.join("app.db"), b"pre-update-bytes").expect("a seeded database");
+
+    runnable_app_tree(
+        source.path(),
+        "0.7.0",
+        r#"{"pre-update": [], "post-update": []}"#,
+    );
+    fs::write(source.path().join("README"), "new tree").expect("a tree marker");
+
+    (base, paths, source, app_dir)
+}
+
+/// Boundaries at which the outgoing state is still the answer: the journal is
+/// left at the phase just before the one named, always earlier than
+/// `RegistryCommitted`.
+const APPLY_REVERT_BOUNDARIES: [&str; 5] = [
+    "snapshot_complete",
+    "tree_retained",
+    "replacement_installed",
+    "lifecycle_complete",
+    "registry_committed",
+];
+
+/// Boundaries at which the registry already names the new version: the three
+/// stop points reached from inside `finalise_anchor` itself, plus the two
+/// right after it, in `apply`.
+const APPLY_FORWARD_BOUNDARIES: [&str; 5] = [
+    "finalise_tree_promoted",
+    "finalise_members_promoted",
+    "finalise_rollback_written",
+    "anchor_finalised",
+    "journal_discarded",
+];
+
+#[test]
+fn a_killed_apply_reverts_to_the_outgoing_version_before_registry_commit() {
+    if !resources_present() {
+        return;
+    }
+    for point in APPLY_REVERT_BOUNDARIES {
+        let (base, paths, _source, app_dir) = seeded_for_apply_kill();
+        let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+
+        test_stop::arm(point);
+        let result = update(&paths, "demo", None, false, true, "0.1.0");
+        test_stop::disarm();
+        assert!(result.is_err(), "{point}: the stop point should have fired");
+
+        assert!(repair_required(&paths, "demo").unwrap(), "{point}");
+        repair_at(&paths, "demo", true).unwrap_or_else(|error| panic!("{point}: {error}"));
+
+        assert!(!repair_required(&paths, "demo").unwrap(), "{point}");
+        assert!(
+            !app_dir.join("README").exists(),
+            "{point}: the outgoing tree must be live again"
+        );
+        assert_eq!(
+            fs::read_to_string(data_subdir.join("app.db")).unwrap(),
+            "pre-update-bytes",
+            "{point}: the outgoing database must be restored"
+        );
+        assert!(
+            !previous_tree_path(&app_dir).exists(),
+            "{point}: a revert creates no anchor"
+        );
+        let entry = registry::load(&paths)
+            .unwrap()
+            .get("demo")
+            .cloned()
+            .unwrap();
+        assert_eq!(entry.app_version, "0.6.0", "{point}");
+
+        assert!(
+            matches!(
+                repair_at(&paths, "demo", true),
+                Err(UpdateError::NoJournal { .. })
+            ),
+            "{point}: repairing twice must say there is nothing to repair"
+        );
+    }
+}
+
+#[test]
+fn a_killed_apply_finishes_forward_from_registry_commit_on() {
+    if !resources_present() {
+        return;
+    }
+    for point in APPLY_FORWARD_BOUNDARIES {
+        let (base, paths, _source, app_dir) = seeded_for_apply_kill();
+        let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
+
+        test_stop::arm(point);
+        let result = update(&paths, "demo", None, false, true, "0.1.0");
+        test_stop::disarm();
+        assert!(result.is_err(), "{point}: the stop point should have fired");
+
+        assert!(repair_required(&paths, "demo").unwrap(), "{point}");
+        repair_at(&paths, "demo", true).unwrap_or_else(|error| panic!("{point}: {error}"));
+
+        assert!(!repair_required(&paths, "demo").unwrap(), "{point}");
+        assert!(
+            app_dir.join("README").exists(),
+            "{point}: the update already happened — the new tree stays live"
+        );
+        let entry = registry::load(&paths)
+            .unwrap()
+            .get("demo")
+            .cloned()
+            .unwrap();
+        assert_eq!(entry.app_version, "0.7.0", "{point}");
+
+        assert!(
+            previous_tree_path(&app_dir).is_dir(),
+            "{point}: the outgoing tree is promoted to the anchor"
+        );
+        assert!(
+            !previous_tree_path(&app_dir).join("README").exists(),
+            "{point}: the anchor holds the outgoing tree, not the new one"
+        );
+        assert_eq!(
+            fs::read_to_string(data_subdir.join("app.db.pre-update")).unwrap(),
+            "pre-update-bytes",
+            "{point}: the anchor's database half is the outgoing one"
+        );
+        let anchor = read_rollback_anchor(&data_subdir).expect("a written rollback anchor");
+        assert_eq!(anchor.app_version, "0.6.0", "{point}");
+
+        assert!(
+            matches!(
+                repair_at(&paths, "demo", true),
+                Err(UpdateError::NoJournal { .. })
+            ),
+            "{point}: repairing twice must say there is nothing to repair"
+        );
+    }
+}
+
+/// An installed `0.6.0` app whose source is then edited in place without a
+/// version bump — a resolvable forced re-sync — for a killed `resync_only`.
+fn seeded_for_resync_kill() -> (
+    tempfile::TempDir,
+    Paths,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    String,
+) {
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+
+    runnable_app_tree(
+        source.path(),
+        "0.6.0",
+        r#"{"pre-install": [], "post-install": []}"#,
+    );
+    crate::install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the first install");
+
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    let original_revision = registry::load(&paths)
+        .expect("a readable registry")
+        .get("demo")
+        .expect("the entry")
+        .source_revision
+        .clone();
+
+    // Edited without a version bump — the same content/tree marker the
+    // `Apply` boundary tests above use.
+    fs::write(source.path().join("README"), "new tree").expect("a tree marker");
+
+    (base, paths, source, app_dir, original_revision)
+}
+
+const RESYNC_REVERT_BOUNDARIES: [&str; 3] = [
+    "tree_retained",
+    "replacement_installed",
+    "registry_committed",
+];
+const RESYNC_FORWARD_BOUNDARIES: [&str; 2] = ["anchor_finalised", "journal_discarded"];
+
+#[test]
+fn a_killed_resync_reverts_to_the_outgoing_source_before_registry_commit() {
+    if !resources_present() {
+        return;
+    }
+    for point in RESYNC_REVERT_BOUNDARIES {
+        let (_base, paths, _source, app_dir, original_revision) = seeded_for_resync_kill();
+
+        test_stop::arm(point);
+        let result = update(&paths, "demo", None, true, true, "0.1.0");
+        test_stop::disarm();
+        assert!(result.is_err(), "{point}: the stop point should have fired");
+
+        assert!(repair_required(&paths, "demo").unwrap(), "{point}");
+        repair_at(&paths, "demo", true).unwrap_or_else(|error| panic!("{point}: {error}"));
+
+        assert!(!repair_required(&paths, "demo").unwrap(), "{point}");
+        assert!(
+            !app_dir.join("README").exists(),
+            "{point}: the outgoing tree must be live again"
+        );
+        assert!(
+            !previous_tree_path(&app_dir).exists(),
+            "{point}: a resync rotates no anchor, reverted or not"
+        );
+        let entry = registry::load(&paths)
+            .unwrap()
+            .get("demo")
+            .cloned()
+            .unwrap();
+        assert_eq!(entry.source_revision, original_revision, "{point}");
+
+        assert!(
+            matches!(
+                repair_at(&paths, "demo", true),
+                Err(UpdateError::NoJournal { .. })
+            ),
+            "{point}: repairing twice must say there is nothing to repair"
+        );
+    }
+}
+
+#[test]
+fn a_killed_resync_finishes_forward_from_registry_commit_on() {
+    if !resources_present() {
+        return;
+    }
+    for point in RESYNC_FORWARD_BOUNDARIES {
+        let (_base, paths, _source, app_dir, original_revision) = seeded_for_resync_kill();
+
+        test_stop::arm(point);
+        let result = update(&paths, "demo", None, true, true, "0.1.0");
+        test_stop::disarm();
+        assert!(result.is_err(), "{point}: the stop point should have fired");
+
+        assert!(repair_required(&paths, "demo").unwrap(), "{point}");
+        repair_at(&paths, "demo", true).unwrap_or_else(|error| panic!("{point}: {error}"));
+
+        assert!(!repair_required(&paths, "demo").unwrap(), "{point}");
+        assert!(
+            app_dir.join("README").exists(),
+            "{point}: the resync already happened — the new tree stays live"
+        );
+        assert!(
+            !previous_tree_path(&app_dir).exists(),
+            "{point}: a resync rotates no anchor, finished or not"
+        );
+        let entry = registry::load(&paths)
+            .unwrap()
+            .get("demo")
+            .cloned()
+            .unwrap();
+        assert_ne!(entry.source_revision, original_revision, "{point}");
+
+        assert!(
+            matches!(
+                repair_at(&paths, "demo", true),
+                Err(UpdateError::NoJournal { .. })
+            ),
+            "{point}: repairing twice must say there is nothing to repair"
+        );
+    }
 }
 
 // --- update on a remote source ----------------------------------------------

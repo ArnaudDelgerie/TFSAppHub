@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+`tfsapp-hub repair <id>` is now safe against a kill at any instant of an
+interrupted `update` or forced re-sync, not only right after one of its
+journal writes — the gap between a filesystem change and the journal record
+of it is now covered too. It also finishes rather than reverts an update
+that was killed after the registry already recorded the new version: the
+update had already happened at that point, so `repair` now completes the
+rollback-point promotion instead of undoing a commit that already landed,
+leaving `rollback <id>` usable afterwards where it previously could not be.
+Every earlier interruption still restores the outgoing version exactly as
+before.
+
 An app can now declare `actions.paths` — one boolean per GLib special
 directory (`desktop`, `documents`, `downloads`, `music`, `pictures`,
 `public_share`, `templates`, `videos`) — and have the hub resolve each

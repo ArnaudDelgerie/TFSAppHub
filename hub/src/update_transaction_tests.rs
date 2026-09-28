@@ -7,8 +7,8 @@ use crate::{
     registry::{Platform, RegistryEntry, Source, SourceKind, State},
     update::recover_transaction,
     update_transaction::{
-        journal_path, read, retain_tree, snapshot_db, staged_db_path, staged_tree_path, write,
-        Journal, Phase, TransactionKind,
+        finalise_anchor, journal_path, read, retain_tree, snapshot_db, staged_db_path,
+        staged_tree_path, write, Journal, Phase, TransactionKind,
     },
 };
 
@@ -58,8 +58,150 @@ fn seeded_paths() -> (
     (base, paths, entry, data_dir, app_dir)
 }
 
+/// Everything true right before `finalise_anchor` runs: the outgoing entry's
+/// tree and database staged for promotion, a fresh replacement tree and
+/// database already live under `app_dir`/`data_subdir`, and the staged
+/// database members it will promote.
+fn ready_to_finalise() -> (
+    tempfile::TempDir,
+    Paths,
+    RegistryEntry,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Vec<String>,
+) {
+    let (base, paths, entry, data_dir, app_dir) = seeded_paths();
+    let members = snapshot_db(&data_dir.join("data"), &data_dir).unwrap();
+    retain_tree(&app_dir).unwrap();
+    fs::create_dir_all(app_dir.join("public")).unwrap();
+    fs::write(app_dir.join("public/version"), "new").unwrap();
+    fs::write(data_dir.join("data/app.db"), "new-db").unwrap();
+    (base, paths, entry, data_dir, app_dir, members)
+}
+
+fn assert_anchor_complete(
+    entry: &RegistryEntry,
+    data_dir: &std::path::Path,
+    app_dir: &std::path::Path,
+) {
+    let data_subdir = data_dir.join("data");
+    assert!(
+        lifecycle::previous_tree_path(app_dir).is_dir(),
+        "retained tree should be promoted to .previous"
+    );
+    assert_eq!(
+        fs::read_to_string(lifecycle::previous_tree_path(app_dir).join("public/version")).unwrap(),
+        "old"
+    );
+    assert!(
+        lifecycle::db_snapshot_path(&data_subdir, "app.db").is_file(),
+        "database snapshot should be promoted to the public anchor"
+    );
+    assert_eq!(
+        fs::read_to_string(lifecycle::db_snapshot_path(&data_subdir, "app.db")).unwrap(),
+        "old-db"
+    );
+    let anchor = lifecycle::read_rollback_anchor(&data_subdir).expect("a written rollback.json");
+    assert_eq!(anchor.app_version, entry.app_version);
+    assert_eq!(anchor.source_revision, entry.source_revision);
+    assert!(
+        !staged_tree_path(app_dir).is_dir(),
+        "staged tree left behind"
+    );
+    assert!(
+        !staged_db_path(data_dir, "app.db").is_file(),
+        "staged database member left behind"
+    );
+}
+
+#[test]
+fn finalise_anchor_from_a_fresh_start_completes_the_promotion() {
+    let (_base, _paths, entry, data_dir, app_dir, members) = ready_to_finalise();
+    finalise_anchor(
+        &data_dir.join("data"),
+        &data_dir,
+        &app_dir,
+        &entry,
+        &members,
+    )
+    .unwrap();
+    assert_anchor_complete(&entry, &data_dir, &app_dir);
+}
+
+#[test]
+fn finalise_anchor_replays_after_a_kill_between_every_sub_step() {
+    // Sub-step 1: the tree promotion alone, nothing else done yet.
+    {
+        let (_base, _paths, entry, data_dir, app_dir, members) = ready_to_finalise();
+        let previous = lifecycle::previous_tree_path(&app_dir);
+        fs::rename(staged_tree_path(&app_dir), &previous).unwrap();
+        finalise_anchor(
+            &data_dir.join("data"),
+            &data_dir,
+            &app_dir,
+            &entry,
+            &members,
+        )
+        .unwrap();
+        assert_anchor_complete(&entry, &data_dir, &app_dir);
+    }
+    // Sub-step 2: the tree and the database member promoted, rollback.json
+    // not yet written.
+    {
+        let (_base, _paths, entry, data_dir, app_dir, members) = ready_to_finalise();
+        let previous = lifecycle::previous_tree_path(&app_dir);
+        fs::rename(staged_tree_path(&app_dir), &previous).unwrap();
+        let data_subdir = data_dir.join("data");
+        fs::rename(
+            staged_db_path(&data_dir, "app.db"),
+            lifecycle::db_snapshot_path(&data_subdir, "app.db"),
+        )
+        .unwrap();
+        finalise_anchor(&data_subdir, &data_dir, &app_dir, &entry, &members).unwrap();
+        assert_anchor_complete(&entry, &data_dir, &app_dir);
+    }
+    // Sub-step 3: everything already promoted and rollback.json already
+    // written — the ordinary "killed right after success" replay.
+    {
+        let (_base, _paths, entry, data_dir, app_dir, members) = ready_to_finalise();
+        finalise_anchor(
+            &data_dir.join("data"),
+            &data_dir,
+            &app_dir,
+            &entry,
+            &members,
+        )
+        .unwrap();
+        assert_anchor_complete(&entry, &data_dir, &app_dir);
+        let data_subdir = data_dir.join("data");
+        let before = fs::read_to_string(lifecycle::rollback_anchor_path(&data_subdir)).unwrap();
+        finalise_anchor(&data_subdir, &data_dir, &app_dir, &entry, &members).unwrap();
+        let after = fs::read_to_string(lifecycle::rollback_anchor_path(&data_subdir)).unwrap();
+        assert_eq!(before, after, "a second full replay must change nothing");
+        assert_anchor_complete(&entry, &data_dir, &app_dir);
+    }
+}
+
+#[test]
+fn finalise_anchor_reports_a_database_member_missing_from_both_places() {
+    let (_base, _paths, entry, data_dir, app_dir, members) = ready_to_finalise();
+    fs::remove_file(staged_db_path(&data_dir, "app.db")).unwrap();
+    assert!(finalise_anchor(
+        &data_dir.join("data"),
+        &data_dir,
+        &app_dir,
+        &entry,
+        &members
+    )
+    .is_err());
+}
+
 #[test]
 fn recovery_restores_a_replacement_from_the_durable_outgoing_state() {
+    // The last phase at which recovery is still a revert: the registry is
+    // only ever written between `LifecycleComplete` and `RegistryCommitted`
+    // (`apply`'s own order), so this is also the last phase at which the
+    // registry entry actually needs restoring rather than already matching.
     let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
     let mut journal = Journal::prepared(TransactionKind::Apply, entry.clone());
     journal.database_members = snapshot_db(&data_dir.join("data"), &data_dir).unwrap();
@@ -70,11 +212,7 @@ fn recovery_restores_a_replacement_from_the_durable_outgoing_state() {
     fs::write(app_dir.join("public/version"), "new").unwrap();
     fs::write(data_dir.join("data/app.db"), "new-db").unwrap();
     lifecycle::write_data_version(&data_dir.join("data"), "0.7.0").unwrap();
-    registry::update(&paths, |registry| {
-        registry.get_mut("demo").unwrap().app_version = "0.7.0".into();
-    })
-    .unwrap();
-    journal.advance(Phase::RegistryCommitted);
+    journal.advance(Phase::LifecycleComplete);
     write(&data_dir, &journal).unwrap();
 
     let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
@@ -95,6 +233,101 @@ fn recovery_restores_a_replacement_from_the_durable_outgoing_state() {
     );
     assert_eq!(registry::load(&paths).unwrap().get("demo").unwrap(), &entry);
     assert!(read(&data_dir).unwrap().is_none());
+}
+
+#[test]
+fn recovery_finishes_a_registry_committed_update_forward() {
+    let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+    let mut journal = Journal::prepared(TransactionKind::Apply, entry.clone());
+    journal.database_members = snapshot_db(&data_dir.join("data"), &data_dir).unwrap();
+    journal.advance(Phase::SnapshotComplete);
+    retain_tree(&app_dir).unwrap();
+    journal.advance(Phase::TreeRetained);
+    fs::create_dir_all(app_dir.join("public")).unwrap();
+    fs::write(app_dir.join("public/version"), "new").unwrap();
+    fs::write(data_dir.join("data/app.db"), "new-db").unwrap();
+    lifecycle::write_data_version(&data_dir.join("data"), "0.7.0").unwrap();
+    registry::update(&paths, |registry| {
+        registry.get_mut("demo").unwrap().app_version = "0.7.0".into();
+    })
+    .unwrap();
+    journal.advance(Phase::RegistryCommitted);
+    write(&data_dir, &journal).unwrap();
+
+    let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+    assert!(outcome.is_complete(), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(app_dir.join("public/version")).unwrap(),
+        "new"
+    );
+    assert_eq!(
+        fs::read_to_string(data_dir.join("data/app.db")).unwrap(),
+        "new-db"
+    );
+    assert_eq!(
+        read_data_version(&data_dir.join("data"))
+            .unwrap()
+            .as_deref(),
+        Some("0.7.0")
+    );
+    let mut expected = entry.clone();
+    expected.app_version = "0.7.0".into();
+    assert_eq!(
+        registry::load(&paths).unwrap().get("demo").unwrap(),
+        &expected
+    );
+    assert!(read(&data_dir).unwrap().is_none());
+
+    let data_subdir = data_dir.join("data");
+    assert!(lifecycle::previous_tree_path(&app_dir).is_dir());
+    assert_eq!(
+        fs::read_to_string(lifecycle::previous_tree_path(&app_dir).join("public/version")).unwrap(),
+        "old"
+    );
+    assert!(lifecycle::db_snapshot_path(&data_subdir, "app.db").is_file());
+    assert_eq!(
+        fs::read_to_string(lifecycle::db_snapshot_path(&data_subdir, "app.db")).unwrap(),
+        "old-db"
+    );
+    let anchor = lifecycle::read_rollback_anchor(&data_subdir).expect("a written rollback.json");
+    assert_eq!(anchor.app_version, entry.app_version);
+    assert_eq!(anchor.source_revision, entry.source_revision);
+}
+
+#[test]
+fn recovery_finishes_a_registry_committed_resync_forward() {
+    let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+    let mut journal = Journal::prepared(TransactionKind::ResyncOnly, entry.clone());
+    retain_tree(&app_dir).unwrap();
+    journal.advance(Phase::TreeRetained);
+    fs::create_dir_all(app_dir.join("public")).unwrap();
+    fs::write(app_dir.join("public/version"), "new").unwrap();
+    journal.advance(Phase::ReplacementInstalled);
+    registry::update(&paths, |registry| {
+        registry.get_mut("demo").unwrap().source_revision = "new-rev".into();
+    })
+    .unwrap();
+    journal.advance(Phase::RegistryCommitted);
+    write(&data_dir, &journal).unwrap();
+
+    let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+    assert!(outcome.is_complete(), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(app_dir.join("public/version")).unwrap(),
+        "new"
+    );
+    assert!(!staged_tree_path(&app_dir).is_dir());
+    assert!(read(&data_dir).unwrap().is_none());
+    // A resync rotates no anchor: the existing rollback point, if any, is
+    // left exactly as it was — recovery must not create one either.
+    assert!(!lifecycle::previous_tree_path(&app_dir).is_dir());
+    assert!(lifecycle::read_rollback_anchor(&data_dir.join("data")).is_none());
+    let mut expected = entry.clone();
+    expected.source_revision = "new-rev".into();
+    assert_eq!(
+        registry::load(&paths).unwrap().get("demo").unwrap(),
+        &expected
+    );
 }
 
 #[test]
@@ -187,30 +420,59 @@ fn recovery_obeys_each_durable_phase_without_guessing() {
         let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
         assert!(outcome.is_complete(), "{phase:?}: {outcome:?}");
         assert!(read(&data_dir).unwrap().is_none(), "{phase:?}");
-        if phase == Phase::AnchorFinalised {
+        // From `RegistryCommitted` on, the update already happened and
+        // recovery completes it forward instead of reverting it: the live
+        // tree/version stay "new" and the outgoing state is promoted to the
+        // ordinary rollback anchor rather than restored in place.
+        if matches!(phase, Phase::RegistryCommitted | Phase::AnchorFinalised) {
             assert_eq!(
                 fs::read_to_string(app_dir.join("public/version")).unwrap(),
-                "new"
+                "new",
+                "{phase:?}"
             );
         } else if matches!(
             phase,
-            Phase::TreeRetained
-                | Phase::ReplacementInstalled
-                | Phase::LifecycleComplete
-                | Phase::RegistryCommitted
+            Phase::TreeRetained | Phase::ReplacementInstalled | Phase::LifecycleComplete
         ) {
             assert_eq!(
                 fs::read_to_string(app_dir.join("public/version")).unwrap(),
-                "old"
+                "old",
+                "{phase:?}"
             );
         }
-        // `AnchorFinalised` is the one phase recovery must not reverse: the
-        // registry write already committed and the anchor step means the
-        // update is done, so `recover_transaction` only discards the journal
-        // (update.rs's early `AnchorFinalised` branch) and rightly leaves the
-        // new version in place — matching `public/version` staying "new"
-        // above rather than reverting to the pre-update `entry`.
-        let expected_entry = if phase == Phase::AnchorFinalised {
+        if phase == Phase::RegistryCommitted {
+            let data_subdir = data_dir.join("data");
+            assert!(
+                lifecycle::previous_tree_path(&app_dir).is_dir(),
+                "{phase:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(lifecycle::previous_tree_path(&app_dir).join("public/version"))
+                    .unwrap(),
+                "old",
+                "{phase:?}"
+            );
+            assert!(
+                lifecycle::db_snapshot_path(&data_subdir, "app.db").is_file(),
+                "{phase:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(lifecycle::db_snapshot_path(&data_subdir, "app.db")).unwrap(),
+                "old-db",
+                "{phase:?}"
+            );
+            let anchor = lifecycle::read_rollback_anchor(&data_subdir)
+                .unwrap_or_else(|| panic!("{phase:?}: a written rollback.json"));
+            assert_eq!(anchor.app_version, entry.app_version, "{phase:?}");
+        }
+        // `RegistryCommitted` and `AnchorFinalised` are the two phases
+        // recovery must not reverse: the registry write already committed
+        // and the update is done, so `recover_transaction` completes the
+        // anchor promotion (or, at `AnchorFinalised`, only discards the
+        // journal) and rightly leaves the new version registered — matching
+        // `public/version` staying "new" above rather than reverting to the
+        // pre-update `entry`.
+        let expected_entry = if matches!(phase, Phase::RegistryCommitted | Phase::AnchorFinalised) {
             RegistryEntry {
                 app_version: "0.7.0".into(),
                 ..entry.clone()
@@ -224,6 +486,72 @@ fn recovery_obeys_each_durable_phase_without_guessing() {
             "{phase:?}"
         );
     }
+}
+
+#[test]
+fn a_tree_retained_before_its_phase_is_durable_is_renamed_back() {
+    // Simulates a kill right after `retain_tree`'s rename but before the
+    // journal write that would have advanced to `TreeRetained`, for every
+    // phase/kind combination that boundary can occur at.
+    for (phase, kind) in [
+        (Phase::Prepared, TransactionKind::Apply),
+        (Phase::SnapshotComplete, TransactionKind::Apply),
+        (Phase::Prepared, TransactionKind::ResyncOnly),
+    ] {
+        let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+        let mut journal = Journal::prepared(kind, entry.clone());
+        if phase == Phase::SnapshotComplete {
+            journal.database_members = snapshot_db(&data_dir.join("data"), &data_dir).unwrap();
+            journal.advance(Phase::SnapshotComplete);
+        }
+        retain_tree(&app_dir).unwrap();
+        write(&data_dir, &journal).unwrap();
+
+        let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+        assert!(outcome.is_complete(), "{phase:?}/{kind:?}: {outcome:?}");
+        assert!(app_dir.is_dir(), "{phase:?}/{kind:?}");
+        assert!(!staged_tree_path(&app_dir).is_dir(), "{phase:?}/{kind:?}");
+        assert_eq!(
+            fs::read_to_string(app_dir.join("public/version")).unwrap(),
+            "old",
+            "{phase:?}/{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn a_stale_retained_tree_left_over_from_an_earlier_attempt_is_discarded() {
+    // The current transaction never reached `retain_tree` (`app_dir` is
+    // still present), but a leftover staged tree from an earlier, unrelated
+    // interruption sits beside it. `app_dir` is authoritative; the leftover
+    // is discarded, not swapped in.
+    let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+    let journal = Journal::prepared(TransactionKind::Apply, entry);
+    let staged = staged_tree_path(&app_dir);
+    fs::create_dir_all(staged.join("public")).unwrap();
+    fs::write(staged.join("public/version"), "leftover").unwrap();
+    write(&data_dir, &journal).unwrap();
+
+    let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+    assert!(outcome.is_complete(), "{outcome:?}");
+    assert!(app_dir.is_dir());
+    assert!(!staged.is_dir());
+    assert_eq!(
+        fs::read_to_string(app_dir.join("public/version")).unwrap(),
+        "old"
+    );
+}
+
+#[test]
+fn neither_a_live_nor_a_retained_tree_keeps_the_journal_and_names_the_path() {
+    let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+    let journal = Journal::prepared(TransactionKind::Apply, entry);
+    fs::remove_dir_all(&app_dir).unwrap();
+    write(&data_dir, &journal).unwrap();
+
+    let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+    assert!(!outcome.is_complete());
+    assert!(read(&data_dir).unwrap().is_some());
 }
 
 #[test]
