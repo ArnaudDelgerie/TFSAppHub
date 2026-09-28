@@ -10,6 +10,7 @@ mod archive;
 mod bridge;
 mod cli;
 mod close_guard;
+mod crash;
 mod desktop;
 mod dev;
 mod gh;
@@ -616,6 +617,8 @@ fn open_window(
                                     microphone_declared,
                                     origin.clone(),
                                 );
+                                let _ =
+                                    crash::install_crash_recovery_handler(&window, guards.clone());
                                 Ok(())
                             })
                             .map_err(|error| error.to_string())
@@ -722,6 +725,7 @@ fn open_window(
                 app_origin.clone(),
             )
             .is_ok();
+            let _ = crash::install_crash_recovery_handler(&splash, close_guards.clone());
 
             let handle = app.handle().clone();
             std::thread::spawn(move || {
