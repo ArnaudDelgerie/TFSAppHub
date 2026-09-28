@@ -316,10 +316,9 @@ pub fn write_cache_stamp(data_subdir: &Path, stamp: &CacheStamp) -> Result<(), L
 /// restores: a stamp written for the version an update was moving *to* must
 /// not survive next to a tree reverted back to the version it was moving
 /// *from*. Reaching for the field of a mismatched dimension covers most such
-/// cases already (`read_cache_stamp`'s `app_version` check), but an update
-/// that resyncs the same version onto a different tree is a case where
-/// nothing else would catch it — so the revert clears it outright rather than
-/// leaning on a comparison that happens to save it most of the time.
+/// cases already (`read_cache_stamp`'s `app_version` check), but the revert
+/// clears it outright rather than leaning on a comparison that happens to
+/// save it most of the time.
 pub fn discard_cache_stamp(data_subdir: &Path) -> io::Result<()> {
     match fs::remove_file(cache_stamp_path(data_subdir)) {
         Ok(()) => Ok(()),

@@ -117,17 +117,15 @@ fn bare_words_route_to_an_app() {
             id: "demo".to_string(),
             archive: None,
             reference: None,
-            force: false,
             assume_yes: false,
         }
     );
     assert_eq!(
-        command("update demo --ref main --force --yes"),
+        command("update demo --ref main --yes"),
         Command::Update {
             id: "demo".to_string(),
             archive: None,
             reference: Some("main".to_string()),
-            force: true,
             assume_yes: true,
         }
     );
@@ -762,9 +760,21 @@ fn update_accepts_optional_archive_and_rejects_other_second_word() {
             id: "demo".to_string(),
             archive: Some("/mnt/releases/demo-0.7.0.tar.gz".to_string()),
             reference: None,
-            force: false,
             assume_yes: true,
         }
+    );
+    let error = super::parse(
+        &["update", "demo", "--force"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unknown option --force for update"),
+        "{error}"
     );
     let args = ["update", "demo", "some-directory"]
         .into_iter()

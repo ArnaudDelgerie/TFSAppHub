@@ -51,7 +51,7 @@ mod update;
 mod update_cache;
 mod update_check;
 mod update_refresh;
-#[allow(dead_code)] // Step 2 wires the persisted protocol into update/resync.
+#[allow(dead_code)] // Step 2 wires the persisted protocol into update.
 mod update_transaction;
 mod user_dirs;
 mod version;
@@ -225,13 +225,11 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
             id,
             archive,
             reference,
-            force,
             assume_yes,
         } => update::run(
             &id,
             archive.as_deref().map(std::path::Path::new),
             reference.as_deref(),
-            force,
             assume_yes,
             &context.package_info().version.to_string(),
         ),

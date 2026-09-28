@@ -23,7 +23,7 @@ use std::{
 };
 
 use crate::{
-    app_env::{self, EnvError},
+    app_env::EnvError,
     cli::{EXIT_FAILED, EXIT_OK},
     import_transaction,
     install::{self, InstallError},
@@ -40,19 +40,6 @@ use crate::{
     update_transaction::{self, Journal, Phase, TransactionKind},
 };
 
-/// What `update <id>` does, decided from the registry's recorded `app_version`
-/// against the freshly resolved source's own. No I/O.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdateAction {
-    /// The update event: snapshot, swap, `pre-update` then `post-update`,
-    /// commit.
-    Apply,
-    /// `--force` on an equal record: re-sync the code and its dependencies,
-    /// run no lifecycle command, take no snapshot, and leave the existing
-    /// anchor alone.
-    ResyncOnly,
-}
-
 /// Why [`update_decision`] refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateRefusal {
@@ -62,13 +49,10 @@ pub enum UpdateRefusal {
     /// row of the decision table anyway so it is one function to test rather
     /// than an assumption baked silently into the caller.
     NoRecord,
-    /// The source is exactly what is already installed. `--force` unlocks
-    /// [`UpdateAction::ResyncOnly`]; without it, this refuses.
+    /// The source is exactly what is already installed.
     Equal { version: semver::Version },
     /// The source is *older* than what is installed — a downgrade, which
-    /// `--force` does not unlock: it is for the case `source_revision` exists
-    /// to catch (a tree edited without bumping the version), not for
-    /// reverting to an older release.
+    /// update never applies.
     Downgrade {
         recorded: semver::Version,
         source: semver::Version,
@@ -81,14 +65,13 @@ pub enum UpdateRefusal {
     InvalidRecordedVersion(String),
 }
 
-/// The Overview's decision table:
+/// The decision table:
 ///
-/// | record vs source | action |
+/// | record vs source | outcome |
 /// | --- | --- |
-/// | source newer | [`UpdateAction::Apply`] |
-/// | equal | [`UpdateRefusal::Equal`], naming `--force` |
-/// | equal, with `--force` | [`UpdateAction::ResyncOnly`] |
-/// | source older | [`UpdateRefusal::Downgrade`] — `--force` does not unlock it |
+/// | source newer | `Ok(())` — the update event |
+/// | equal | [`UpdateRefusal::Equal`] — there is nothing to update |
+/// | source older | [`UpdateRefusal::Downgrade`] |
 /// | no record at all | [`UpdateRefusal::NoRecord`] |
 ///
 /// `recorded` is the registry entry's own `app_version`, straight from the
@@ -99,17 +82,13 @@ pub enum UpdateRefusal {
 pub fn update_decision(
     recorded: Option<&str>,
     source: &semver::Version,
-    force: bool,
-) -> Result<UpdateAction, UpdateRefusal> {
+) -> Result<(), UpdateRefusal> {
     match lifecycle::lifecycle_decision(recorded, source) {
         Ok(LifecycleEvent::Install) => Err(UpdateRefusal::NoRecord),
-        Ok(LifecycleEvent::None) => match force {
-            true => Ok(UpdateAction::ResyncOnly),
-            false => Err(UpdateRefusal::Equal {
-                version: source.clone(),
-            }),
-        },
-        Ok(LifecycleEvent::Update) => Ok(UpdateAction::Apply),
+        Ok(LifecycleEvent::None) => Err(UpdateRefusal::Equal {
+            version: source.clone(),
+        }),
+        Ok(LifecycleEvent::Update) => Ok(()),
         Err(LifecycleDecisionError::Downgrade { recorded, current }) => {
             Err(UpdateRefusal::Downgrade {
                 recorded,
@@ -154,73 +133,12 @@ pub fn discard_tree(app_dir: &Path) {
     let _ = fs::remove_dir_all(lifecycle::previous_tree_path(app_dir));
 }
 
-/// The temporary sibling used while a forced equal-version resync replaces an
-/// app tree. It is deliberately not the `.previous` rollback anchor: a resync
-/// must leave that anchor alone.
-#[allow(dead_code)]
-fn resync_aside_path(app_dir: &Path) -> PathBuf {
-    let mut aside = app_dir.as_os_str().to_os_string();
-    aside.push(".resync-aside");
-    PathBuf::from(aside)
-}
-
-/// Move the current tree aside, copy its replacement, and put the current
-/// tree back if the copy fails. A stale aside can only be from an interrupted
-/// earlier resync, so the next resync clears it before creating its own.
-#[allow(dead_code)]
-fn resync_snapshot(source_root: &Path, app_dir: &Path) -> Result<(), UpdateError> {
-    let aside = resync_aside_path(app_dir);
-    remove_dir_if_present(&aside).map_err(|source| UpdateError::Io {
-        path: aside.clone(),
-        source,
-    })?;
-    fs::rename(app_dir, &aside).map_err(|source| UpdateError::Io {
-        path: app_dir.to_path_buf(),
-        source,
-    })?;
-
-    if let Err(error) = install::snapshot(source_root, app_dir) {
-        restore_resync_tree(app_dir)?;
-        return Err(UpdateError::Reverted {
-            detail: error.to_string(),
-            outcome: RevertOutcome::default(),
-        });
-    }
-
-    Ok(())
-}
-
-/// Discard the newly copied tree and restore the pre-resync one. This is the
-/// undo for [`resync_snapshot`] when Composer cannot finish the replacement.
-#[allow(dead_code)]
-fn restore_resync_tree(app_dir: &Path) -> Result<(), UpdateError> {
-    remove_dir_if_present(app_dir).map_err(|source| UpdateError::Io {
-        path: app_dir.to_path_buf(),
-        source,
-    })?;
-    let aside = resync_aside_path(app_dir);
-    fs::rename(&aside, app_dir).map_err(|source| UpdateError::Io {
-        path: aside,
-        source,
-    })
-}
-
-#[allow(dead_code)]
-fn discard_resync_aside(app_dir: &Path) -> Result<(), UpdateError> {
-    let aside = resync_aside_path(app_dir);
-    remove_dir_if_present(&aside).map_err(|source| UpdateError::Io {
-        path: aside,
-        source,
-    })
-}
-
 /// The whole command: update `id`, or say why not. Returns the process's
 /// exit code.
 pub fn run(
     id: &str,
     archive: Option<&Path>,
     reference: Option<&str>,
-    force: bool,
     assume_yes: bool,
     hub_version: &str,
 ) -> i32 {
@@ -232,15 +150,7 @@ pub fn run(
         }
     };
 
-    match update(
-        &paths,
-        id,
-        archive,
-        reference,
-        force,
-        assume_yes,
-        hub_version,
-    ) {
+    match update(&paths, id, archive, reference, assume_yes, hub_version) {
         Ok(true) => EXIT_OK,
         // Declining is not a failure of the command, but nothing changed
         // either — a script reading 0 would conclude it did.
@@ -254,7 +164,7 @@ pub fn run(
 
 /// The pipeline, in order (the plan's Overview): load the registry entry,
 /// re-resolve and validate its source, decide the event, guard the data
-/// directory, confirm, then apply or resync. `false` means the user declined.
+/// directory, confirm, then apply. `false` means the user declined.
 ///
 /// Takes its `Paths` rather than resolving them, matching `install::install`
 /// — what lets the whole pipeline run against a throwaway root in a test.
@@ -267,7 +177,6 @@ pub(crate) fn update(
     id: &str,
     archive: Option<&Path>,
     reference: Option<&str>,
-    force: bool,
     assume_yes: bool,
     hub_version: &str,
 ) -> Result<bool, UpdateError> {
@@ -282,7 +191,6 @@ pub(crate) fn update(
         id,
         archive,
         reference,
-        force,
         assume_yes,
         hub_version,
     );
@@ -302,7 +210,6 @@ fn update_into(
     id: &str,
     archive: Option<&Path>,
     reference: Option<&str>,
-    force: bool,
     assume_yes: bool,
     hub_version: &str,
 ) -> Result<bool, UpdateError> {
@@ -342,7 +249,7 @@ fn update_into(
     loaded.report_warnings();
     let manifest = &loaded.manifest;
 
-    let action = update_decision(Some(&entry.app_version), &app_version, force)
+    update_decision(Some(&entry.app_version), &app_version)
         .map_err(|refusal| UpdateError::refused(id, refusal))?;
 
     let data_dir = paths.app_data_dir(&entry.identifier)?;
@@ -354,29 +261,24 @@ fn update_into(
     let platform = platform::probe(&toolchain.frankenphp)?.fingerprint();
 
     let app_dir = paths.app_dir(id)?;
-    announce(id, &entry, manifest, &resolved, action);
+    announce(id, &entry, manifest, &resolved);
     if !prompt::confirmed(assume_yes) {
         println!("Aborted — nothing was changed.");
         return Ok(false);
     }
 
-    match action {
-        UpdateAction::Apply => apply(
-            paths,
-            &toolchain,
-            id,
-            &entry,
-            manifest,
-            &resolved,
-            &app_dir,
-            &data_dir,
-            platform,
-            hub_version,
-        )?,
-        UpdateAction::ResyncOnly => {
-            resync_only(paths, &toolchain, &entry, manifest, &resolved, &app_dir)?
-        }
-    }
+    apply(
+        paths,
+        &toolchain,
+        id,
+        &entry,
+        manifest,
+        &resolved,
+        &app_dir,
+        &data_dir,
+        platform,
+        hub_version,
+    )?;
 
     Ok(true)
 }
@@ -399,41 +301,22 @@ fn origin(source: &Source) -> Origin {
 
 /// Say what is about to happen, in the terms the user will have to reason
 /// about afterwards — `install::announce`'s counterpart for `update`.
-fn announce(
-    id: &str,
-    entry: &RegistryEntry,
-    manifest: &Manifest,
-    resolved: &source::Resolved,
-    action: UpdateAction,
-) {
+fn announce(id: &str, entry: &RegistryEntry, manifest: &Manifest, resolved: &source::Resolved) {
     println!(
         "Update {id}: {} -> {}",
         entry.app_version, manifest.app_version
     );
     println!("  source    {}", resolved.root.display());
-    match action {
-        UpdateAction::Apply => {
-            println!(
-                "  will run  pre-update, then post-update — its database is snapshotted \
-                 first, and put back if anything fails"
-            );
-            println!();
-            println!(
-                "This runs the app's own PHP on your machine: Composer's dependency\n\
-                 resolution, the scripts it fires, and the app's own update commands.\n\
-                 There is no sandbox — it is the same trust you give `composer require`."
-            );
-        }
-        UpdateAction::ResyncOnly => {
-            println!(
-                "  will run  composer install only — {id} is already recorded at {}. \
-                 --force re-syncs a source that changed without a version bump: no \
-                 lifecycle command runs, no database snapshot is taken, and the \
-                 existing rollback point (if any) is left alone.",
-                manifest.app_version
-            );
-        }
-    }
+    println!(
+        "  will run  pre-update, then post-update — its database is snapshotted \
+         first, and put back if anything fails"
+    );
+    println!();
+    println!(
+        "This runs the app's own PHP on your machine: Composer's dependency\n\
+         resolution, the scripts it fires, and the app's own update commands.\n\
+         There is no sandbox — it is the same trust you give `composer require`."
+    );
 }
 
 /// The update event: snapshot the database, retain the outgoing tree, copy
@@ -586,10 +469,10 @@ fn transaction_error(error: update_transaction::JournalError) -> UpdateError {
 }
 
 /// The one error a failure past `RegistryCommitted` can produce: the update
-/// or resync itself already happened, only its rollback-point promotion did
-/// not finish in this process. `repair <id>` is what finishes it — nothing
-/// here is reverted, per the Overview's argument that nothing durable is
-/// left to fail in that sense once the registry names the new version.
+/// itself already happened, only its rollback-point promotion did not finish
+/// in this process. `repair <id>` is what finishes it — nothing here is
+/// reverted, per the Overview's argument that nothing durable is left to
+/// fail in that sense once the registry names the new version.
 fn committed_needs_repair(id: &str, version: &str, error: impl std::fmt::Display) -> UpdateError {
     UpdateError::CommittedNeedsRepair {
         id: id.to_string(),
@@ -638,22 +521,21 @@ pub(crate) fn recover_transaction(
         transaction.phase,
         Phase::TreeRetained | Phase::ReplacementInstalled | Phase::LifecycleComplete
     );
-    let snapshot_is_authoritative = transaction.kind == TransactionKind::Apply
-        && matches!(
-            transaction.phase,
-            Phase::SnapshotComplete
-                | Phase::TreeRetained
-                | Phase::ReplacementInstalled
-                | Phase::LifecycleComplete
-        );
+    let snapshot_is_authoritative = matches!(
+        transaction.phase,
+        Phase::SnapshotComplete
+            | Phase::TreeRetained
+            | Phase::ReplacementInstalled
+            | Phase::LifecycleComplete
+    );
 
     // `retain_tree`'s rename is the one mutation that can have happened
-    // without yet being durable at these two phases (`apply`/`resync_only`
-    // write `Prepared` before it, `SnapshotComplete` — Apply only — right
-    // before it too). What it did is visible on disk: `app_dir` is either
-    // still there (the rename never ran) or it is not (it ran and the
-    // journal did not catch up). Never inferred as a phase, only observed as
-    // the one step this phase allows next.
+    // without yet being durable at these two phases (`apply` writes
+    // `Prepared` before it, `SnapshotComplete` right before it too). What it
+    // did is visible on disk: `app_dir` is either still there (the rename
+    // never ran) or it is not (it ran and the journal did not catch up).
+    // Never inferred as a phase, only observed as the one step this phase
+    // allows next.
     if matches!(transaction.phase, Phase::Prepared | Phase::SnapshotComplete) {
         let staged = update_transaction::staged_tree_path(app_dir);
         match (app_dir.is_dir(), staged.is_dir()) {
@@ -742,14 +624,12 @@ pub(crate) fn recover_transaction(
             lifecycle::cache_stamp_path(&data_subdir),
             lifecycle::discard_cache_stamp(&data_subdir),
         );
-        if transaction.kind == TransactionKind::Apply {
-            outcome.record(
-                "data version rewrite",
-                lifecycle::data_config_path(&data_subdir),
-                lifecycle::write_data_version(&data_subdir, &transaction.outgoing.app_version)
-                    .map_err(lifecycle_error_io),
-            );
-        }
+        outcome.record(
+            "data version rewrite",
+            lifecycle::data_config_path(&data_subdir),
+            lifecycle::write_data_version(&data_subdir, &transaction.outgoing.app_version)
+                .map_err(lifecycle_error_io),
+        );
         outcome.record(
             "registry entry restore",
             paths.registry_path(),
@@ -777,11 +657,10 @@ pub(crate) fn recover_transaction(
 
 /// `RegistryCommitted`'s recovery: the update itself already happened — the
 /// registry names the new version — so there is nothing left to decide, only
-/// the anchor promotion to finish. `Apply` replays [`update_transaction::finalise_anchor`];
-/// `ResyncOnly`, which promotes no anchor, replays its own
-/// [`update_transaction::discard_tree`]. Both are idempotent, so a kill during
-/// this very completion is itself safe to retry. Every step is reported the
-/// same path-by-path way the outgoing revert above is.
+/// the anchor promotion to finish. [`update_transaction::finalise_anchor`]
+/// is idempotent, so a kill during this very completion is itself safe to
+/// retry. Every step is reported the same path-by-path way the outgoing
+/// revert above is.
 fn complete_forward(
     paths: &Paths,
     data_dir: &Path,
@@ -791,28 +670,17 @@ fn complete_forward(
     let mut outcome = RevertOutcome::default();
     let data_subdir = data_dir.join("data");
 
-    match transaction.kind {
-        TransactionKind::Apply => {
-            outcome.record(
-                "anchor finalisation",
-                app_dir.to_path_buf(),
-                update_transaction::finalise_anchor(
-                    &data_subdir,
-                    data_dir,
-                    app_dir,
-                    &transaction.outgoing,
-                    &transaction.database_members,
-                ),
-            );
-        }
-        TransactionKind::ResyncOnly => {
-            outcome.record(
-                "staged tree discard",
-                update_transaction::staged_tree_path(app_dir),
-                update_transaction::discard_tree(app_dir),
-            );
-        }
-    }
+    outcome.record(
+        "anchor finalisation",
+        app_dir.to_path_buf(),
+        update_transaction::finalise_anchor(
+            &data_subdir,
+            data_dir,
+            app_dir,
+            &transaction.outgoing,
+            &transaction.database_members,
+        ),
+    );
     if !outcome.is_complete() {
         return outcome;
     }
@@ -955,128 +823,6 @@ fn lifecycle_error_io(error: LifecycleError) -> io::Error {
     io::Error::other(error.to_string())
 }
 
-/// `--force` on an equal record: move the current tree aside, re-copy the
-/// source and re-run its dependency install, then discard the aside. No hooks,
-/// database snapshot or anchor rotation — the existing rollback point, if any,
-/// is left exactly as it was. A copy or Composer failure restores the aside;
-/// only a later registry-write failure keeps the healthy replacement tree.
-fn resync_only(
-    paths: &Paths,
-    toolchain: &php::Toolchain,
-    entry: &RegistryEntry,
-    manifest: &Manifest,
-    resolved: &source::Resolved,
-    app_dir: &Path,
-) -> Result<(), UpdateError> {
-    let state_root = paths.create_app_data_dir(&entry.identifier)?;
-    let mut transaction = Journal::prepared(TransactionKind::ResyncOnly, entry.clone());
-    update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
-    // A resync uses the transaction sibling, never `.previous`: its existing
-    // public rollback anchor remains untouched until this attempt is known good.
-    update_transaction::retain_tree(app_dir).map_err(|source| UpdateError::Io {
-        path: app_dir.to_path_buf(),
-        source,
-    })?;
-    stop_at("tree_retained")?;
-    transaction.advance(Phase::TreeRetained);
-    update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
-    if let Err(error) = install::snapshot(&resolved.root, app_dir) {
-        return Err(recover_after_failure(
-            paths,
-            &state_root,
-            app_dir,
-            &transaction,
-            error,
-        ));
-    }
-    stop_at("replacement_installed")?;
-    transaction.advance(Phase::ReplacementInstalled);
-    update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
-    let environment = app_env::resolve(
-        manifest,
-        app_dir,
-        &entry.identifier,
-        &state_root,
-        app_env::Mode::Install,
-        // No window is built by an update either — see install.rs's own
-        // call.
-        false,
-    )?;
-    if let Err(error) = toolchain.composer_install(app_dir, &environment.vars) {
-        return Err(recover_after_failure(
-            paths,
-            &state_root,
-            app_dir,
-            &transaction,
-            error,
-        ));
-    }
-
-    // A forced equal-version resync replaces the tree without changing any of
-    // the fields a cache stamp compares. Keeping that stamp would let the next
-    // launch reuse a container compiled from the tree just moved aside.
-    let data_subdir = state_root.join("data");
-    if let Err(error) = lifecycle::discard_cache_stamp(&data_subdir) {
-        return Err(recover_after_failure(
-            paths,
-            &state_root,
-            app_dir,
-            &transaction,
-            error,
-        ));
-    }
-
-    let now = registry::now_timestamp();
-    // Do not restore the aside if this write fails: the new tree and its
-    // dependencies are healthy and already serving the resolved source. The
-    // old revision only causes a later `--force` to repeat this safe resync.
-    if let Err(error) = registry::update(paths, |registry| {
-        if let Some(existing) = registry.get_mut(&entry.id) {
-            existing.source_revision = resolved.revision.clone();
-            // Same reasoning as `apply`'s own registry write: a resync
-            // re-resolved the source too, and its `Source` — not only its
-            // revision — is what has to be recorded.
-            existing.source = resolved.source.clone();
-            existing.updated_at = now;
-        }
-    }) {
-        return Err(recover_after_failure(
-            paths,
-            &state_root,
-            app_dir,
-            &transaction,
-            error,
-        ));
-    }
-    stop_at("registry_committed")?;
-    transaction.advance(Phase::RegistryCommitted);
-    update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
-    // The resync itself is now committed — the registry names the resolved
-    // revision. As in `apply`, nothing past this point is reverted; a
-    // failure is reported for `repair` to finish.
-    update_transaction::discard_tree(app_dir)
-        .map_err(|error| committed_needs_repair(&entry.id, &manifest.app_version, error))?;
-    stop_at("anchor_finalised")?;
-    transaction.advance(Phase::AnchorFinalised);
-    update_transaction::write(&state_root, &transaction)
-        .map_err(|error| committed_needs_repair(&entry.id, &manifest.app_version, error))?;
-    stop_at("journal_discarded")?;
-    update_transaction::discard(&state_root)
-        .map_err(|error| committed_needs_repair(&entry.id, &manifest.app_version, error))?;
-
-    // The same last step `apply` ends with, for the same reason: a resync
-    // re-snapshots the tree, and the manifest it lands can change
-    // `product_name` or `icon_path` — or, with `file_associations`, the
-    // MIME types the entry advertises to the desktop. Leaving the old
-    // entry standing would keep advertising a declaration the new tree no
-    // longer carries; best-effort here too, because the resync itself has
-    // already succeeded.
-    install::write_desktop_entry(paths, &entry.id, manifest, app_dir);
-
-    println!("Resynced {} from {}.", entry.id, resolved.root.display());
-    Ok(())
-}
-
 /// Explicitly recover an update that was interrupted after its journal became
 /// durable.  Normal commands deliberately never call this: choosing to put
 /// the old version back is a user-visible decision.
@@ -1131,7 +877,7 @@ pub(crate) fn repair_at(paths: &Paths, id: &str, assume_yes: bool) -> Result<boo
         });
     }
     let app_dir = paths.app_dir(id)?;
-    // From `RegistryCommitted` on, the update or resync already happened —
+    // From `RegistryCommitted` on, the update already happened —
     // `entry.app_version` already names it — and repair only finishes the
     // rollback-point promotion; before it, repair reverts to the outgoing
     // version instead (the Overview's reopened forward-completion decision).
@@ -1144,16 +890,8 @@ pub(crate) fn repair_at(paths: &Paths, id: &str, assume_yes: bool) -> Result<boo
             "Repairing {id}: this finishes the update to {}: records {} as its rollback point.",
             entry.app_version, journal.outgoing.app_version
         ),
-        (true, TransactionKind::ResyncOnly) => println!(
-            "Repairing {id}: this finishes the re-sync to {}.",
-            entry.app_version
-        ),
-        (false, kind) => println!(
-            "Repairing {id}: this restores the interrupted {} attempt to {}.",
-            match kind {
-                TransactionKind::Apply => "update",
-                TransactionKind::ResyncOnly => "re-sync",
-            },
+        (false, TransactionKind::Apply) => println!(
+            "Repairing {id}: this restores the interrupted update attempt to {}.",
             journal.outgoing.app_version
         ),
     }
@@ -1176,12 +914,6 @@ pub(crate) fn repair_at(paths: &Paths, id: &str, assume_yes: bool) -> Result<boo
         (true, TransactionKind::Apply) => {
             println!(
                 "Repaired {id}: finished the update to {}.",
-                entry.app_version
-            )
-        }
-        (true, TransactionKind::ResyncOnly) => {
-            println!(
-                "Repaired {id}: finished the re-sync to {}.",
                 entry.app_version
             )
         }
@@ -1281,9 +1013,9 @@ pub enum UpdateError {
     JournalMismatch {
         path: PathBuf,
     },
-    /// The update or resync is already committed — the registry names the
-    /// new version — but its rollback-point promotion failed in this same
-    /// process. Never reverted; `repair <id>` finishes it.
+    /// The update is already committed — the registry names the new version —
+    /// but its rollback-point promotion failed in this same process. Never
+    /// reverted; `repair <id>` finishes it.
     CommittedNeedsRepair {
         id: String,
         version: String,
@@ -1385,9 +1117,7 @@ impl fmt::Display for UpdateError {
             ),
             Self::Equal { id, version } => write!(
                 formatter,
-                "{id} is already at version {version} — nothing to update. Pass --force to \
-                 re-sync its code and dependencies anyway, for a source that changed \
-                 without a version bump."
+                "{id} is already at version {version} — nothing to update."
             ),
             Self::Downgrade {
                 id,
@@ -1397,8 +1127,7 @@ impl fmt::Display for UpdateError {
                 formatter,
                 "{id}'s resolved source is version {source}, older than the {recorded} \
                  already recorded for it — that would be a downgrade, and update does not \
-                 apply one. --force does not unlock this: it is for a tree edited without \
-                 bumping the version, not for going backwards."
+                 apply one."
             ),
             Self::InvalidRecordedVersion { id, detail } => write!(
                 formatter,
@@ -1521,8 +1250,8 @@ pub(crate) mod test_stop {
         static POINT: Cell<Option<&'static str>> = const { Cell::new(None) };
     }
 
-    /// Arm the named boundary for the next `apply`/`resync_only` call on this
-    /// thread. Names match the ones passed to `stop_at` in this module.
+    /// Arm the named boundary for the next `apply` call on this thread.
+    /// Names match the ones passed to `stop_at` in this module.
     pub(crate) fn arm(point: &'static str) {
         POINT.with(|cell| cell.set(Some(point)));
     }

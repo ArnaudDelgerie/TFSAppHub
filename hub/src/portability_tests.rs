@@ -900,7 +900,7 @@ fn exported_backup_refuses_install_and_update_before_mutation() {
     assert!(!paths.app_dir("backup-copy").unwrap().exists());
 
     let update_error =
-        update::update(&paths, "demo", Some(&backup), None, false, true, "0.1.0").unwrap_err();
+        update::update(&paths, "demo", Some(&backup), None, true, "0.1.0").unwrap_err();
     assert!(
         update_error.to_string().contains("tfsapp-hub import <id>"),
         "{update_error}"

@@ -38,7 +38,6 @@ fn stop_at(_point: &'static str) -> io::Result<()> {
 #[serde(rename_all = "snake_case")]
 pub enum TransactionKind {
     Apply,
-    ResyncOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

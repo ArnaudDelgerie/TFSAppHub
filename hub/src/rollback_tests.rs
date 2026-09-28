@@ -230,7 +230,7 @@ fn a_successful_update_can_be_rolled_back_end_to_end() {
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
     let second = crate::test_release::release_of(source.path(), release.path());
-    crate::update::update(&paths, "demo", Some(&second), None, false, true, "0.1.0")
+    crate::update::update(&paths, "demo", Some(&second), None, true, "0.1.0")
         .expect("the update applies");
 
     // Data written after the update, which the rollback must set aside
@@ -324,7 +324,7 @@ fn a_rollback_leaves_a_stale_cache_stamp_that_mismatches_the_restored_version() 
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
     let second = crate::test_release::release_of(source.path(), release.path());
-    crate::update::update(&paths, "demo", Some(&second), None, false, true, "0.1.0")
+    crate::update::update(&paths, "demo", Some(&second), None, true, "0.1.0")
         .expect("the update applies");
 
     assert!(rollback(&paths, "demo", true).expect("it rolls back"));
@@ -399,7 +399,7 @@ fn updated_for_rollback_stop() -> (tempfile::TempDir, Paths, PathBuf) {
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
     let second = crate::test_release::release_of(source.path(), release.path());
-    crate::update::update(&paths, "demo", Some(&second), None, false, true, "0.1.0")
+    crate::update::update(&paths, "demo", Some(&second), None, true, "0.1.0")
         .expect("the update applies");
 
     // Data written after the update, which the rollback must set aside
@@ -542,9 +542,7 @@ fn rollback_after_forge_to_archive_keeps_archive_source_kind() {
     fs::write(data_dir.join("app.db"), b"pre-update-bytes").unwrap();
     runnable_app_tree(source.path(), "0.7.0", "{}");
     let archive = crate::test_release::release_of(source.path(), release.path());
-    assert!(
-        crate::update::update(&paths, "demo", Some(&archive), None, false, true, "0.1.0").unwrap()
-    );
+    assert!(crate::update::update(&paths, "demo", Some(&archive), None, true, "0.1.0").unwrap());
     assert!(rollback(&paths, "demo", true).unwrap());
     let entry = registry::load(&paths).unwrap().get("demo").unwrap().clone();
     assert_eq!(entry.app_version, "0.6.0");
