@@ -47,11 +47,15 @@ check:
 	shellcheck build/scripts/*.sh build/scripts/tests/*.sh
 	build/scripts/tests/release-chain.sh
 
-# The deliberately explicit production-backend smoke check. It alone starts
+# The deliberately explicit production-backend smoke checks. This alone starts
 # the repository-owned private D-Bus session and throwaway Secret Service; the
-# ordinary `check` target must never invoke this harness.
+# ordinary `check` target must never invoke this harness. The filter runs both
+# ignored production tests — the round trip, and the frozen-service test that
+# SIGSTOPs the harness's own daemon (the PID the harness exports) and expects
+# the deadline to answer. One test thread, so the stopped daemon cannot stall
+# the round-trip test behind it.
 keyring-integration:
-	build/scripts/run-tests.sh -p tfsapp-hub secrets::tests::production_keyring_round_trip -- --ignored --exact
+	build/scripts/run-tests.sh -p tfsapp-hub secrets::tests::production_keyring_ -- --ignored --test-threads=1
 
 # The hub's own TFSAppHub_<version>_amd64.AppImage under
 # target/release/bundle/appimage/ (the workspace's shared target/, not

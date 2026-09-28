@@ -28,7 +28,7 @@ use tiny_http::{Header, Method, Response, StatusCode};
 
 use crate::secrets::{
     secret_key_allowed, secret_list_entries, secrets_delete, secrets_get, secrets_has, secrets_set,
-    SecretStore, MAX_SECRET_VALUE_BYTES,
+    storage_failed, SecretStore, MAX_SECRET_VALUE_BYTES,
 };
 
 /// A transport-level cap on the whole body, independent of the per-value one: a
@@ -166,10 +166,18 @@ fn handle_request(
             respond(request, 200, &body);
         }
 
-        (Method::Get, "/secrets/keys") => {
-            let entries = secret_list_entries(store, keys);
-            respond(request, 200, &json!({"keys": entries}));
-        }
+        // A store failure is `500 storage_failed`, checked last: every
+        // refusal the route can answer without touching the store — a
+        // declined group, an undeclared key, an oversized value — stays in
+        // front of it, and `storage_failed` writes the one warning line both
+        // transports share.
+        (Method::Get, "/secrets/keys") => match secret_list_entries(store, keys) {
+            Ok(entries) => respond(request, 200, &json!({"keys": entries})),
+            Err(error) => {
+                let code = storage_failed(&error);
+                respond(request, 500, &json!({"error": code}))
+            }
+        },
 
         (Method::Post, "/secrets/has") => match read_body::<KeyRequest>(&mut request) {
             Ok(body) => {
@@ -177,8 +185,13 @@ fn handle_request(
                     respond(request, 403, &json!({"error": "key_not_declared"}));
                     return;
                 }
-                let has = secrets_has(store, &body.key);
-                respond(request, 200, &json!({"has": has}));
+                match secrets_has(store, &body.key) {
+                    Ok(has) => respond(request, 200, &json!({"has": has})),
+                    Err(error) => {
+                        let code = storage_failed(&error);
+                        respond(request, 500, &json!({"error": code}))
+                    }
+                }
             }
             Err(error) => respond(request, error.status(), &error.body()),
         },
@@ -190,8 +203,14 @@ fn handle_request(
                     return;
                 }
                 match secrets_get(store, &body.key) {
-                    Some(value) => respond(request, 200, &json!({"value": value})),
-                    None => respond(request, 404, &json!({"error": "not_found"})),
+                    Ok(Some(value)) => respond(request, 200, &json!({"value": value})),
+                    // `Ok(None)` only: a key that was never set, never a
+                    // store that could not say.
+                    Ok(None) => respond(request, 404, &json!({"error": "not_found"})),
+                    Err(error) => {
+                        let code = storage_failed(&error);
+                        respond(request, 500, &json!({"error": code}))
+                    }
                 }
             }
             Err(error) => respond(request, error.status(), &error.body()),
@@ -207,8 +226,13 @@ fn handle_request(
                     respond(request, 413, &json!({"error": "value_too_large"}));
                     return;
                 }
-                secrets_set(store, &body.key, body.value);
-                respond(request, 200, &json!({"ok": true}));
+                match secrets_set(store, &body.key, body.value) {
+                    Ok(()) => respond(request, 200, &json!({"ok": true})),
+                    Err(error) => {
+                        let code = storage_failed(&error);
+                        respond(request, 500, &json!({"error": code}))
+                    }
+                }
             }
             Err(error) => respond(request, error.status(), &error.body()),
         },
@@ -219,8 +243,13 @@ fn handle_request(
                     respond(request, 403, &json!({"error": "key_not_declared"}));
                     return;
                 }
-                let existed = secrets_delete(store, &body.key);
-                respond(request, 200, &json!({"ok": existed}));
+                match secrets_delete(store, &body.key) {
+                    Ok(existed) => respond(request, 200, &json!({"ok": existed})),
+                    Err(error) => {
+                        let code = storage_failed(&error);
+                        respond(request, 500, &json!({"error": code}))
+                    }
+                }
             }
             Err(error) => respond(request, error.status(), &error.body()),
         },

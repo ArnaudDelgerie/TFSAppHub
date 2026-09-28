@@ -172,7 +172,7 @@ fn execute_with_keyring<F>(
     delete_keyring_account: F,
 ) -> Result<(), RemoveError>
 where
-    F: Fn(&str, &str) -> bool,
+    F: Fn(&str, &str) -> Result<&'static str, crate::secrets::StorageError>,
 {
     if let Some(id) = &plan.id {
         // The entry goes first, under the registry's own lock. An app whose
@@ -212,14 +212,8 @@ where
         report("data dir", remove_directory(&plan.data_dir));
         report("WebKit data dir", remove_directory(&plan.webkit_data_dir));
         for account in &plan.keyring_accounts {
-            let removed = delete_keyring_account(&plan.identifier, account);
-            println!(
-                "  keyring[{account}]: {}",
-                match removed {
-                    true => "removed",
-                    false => "already clean",
-                }
-            );
+            let outcome = delete_keyring_account(&plan.identifier, account);
+            report(&format!("keyring[{account}]"), outcome);
         }
     } else {
         // Only reached by a retaining `remove` (plan_orphan's own subject
@@ -300,7 +294,7 @@ fn purge_identifier_with_keyring<F>(
     delete_keyring_account: F,
 ) -> Result<bool, RemoveError>
 where
-    F: Fn(&str, &str) -> bool,
+    F: Fn(&str, &str) -> Result<&'static str, crate::secrets::StorageError>,
 {
     // Refusal 0: these names identify infrastructure, never orphaned app data.
     if paths::is_reserved_identifier(identifier) {
@@ -776,12 +770,25 @@ fn report<E: fmt::Display>(label: &str, outcome: Result<&'static str, E>) {
 }
 
 /// Delete one account from the OS keyring, keyed by the app's `identifier` as
-/// the station's store keys it. `false` covers both "there was nothing" and "the
-/// backend would not confirm", which are the same outcome here.
-fn delete_keyring_account(identifier: &str, account: &str) -> bool {
-    keyring::Entry::new(identifier, account)
-        .map(|entry| entry.delete_credential().is_ok())
-        .unwrap_or(false)
+/// the station's store keys it. `Ok("already clean")` is the keyring's plain
+/// absence; any other failure — a backend that refuses, or one that does not
+/// answer within the deadline — is an `Err`, which `report` prints as
+/// `FAILED (<cause>)` exactly like a directory that cannot be removed. The
+/// command's own outcome is unchanged either way.
+fn delete_keyring_account(
+    identifier: &str,
+    account: &str,
+) -> Result<&'static str, crate::secrets::StorageError> {
+    let service = identifier.to_string();
+    let account = account.to_string();
+    match crate::secrets::with_deadline(crate::secrets::KEYRING_DEADLINE, move || {
+        keyring::Entry::new(&service, &account).and_then(|entry| entry.delete_credential())
+    }) {
+        Some(Ok(())) => Ok("removed"),
+        Some(Err(keyring::Error::NoEntry)) => Ok("already clean"),
+        Some(Err(error)) => Err(crate::secrets::StorageError::Keyring(error)),
+        None => Err(crate::secrets::StorageError::TimedOut),
+    }
 }
 
 #[derive(Debug)]

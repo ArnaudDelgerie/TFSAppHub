@@ -30,7 +30,8 @@ fn bridge_with_close_guards(
     close_guards: &crate::close_guard::SharedCloseGuards,
 ) -> Bridge {
     let store = new_fake_keyring_store();
-    crate::secrets::secrets_set(&store, "openai", "sk-stored".to_string());
+    crate::secrets::secrets_set(&store, "openai", "sk-stored".to_string())
+        .expect("the store accepts the write");
     start(
         store,
         keys.iter().map(|key| key.to_string()).collect(),
@@ -43,6 +44,35 @@ fn bridge_with_close_guards(
 
 fn fresh_close_guards() -> crate::close_guard::SharedCloseGuards {
     std::sync::Arc::new(crate::close_guard::CloseGuardState::new())
+}
+
+/// A bridge whose store fails every operation — the shape every
+/// `storage_failed` assertion drives, without needing a broken D-Bus.
+fn failing_bridge(keys: &[&str]) -> Bridge {
+    stalled_or_failing_bridge(keys, false)
+}
+
+/// A bridge whose store never answers — the frozen-Secret-Service shape,
+/// under the shortened test deadline, so the wedged request costs ~100 ms.
+fn stalled_bridge(keys: &[&str]) -> Bridge {
+    stalled_or_failing_bridge(keys, true)
+}
+
+fn stalled_or_failing_bridge(keys: &[&str], stalled: bool) -> Bridge {
+    let keyring = crate::secrets::new_fake_keyring();
+    let store = if stalled {
+        keyring.stalled_store("test.tfsapp-hub")
+    } else {
+        keyring.failing_store("test.tfsapp-hub")
+    };
+    start(
+        store,
+        keys.iter().map(|key| key.to_string()).collect(),
+        BOTH,
+        Context::Dev,
+        fresh_close_guards(),
+    )
+    .expect("a started bridge")
 }
 
 /// A release source pointing at `cache_path`, the shape `/update/check`
@@ -206,6 +236,107 @@ fn a_reserved_key_is_refused_even_though_the_app_declared_it() {
     );
 
     assert_eq!(answer.status, 403);
+}
+
+#[test]
+fn every_secret_route_answers_storage_failed_when_the_store_fails() {
+    let bridge = failing_bridge(&["openai"]);
+    let token = bridge.token.clone();
+
+    let keys = request(&bridge, "GET", "/secrets/keys", Some(&token), "");
+    assert_eq!(keys.status, 500);
+    assert_eq!(keys.json()["error"], "storage_failed");
+
+    let has = request(
+        &bridge,
+        "POST",
+        "/secrets/has",
+        Some(&token),
+        r#"{"key":"openai"}"#,
+    );
+    assert_eq!(has.status, 500);
+    assert_eq!(has.json()["error"], "storage_failed");
+
+    let get = request(
+        &bridge,
+        "POST",
+        "/secrets/get",
+        Some(&token),
+        r#"{"key":"openai"}"#,
+    );
+    assert_eq!(get.status, 500);
+    assert_eq!(get.json()["error"], "storage_failed");
+
+    // Neither is answered 200 any more: a write the backend refused is not a
+    // success the next launch disproves, and a delete that failed leaves the
+    // key to be assumed still there.
+    let set = request(
+        &bridge,
+        "POST",
+        "/secrets/set",
+        Some(&token),
+        r#"{"key":"openai","value":"sk-new"}"#,
+    );
+    assert_eq!(set.status, 500);
+    assert_eq!(set.json()["error"], "storage_failed");
+
+    let deleted = request(
+        &bridge,
+        "POST",
+        "/secrets/delete",
+        Some(&token),
+        r#"{"key":"openai"}"#,
+    );
+    assert_eq!(deleted.status, 500);
+    assert_eq!(deleted.json()["error"], "storage_failed");
+}
+
+#[test]
+fn a_stalled_store_answers_storage_failed_over_the_bridge() {
+    // The frozen-Secret-Service shape: the request is answered after the
+    // deadline, as `storage_failed` — never held open forever.
+    let bridge = stalled_bridge(&["openai"]);
+    let token = bridge.token.clone();
+
+    let answer = request(
+        &bridge,
+        "POST",
+        "/secrets/get",
+        Some(&token),
+        r#"{"key":"openai"}"#,
+    );
+
+    assert_eq!(answer.status, 500);
+    assert_eq!(answer.json()["error"], "storage_failed");
+}
+
+#[test]
+fn a_store_failure_is_answered_after_every_other_refusal() {
+    let bridge = failing_bridge(&["openai"]);
+    let token = bridge.token.clone();
+
+    let undeclared = request(
+        &bridge,
+        "POST",
+        "/secrets/get",
+        Some(&token),
+        r#"{"key":"anthropic"}"#,
+    );
+    assert_eq!(undeclared.status, 403);
+    assert_eq!(undeclared.json()["error"], "key_not_declared");
+
+    let too_large = request(
+        &bridge,
+        "POST",
+        "/secrets/set",
+        Some(&token),
+        &format!(
+            r#"{{"key":"openai","value":"{}"}}"#,
+            "x".repeat(crate::secrets::MAX_SECRET_VALUE_BYTES + 1)
+        ),
+    );
+    assert_eq!(too_large.status, 413);
+    assert_eq!(too_large.json()["error"], "value_too_large");
 }
 
 #[test]

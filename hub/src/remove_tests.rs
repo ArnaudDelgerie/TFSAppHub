@@ -637,21 +637,54 @@ fn a_purge_with_a_note_deletes_the_declared_accounts() {
 
     let keyring = new_fake_keyring();
     let store = keyring.store(ORPHAN_IDENTIFIER);
-    secrets_set(&store, "openai", "secret".to_string());
-    secrets_set(&store, "undeclared", "keep".to_string());
+    secrets_set(&store, "openai", "secret".to_string()).expect("the store accepts the write");
+    secrets_set(&store, "undeclared", "keep".to_string()).expect("the store accepts the write");
 
     assert!(
         purge_identifier_with_keyring(&paths, ORPHAN_IDENTIFIER, true, |service, account| {
-            crate::secrets::secrets_delete(&keyring.store(service), account)
+            crate::secrets::secrets_delete(&keyring.store(service), account).map(|existed| {
+                if existed {
+                    "removed"
+                } else {
+                    "already clean"
+                }
+            })
         })
         .expect("it purges")
     );
 
     assert!(
-        secrets_get(&store, "openai").is_none(),
+        secrets_get(&store, "openai")
+            .expect("the store answers")
+            .is_none(),
         "the account this note declared must be gone"
     );
-    assert_eq!(secrets_get(&store, "undeclared").as_deref(), Some("keep"));
+    assert_eq!(
+        secrets_get(&store, "undeclared")
+            .expect("the store answers")
+            .as_deref(),
+        Some("keep")
+    );
+}
+
+#[test]
+fn a_failed_keyring_delete_is_reported_and_does_not_fail_the_purge() {
+    // `report()` prints `FAILED (<cause>)` for a keyring delete that fails or
+    // times out, the same way it does for a directory that cannot be removed
+    // — never "already clean". What this test can observe is the part plan
+    // 068 keeps in scope: the failure is not swallowed into a success, and
+    // the purge's own outcome is unchanged.
+    let (_base, paths) = temp_paths();
+    let data_dir = paths.app_data_dir(ORPHAN_IDENTIFIER).expect("a data dir");
+    fs::create_dir_all(data_dir.join("data")).expect("an orphan data dir");
+    write_keyring_note(&data_dir, &["openai".to_string()]).expect("a note is written");
+
+    assert!(
+        purge_identifier_with_keyring(&paths, ORPHAN_IDENTIFIER, true, |_, _| {
+            Err(crate::secrets::fake_keyring_failure())
+        })
+        .expect("it purges")
+    );
 }
 
 /// Registry fixtures, kept out of the tests above so they read as what they are

@@ -1,15 +1,36 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    sync::{Arc, Barrier},
+    time::{Duration, Instant},
+};
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 use super::{
-    is_keyring, keys_for_window, new_fake_keyring_store, new_file_store_for_test, new_store,
-    resolve_app_secret, secret_key_allowed, secrets_delete, secrets_get, secrets_has, secrets_set,
-    store_for_window, APP_SECRET_ACCOUNT, PROBE_ACCOUNT,
+    is_keyring, keys_for_window, new_fake_keyring, new_fake_keyring_store, new_file_store_for_test,
+    new_store, new_store_with, resolve_app_secret, secret_delete_for_window, secret_get_for_window,
+    secret_has_for_window, secret_key_allowed, secret_list_for_window, secret_set_for_window,
+    secrets_delete, secrets_get, secrets_has, secrets_set, store_for_window, with_deadline,
+    StorageError, APP_SECRET_ACCOUNT, PROBE_ACCOUNT, TEST_KEYRING_DEADLINE,
 };
 
 fn file_store(directory: &Path) -> super::SecretStore {
     new_file_store_for_test(directory.join("secrets.json"))
+}
+
+/// Make a directory read-only. Pair it with [`writable`] right after the
+/// operation under test, before any assertion: the tempdir's own cleanup needs
+/// the write bit back before it can unlink anything inside.
+fn read_only(directory: &Path) {
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o500))
+        .expect("the directory permissions change");
+}
+
+fn writable(directory: &Path) {
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        .expect("the directory permissions change");
 }
 
 // --- the file fallback ---------------------------------------------------
@@ -19,28 +40,35 @@ fn the_file_backend_round_trips() {
     let directory = tempfile::tempdir().expect("a temp dir");
     let store = file_store(directory.path());
 
-    assert!(!secrets_has(&store, "openai"));
-    assert_eq!(secrets_get(&store, "openai"), None);
+    assert!(!secrets_has(&store, "openai").expect("the store answers"));
+    assert_eq!(
+        secrets_get(&store, "openai").expect("the store answers"),
+        None
+    );
 
-    secrets_set(&store, "openai", "sk-test".to_string());
-    assert!(secrets_has(&store, "openai"));
-    assert_eq!(secrets_get(&store, "openai"), Some("sk-test".to_string()));
+    secrets_set(&store, "openai", "sk-test".to_string()).expect("the store accepts the write");
+    assert!(secrets_has(&store, "openai").expect("the store answers"));
+    assert_eq!(
+        secrets_get(&store, "openai").expect("the store answers"),
+        Some("sk-test".to_string())
+    );
 
-    assert!(secrets_delete(&store, "openai"));
-    assert!(!secrets_has(&store, "openai"));
+    assert!(secrets_delete(&store, "openai").expect("the store answers"));
+    assert!(!secrets_has(&store, "openai").expect("the store answers"));
 }
 
 #[test]
 fn deleting_a_key_that_was_never_there_is_false_not_a_panic() {
     let directory = tempfile::tempdir().expect("a temp dir");
 
-    assert!(!secrets_delete(&file_store(directory.path()), "never-set"));
+    assert!(!secrets_delete(&file_store(directory.path()), "never-set").expect("the store answers"));
 }
 
 #[test]
 fn the_fallback_file_is_0600() {
     let directory = tempfile::tempdir().expect("a temp dir");
-    secrets_set(&file_store(directory.path()), "openai", "sk-test".into());
+    secrets_set(&file_store(directory.path()), "openai", "sk-test".into())
+        .expect("the store accepts the write");
 
     // The whole point of the fallback is that it is plaintext, so the file's
     // own permissions are the only thing left protecting it.
@@ -49,14 +77,146 @@ fn the_fallback_file_is_0600() {
 }
 
 #[test]
-fn an_unreadable_store_file_reads_as_empty_rather_than_panicking() {
+fn a_store_under_a_read_only_directory_reports_the_failed_set() {
     let directory = tempfile::tempdir().expect("a temp dir");
-    fs::write(directory.path().join("secrets.json"), "{ not json").expect("a broken store");
+    let store = file_store(directory.path());
+    read_only(directory.path());
 
-    assert!(!secrets_has(&file_store(directory.path()), "openai"));
+    let outcome = secrets_set(&store, "openai", "sk-test".to_string());
+    writable(directory.path());
+
+    // The one regression audit 024 named: a write the backend refused must
+    // not be answered as a success the next launch disproves.
+    assert!(outcome.is_err(), "a set under a read-only dir must fail");
+    assert_eq!(
+        secrets_get(&store, "openai").expect("the store answers"),
+        None
+    );
+}
+
+#[test]
+fn a_failed_delete_keeps_the_key_and_reports_it() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let store = file_store(directory.path());
+    secrets_set(&store, "openai", "sk-test".to_string()).expect("the store accepts the write");
+    read_only(directory.path());
+
+    let outcome = secrets_delete(&store, "openai");
+    writable(directory.path());
+
+    assert!(outcome.is_err(), "a delete under a read-only dir must fail");
+    // The token the app believes revoked must still be assumed present.
+    assert!(secrets_has(&store, "openai").expect("the store answers"));
+    assert_eq!(
+        secrets_get(&store, "openai").expect("the store answers"),
+        Some("sk-test".to_string())
+    );
+}
+
+#[test]
+fn a_corrupt_store_file_is_an_error_and_is_never_written_over() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let store = file_store(directory.path());
+    let corrupt = b"{ not json".to_vec();
+    fs::write(directory.path().join("secrets.json"), &corrupt).expect("a broken store");
+
+    assert!(secrets_get(&store, "openai").is_err());
+    assert!(secrets_has(&store, "openai").is_err());
+    let set = secrets_set(&store, "openai", "sk-test".to_string());
+    assert!(set.is_err(), "a set over a corrupt file must fail");
+    assert!(secrets_delete(&store, "openai").is_err());
+
+    // The file is left byte-for-byte as it was found: a write over it would
+    // destroy every other secret it holds, silently.
+    let after = fs::read(directory.path().join("secrets.json")).expect("the untouched store");
+    assert_eq!(after, corrupt);
 }
 
 // --- the explicit production backend smoke test -------------------------
+
+/// Resume the harness's daemon from a panic as from a pass: the drop guard
+/// runs even when an assertion fails, so a stopped daemon is never left
+/// behind for the next test.
+struct ResumeDaemon(String);
+
+impl Drop for ResumeDaemon {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("kill")
+            .arg("-CONT")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+#[test]
+#[ignore = "requires the private Secret Service from make keyring-integration"]
+fn production_keyring_frozen_service() {
+    // The harness exports the PID of the exact daemon it verified ownership
+    // of. This test refuses to run without it and never guesses a PID, so
+    // the developer's own gnome-keyring-daemon is out of reach by
+    // construction.
+    let pid = std::env::var("TFS_TEST_SECRET_SERVICE_PID")
+        .expect("TFS_TEST_SECRET_SERVICE_PID must name the harness's own daemon");
+
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let service = format!(
+        "test.tfsapp-hub.keyring-integration.frozen.{}",
+        std::process::id()
+    );
+    let store = new_store(&service, directory.path());
+    assert!(
+        is_keyring(&store),
+        "the production store fell back to a file backend; make keyring-integration requires its private Secret Service"
+    );
+
+    let _resume = ResumeDaemon(pid.clone());
+    let stopped = std::process::Command::new("kill")
+        .arg("-STOP")
+        .arg(&pid)
+        .status()
+        .expect("SIGSTOP reaches the harness daemon");
+    assert!(stopped.success(), "the harness daemon must be stoppable");
+
+    // An operation against the frozen service answers an error within the
+    // bound, never a hang. Two shapes reach here: this D-Bus stack answers
+    // org.freedesktop.DBus.Error.NoReply against a stopped peer on its own
+    // (measured ~1.5 s — a `Keyring` error), and the wedges D-Bus does not
+    // time out on its own — the audit-004 locked-service shape — hit the
+    // store's deadline and answer `TimedOut`. Both reach the app as
+    // `storage_failed` (proven against the stalled fake above).
+    let started = Instant::now();
+    let answer = secrets_get(&store, "frozen");
+    let elapsed = started.elapsed();
+    assert!(
+        answer.is_err(),
+        "a frozen Secret Service must not answer ok"
+    );
+    assert!(
+        matches!(
+            answer,
+            Err(StorageError::TimedOut | StorageError::Keyring(_))
+        ),
+        "a frozen Secret Service must answer a store error, not {answer:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(7),
+        "the frozen call must be bounded: {elapsed:?}"
+    );
+
+    // A fresh store on the same frozen service falls back to the file
+    // backend after one bounded probe, not a held launch.
+    let started = Instant::now();
+    let fresh = new_store(&format!("{service}.fresh"), directory.path());
+    let elapsed = started.elapsed();
+    assert!(
+        !is_keyring(&fresh),
+        "a frozen Secret Service must yield the file backend"
+    );
+    assert!(
+        elapsed < Duration::from_secs(7),
+        "the probe must bound the launch: {elapsed:?}"
+    );
+}
 
 #[test]
 #[ignore = "requires the private Secret Service from make keyring-integration"]
@@ -69,15 +229,96 @@ fn production_keyring_round_trip() {
         is_keyring(&store),
         "the production store fell back to a file backend; make keyring-integration requires its private Secret Service"
     );
-    assert_eq!(secrets_get(&store, "round-trip"), None);
-
-    secrets_set(&store, "round-trip", "ephemeral-value".to_string());
     assert_eq!(
-        secrets_get(&store, "round-trip"),
+        secrets_get(&store, "round-trip").expect("the store answers"),
+        None
+    );
+
+    secrets_set(&store, "round-trip", "ephemeral-value".to_string())
+        .expect("the store accepts the write");
+    assert_eq!(
+        secrets_get(&store, "round-trip").expect("the store answers"),
         Some("ephemeral-value".to_string())
     );
-    assert!(secrets_delete(&store, "round-trip"));
-    assert_eq!(secrets_get(&store, "round-trip"), None);
+    assert!(secrets_delete(&store, "round-trip").expect("the store answers"));
+    assert_eq!(
+        secrets_get(&store, "round-trip").expect("the store answers"),
+        None
+    );
+}
+
+// --- the deadline --------------------------------------------------------
+
+#[test]
+fn with_deadline_returns_a_fast_closure_s_answer() {
+    assert_eq!(with_deadline(TEST_KEYRING_DEADLINE, || 2 + 2), Some(4));
+}
+
+#[test]
+fn with_deadline_gives_up_on_a_blocked_closure_within_bound() {
+    // The one participant: the operation's thread waits on a barrier nobody
+    // else ever reaches, which is the frozen-Secret-Service shape.
+    let barrier = Arc::new(Barrier::new(2));
+    let wait = barrier.clone();
+    let started = Instant::now();
+
+    let answer = with_deadline(TEST_KEYRING_DEADLINE, move || {
+        let _ = wait.wait();
+        7
+    });
+
+    assert_eq!(answer, None);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= TEST_KEYRING_DEADLINE,
+        "the deadline must be waited out, not skipped: {elapsed:?}"
+    );
+    // Within bound: a deadline that overshoots by minutes would trade the
+    // held launch for a held test run.
+    assert!(
+        elapsed < TEST_KEYRING_DEADLINE + Duration::from_secs(2),
+        "the deadline must be honoured promptly: {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_stalled_probe_yields_the_file_backend() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let barrier = Arc::new(Barrier::new(2));
+    let wait = barrier.clone();
+
+    let store = new_store_with(
+        "test.tfsapp-hub",
+        directory.path(),
+        TEST_KEYRING_DEADLINE,
+        move |_| {
+            let _ = wait.wait();
+            true
+        },
+    );
+
+    // A Secret Service frozen at startup makes the launch fall back to the
+    // file store after one bounded wait, not hold the splash forever.
+    assert!(!is_keyring(&store));
+}
+
+#[test]
+fn a_stalled_keyring_operation_answers_timed_out() {
+    let store = new_fake_keyring().stalled_store("test.tfsapp-hub");
+
+    let started = Instant::now();
+    let answer = secrets_get(&store, "openai");
+    let elapsed = started.elapsed();
+
+    assert!(matches!(answer, Err(StorageError::TimedOut)));
+    // A second call through the same store: the thread the deadline left
+    // behind must not poison the store for the next (also stalled) caller.
+    assert!(matches!(
+        secrets_get(&store, "openai"),
+        Err(StorageError::TimedOut)
+    ));
+    // The shortened test deadline, not five seconds per stalled call.
+    assert!(elapsed < Duration::from_secs(1), "too slow: {elapsed:?}");
 }
 
 // --- the key manifest ----------------------------------------------------
@@ -107,7 +348,8 @@ fn reserved_keys_are_refused_even_when_an_app_declares_them() {
 fn an_existing_keyring_entry_always_wins_and_clears_the_stale_file() {
     let directory = tempfile::tempdir().expect("a temp dir");
     let store = new_fake_keyring_store();
-    secrets_set(&store, APP_SECRET_ACCOUNT, "from-keyring".to_string());
+    secrets_set(&store, APP_SECRET_ACCOUNT, "from-keyring".to_string())
+        .expect("the store accepts the write");
     fs::write(directory.path().join("app.secret"), "from-file").expect("a stale file");
 
     let secret = resolve_app_secret(&store, directory.path()).expect("a resolved secret");
@@ -130,7 +372,7 @@ fn a_pre_keyring_file_is_migrated_and_only_then_deleted() {
     // signed stays valid across the migration.
     assert_eq!(secret, "carried-over");
     assert_eq!(
-        secrets_get(&store, APP_SECRET_ACCOUNT),
+        secrets_get(&store, APP_SECRET_ACCOUNT).expect("the store answers"),
         Some("carried-over".to_string())
     );
     assert!(!directory.path().join("app.secret").exists());
@@ -164,17 +406,83 @@ fn with_no_keyring_the_secret_still_resolves_from_the_file() {
     assert_eq!(first, second);
 }
 
+#[test]
+fn a_failing_keyring_never_generates_and_falls_back_to_the_file() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let keyring = new_fake_keyring();
+    // Seeded through the working view: the entry exists behind the failing
+    // one's refusal to say whether it does.
+    secrets_set(
+        &keyring.store("test.tfsapp-hub"),
+        APP_SECRET_ACCOUNT,
+        "existing".to_string(),
+    )
+    .expect("the store accepts the write");
+    let failing = keyring.failing_store("test.tfsapp-hub");
+    fs::write(directory.path().join("app.secret"), "from-file").expect("an existing file");
+
+    let secret = resolve_app_secret(&failing, directory.path()).expect("a resolved secret");
+
+    // The file is the only value this launch can trust: the keyring said
+    // nothing about what it holds, so nothing is written to it and nothing
+    // is generated over the entry that may exist.
+    assert_eq!(secret, "from-file");
+    assert_eq!(
+        secrets_get(&keyring.store("test.tfsapp-hub"), APP_SECRET_ACCOUNT)
+            .expect("the store answers"),
+        Some("existing".to_string())
+    );
+    assert!(directory.path().join("app.secret").exists());
+}
+
 // --- the regression this plan must not ship ------------------------------
+
+#[test]
+fn a_failing_store_answers_storage_failed_over_ipc() {
+    // The window is the whole address: every command resolves the store from
+    // it, so a failing one reaches the app as `storage_failed` — never as a
+    // success, an absence or a `false`.
+    let app = tauri::test::mock_app();
+    app.manage(new_fake_keyring().failing_store("test.tfsapp-hub"));
+    app.manage(crate::manifest::SecretsActions {
+        ipc: true,
+        bridge: false,
+        keys: vec!["openai".to_string()],
+    });
+    let window = WebviewWindowBuilder::new(&app, "main", WebviewUrl::App("index.html".into()))
+        .build()
+        .expect("a window");
+    let handle = window.as_ref().window();
+
+    assert_eq!(
+        secret_has_for_window(&handle, "openai"),
+        Err("storage_failed")
+    );
+    assert_eq!(
+        secret_get_for_window(&handle, "openai"),
+        Err("storage_failed")
+    );
+    assert_eq!(
+        secret_set_for_window(&handle, "openai", "sk-test"),
+        Err("storage_failed")
+    );
+    assert_eq!(
+        secret_delete_for_window(&handle, "openai"),
+        Err("storage_failed")
+    );
+    assert_eq!(secret_list_for_window(&handle), Err("storage_failed"));
+}
 
 #[test]
 fn a_window_reaches_its_own_app_s_store_and_no_other() {
     // Two apps, each in its own process — which is exactly what the hub does,
-    // and what a `secret_get(app_id, key)` signature would have undone. There
+    // and what a `secret_get(app_id: String)` signature would have undone. There
     // is no argument here that names a store: the window is the whole address,
     // and a webview does not get to choose which window it is.
     let first = tauri::test::mock_app();
     let first_store = new_fake_keyring_store();
-    secrets_set(&first_store, "openai", "first-app-value".to_string());
+    secrets_set(&first_store, "openai", "first-app-value".to_string())
+        .expect("the store accepts the write");
     first.manage(first_store);
     first.manage(crate::manifest::SecretsActions {
         ipc: true,
@@ -184,7 +492,8 @@ fn a_window_reaches_its_own_app_s_store_and_no_other() {
 
     let second = tauri::test::mock_app();
     let second_store = new_fake_keyring_store();
-    secrets_set(&second_store, "openai", "second-app-value".to_string());
+    secrets_set(&second_store, "openai", "second-app-value".to_string())
+        .expect("the store accepts the write");
     second.manage(second_store);
     second.manage(crate::manifest::SecretsActions::default());
 
@@ -204,14 +513,16 @@ fn a_window_reaches_its_own_app_s_store_and_no_other() {
         secrets_get(
             &store_for_window(&first_handle).expect("the first app's store"),
             "openai"
-        ),
+        )
+        .expect("the store answers"),
         Some("first-app-value".to_string())
     );
     assert_eq!(
         secrets_get(
             &store_for_window(&second_handle).expect("the second app's store"),
             "openai"
-        ),
+        )
+        .expect("the store answers"),
         Some("second-app-value".to_string())
     );
 

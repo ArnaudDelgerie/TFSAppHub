@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+The secret store no longer reports a failed write as a success: a set, delete,
+get, has or list that the keyring or the fallback file fails answers
+`storage_failed` over IPC and `500 {"error": "storage_failed"}` on the bridge,
+with one warning line in `hub.log` naming the cause (never the key or the
+value). Every keyring call — the startup probe included — now carries a
+5-second deadline, so a frozen Secret Service makes the launch fall back to
+the file store (or answers an operation as a failure) instead of holding the
+splash or a request forever. A corrupt `secrets.json` is left byte-for-byte
+untouched instead of being overwritten by the next write, and `purge` reports
+a keyring delete it could not make as `FAILED (<cause>)` instead of
+"already clean".
+
 `install` and `update` no longer accept a working directory: every install
 and update now starts from a checksummed release archive, from a forge or
 from `publish <project> --local <dir>`. A directory argument is refused with

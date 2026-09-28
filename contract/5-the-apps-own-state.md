@@ -66,6 +66,11 @@ backend generates a fresh one, and everything previously signed stops validating
 once. This is rare, non-destructive (the user logs in again) and accepted rather
 than papered over.
 
+A keyring that does not answer the startup probe within 5 s counts as
+unreachable, the same as a failed probe. And declared secrets (§7) are visible
+only from the backend that stored them: a launch that fell back to the file
+does not see what the keyring holds, and the reverse.
+
 A pre-existing plaintext secret is migrated into the keyring on the first launch
 that can reach one, and the file is deleted in the same launch once the write is
 confirmed. Keeping it "just in case" would defeat the keyring.
