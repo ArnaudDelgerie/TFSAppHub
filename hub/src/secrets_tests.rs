@@ -1,13 +1,19 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    sync::{Arc, Barrier},
+    time::{Duration, Instant},
+};
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 use super::{
     is_keyring, keys_for_window, new_fake_keyring, new_fake_keyring_store, new_file_store_for_test,
-    new_store, resolve_app_secret, secret_delete_for_window, secret_get_for_window,
+    new_store, new_store_with, resolve_app_secret, secret_delete_for_window, secret_get_for_window,
     secret_has_for_window, secret_key_allowed, secret_list_for_window, secret_set_for_window,
-    secrets_delete, secrets_get, secrets_has, secrets_set, store_for_window, APP_SECRET_ACCOUNT,
-    PROBE_ACCOUNT,
+    secrets_delete, secrets_get, secrets_has, secrets_set, store_for_window, with_deadline,
+    StorageError, APP_SECRET_ACCOUNT, PROBE_ACCOUNT, TEST_KEYRING_DEADLINE,
 };
 
 fn file_store(directory: &Path) -> super::SecretStore {
@@ -155,6 +161,80 @@ fn production_keyring_round_trip() {
         secrets_get(&store, "round-trip").expect("the store answers"),
         None
     );
+}
+
+// --- the deadline --------------------------------------------------------
+
+#[test]
+fn with_deadline_returns_a_fast_closure_s_answer() {
+    assert_eq!(with_deadline(TEST_KEYRING_DEADLINE, || 2 + 2), Some(4));
+}
+
+#[test]
+fn with_deadline_gives_up_on_a_blocked_closure_within_bound() {
+    // The one participant: the operation's thread waits on a barrier nobody
+    // else ever reaches, which is the frozen-Secret-Service shape.
+    let barrier = Arc::new(Barrier::new(2));
+    let wait = barrier.clone();
+    let started = Instant::now();
+
+    let answer = with_deadline(TEST_KEYRING_DEADLINE, move || {
+        let _ = wait.wait();
+        7
+    });
+
+    assert_eq!(answer, None);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= TEST_KEYRING_DEADLINE,
+        "the deadline must be waited out, not skipped: {elapsed:?}"
+    );
+    // Within bound: a deadline that overshoots by minutes would trade the
+    // held launch for a held test run.
+    assert!(
+        elapsed < TEST_KEYRING_DEADLINE + Duration::from_secs(2),
+        "the deadline must be honoured promptly: {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_stalled_probe_yields_the_file_backend() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let barrier = Arc::new(Barrier::new(2));
+    let wait = barrier.clone();
+
+    let store = new_store_with(
+        "test.tfsapp-hub",
+        directory.path(),
+        TEST_KEYRING_DEADLINE,
+        move |_| {
+            let _ = wait.wait();
+            true
+        },
+    );
+
+    // A Secret Service frozen at startup makes the launch fall back to the
+    // file store after one bounded wait, not hold the splash forever.
+    assert!(!is_keyring(&store));
+}
+
+#[test]
+fn a_stalled_keyring_operation_answers_timed_out() {
+    let store = new_fake_keyring().stalled_store("test.tfsapp-hub");
+
+    let started = Instant::now();
+    let answer = secrets_get(&store, "openai");
+    let elapsed = started.elapsed();
+
+    assert!(matches!(answer, Err(StorageError::TimedOut)));
+    // A second call through the same store: the thread the deadline left
+    // behind must not poison the store for the next (also stalled) caller.
+    assert!(matches!(
+        secrets_get(&store, "openai"),
+        Err(StorageError::TimedOut)
+    ));
+    // The shortened test deadline, not five seconds per stalled call.
+    assert!(elapsed < Duration::from_secs(1), "too slow: {elapsed:?}");
 }
 
 // --- the key manifest ----------------------------------------------------

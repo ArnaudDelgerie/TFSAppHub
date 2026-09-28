@@ -49,7 +49,22 @@ fn fresh_close_guards() -> crate::close_guard::SharedCloseGuards {
 /// A bridge whose store fails every operation — the shape every
 /// `storage_failed` assertion drives, without needing a broken D-Bus.
 fn failing_bridge(keys: &[&str]) -> Bridge {
-    let store = crate::secrets::new_fake_keyring().failing_store("test.tfsapp-hub");
+    stalled_or_failing_bridge(keys, false)
+}
+
+/// A bridge whose store never answers — the frozen-Secret-Service shape,
+/// under the shortened test deadline, so the wedged request costs ~100 ms.
+fn stalled_bridge(keys: &[&str]) -> Bridge {
+    stalled_or_failing_bridge(keys, true)
+}
+
+fn stalled_or_failing_bridge(keys: &[&str], stalled: bool) -> Bridge {
+    let keyring = crate::secrets::new_fake_keyring();
+    let store = if stalled {
+        keyring.stalled_store("test.tfsapp-hub")
+    } else {
+        keyring.failing_store("test.tfsapp-hub")
+    };
     start(
         store,
         keys.iter().map(|key| key.to_string()).collect(),
@@ -274,6 +289,25 @@ fn every_secret_route_answers_storage_failed_when_the_store_fails() {
     );
     assert_eq!(deleted.status, 500);
     assert_eq!(deleted.json()["error"], "storage_failed");
+}
+
+#[test]
+fn a_stalled_store_answers_storage_failed_over_the_bridge() {
+    // The frozen-Secret-Service shape: the request is answered after the
+    // deadline, as `storage_failed` — never held open forever.
+    let bridge = stalled_bridge(&["openai"]);
+    let token = bridge.token.clone();
+
+    let answer = request(
+        &bridge,
+        "POST",
+        "/secrets/get",
+        Some(&token),
+        r#"{"key":"openai"}"#,
+    );
+
+    assert_eq!(answer.status, 500);
+    assert_eq!(answer.json()["error"], "storage_failed");
 }
 
 #[test]

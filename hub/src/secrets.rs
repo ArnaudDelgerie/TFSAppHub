@@ -43,13 +43,48 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
+    time::Duration,
 };
 
 use keyring::Entry;
 use tauri::Manager;
 
 use tfsapp_core::app_secret::{app_secret_action, load_or_create_app_secret, AppSecretAction};
+
+/// The deadline every production keyring call runs under — the startup probe
+/// as a whole, and each store operation individually. Five seconds is long
+/// for a healthy Secret Service (its answers are local D-Bus round trips,
+/// milliseconds) and short for a launch the user is watching: a service this
+/// slow is not one to hold the splash behind.
+pub const KEYRING_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The shortened deadline test stores run under, so a stalled fake answers
+/// `TimedOut` in ~100 ms instead of costing every test five seconds.
+#[cfg(test)]
+pub const TEST_KEYRING_DEADLINE: Duration = Duration::from_millis(100);
+
+/// Run `f` on its own thread and wait no longer than `deadline` for it,
+/// returning `None` on expiry.
+///
+/// **The thread is left behind on purpose.** A frozen Secret Service cannot be
+/// cancelled — the blocked D-Bus call owns the thread until it answers — so
+/// the only alternative to leaking it would be blocking the caller forever,
+/// which is the launch-holding bug this exists to bound. One leaked thread
+/// per wedged call is the accepted cost; a launch that falls back to the file
+/// store does not call the keyring again.
+pub(crate) fn with_deadline<T: Send + 'static>(
+    deadline: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        // A failed send only means the caller already timed out and dropped
+        // the receiver — never a second error to report.
+        let _ = sender.send(f());
+    });
+    receiver.recv_timeout(deadline).ok()
+}
 
 /// The keyring account `APP_SECRET` lives under, paired with the app's
 /// `identifier` as the service — which is what makes a hubbed install of an app
@@ -86,7 +121,6 @@ pub enum StorageError {
     /// write over it would destroy every other secret it holds.
     Corrupt,
     /// The keyring did not answer within the store's deadline (plan 068).
-    #[allow(dead_code)] // constructed from step 3's deadline wrapper
     TimedOut,
 }
 
@@ -120,6 +154,7 @@ pub fn secret_key_allowed(keys: &[String], key: &str) -> bool {
 enum Backend {
     Keyring {
         service: String,
+        deadline: Duration,
     },
     /// Deliberately **not** encrypted. With no reachable keyring there is no
     /// secure place left to keep an encryption key, so encrypting the file would
@@ -138,15 +173,30 @@ enum Backend {
     /// `APP_SECRET` resolution path can be exercised against a working
     /// "keyring" without one — and without ever writing to a developer's real
     /// login keyring, which is what calling `new_store` in a test would do.
-    /// `failing` is the audit-024 failure mode: every operation returns a
-    /// keyring error, so a store that reports failures can be tested without
-    /// a broken D-Bus.
+    /// The mode covers the two failure shapes audit 024 cares about — every
+    /// operation refused, and every operation wedged — and both run under
+    /// the same deadline wrapper as the real backend, so a stalled fake
+    /// answers `TimedOut` exactly the way a frozen Secret Service does.
     #[cfg(test)]
     FakeKeyring {
         service: String,
         entries: FakeKeyring,
-        failing: bool,
+        mode: FakeMode,
+        deadline: Duration,
     },
+}
+
+/// What one fake keyring does to each operation. `Stalled` waits on a
+/// condvar that is never notified: the operation's thread blocks for the rest
+/// of the test, whatever the number of calls — which is the whole point, a
+/// wedged call cannot be cancelled, only abandoned.
+#[cfg(test)]
+#[derive(Clone, Default)]
+enum FakeMode {
+    #[default]
+    Working,
+    Failing,
+    Stalled(Arc<(Mutex<()>, std::sync::Condvar)>),
 }
 
 #[derive(Clone)]
@@ -162,27 +212,38 @@ pub struct FakeKeyring(Arc<Mutex<HashMap<(String, String), String>>>);
 #[cfg(test)]
 impl FakeKeyring {
     pub fn store(&self, service: &str) -> SecretStore {
-        SecretStore(Arc::new(Backend::FakeKeyring {
-            service: service.to_string(),
-            entries: self.clone(),
-            failing: false,
-        }))
+        self.store_in_mode(service, FakeMode::Working)
     }
 
     /// A store over the same entries that fails every operation, so tests can
     /// seed through [`Self::store`] and observe what a caller did or did not
     /// overwrite once the failing view refused everything.
     pub fn failing_store(&self, service: &str) -> SecretStore {
+        self.store_in_mode(service, FakeMode::Failing)
+    }
+
+    /// A store over the same entries whose every operation blocks until the
+    /// test ends — the frozen-Secret-Service shape, under the shortened test
+    /// deadline.
+    pub fn stalled_store(&self, service: &str) -> SecretStore {
+        self.store_in_mode(
+            service,
+            FakeMode::Stalled(Arc::new((Mutex::new(()), std::sync::Condvar::new()))),
+        )
+    }
+
+    fn store_in_mode(&self, service: &str, mode: FakeMode) -> SecretStore {
         SecretStore(Arc::new(Backend::FakeKeyring {
             service: service.to_string(),
             entries: self.clone(),
-            failing: true,
+            mode,
+            deadline: TEST_KEYRING_DEADLINE,
         }))
     }
 }
 
 #[cfg(test)]
-fn fake_keyring_failure() -> StorageError {
+pub(crate) fn fake_keyring_failure() -> StorageError {
     StorageError::Keyring(keyring::Error::NoStorageAccess(
         "the failing keyring refuses every operation".into(),
     ))
@@ -205,15 +266,54 @@ fn keyring_available(service: &str) -> bool {
 
 /// Open the app's store. `service` is the app's `identifier` and `data_subdir`
 /// the same `<data dir>/data` everything else writes into.
+///
+/// The probe — a full set/get/delete round trip — runs under
+/// [`KEYRING_DEADLINE`] as a whole: a Secret Service that never answers costs
+/// the launch one bounded wait and one warning line, not a splash held
+/// forever. Its callers in `app_env.rs` are untouched by the injectable
+/// variant below.
 pub fn new_store(service: &str, data_subdir: &Path) -> SecretStore {
-    let backend = if keyring_available(service) {
-        Backend::Keyring {
+    new_store_with(service, data_subdir, KEYRING_DEADLINE, keyring_available)
+}
+
+/// The same store behind an injectable probe and deadline, so a test can
+/// stall the probe or the service without D-Bus. The probe decides exactly
+/// what `new_store`'s does: `true` is the keyring, `false` the file backend,
+/// and a probe that outlives `deadline` the file backend plus the warning
+/// line a frozen service costs.
+pub fn new_store_with<P>(
+    service: &str,
+    data_subdir: &Path,
+    deadline: Duration,
+    probe: P,
+) -> SecretStore
+where
+    P: Fn(&str) -> bool + Send + 'static,
+{
+    let path = data_subdir.join("secrets.json");
+    let probe_service = service.to_string();
+    let backend = match with_deadline(deadline, move || probe(&probe_service)) {
+        Some(true) => Backend::Keyring {
             service: service.to_string(),
-        }
-    } else {
-        Backend::File {
-            path: data_subdir.join("secrets.json"),
+            deadline,
+        },
+        // A failed probe is the silent fallback it always was: a headless
+        // Linux box is the normal case, not a warning.
+        Some(false) => Backend::File {
+            path,
             lock: Mutex::new(()),
+        },
+        None => {
+            eprintln!(
+                "tfsapp-hub: warning: the Secret Service did not answer within {}s; \
+                 secrets fall back to {} for this launch",
+                deadline.as_secs(),
+                path.display()
+            );
+            Backend::File {
+                path,
+                lock: Mutex::new(()),
+            }
         }
     };
     SecretStore(Arc::new(backend))
@@ -290,34 +390,65 @@ fn create_0600(path: &Path) -> std::io::Result<fs::File> {
         .open(path)
 }
 
+/// One store operation under its deadline: an expiry is `TimedOut`, which
+/// the transports answer like any other store failure — never a success and
+/// never a silent absence.
+fn with_store_deadline<T, F>(deadline: Duration, run: F) -> Result<T, StorageError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, StorageError> + Send + 'static,
+{
+    with_deadline(deadline, run).unwrap_or(Err(StorageError::TimedOut))
+}
+
 /// `Ok(false)`: a keyring with no entry, or a file with none. `Err`: the
 /// backend could not answer the question — never a silent `false`, which a
 /// caller would read as "there is nothing there".
 pub fn secrets_has(store: &SecretStore, account: &str) -> Result<bool, StorageError> {
     match store.0.as_ref() {
-        Backend::Keyring { service } => {
-            let entry = Entry::new(service, account).map_err(StorageError::Keyring)?;
-            match entry.get_password() {
-                Ok(_) => Ok(true),
-                Err(keyring::Error::NoEntry) => Ok(false),
-                Err(error) => Err(StorageError::Keyring(error)),
-            }
+        Backend::Keyring { service, deadline } => {
+            let service = service.clone();
+            let account = account.to_string();
+            with_store_deadline(*deadline, move || {
+                let entry = Entry::new(&service, &account).map_err(StorageError::Keyring)?;
+                match entry.get_password() {
+                    Ok(_) => Ok(true),
+                    Err(keyring::Error::NoEntry) => Ok(false),
+                    Err(error) => Err(StorageError::Keyring(error)),
+                }
+            })
         }
         Backend::File { path, .. } => Ok(read_file_map(path)?.contains_key(account)),
         #[cfg(test)]
         Backend::FakeKeyring {
             service,
             entries,
-            failing,
+            mode,
+            deadline,
         } => {
-            if *failing {
-                return Err(fake_keyring_failure());
-            }
-            Ok(entries
-                .0
-                .lock()
-                .expect("the secret store is not poisoned")
-                .contains_key(&(service.clone(), account.to_string())))
+            let key = (service.clone(), account.to_string());
+            let entries = entries.clone();
+            let mode = mode.clone();
+            with_store_deadline(*deadline, move || match mode {
+                FakeMode::Failing => Err(fake_keyring_failure()),
+                FakeMode::Stalled(stall) => {
+                    let (lock, never_notified) = &*stall;
+                    let guard = lock.lock().expect("the secret store is not poisoned");
+                    // Nobody ever notifies: this thread is abandoned by the
+                    // deadline wrapper, on purpose. The lock guard is bound
+                    // only to satisfy the lock lint — `wait` blocks forever
+                    // before it could be dropped.
+                    let (_guard, _timeout) = never_notified
+                        .wait_timeout(guard, std::time::Duration::MAX)
+                        .expect("the secret store is not poisoned");
+                    Ok(false)
+                }
+                FakeMode::Working => Ok(entries
+                    .0
+                    .lock()
+                    .expect("the secret store is not poisoned")
+                    .contains_key(&key)),
+            })
         }
     }
 }
@@ -328,30 +459,50 @@ pub fn secrets_has(store: &SecretStore, account: &str) -> Result<bool, StorageEr
 /// "cannot say" otherwise.
 pub fn secrets_get(store: &SecretStore, account: &str) -> Result<Option<String>, StorageError> {
     match store.0.as_ref() {
-        Backend::Keyring { service } => {
-            let entry = Entry::new(service, account).map_err(StorageError::Keyring)?;
-            match entry.get_password() {
-                Ok(value) => Ok(Some(value)),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(error) => Err(StorageError::Keyring(error)),
-            }
+        Backend::Keyring { service, deadline } => {
+            let service = service.clone();
+            let account = account.to_string();
+            with_store_deadline(*deadline, move || {
+                let entry = Entry::new(&service, &account).map_err(StorageError::Keyring)?;
+                match entry.get_password() {
+                    Ok(value) => Ok(Some(value)),
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(error) => Err(StorageError::Keyring(error)),
+                }
+            })
         }
         Backend::File { path, .. } => Ok(read_file_map(path)?.get(account).cloned()),
         #[cfg(test)]
         Backend::FakeKeyring {
             service,
             entries,
-            failing,
+            mode,
+            deadline,
         } => {
-            if *failing {
-                return Err(fake_keyring_failure());
-            }
-            Ok(entries
-                .0
-                .lock()
-                .expect("the secret store is not poisoned")
-                .get(&(service.clone(), account.to_string()))
-                .cloned())
+            let key = (service.clone(), account.to_string());
+            let entries = entries.clone();
+            let mode = mode.clone();
+            with_store_deadline(*deadline, move || match mode {
+                FakeMode::Failing => Err(fake_keyring_failure()),
+                FakeMode::Stalled(stall) => {
+                    let (lock, never_notified) = &*stall;
+                    let guard = lock.lock().expect("the secret store is not poisoned");
+                    // Nobody ever notifies: this thread is abandoned by the
+                    // deadline wrapper, on purpose. The lock guard is bound
+                    // only to satisfy the lock lint — `wait` blocks forever
+                    // before it could be dropped.
+                    let (_guard, _timeout) = never_notified
+                        .wait_timeout(guard, std::time::Duration::MAX)
+                        .expect("the secret store is not poisoned");
+                    Ok(None)
+                }
+                FakeMode::Working => Ok(entries
+                    .0
+                    .lock()
+                    .expect("the secret store is not poisoned")
+                    .get(&key)
+                    .cloned()),
+            })
         }
     }
 }
@@ -363,10 +514,14 @@ pub fn secrets_get(store: &SecretStore, account: &str) -> Result<Option<String>,
 /// destroy every other secret it holds.
 pub fn secrets_set(store: &SecretStore, account: &str, value: String) -> Result<(), StorageError> {
     match store.0.as_ref() {
-        Backend::Keyring { service } => {
-            let entry = Entry::new(service, account).map_err(StorageError::Keyring)?;
-            entry.set_password(&value).map_err(StorageError::Keyring)?;
-            Ok(())
+        Backend::Keyring { service, deadline } => {
+            let service = service.clone();
+            let account = account.to_string();
+            with_store_deadline(*deadline, move || {
+                let entry = Entry::new(&service, &account).map_err(StorageError::Keyring)?;
+                entry.set_password(&value).map_err(StorageError::Keyring)?;
+                Ok(())
+            })
         }
         Backend::File { path, lock } => {
             let _guard = lock.lock().expect("the secrets file lock is not poisoned");
@@ -378,17 +533,35 @@ pub fn secrets_set(store: &SecretStore, account: &str, value: String) -> Result<
         Backend::FakeKeyring {
             service,
             entries,
-            failing,
+            mode,
+            deadline,
         } => {
-            if *failing {
-                return Err(fake_keyring_failure());
-            }
-            entries
-                .0
-                .lock()
-                .expect("the secret store is not poisoned")
-                .insert((service.clone(), account.to_string()), value);
-            Ok(())
+            let key = (service.clone(), account.to_string());
+            let entries = entries.clone();
+            let mode = mode.clone();
+            with_store_deadline(*deadline, move || match mode {
+                FakeMode::Failing => Err(fake_keyring_failure()),
+                FakeMode::Stalled(stall) => {
+                    let (lock, never_notified) = &*stall;
+                    let guard = lock.lock().expect("the secret store is not poisoned");
+                    // Nobody ever notifies: this thread is abandoned by the
+                    // deadline wrapper, on purpose. The lock guard is bound
+                    // only to satisfy the lock lint — `wait` blocks forever
+                    // before it could be dropped.
+                    let (_guard, _timeout) = never_notified
+                        .wait_timeout(guard, std::time::Duration::MAX)
+                        .expect("the secret store is not poisoned");
+                    Ok(())
+                }
+                FakeMode::Working => {
+                    entries
+                        .0
+                        .lock()
+                        .expect("the secret store is not poisoned")
+                        .insert(key, value);
+                    Ok(())
+                }
+            })
         }
     }
 }
@@ -399,13 +572,17 @@ pub fn secrets_set(store: &SecretStore, account: &str, value: String) -> Result<
 /// delete as though it had been revoked.
 pub fn secrets_delete(store: &SecretStore, account: &str) -> Result<bool, StorageError> {
     match store.0.as_ref() {
-        Backend::Keyring { service } => {
-            let entry = Entry::new(service, account).map_err(StorageError::Keyring)?;
-            match entry.delete_credential() {
-                Ok(()) => Ok(true),
-                Err(keyring::Error::NoEntry) => Ok(false),
-                Err(error) => Err(StorageError::Keyring(error)),
-            }
+        Backend::Keyring { service, deadline } => {
+            let service = service.clone();
+            let account = account.to_string();
+            with_store_deadline(*deadline, move || {
+                let entry = Entry::new(&service, &account).map_err(StorageError::Keyring)?;
+                match entry.delete_credential() {
+                    Ok(()) => Ok(true),
+                    Err(keyring::Error::NoEntry) => Ok(false),
+                    Err(error) => Err(StorageError::Keyring(error)),
+                }
+            })
         }
         Backend::File { path, lock } => {
             let _guard = lock.lock().expect("the secrets file lock is not poisoned");
@@ -420,17 +597,33 @@ pub fn secrets_delete(store: &SecretStore, account: &str) -> Result<bool, Storag
         Backend::FakeKeyring {
             service,
             entries,
-            failing,
+            mode,
+            deadline,
         } => {
-            if *failing {
-                return Err(fake_keyring_failure());
-            }
-            Ok(entries
-                .0
-                .lock()
-                .expect("the secret store is not poisoned")
-                .remove(&(service.clone(), account.to_string()))
-                .is_some())
+            let key = (service.clone(), account.to_string());
+            let entries = entries.clone();
+            let mode = mode.clone();
+            with_store_deadline(*deadline, move || match mode {
+                FakeMode::Failing => Err(fake_keyring_failure()),
+                FakeMode::Stalled(stall) => {
+                    let (lock, never_notified) = &*stall;
+                    let guard = lock.lock().expect("the secret store is not poisoned");
+                    // Nobody ever notifies: this thread is abandoned by the
+                    // deadline wrapper, on purpose. The lock guard is bound
+                    // only to satisfy the lock lint — `wait` blocks forever
+                    // before it could be dropped.
+                    let (_guard, _timeout) = never_notified
+                        .wait_timeout(guard, std::time::Duration::MAX)
+                        .expect("the secret store is not poisoned");
+                    Ok(false)
+                }
+                FakeMode::Working => Ok(entries
+                    .0
+                    .lock()
+                    .expect("the secret store is not poisoned")
+                    .remove(&key)
+                    .is_some()),
+            })
         }
     }
 }
