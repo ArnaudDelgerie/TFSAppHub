@@ -650,6 +650,7 @@ fn open_window(
                                     launch.product_name.clone(),
                                     launch.splash_bg.clone(),
                                     launch.splash_text.clone(),
+                                    launch.url.clone(),
                                 );
                                 Ok(())
                             })
@@ -763,6 +764,10 @@ fn open_window(
                 identity.product_name.clone(),
                 spec.manifest.splash_bg.clone(),
                 spec.manifest.splash_text.clone(),
+                // The URL this window was created showing, so a web process
+                // killed before any page committed still gets a Reload
+                // target (`crash::reload_target`).
+                splash_source.initial_url(),
             );
 
             let handle = app.handle().clone();

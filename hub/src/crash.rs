@@ -25,12 +25,16 @@
 //! **Showing the page is not a navigation.** `load_alternate_html` displays
 //! content *for* the URI that died without issuing a real load, so the
 //! navigation policy in `window.rs` never sees it and a reload still lands on
-//! the real page. The Reload link's `href` is that same dead URI — clicking
-//! it is an ordinary link navigation, so it goes through the very same
-//! `classify_navigation`/`on_page_load` machinery as any other load, with no
-//! separate reload path to keep in sync with those. There is deliberately no
-//! automatic reload: whatever crashed the process may crash again on the same
-//! input, so the user's click is what breaks that loop.
+//! the real page. The Reload link's `href` is that same dead URI — and when
+//! no URI had committed yet, the window's own creation URL, so a web process
+//! killed before its first page ever painted still gets the crash page and a
+//! way back. Clicking it is an ordinary link navigation, so it goes through
+//! the very same `classify_navigation`/`on_page_load` machinery as any other
+//! load, with no separate reload path to keep in sync with those (the
+//! creation URL is one `classify_navigation` already lets through, whichever
+//! side of the hand-over it is asked on). There is deliberately no automatic
+//! reload: whatever crashed the process may crash again on the same input,
+//! so the user's click is what breaks that loop.
 
 use webkit2gtk::WebProcessTerminationReason;
 
@@ -53,6 +57,19 @@ pub fn decide(reason: WebProcessTerminationReason) -> TerminationAction {
     match reason {
         WebProcessTerminationReason::TerminatedByApi => TerminationAction::Ignore,
         _ => TerminationAction::Recover,
+    }
+}
+
+/// The URL the crash page's Reload link targets: the live URI when the dead
+/// process had one, the window's creation URL otherwise — a web process
+/// killed before its first page ever committed leaves no URI to reload, but
+/// the window was still created to show one, and that URL is the one place
+/// Reload can still point (CONTRACT.md §8 promises the page without
+/// excluding the start of a window's life).
+fn reload_target<'a>(live: Option<&'a str>, creation: &'a str) -> &'a str {
+    match live {
+        Some(live) => live,
+        None => creation,
     }
 }
 
@@ -158,7 +175,10 @@ fn escape_html(input: &str) -> String {
 /// every later window — the two windows share one webview across hand-over
 /// (`architecture/09`), so this one install covers the window's whole life.
 /// `product_name`/`splash_bg`/`splash_text` are the same three values
-/// `window::splash_style` renders the cold-start page with.
+/// `window::splash_style` renders the cold-start page with, and
+/// `creation_url` is the URL the window was created to show — the Reload
+/// target when the process dies before any page has committed
+/// ([`reload_target`]).
 ///
 /// Returns whatever `WebviewWindow::with_webview`'s dispatch returned. `Ok`
 /// means the closure was queued onto the GTK main thread, not that it has run
@@ -170,6 +190,7 @@ pub fn install_crash_recovery_handler<R: tauri::Runtime>(
     product_name: String,
     splash_bg: Option<String>,
     splash_text: Option<String>,
+    creation_url: String,
 ) -> tauri::Result<()> {
     let label = window.label().to_string();
     window.with_webview(move |webview| {
@@ -187,19 +208,24 @@ pub fn install_crash_recovery_handler<R: tauri::Runtime>(
             );
             if let TerminationAction::Recover = decide(reason) {
                 close_guards.end_document(&label);
-                // No URI yet means the crash landed before any page ever
-                // committed — there is nothing to show the page "for" and
-                // nothing for Reload to point at, so this rare window is
-                // left to the user closing it, same as before this plan.
-                if let Some(uri) = uri.as_deref() {
-                    let page = render_crash_page(
-                        &product_name,
-                        splash_bg.as_deref(),
-                        splash_text.as_deref(),
-                        uri,
+                let target = reload_target(uri.as_deref(), &creation_url);
+                if uri.is_none() {
+                    // No URI ever committed, so Reload targets the window's
+                    // creation URL instead — said here because the line above
+                    // names "no page yet", and nothing else would tell
+                    // `hub.log` where Reload sends the user.
+                    eprintln!(
+                        "tfsapp-hub: no page had committed yet; the crash page's Reload \
+                         targets the window's creation URL {creation_url}"
                     );
-                    webview.load_alternate_html(&page, uri, None);
                 }
+                let page = render_crash_page(
+                    &product_name,
+                    splash_bg.as_deref(),
+                    splash_text.as_deref(),
+                    target,
+                );
+                webview.load_alternate_html(&page, target, None);
             }
         });
     })
