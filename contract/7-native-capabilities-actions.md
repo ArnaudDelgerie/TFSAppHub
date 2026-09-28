@@ -5,9 +5,9 @@ Not what the user may do — the commands a person types are the host's, and the
 run because that person typed them, which is a different act with different
 consent. This section is about the doors application code can knock on.
 
-There are five capability groups today. `secrets`, `update` and `close_guard`
+There are six capability groups today. `secrets`, `update` and `close_guard`
 may declare either of the two transports; `picker` and `open_files` are
-deliberately IPC-only:
+deliberately IPC-only; `media` uses neither:
 
 ```json
 {
@@ -16,7 +16,8 @@ deliberately IPC-only:
     "update":      { "ipc": true,  "bridge": true },
     "picker":      { "ipc": true },
     "close_guard": { "ipc": true,  "bridge": true },
-    "open_files":  { "ipc": true }
+    "open_files":  { "ipc": true },
+    "media":       { "microphone": true }
   }
 }
 ```
@@ -33,6 +34,11 @@ Absent means off, at every level: no `actions`, an absent group, and an absent
 transport all mean the same thing. A group declared on none of its available
 transports is completely unreachable — no server thread, no environment
 variables, no grant — and the app is unaffected either way.
+
+`media` is the exception to "group × transport": its members name **devices**,
+not transports, because it grants nothing to `invoke()` and starts no bridge
+route — see "`media`" below. `ipc` or `bridge` spelled under it is refused the
+same way `picker`'s `bridge` is.
 
 ### `secrets`
 
@@ -378,6 +384,51 @@ it, and the hub does not build a cross-process acknowledgement protocol to
 cover it. Discarded arrivals are diagnosed where they are observable. An app
 that must not lose work reads on every notification and acknowledges promptly;
 everything beyond that is outside this group's guarantee.
+
+### `media`
+
+Lets the app's own page reach a native device through the ordinary web
+platform — `getUserMedia()` — rather than through `invoke()` or the bridge.
+`microphone` is the only member today:
+
+```json
+{"media": {"microphone": true}}
+```
+
+Undeclared, the webview keeps WebKitGTK's default (`enable-media-stream =
+false`): the app meets a platform with no capture at all, not a permission
+that answers no. There is no dialog and nothing to retry. Declared, the app's
+own page may call `getUserMedia({audio: true})` on its own origin and get a
+live audio track, exactly as it would in a browser that had granted the
+permission.
+
+**Exactly two WebKit permission requests are ever allowed, both only while
+`microphone` is declared and the requesting page is the app's own origin: an
+audio-only capture request, and a device-info request** (without the second,
+`enumerateDevices()` returns no labels, and the app cannot let a person choose
+between a built-in microphone and a headset). A combined audio+video or a
+video-only request is refused as a whole — WebKit offers no partial grant —
+and every other permission type WebKit can ask for (geolocation,
+notification, pointer lock, a media key system, website data access, and
+whatever WebKit adds next) is denied unconditionally, whatever the manifest
+declares. Declaring this group is not a claim that the person consented at
+the moment of capture: there is no runtime prompt and no host-drawn recording
+indicator, and the declaration itself — readable before install — is the
+whole of the consent story.
+
+**`ipc` and `bridge` are both refused, at parse time, even when set to
+`false`.** This group has neither transport: there is nothing to `invoke()`
+and no bridge route, so accepting either spelling would make a manifest
+appear to grant something it never can — the same refusal `picker`'s `bridge`
+already gets.
+
+The grant belongs to the app's own origin, never to a window: the splash and
+the app share one webview (see `architecture/09-opening-an-app.md`), so the
+cold-start page can never receive it, whatever window it happens to be
+painted in. The camera and screen or display capture are not members of this
+group and are not planned as one — see
+`.project/decision/007-the-microphone-is-a-declared-capability.md` for why,
+kept there rather than restated here.
 
 ### `close_guard`
 
