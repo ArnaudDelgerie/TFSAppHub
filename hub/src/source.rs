@@ -371,10 +371,15 @@ fn resolve_local_archive(
             source,
         },
     })?;
+    // Canonicalising resolved any symlink, so the name checked against
+    // `SHA256SUMS.txt` is the real file's — which the classified spelling
+    // no longer guarantees to be UTF-8, nor even to end in `.tar.gz`.
     let archive_name = archive_path
         .file_name()
         .and_then(|name| name.to_str())
-        .expect("classified .tar.gz path has a UTF-8 file name");
+        .ok_or_else(|| SourceError::NotAFile {
+            path: archive_path.clone(),
+        })?;
     let checksums = release::parse_sha256sums(&sums_text);
     let actual = release::sha256_file(&archive_path)?;
     check_checksum(&checksums, archive_name, &actual)?;
@@ -569,11 +574,35 @@ impl fmt::Display for SourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Missing { path } => write!(formatter, "no such source: {}", path.display()),
-            Self::NotAFile { path } => write!(formatter, "{} is not a regular archive file", path.display()),
-            Self::IsABackup { path } => write!(formatter, "{} is a backup written by export — use `tfsapp-hub import <id> {}`", path.display(), path.display()),
-            Self::ChecksumFileMissing { directory } => write!(formatter, "no SHA256SUMS.txt beside the archive in {} — an unverified archive cannot be installed", directory.display()),
-            Self::ReferenceOnLocalArchive { reference } => write!(formatter, "--ref {reference} cannot select a revision of a local archive — pass the desired archive itself"),
-            Self::ArchiveNameMismatch { archive_name, expected } => write!(formatter, "archive {archive_name} does not match its manifest — expected {expected}"),
+            Self::NotAFile { path } => write!(
+                formatter,
+                "{} is not a regular archive file with a UTF-8 name",
+                path.display()
+            ),
+            Self::IsABackup { path } => write!(
+                formatter,
+                "{} is a backup written by export — use `tfsapp-hub import <id> {}`",
+                path.display(),
+                path.display()
+            ),
+            Self::ChecksumFileMissing { directory } => write!(
+                formatter,
+                "no SHA256SUMS.txt beside the archive in {} — an unverified archive \
+                 cannot be installed",
+                directory.display()
+            ),
+            Self::ReferenceOnLocalArchive { reference } => write!(
+                formatter,
+                "--ref {reference} cannot select a revision of a local archive — pass the \
+                 desired archive itself"
+            ),
+            Self::ArchiveNameMismatch {
+                archive_name,
+                expected,
+            } => write!(
+                formatter,
+                "archive {archive_name} does not match its manifest — expected {expected}"
+            ),
             Self::NotADirectory { path } => write!(
                 formatter,
                 "{} is not a directory — a local source is the project root, the \

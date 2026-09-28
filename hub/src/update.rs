@@ -1345,7 +1345,11 @@ impl UpdateError {
 impl fmt::Display for UpdateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ArchiveRequired { id, location } => write!(formatter, "{id} was last installed from {location}; supply the next archive with: tfsapp-hub update {id} <path.tar.gz>"),
+            Self::ArchiveRequired { id, location } => write!(
+                formatter,
+                "{id} was last installed from {location}; supply the next archive with: \
+                 tfsapp-hub update {id} <path.tar.gz>"
+            ),
             Self::Paths(error) => write!(formatter, "{error}"),
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Source(error) => write!(formatter, "{error}"),

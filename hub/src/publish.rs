@@ -599,6 +599,9 @@ pub(crate) fn publish_local(
         path: folder.clone(),
         source,
     })?;
+    // The directory now lives under its final name; the guard must not try
+    // to remove the old one on drop.
+    let _ = temporary.keep();
     fs::File::open(out_dir)
         .and_then(|handle| handle.sync_all())
         .map_err(|source| PublishError::Io {

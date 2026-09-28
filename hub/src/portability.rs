@@ -1261,7 +1261,14 @@ impl fmt::Display for PortabilityError {
                  `export` wrote.",
                 path.display()
             ),
-            Self::IsARelease { path } => write!(formatter, "{} is a release archive — use `tfsapp-hub install {}` (or `tfsapp-hub update <id> {}` for an installed app)", path.display(), path.display(), path.display()),
+            Self::IsARelease { path } => write!(
+                formatter,
+                "{} is a release archive — use `tfsapp-hub install {}` (or \
+                 `tfsapp-hub update <id> {}` for an installed app)",
+                path.display(),
+                path.display(),
+                path.display()
+            ),
             Self::MalformedManifest { path, detail } => write!(
                 formatter,
                 "{}: its manifest.json is unreadable ({detail}) — this does not look like an \

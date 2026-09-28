@@ -554,6 +554,28 @@ fn local_archive_refuses_missing_sums_mismatch_and_missing_entry() {
 }
 
 #[test]
+fn a_local_archive_symlink_to_a_non_utf8_name_is_refused_not_a_panic() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let folder = local_archive_fixture(&remote_manifest("1.2.0", "demo"));
+    let target = folder
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"demo-\xff.tar.gz"));
+    fs::rename(folder.path().join("demo-1.2.0.tar.gz"), &target).unwrap();
+    let link = folder.path().join("link.tar.gz");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let error = resolve(
+        &Origin::LocalArchive(link),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .unwrap_err();
+    assert!(matches!(error, SourceError::NotAFile { .. }), "{error}");
+}
+
+#[test]
 fn local_archive_checks_manifest_name_version_and_ref() {
     let scratch = tempfile::tempdir().unwrap();
     for (version, name) in [("1.3.0", "demo"), ("1.2.0", "other")] {
