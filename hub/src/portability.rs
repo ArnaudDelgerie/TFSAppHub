@@ -72,6 +72,7 @@ pub struct Manifest {
 
 /// The manifest's filename at the archive's root.
 pub const MANIFEST_FILE: &str = "manifest.json";
+const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 
 /// The archive's internal directory holding the curated database files —
 /// [`lifecycle::DB_FILE_NAMES`] joined under it, never a separate list.
@@ -787,14 +788,23 @@ fn read_manifest(archive_path: &Path) -> Result<Manifest, PortabilityError> {
     let entries = archive.entries().map_err(io_error)?;
 
     for entry in entries {
-        let mut entry = entry.map_err(io_error)?;
+        let entry = entry.map_err(io_error)?;
         let path = entry.path().map_err(io_error)?.into_owned();
         if path != Path::new(MANIFEST_FILE) {
             continue;
         }
 
         let mut contents = String::new();
-        entry.read_to_string(&mut contents).map_err(io_error)?;
+        entry
+            .take(MANIFEST_MAX_BYTES + 1)
+            .read_to_string(&mut contents)
+            .map_err(io_error)?;
+        if contents.len() as u64 > MANIFEST_MAX_BYTES {
+            return Err(PortabilityError::MalformedManifest {
+                path: archive_path.to_path_buf(),
+                detail: "manifest.json exceeds the 1 MiB limit".to_string(),
+            });
+        }
         return serde_json::from_str(&contents).map_err(|error| {
             PortabilityError::MalformedManifest {
                 path: archive_path.to_path_buf(),

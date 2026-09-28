@@ -709,6 +709,35 @@ fn an_archive_missing_manifest_json_is_refused() {
 }
 
 #[test]
+fn an_oversized_manifest_is_refused_before_touching_the_data_directory() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    fs::write(data_subdir.join("app.db"), b"original database").expect("database sentinel");
+    seed_derived_sentinels(&data_dir, &data_subdir);
+
+    let mut oversized = manifest_json("dev.local.demo", "1.2.3");
+    oversized.extend(vec![b' '; 1024 * 1024 + 1]);
+    let archive = base.path().join("oversized-manifest.tar.gz");
+    write_test_archive(&archive, &[(MANIFEST_FILE, &oversized)]);
+
+    let error = run_import(&paths, "demo", &archive, true, true)
+        .expect_err("manifest over 1 MiB must be refused");
+    assert!(
+        matches!(error, PortabilityError::MalformedManifest { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("1 MiB"), "{error}");
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).unwrap(),
+        b"original database"
+    );
+    assert_derived_state_retained(&data_dir, &data_subdir);
+}
+
+#[test]
 fn importing_refuses_a_foreign_identifier() {
     let (base, paths) = temp_paths();
     seed_registry(&paths, seeded_entry());
