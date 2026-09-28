@@ -79,7 +79,7 @@ start").
 
 ```sh
 make resources # fetch the pinned FrankenPHP and composer.phar into hub/resources (once)
-make check     # cargo fmt --check, clippy -D warnings, unit tests, shellcheck
+make check     # cargo fmt --check, clippy -D warnings, unit tests, shellcheck, release-chain test
 make keyring-integration # explicit production Secret Service smoke; needs dbus + gnome-keyring
 make build     # the hub's own AppImage, target/release/bundle/appimage/
 ```
@@ -89,6 +89,13 @@ app with that interpreter and that Composer, so no system-wide PHP is required �
 and nothing works without them. (`make sidecar` and `make composer` fetch one
 half each, if you want them separately.) `make build` refuses up front if
 `make resources` has not run.
+
+Releasing the hub (`build/scripts/release.sh`, see the Makefile) accepts only a
+clean tree whose `HEAD` is pushed to its upstream: the released AppImage is
+built from — or, when reused, recorded from — exactly that revision, and the
+release notes end with a `Built from <repo>@<sha>` line naming it. That line is
+provenance, not authenticity: it says where the binary came from, and signs
+nothing.
 
 ### Prerequisites
 

@@ -11,18 +11,31 @@ set -euo pipefail
 # `actions.secrets.ipc` confirmation gate.
 #
 # End to end:
-#   1. Version guard: tag = v<hub version>; stop if that release exists.
-#   2. Changelog gate: CHANGELOG.md must exist at the repo root with a
-#      "## <version>" heading ("## v<version>" and "## [<version>]" count too,
-#      with an optional trailing date); refuse otherwise. That section becomes
-#      the release notes, nothing more.
-#   3. Build (`make build`), or reuse a matching AppImage already under
-#      target/release/bundle/appimage/ — prompted once, default rebuild.
-#   4. Checksums: SHA256SUMS.txt (integrity for the unsigned flow).
-#   5. Publish: gh release create with the .AppImage and the checksums as
-#      assets (GitHub object storage, never committed — the repo clone stays
-#      light). A fresh build (not a reused one) is then offered for cleanup —
-#      keep on disk by default, or discard both files.
+#   1. Provenance gate: the working tree must be clean and its HEAD pushed to
+#      the branch's upstream; that HEAD is pinned as the revision this release
+#      is of. A dirty tree, an unpushed or detached HEAD is refused with the
+#      fix named — local and cheapest first, before any gh call.
+#   2. Version guard: tag = v<hub version>; stop if that release exists.
+#   3. Changelog gate: CHANGELOG.md must exist at the repo root with one of
+#      three spellings — "## <version>", "## v<version>", "## [<version>]" —
+#      each optionally followed by anything from a space on (a date, a link);
+#      no other spelling is accepted. That section becomes the release notes,
+#      nothing more, and the notes end with "Built from <repo>@<sha>": the
+#      provenance of the binary, not an authenticity claim (decision 004).
+#   4. Build (`make build`), or reuse an AppImage already under
+#      target/release/bundle/appimage/ — offered only when its
+#      .source-commit reads exactly the pinned HEAD; prompted once, default
+#      rebuild. A build from any other revision is rebuilt without prompting.
+#   5. Checksums: SHA256SUMS.txt (integrity for the unsigned flow), covering
+#      the AppImage and its .versions.txt.
+#   6. Re-check: the tree must still be clean, HEAD still the pinned revision,
+#      and the chosen build's .source-commit must still read it — otherwise
+#      refuse, publish nothing.
+#   7. Publish: gh release create with the .AppImage, its .versions.txt and
+#      the checksums as assets (GitHub object storage, never committed — the
+#      repo clone stays light). A fresh build (not a reused one) is then
+#      offered for cleanup — keep on disk by default, or discard all four
+#      files.
 #
 # Unlike the station, and unlike this script's own per-*app* release.sh
 # ancestor: the version comes from hub/Cargo.toml, the hub's own version —

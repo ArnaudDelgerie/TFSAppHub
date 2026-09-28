@@ -8,6 +8,15 @@ set -euo pipefail
 # never run (see `hub/build.rs` and `core::sidecar::is_present`). "present"
 # alone is not enough to tell the two apart, so this checks size rather than
 # mere existence.
+#
+# The AppImage selected at the end is the one for the version in
+# hub/Cargo.toml (read the same way release.sh reads it), not every
+# *.AppImage in the bundle directory: an older build kept there (release.sh's
+# reuse prompt defaults to keeping it) neither blocks the build nor reaches
+# fix-appimage-bundle.sh. The revision built — HEAD, suffixed -dirty on a
+# dirty tree, which is still built, a local build staying free — is written to
+# <stem>.source-commit beside the AppImage; release.sh reads it before
+# offering the build for reuse and re-checks it before publishing.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HUB_DIR="$ROOT_DIR/hub"
