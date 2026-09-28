@@ -103,6 +103,16 @@ Nothing an app declares changes, and `CONTRACT.md` §3's guarantee that
 `APP_CACHE_DIR`/`APP_BUILD_DIR` may be emptied at any launch is unchanged —
 only how often the hub actually chooses to.
 
+A window whose web process dies — a crash, a memory limit, any end to
+`WebKitWebProcess` the hub did not ask for itself — no longer sits on a dead
+page. `hub.log` records the reason, and the window shows the hub's own crash
+page in the app's declared `splash_bg` / `splash_text` with its
+`product_name`, with a Reload link that goes back through the same
+navigation policy and page-load hooks as any other load. There is no
+automatic reload and no crash-loop heuristic: the user's click is the only
+way back, and the app is never told a reload followed a crash. A close guard
+held by the document that crashed no longer blocks closing the window.
+
 ## 0.3.0
 
 No user-facing change — this release exists to validate `tfsapp-hub --update`
