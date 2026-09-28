@@ -1,8 +1,12 @@
-use std::{fs, path::Path};
+use std::{
+    fs, io,
+    path::Path,
+    time::{Duration, UNIX_EPOCH},
+};
 
 use super::{
-    append_bytes, data_dir_populated, export_temp_path, import_decision, run_export, run_import,
-    write_archive, ImportRefusal, Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE, UPLOADS_DIR,
+    append_bytes, append_reader, data_dir_populated, export_temp_path, import_decision, run_export,
+    run_import, ImportRefusal, Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE, UPLOADS_DIR,
 };
 use crate::{
     install, lifecycle, lifecycle_gate,
@@ -398,9 +402,9 @@ fn a_failed_export_removes_its_temp_file() {
     seed_registry(&paths, seeded_entry());
     let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
     fs::create_dir_all(&data_subdir).expect("a data subdir");
-    // `/proc/self/mem` presents as a regular file but reading it reliably
-    // fails, which makes the archive fail only after its temp was created.
-    std::os::unix::fs::symlink("/proc/self/mem", data_subdir.join("app.db"))
+    // `/proc/1/mem` presents as a regular file but cannot be opened by this
+    // process, so the failure occurs after the temporary archive is created.
+    std::os::unix::fs::symlink("/proc/1/mem", data_subdir.join("app.db"))
         .expect("a deliberately unreadable database");
     let target = base.path().join("backup.tar.gz");
     let temporary = export_temp_path(&target);
@@ -525,28 +529,106 @@ fn a_symlink_under_uploads_is_skipped_rather_than_followed() {
 }
 
 #[test]
-fn two_exports_of_the_same_upload_tree_are_byte_identical() {
-    let base = tempfile::tempdir().expect("a temp base");
-    let data_subdir = base.path().join("data");
-    let uploads_dir = base.path().join("uploads");
-    fs::create_dir_all(&data_subdir).expect("a data subdir");
+fn two_exports_of_the_same_upload_tree_differ_only_by_exported_at() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let uploads_dir = base.path().join("TFSApp/dev.local.demo/uploads");
     fs::create_dir_all(uploads_dir.join("a")).expect("a nested uploads dir");
     fs::write(uploads_dir.join("a/one.txt"), b"one").expect("a nested upload");
     fs::write(uploads_dir.join("two.txt"), b"two").expect("a top-level upload");
-    let archive_manifest = manifest("dev.local.demo", "1.2.3");
-
     let first = base.path().join("first.tar.gz");
-    write_archive(&first, &archive_manifest, &data_subdir, &uploads_dir)
-        .expect("the first export succeeds");
+    run_export(&paths, "demo", &first).expect("the first export succeeds");
     let second = base.path().join("second.tar.gz");
-    write_archive(&second, &archive_manifest, &data_subdir, &uploads_dir)
-        .expect("the second export succeeds");
+    run_export(&paths, "demo", &second).expect("the second export succeeds");
 
-    assert_eq!(
-        fs::read(&first).expect("the first archive"),
-        fs::read(&second).expect("the second archive"),
-        "two exports of identical content must produce byte-identical archives"
-    );
+    let read_entries = |path: &Path| {
+        let file = fs::File::open(path).expect("archive opens");
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        archive
+            .entries()
+            .expect("entries open")
+            .map(|entry| {
+                let mut entry = entry.expect("entry opens");
+                let path = entry
+                    .path()
+                    .expect("entry path")
+                    .to_string_lossy()
+                    .into_owned();
+                let header = entry.header().as_bytes().to_vec();
+                let mut bytes = Vec::new();
+                io::Read::read_to_end(&mut entry, &mut bytes).expect("entry body");
+                (path, header, bytes)
+            })
+            .collect::<Vec<_>>()
+    };
+    let first_entries = read_entries(&first);
+    let second_entries = read_entries(&second);
+    assert_eq!(first_entries.len(), second_entries.len());
+    for ((first_path, first_header, first_bytes), (second_path, second_header, second_bytes)) in
+        first_entries.iter().zip(&second_entries)
+    {
+        assert_eq!(first_path, second_path);
+        if first_path == MANIFEST_FILE {
+            assert_eq!(
+                &first_header[136..148],
+                &second_header[136..148],
+                "manifest mtime is fixed"
+            );
+            let mut first_manifest: serde_json::Value =
+                serde_json::from_slice(first_bytes).unwrap();
+            let mut second_manifest: serde_json::Value =
+                serde_json::from_slice(second_bytes).unwrap();
+            first_manifest
+                .as_object_mut()
+                .unwrap()
+                .remove("exported_at");
+            second_manifest
+                .as_object_mut()
+                .unwrap()
+                .remove("exported_at");
+            assert_eq!(first_manifest, second_manifest);
+        } else {
+            assert_eq!(first_header, second_header);
+            assert_eq!(first_bytes, second_bytes);
+        }
+    }
+}
+
+#[test]
+fn an_upload_entry_carries_its_source_mtime() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let upload = base.path().join("TFSApp/dev.local.demo/uploads/past.txt");
+    fs::create_dir_all(upload.parent().unwrap()).unwrap();
+    let file = fs::File::create(&upload).unwrap();
+    file.set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+        .unwrap();
+    let target = base.path().join("backup.tar.gz");
+    run_export(&paths, "demo", &target).unwrap();
+
+    let file = fs::File::open(target).unwrap();
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let upload_entry = archive
+        .entries()
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.path().unwrap().as_ref() == Path::new("uploads/past.txt"))
+        .expect("upload entry");
+    assert_eq!(upload_entry.header().mtime().unwrap(), 1_000_000_000);
+}
+
+#[test]
+fn an_early_eof_in_a_source_file_fails_the_archive_append() {
+    let mut builder = tar::Builder::new(Vec::new());
+    let error = append_reader(
+        &mut builder,
+        "uploads/short.txt",
+        io::Cursor::new(b"short"),
+        100,
+        0,
+    )
+    .expect_err("the declared file size must be supplied exactly");
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
 }
 
 #[test]
@@ -1171,6 +1253,12 @@ fn a_round_trip_through_export_then_import_restores_a_nested_upload_tree_exactly
     fs::create_dir_all(uploads_dir.join("invoices")).expect("a nested uploads dir");
     fs::write(uploads_dir.join("avatar.png"), b"avatar bytes").expect("a top-level upload");
     fs::write(uploads_dir.join("invoices/2026-01.pdf"), b"invoice bytes").expect("a nested upload");
+    fs::File::options()
+        .write(true)
+        .open(uploads_dir.join("avatar.png"))
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+        .unwrap();
     let archive = base.path().join("backup.tar.gz");
     run_export(&paths, "demo", &archive).expect("export succeeds");
     fs::remove_dir_all(&uploads_dir).expect("empty the data dir before reimporting");
@@ -1180,6 +1268,16 @@ fn a_round_trip_through_export_then_import_restores_a_nested_upload_tree_exactly
     assert_eq!(
         fs::read(uploads_dir.join("avatar.png")).expect("the top-level upload restored"),
         b"avatar bytes"
+    );
+    assert_eq!(
+        fs::metadata(uploads_dir.join("avatar.png"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        1_000_000_000,
     );
     assert_eq!(
         fs::read(uploads_dir.join("invoices/2026-01.pdf")).expect("the nested upload restored"),

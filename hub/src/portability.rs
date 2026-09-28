@@ -28,7 +28,7 @@ use std::{
     fmt, fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 
 use serde::{Deserialize, Serialize};
@@ -357,13 +357,13 @@ fn write_archive(
             if !source_path.is_file() {
                 continue;
             }
-            let bytes = fs::read(&source_path).map_err(io_error(&source_path))?;
             let archive_path = format!("{DATA_DIR}/{name}");
-            append_bytes(&mut builder, &archive_path, &bytes).map_err(io_error(&temporary))?;
+            append_file(&mut builder, &archive_path, &source_path)
+                .map_err(io_error(&source_path))?;
             database.push(name);
         }
 
-        let (uploads_count, uploads_bytes) = append_uploads(&mut builder, uploads_dir, &temporary)?;
+        let (uploads_count, uploads_bytes) = append_uploads(&mut builder, uploads_dir)?;
 
         let encoder = builder.into_inner().map_err(io_error(&temporary))?;
         encoder.finish().map_err(io_error(&temporary))?;
@@ -384,34 +384,22 @@ fn write_archive(
 
 /// Walk `uploads_dir` and append every regular file it holds under an
 /// `uploads/`-prefixed archive path, sorted at every level so two exports of
-/// identical content produce byte-identical archives (the same determinism
-/// the fixed header in [`append_bytes`] exists for). A directory that does
+/// identical content produce entries in the same order. A directory that does
 /// not exist is not a skip and not an error — the ordinary case for an app
 /// that has never written a file. Anything that is not a regular file (a
 /// symlink, a socket, a fifo) is skipped and named on stderr rather than
 /// followed or embedded.
 ///
-/// `io_error`s are attributed to `temporary` — `append_bytes`'s own failure
-/// is always a write to the archive being built, never to the source file
-/// just read, matching the database loop just above this call.
 fn append_uploads<W: io::Write>(
     builder: &mut tar::Builder<W>,
     uploads_dir: &Path,
-    temporary: &Path,
 ) -> Result<(u64, u64), PortabilityError> {
     if !uploads_dir.is_dir() {
         return Ok((0, 0));
     }
     let mut count = 0u64;
     let mut bytes = 0u64;
-    append_uploads_dir(
-        builder,
-        uploads_dir,
-        Path::new(""),
-        temporary,
-        &mut count,
-        &mut bytes,
-    )?;
+    append_uploads_dir(builder, uploads_dir, Path::new(""), &mut count, &mut bytes)?;
     Ok((count, bytes))
 }
 
@@ -419,7 +407,6 @@ fn append_uploads_dir<W: io::Write>(
     builder: &mut tar::Builder<W>,
     uploads_dir: &Path,
     relative: &Path,
-    temporary: &Path,
     count: &mut u64,
     bytes: &mut u64,
 ) -> Result<(), PortabilityError> {
@@ -440,20 +427,13 @@ fn append_uploads_dir<W: io::Write>(
         let child_relative = relative.join(entry.file_name());
         let child_absolute = uploads_dir.join(&child_relative);
         if file_type.is_dir() {
-            append_uploads_dir(
-                builder,
-                uploads_dir,
-                &child_relative,
-                temporary,
-                count,
-                bytes,
-            )?;
+            append_uploads_dir(builder, uploads_dir, &child_relative, count, bytes)?;
         } else if file_type.is_file() {
-            let data = fs::read(&child_absolute).map_err(io_error(&child_absolute))?;
             let archive_path = Path::new(UPLOADS_DIR).join(&child_relative);
-            append_bytes(builder, &archive_path, &data).map_err(io_error(temporary))?;
+            let size = append_file(builder, &archive_path, &child_absolute)
+                .map_err(io_error(&child_absolute))?;
             *count += 1;
-            *bytes += data.len() as u64;
+            *bytes += size;
         } else {
             eprintln!(
                 "skipping {}: not a regular file ({})",
@@ -477,9 +457,7 @@ fn export_temp_path(target: &Path) -> PathBuf {
     PathBuf::from(temporary)
 }
 
-/// Append one in-memory file to `builder` at `archive_path`, with an ordinary
-/// `0644` mode and this process's own start-adjacent mtime — nothing here
-/// reads back a timestamp so any fixed, valid one does.
+/// Append the in-memory manifest with a stable header.
 fn append_bytes<W: io::Write>(
     builder: &mut tar::Builder<W>,
     archive_path: impl AsRef<Path>,
@@ -488,13 +466,75 @@ fn append_bytes<W: io::Write>(
     let mut header = tar::Header::new_gnu();
     header.set_size(data.len() as u64);
     header.set_mode(0o644);
-    let mtime = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    header.set_mtime(mtime);
+    header.set_mtime(0);
     header.set_cksum();
     builder.append_data(&mut header, archive_path, data)
+}
+
+/// Append a regular file using only a bounded buffer. A file truncated after
+/// its metadata was read must fail rather than silently produce a short entry.
+fn append_file<W: io::Write>(
+    builder: &mut tar::Builder<W>,
+    archive_path: impl AsRef<Path>,
+    source_path: &Path,
+) -> io::Result<u64> {
+    let file = fs::File::open(source_path)?;
+    let metadata = file.metadata()?;
+    let size = metadata.len();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    append_reader(builder, archive_path, file, size, mtime)?;
+    Ok(size)
+}
+
+fn append_reader<W: io::Write, R: Read>(
+    builder: &mut tar::Builder<W>,
+    archive_path: impl AsRef<Path>,
+    reader: R,
+    size: u64,
+    mtime: u64,
+) -> io::Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(size);
+    header.set_mode(0o644);
+    header.set_mtime(mtime);
+    header.set_cksum();
+    builder.append_data(&mut header, archive_path, ExactLength::new(reader, size))
+}
+
+struct ExactLength<R> {
+    reader: R,
+    remaining: u64,
+}
+
+impl<R> ExactLength<R> {
+    fn new(reader: R, remaining: u64) -> Self {
+        Self { reader, remaining }
+    }
+}
+
+impl<R: Read> Read for ExactLength<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || buffer.is_empty() {
+            return Ok(0);
+        }
+        let limit = buffer
+            .len()
+            .min(self.remaining.try_into().unwrap_or(usize::MAX));
+        let count = self.reader.read(&mut buffer[..limit])?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "source file ended before its recorded size",
+            ));
+        }
+        self.remaining -= count as u64;
+        Ok(count)
+    }
 }
 
 /// `tfsapp-hub import <id> <path> [--force] [--yes]` — resolve `Paths`, run
