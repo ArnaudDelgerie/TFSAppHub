@@ -216,6 +216,8 @@ pub struct ActionsConfig {
     pub open_files: OpenFilesActions,
     #[serde(default)]
     pub media: MediaActions,
+    #[serde(default)]
+    pub paths: PathsActions,
 }
 
 /// The `secrets` group, per transport. `keys` is a manifest — typo-catching,
@@ -302,6 +304,33 @@ pub struct FileAssociations {
 pub struct MediaActions {
     #[serde(default)]
     pub microphone: bool,
+}
+
+/// The `paths` group (CONTRACT.md §7, decision 008): the second group whose
+/// members name a resource rather than a transport. Each member is one of
+/// GLib's eight special directories, named exactly as CONTRACT.md §7 spells
+/// them — `$HOME` is deliberately not a ninth member (decision 008). Like
+/// `media`, there is nothing to `invoke()` and no bridge route, so an `ipc` or
+/// `bridge` member spelled under `paths` is refused the same way (see
+/// [`parse`]).
+#[derive(Deserialize, Default, Debug, Clone, PartialEq)]
+pub struct PathsActions {
+    #[serde(default)]
+    pub desktop: bool,
+    #[serde(default)]
+    pub documents: bool,
+    #[serde(default)]
+    pub downloads: bool,
+    #[serde(default)]
+    pub music: bool,
+    #[serde(default)]
+    pub pictures: bool,
+    #[serde(default)]
+    pub public_share: bool,
+    #[serde(default)]
+    pub templates: bool,
+    #[serde(default)]
+    pub videos: bool,
 }
 
 /// A manifest and whatever the parse wanted to say about it.
@@ -440,6 +469,8 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
         ("open_files", "bridge"),
         ("media", "ipc"),
         ("media", "bridge"),
+        ("paths", "ipc"),
+        ("paths", "bridge"),
     ] {
         if action_group_has_transport(object, group, transport) {
             return Err(ManifestError::UnsupportedActionTransport {
@@ -525,6 +556,41 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
                 .map(|key| {
                     format!(
                         "unknown key \"actions.media.{key}\" in {} — check for a typo \
+                 (CONTRACT.md §7). It is ignored, not rejected.",
+                        path.display()
+                    )
+                }),
+        );
+    }
+
+    // Same rule for `paths` (plan 059): the eight members are new enough that
+    // a typo (`"downloads "`, `"public-share"`) is more likely than a
+    // deliberate extension, and a typo here silently omits a
+    // `TFS_USER_*_DIR` variable rather than failing loudly — exactly what a
+    // warning is for.
+    if let Some(fields) = object
+        .get("actions")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|actions| actions.get("paths"))
+        .and_then(serde_json::Value::as_object)
+    {
+        const PATHS_MEMBERS: &[&str] = &[
+            "desktop",
+            "documents",
+            "downloads",
+            "music",
+            "pictures",
+            "public_share",
+            "templates",
+            "videos",
+        ];
+        warnings.extend(
+            fields
+                .keys()
+                .filter(|key| !PATHS_MEMBERS.contains(&key.as_str()))
+                .map(|key| {
+                    format!(
+                        "unknown key \"actions.paths.{key}\" in {} — check for a typo \
                  (CONTRACT.md §7). It is ignored, not rejected.",
                         path.display()
                     )

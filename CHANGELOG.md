@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+An app can now declare `actions.paths` — one boolean per GLib special
+directory (`desktop`, `documents`, `downloads`, `music`, `pictures`,
+`public_share`, `templates`, `videos`) — and have the hub resolve each
+declared member through `glib::user_special_dir` (the same file,
+`~/.config/user-dirs.dirs`, GLib itself reads) and report it as
+`TFS_USER_<NAME>_DIR`. Like `media`, this group's members name a resource
+rather than a transport, so `ipc`/`bridge` are refused under it. A declared
+member GLib cannot resolve reports as an absent variable — never an empty
+string, never a guessed `$HOME`-based fallback. `$HOME` is deliberately not a
+ninth member: it already reaches PHP through the ordinary process
+environment. No filesystem grant and no existence guarantee either — PHP's
+rights are unchanged, and a resolved path may name a directory deleted a
+moment ago; see
+[decision 008](.project/decision/008-user-directories-are-a-declared-capability.md)
+for the full reasoning.
+
 An app can now declare `actions.media.microphone` and reach the microphone
 through the ordinary web platform — `getUserMedia({audio: true})` on its own
 page, never through IPC or the bridge, which is why the group has neither
