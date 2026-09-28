@@ -229,3 +229,15 @@ nothing declared anywhere, the same trust decision the AppImage comparison
 above already makes. The declared route is the auditable one, not the only
 one — see [decision 007](.project/decision/007-the-microphone-is-a-declared-capability.md)
 for the reasoning and what is honestly still missing.
+
+### Declared user directories are a legible line, not a filesystem boundary
+
+Declaring `actions.paths` (`downloads`, `pictures`, and the rest of GLib's
+eight special directories) buys the app a `TFS_USER_<NAME>_DIR` variable it
+would otherwise have to guess at — never a sandbox: PHP runs with the user's
+full rights regardless, exactly like `save_path` and the microphone above. A
+declared member GLib cannot resolve reports as an absent variable rather than
+a guessed `$HOME`-based path, and `$HOME` itself is deliberately not a ninth
+member — it already reaches PHP through the ordinary process environment. See
+[decision 008](.project/decision/008-user-directories-are-a-declared-capability.md)
+for the reasoning and what is left open.
