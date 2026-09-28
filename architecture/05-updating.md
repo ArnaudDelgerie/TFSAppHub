@@ -1,6 +1,6 @@
 ## Updating
 
-`update <id> [<archive.tar.gz>] [--ref <tag>] [--force]` resolves the supplied
+`update <id> [<archive.tar.gz>] [--ref <tag>]` resolves the supplied
 archive, or re-resolves the app's recorded source when none is supplied. An
 app recorded as `local-archive` requires the explicit archive and refuses
 `update <id>` alone with the needed command and last path. A supplied archive
@@ -21,21 +21,16 @@ from removing the first update's `apps/<id>.previous` anchor.
 1. Load the registry entry, resolve the supplied archive or re-resolve its
    recorded source (with `--ref` when appropriate), and validate it exactly
    as `install` does. `--ref` with an archive is refused.
-2. Decide the action (`update_decision`) from the same `lifecycle_decision`
+2. Decide (`update_decision`) from the same `lifecycle_decision`
    `install`/`open`/`run` all read, applied to the registry's recorded
    `app_version` against the freshly resolved source's own:
-   - a newer source → `Apply`, the update event;
-   - an equal source → refused, naming `--force`;
-   - an equal source with `--force` → `ResyncOnly` — re-copy the code and
-     re-run `composer install`, no lifecycle command, no database snapshot,
-     the existing anchor (if any) left exactly alone;
-   - an older source → refused as a downgrade; `--force` does not unlock it,
-     since it is for a tree edited without bumping the version, not for
-     going backwards;
+   - a newer source → the update event;
+   - an equal source → refused — there is nothing to update;
+   - an older source → refused as a downgrade: update never goes backwards;
    - no record at all → refused; that moment belongs to `install`.
 3. Guard the data directory exactly as `install` does (016's
    `check_data_dir_available`), then confirm.
-4. `Apply`, in order: write a durable, outgoing-only transaction journal at
+4. Apply, in order: write a durable, outgoing-only transaction journal at
    `<data>/update-transaction.json`, snapshot `app.db` (+ `-wal`/`-shm`) into
    `<data>/.update-transaction/`, retain the outgoing tree at
    `apps/<id>.update-transaction`, copy the new tree in, empty the app's own
@@ -68,8 +63,8 @@ from removing the first update's `apps/<id>.previous` anchor.
    registry is stamped, the update *has* happened, and there is nothing left to
    revert — `apply` no longer attempts to; a failure past that point names
    `repair` directly. `repair --yes` there instead *finishes* the update:
-   replaying the anchor promotion above (or, for `ResyncOnly`, discarding the
-   staged tree) until it is complete, so `rollback <id>` can then undo it.
+   replaying the anchor promotion above until it is complete, so
+   `rollback <id>` can then undo it.
    Either way, running `repair` a second time changes nothing. A malformed or
    future journal also refuses safely. Interrupted imports and rollbacks have
    recovery protocols of their own now — `repair <id>` puts an uncommitted
@@ -83,13 +78,6 @@ from removing the first update's `apps/<id>.previous` anchor.
    lease after an `update` wrote its journal still refuses, naming `repair`.
    The dispatch-side check that answers before any command runs is only the
    early message; the one under the lease is authoritative.
-
-`ResyncOnly` has no lifecycle event and rotates no anchor of its own, in
-either direction: before its registry write, repair restores the outgoing
-tree and registry entry, exactly as `Apply` does short of the database; after
-it, repair finishes by discarding the staged tree, and the existing public
-rollback anchor — if any — stays exactly as it was throughout, never created
-or touched by a resync.
 
 **The rollback anchor is three halves, or none.** `rollback <id>` refuses
 unless all three are present, naming whichever is missing:

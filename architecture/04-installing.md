@@ -3,10 +3,12 @@
 `install <source>` snapshots a project into the hub's root and makes it ready to
 open. In order:
 
-1. Resolve the source to a directory. A local path is used as it stands; a
-   local `.tar.gz` archive is verified and extracted into scratch space, while
-   a forge release (`github:owner/repo`) is downloaded first — see the release
-   resolution below.
+1. Resolve the source to an extracted tree. A forge release
+   (`github:owner/repo`) is downloaded first, and a local `.tar.gz` archive is
+   verified and extracted into scratch space — see the release resolution
+   below. A directory is refused: the hub installs release archives, not
+   working trees, and the refusal names `publish <path> --local <out-dir>` —
+   and `dev <path>` for running a project in place.
 2. Read and validate the manifest. Missing required fields, a wrong type on a
    known key, or a non-canonical `app_version` all stop here, naming the file and
    the field. An unknown key warns and does not stop anything.

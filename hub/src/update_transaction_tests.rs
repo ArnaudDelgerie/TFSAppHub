@@ -17,8 +17,8 @@ fn entry() -> RegistryEntry {
         id: "demo".into(),
         identifier: "dev.local.demo".into(),
         source: Source {
-            kind: SourceKind::LocalPath,
-            location: "/source".into(),
+            kind: SourceKind::LocalArchive,
+            location: "/releases/demo-0.6.0.tar.gz".into(),
             reference: None,
             reference_kind: None,
             index: None,
@@ -295,42 +295,6 @@ fn recovery_finishes_a_registry_committed_update_forward() {
 }
 
 #[test]
-fn recovery_finishes_a_registry_committed_resync_forward() {
-    let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
-    let mut journal = Journal::prepared(TransactionKind::ResyncOnly, entry.clone());
-    retain_tree(&app_dir).unwrap();
-    journal.advance(Phase::TreeRetained);
-    fs::create_dir_all(app_dir.join("public")).unwrap();
-    fs::write(app_dir.join("public/version"), "new").unwrap();
-    journal.advance(Phase::ReplacementInstalled);
-    registry::update(&paths, |registry| {
-        registry.get_mut("demo").unwrap().source_revision = "new-rev".into();
-    })
-    .unwrap();
-    journal.advance(Phase::RegistryCommitted);
-    write(&data_dir, &journal).unwrap();
-
-    let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
-    assert!(outcome.is_complete(), "{outcome:?}");
-    assert_eq!(
-        fs::read_to_string(app_dir.join("public/version")).unwrap(),
-        "new"
-    );
-    assert!(!staged_tree_path(&app_dir).is_dir());
-    assert!(read(&data_dir).unwrap().is_none());
-    // A resync rotates no anchor: the existing rollback point, if any, is
-    // left exactly as it was — recovery must not create one either.
-    assert!(!lifecycle::previous_tree_path(&app_dir).is_dir());
-    assert!(lifecycle::read_rollback_anchor(&data_dir.join("data")).is_none());
-    let mut expected = entry.clone();
-    expected.source_revision = "new-rev".into();
-    assert_eq!(
-        registry::load(&paths).unwrap().get("demo").unwrap(),
-        &expected
-    );
-}
-
-#[test]
 fn failed_recovery_keeps_its_journal_for_a_later_retry() {
     let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
     let mut journal = Journal::prepared(TransactionKind::Apply, entry);
@@ -496,7 +460,6 @@ fn a_tree_retained_before_its_phase_is_durable_is_renamed_back() {
     for (phase, kind) in [
         (Phase::Prepared, TransactionKind::Apply),
         (Phase::SnapshotComplete, TransactionKind::Apply),
-        (Phase::Prepared, TransactionKind::ResyncOnly),
     ] {
         let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
         let mut journal = Journal::prepared(kind, entry.clone());
@@ -577,7 +540,7 @@ fn journal_round_trip_tolerates_unknown_fields() {
 #[test]
 fn unknown_phase_refuses_to_load() {
     let dir = tempfile::tempdir().unwrap();
-    let journal = Journal::prepared(TransactionKind::ResyncOnly, entry());
+    let journal = Journal::prepared(TransactionKind::Apply, entry());
     write(dir.path(), &journal).unwrap();
     let path = journal_path(dir.path());
     let mut value: serde_json::Value =

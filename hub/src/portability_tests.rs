@@ -215,8 +215,8 @@ fn seeded_entry() -> RegistryEntry {
         id: "demo".to_string(),
         identifier: "dev.local.demo".to_string(),
         source: Source {
-            kind: SourceKind::LocalPath,
-            location: "/dev/null".to_string(),
+            kind: SourceKind::LocalArchive,
+            location: "/releases/demo-0.1.0.tar.gz".to_string(),
             reference: None,
             reference_kind: None,
             index: None,
@@ -900,25 +900,12 @@ fn exported_backup_refuses_install_and_update_before_mutation() {
     assert!(!paths.app_dir("backup-copy").unwrap().exists());
 
     let update_error =
-        update::update(&paths, "demo", Some(&backup), None, false, true, "0.1.0").unwrap_err();
+        update::update(&paths, "demo", Some(&backup), None, true, "0.1.0").unwrap_err();
     assert!(
         update_error.to_string().contains("tfsapp-hub import <id>"),
         "{update_error}"
     );
     assert_eq!(registry::load(&paths).unwrap().get("demo"), Some(&entry));
-}
-
-struct ReleaseManifestBlob(Vec<u8>);
-
-impl crate::publish::BlobSource for ReleaseManifestBlob {
-    fn copy_blob(
-        &mut self,
-        _: &str,
-        destination: &mut dyn io::Write,
-    ) -> Result<u64, crate::git::GitError> {
-        destination.write_all(&self.0).unwrap();
-        Ok(self.0.len() as u64)
-    }
 }
 
 #[test]
@@ -929,16 +916,14 @@ fn importing_a_release_names_install_and_preserves_data() {
     let data_dir = paths.app_data_dir(&entry.identifier).unwrap();
     fs::create_dir_all(data_dir.join(DATA_DIR)).unwrap();
     fs::write(data_dir.join(DATA_DIR).join("app.db"), b"original").unwrap();
-    let tree = vec![crate::git::TreeEntry {
-        path: "tfsapp.config.json".into(),
-        mode: 0o100644,
-        object_id: "manifest".into(),
-    }];
-    let release = crate::publish::build_archive(
-        &tree,
-        &mut ReleaseManifestBlob(br#"{"product_name":"Demo","identifier":"dev.local.demo","project_name":"demo","app_version":"1.2.3"}"#.to_vec()),
-        "demo", "1.2.3", base.path(),
-    ).unwrap().archive_path;
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path()).unwrap();
+    fs::write(
+        project.path().join("tfsapp.config.json"),
+        br#"{"product_name":"Demo","identifier":"dev.local.demo","project_name":"demo","app_version":"1.2.3"}"#,
+    )
+    .unwrap();
+    let release = crate::test_release::release_of(project.path(), base.path());
     let error = run_import(&paths, "demo", &release, false, true).unwrap_err();
     assert!(
         matches!(error, PortabilityError::IsARelease { .. }),
@@ -2323,11 +2308,13 @@ fn repair_backs_out_a_migrated_older_import_to_the_installed_version() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
     runnable_app_tree(source.path(), "1.3.0", r#"{"pre-update": ["about"]}"#);
+    let archive = crate::test_release::release_of(source.path(), release.path());
     install::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -2491,6 +2478,7 @@ fn an_archive_older_than_the_installed_app_is_migrated_forward_on_import() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
 
     // `pre-update`/`post-update` are properties of the manifest, not of an
@@ -2505,9 +2493,10 @@ fn an_archive_older_than_the_installed_app_is_migrated_forward_on_import() {
         "1.3.0",
         r#"{"pre-update": ["probe-derived-state"], "post-update": ["about"]}"#,
     );
+    let archive = crate::test_release::release_of(source.path(), release.path());
     install::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -2605,11 +2594,13 @@ fn a_failed_forward_migration_backs_the_import_out_in_process() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
     runnable_app_tree(source.path(), "1.3.0", r#"{"pre-update": ["boom"]}"#);
+    let archive = crate::test_release::release_of(source.path(), release.path());
     install::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -2724,11 +2715,13 @@ fn a_failed_warm_up_after_a_forward_migration_warns_without_stamping() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
     runnable_app_tree(source.path(), "1.3.0", r#"{"pre-update": ["about"]}"#);
+    let archive = crate::test_release::release_of(source.path(), release.path());
     install::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -2816,11 +2809,13 @@ fn a_run_command_after_an_equal_version_import_reads_the_imported_database() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
     runnable_app_tree(source.path(), "1.3.0", "{}");
+    let archive = crate::test_release::release_of(source.path(), release.path());
     install::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,

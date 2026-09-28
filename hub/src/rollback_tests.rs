@@ -25,7 +25,7 @@ fn seeded_entry(location: &str) -> RegistryEntry {
         id: "demo".to_string(),
         identifier: "dev.local.demo".to_string(),
         source: Source {
-            kind: SourceKind::LocalPath,
+            kind: SourceKind::LocalArchive,
             location: location.to_string(),
             reference: None,
             reference_kind: None,
@@ -83,7 +83,7 @@ fn rolling_back_an_unregistered_id_refuses() {
 #[test]
 fn refuses_with_no_anchor_at_all_naming_all_three_halves() {
     let (_base, paths) = temp_paths();
-    seed_registry(&paths, seeded_entry("/dev/null"));
+    seed_registry(&paths, seeded_entry("/releases/demo-0.1.0.tar.gz"));
 
     let error = rollback(&paths, "demo", true).expect_err("a fresh install has no anchor");
     let RollbackError::NoAnchor { missing, .. } = error else {
@@ -95,7 +95,7 @@ fn refuses_with_no_anchor_at_all_naming_all_three_halves() {
 #[test]
 fn refuses_when_only_the_retained_tree_is_missing() {
     let (base, paths) = temp_paths();
-    seed_registry(&paths, seeded_entry("/dev/null"));
+    seed_registry(&paths, seeded_entry("/releases/demo-0.1.0.tar.gz"));
     let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
     write_anchor(&data_subdir);
     fs::write(data_subdir.join("app.db.pre-update"), b"snapshot").expect("a db snapshot");
@@ -111,7 +111,7 @@ fn refuses_when_only_the_retained_tree_is_missing() {
 #[test]
 fn refuses_when_only_the_database_snapshot_is_missing() {
     let (base, paths) = temp_paths();
-    seed_registry(&paths, seeded_entry("/dev/null"));
+    seed_registry(&paths, seeded_entry("/releases/demo-0.1.0.tar.gz"));
     let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
     write_anchor(&data_subdir);
     let app_dir = paths.app_dir("demo").expect("an app dir");
@@ -128,7 +128,7 @@ fn refuses_when_only_the_database_snapshot_is_missing() {
 #[test]
 fn refuses_when_only_the_rollback_record_is_missing() {
     let (base, paths) = temp_paths();
-    seed_registry(&paths, seeded_entry("/dev/null"));
+    seed_registry(&paths, seeded_entry("/releases/demo-0.1.0.tar.gz"));
     let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
     fs::create_dir_all(&data_subdir).expect("a data subdir");
     fs::write(data_subdir.join("app.db.pre-update"), b"snapshot").expect("a db snapshot");
@@ -204,12 +204,14 @@ fn a_successful_update_can_be_rolled_back_end_to_end() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
 
     runnable_app_tree(source.path(), "0.6.0", "{}");
+    let first = crate::test_release::release_of(source.path(), release.path());
     crate::install::install(
         &paths,
-        &source.path().display().to_string(),
+        &first.display().to_string(),
         None,
         None,
         true,
@@ -227,7 +229,8 @@ fn a_successful_update_can_be_rolled_back_end_to_end() {
     fs::write(data_subdir.join("app.db"), b"pre-update-bytes").expect("a seeded database");
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
-    crate::update::update(&paths, "demo", None, None, false, true, "0.1.0")
+    let second = crate::test_release::release_of(source.path(), release.path());
+    crate::update::update(&paths, "demo", Some(&second), None, true, "0.1.0")
         .expect("the update applies");
 
     // Data written after the update, which the rollback must set aside
@@ -297,12 +300,14 @@ fn a_rollback_leaves_a_stale_cache_stamp_that_mismatches_the_restored_version() 
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
 
     runnable_app_tree(source.path(), "0.6.0", "{}");
+    let first = crate::test_release::release_of(source.path(), release.path());
     crate::install::install(
         &paths,
-        &source.path().display().to_string(),
+        &first.display().to_string(),
         None,
         None,
         true,
@@ -318,7 +323,8 @@ fn a_rollback_leaves_a_stale_cache_stamp_that_mismatches_the_restored_version() 
     fs::write(data_subdir.join("app.db"), b"pre-update-bytes").expect("a seeded database");
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
-    crate::update::update(&paths, "demo", None, None, false, true, "0.1.0")
+    let second = crate::test_release::release_of(source.path(), release.path());
+    crate::update::update(&paths, "demo", Some(&second), None, true, "0.1.0")
         .expect("the update applies");
 
     assert!(rollback(&paths, "demo", true).expect("it rolls back"));
@@ -372,12 +378,14 @@ const ROLLBACK_STOP_POINTS: [&str; 7] = [
 /// one per boundary.
 fn updated_for_rollback_stop() -> (tempfile::TempDir, Paths, PathBuf) {
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
 
     runnable_app_tree(source.path(), "0.6.0", "{}");
+    let first = crate::test_release::release_of(source.path(), release.path());
     crate::install::install(
         &paths,
-        &source.path().display().to_string(),
+        &first.display().to_string(),
         None,
         None,
         true,
@@ -390,7 +398,8 @@ fn updated_for_rollback_stop() -> (tempfile::TempDir, Paths, PathBuf) {
     fs::write(data_subdir.join("app.db"), b"pre-update-bytes").expect("a seeded database");
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
-    crate::update::update(&paths, "demo", None, None, false, true, "0.1.0")
+    let second = crate::test_release::release_of(source.path(), release.path());
+    crate::update::update(&paths, "demo", Some(&second), None, true, "0.1.0")
         .expect("the update applies");
 
     // Data written after the update, which the rollback must set aside
@@ -475,7 +484,7 @@ fn a_killed_rollback_is_refused_by_every_other_command_and_finished_by_rerunning
 #[test]
 fn a_marker_with_neither_tree_left_reports_the_lost_tree_and_keeps_the_marker() {
     let (base, paths) = temp_paths();
-    seed_registry(&paths, seeded_entry("/dev/null"));
+    seed_registry(&paths, seeded_entry("/releases/demo-0.1.0.tar.gz"));
     let data_dir = base.path().join("TFSApp/dev.local.demo");
     fs::create_dir_all(&data_dir).expect("a data dir");
     write_marker(
@@ -496,31 +505,19 @@ fn a_marker_with_neither_tree_left_reports_the_lost_tree_and_keeps_the_marker() 
     assert!(marker_path(&data_dir).exists());
 }
 
-struct RollbackBlobs(std::collections::HashMap<String, Vec<u8>>);
-
-impl crate::publish::BlobSource for RollbackBlobs {
-    fn copy_blob(
-        &mut self,
-        object: &str,
-        destination: &mut dyn std::io::Write,
-    ) -> Result<u64, crate::git::GitError> {
-        let bytes = &self.0[object];
-        destination.write_all(bytes).unwrap();
-        Ok(bytes.len() as u64)
-    }
-}
-
 #[test]
 fn rollback_after_forge_to_archive_keeps_archive_source_kind() {
     if !resources_present() {
         return;
     }
     let source = tempfile::tempdir().unwrap();
+    let release = tempfile::tempdir().unwrap();
     runnable_app_tree(source.path(), "0.6.0", "{}");
+    let first = crate::test_release::release_of(source.path(), release.path());
     let (_base, paths) = temp_paths();
     crate::install::install(
         &paths,
-        &source.path().display().to_string(),
+        &first.display().to_string(),
         None,
         None,
         true,
@@ -544,40 +541,8 @@ fn rollback_after_forge_to_archive_keeps_archive_source_kind() {
     let data_dir = paths.app_data_dir("dev.local.demo").unwrap().join("data");
     fs::write(data_dir.join("app.db"), b"pre-update-bytes").unwrap();
     runnable_app_tree(source.path(), "0.7.0", "{}");
-    let names = [
-        "tfsapp.config.json",
-        "composer.json",
-        "bin/console",
-        "public/index.php",
-    ];
-    let mut blobs = std::collections::HashMap::new();
-    let entries = names
-        .iter()
-        .map(|name| {
-            blobs.insert(
-                (*name).to_string(),
-                fs::read(source.path().join(name)).unwrap(),
-            );
-            crate::git::TreeEntry {
-                path: PathBuf::from(name),
-                mode: 0o100644,
-                object_id: (*name).to_string(),
-            }
-        })
-        .collect::<Vec<_>>();
-    let folder = tempfile::tempdir().unwrap();
-    let archive = crate::publish::build_archive(
-        &entries,
-        &mut RollbackBlobs(blobs),
-        "demo",
-        "0.7.0",
-        folder.path(),
-    )
-    .unwrap()
-    .archive_path;
-    assert!(
-        crate::update::update(&paths, "demo", Some(&archive), None, false, true, "0.1.0").unwrap()
-    );
+    let archive = crate::test_release::release_of(source.path(), release.path());
+    assert!(crate::update::update(&paths, "demo", Some(&archive), None, true, "0.1.0").unwrap());
     assert!(rollback(&paths, "demo", true).unwrap());
     let entry = registry::load(&paths).unwrap().get("demo").unwrap().clone();
     assert_eq!(entry.app_version, "0.6.0");

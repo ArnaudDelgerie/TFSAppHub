@@ -1,7 +1,7 @@
 ## 1. What an app must provide
 
 A TFSApp is a Symfony project directory. The hub is pointed at one — a local
-path, a local release archive, or a published release it downloads over HTTPS
+release archive, or a published release it downloads over HTTPS
 (see "Publishing a release" below) — and that directory must contain:
 
 ```
@@ -47,10 +47,10 @@ without it. This is the same boundary the lifecycle draws in §6 — the develop
 builds on their machine, the host installs and serves — and it is what keeps an
 app's prerequisites down to "a Symfony project".
 
-**What is in the directory is what gets installed.** Installing from a local
-path snapshots the tree as it stands, so a `.env.local` full of development
-overrides is snapshotted with it. Keep the source you install from clean of
-anything you would not commit.
+**What is in the release is what gets installed.** A release archive is built
+from the tree that is committed, so whatever is committed to it is what the
+hub installs. Keep the source you publish from clean of anything you would
+not ship.
 
 **The app's own source is never where its data lives.** The project directory is
 read-only from the app's point of view: the database, cache, sessions, logs and
@@ -60,12 +60,12 @@ directory belongs to the installed snapshot, and that an update replaces it.
 
 ### Publishing a release
 
-Everything above is what an app needs to be installed from a local path or a
-clone. It can also be installed from a local release archive. **To be installable remotely** —
-`tfsapp-hub install github:owner/repo` — it needs one more thing: a published
-release. An app that never publishes one is not in breach of anything; it
-stays local-only, installed from a directory, clone or archive, for as long as
-its author wants.
+Everything above is what an app needs to ship as a release — the only thing
+the hub installs. **To be installable** — `tfsapp-hub install
+github:owner/repo` from a forge, or `tfsapp-hub install <archive.tar.gz>`
+from a local release — it needs exactly that: a published release. An app
+that never publishes one is not in breach of anything; it stays a project
+the hub can only run in `dev`, for as long as its author wants.
 
 A release consists of `<project_name>-<app_version>.tar.gz` and a matching
 `SHA256SUMS.txt` beside it, on a forge or in a folder. The checksum is checked

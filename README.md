@@ -17,7 +17,10 @@ make it executable, and use it — nothing else to install first:
 
 ```sh
 chmod +x TFSAppHub_*.AppImage
-./TFSAppHub_*.AppImage install path/to/project
+./TFSAppHub_*.AppImage install github:owner/repo
+# or, for a project you have locally:
+./TFSAppHub_*.AppImage publish path/to/project --local out/
+./TFSAppHub_*.AppImage install out/<name>-<version>/<name>-<version>.tar.gz
 ./TFSAppHub_*.AppImage open myapp
 ```
 
@@ -35,7 +38,8 @@ resolves a new release without rebuilding the native half.
 
 Status: **it is packaged, and it installs, and it opens.** `make build`
 produces a self-contained AppImage from a machine with nothing else built —
-`install` snapshots a local project, resolves its dependencies with the
+`install` installs a release, from a forge or from a local archive
+`publish --local` wrote, resolves its dependencies with the
 bundled PHP, runs its lifecycle commands, registers it and — by default —
 writes it a `.desktop` entry, so it opens from the shell's own grid and
 search under its own name and icon, with no terminal and the hub not
@@ -166,10 +170,10 @@ for the PHP side of it.
 boundary, runtime identity, the install pipeline, the launch sequence, the
 bundled interpreter.
 
-Install here is a **snapshot**: editing the original source has no effect until
-an explicit `update`, which is what makes `composer install`, migrations and a
-warm persistent cache meaningful — and exactly what makes it useless as a dev
-loop. The dev loop is its own mode (`dev <path>`), and it serves
+Install here is a **snapshot of a release**: nothing edits the installed tree
+until an explicit `update`, which is what makes `composer install`, migrations
+and a warm persistent cache meaningful — and exactly what makes it useless as a
+dev loop. The dev loop is its own mode (`dev <path>`), and it serves
 live source **in place**: it watches nothing, compiles nothing and builds no
 assets. Your build tool already has a `--watch`.
 

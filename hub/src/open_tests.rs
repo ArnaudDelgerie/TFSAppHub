@@ -25,8 +25,8 @@ fn entry(id: &str, state: State) -> RegistryEntry {
         id: id.to_string(),
         identifier: format!("dev.local.{id}"),
         source: Source {
-            kind: SourceKind::LocalPath,
-            location: format!("/home/arnaud/Dev/{id}"),
+            kind: SourceKind::LocalArchive,
+            location: format!("/home/arnaud/Dev/{id}-0.1.0.tar.gz"),
             reference: None,
             reference_kind: None,
             index: None,

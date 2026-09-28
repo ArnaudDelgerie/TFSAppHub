@@ -1,22 +1,14 @@
-//! What a source looks like *right now*, as opposed to when it was installed.
+//! What a `<source>` argument names, and how the named thing becomes a local
+//! directory the installer can copy.
 //!
-//! The registry records a `source_revision` at install time — the git sha for a
-//! git source, a content hash of the tree for a plain directory (design source:
-//! `../TFSAppWorkstation/.project/hub/004-app-sources-and-versioning.md` §4).
-//! This module computes the other half of that comparison, so `list` can say
-//! *"source changed since install"* for the very common case of a developer who
-//! edited their project and forgot to bump `app_version`.
-//!
-//! One rule governs the whole module: **an answer it cannot give is silence,
-//! never a guess.** A source directory that has been moved, renamed or unplugged
-//! is [`Revision::Unreachable`], and a caller must then say nothing rather than
-//! report a difference it did not measure — a false "changed" would send a
-//! developer looking for an edit they never made.
-//!
-//! The resolver half — [`resolve`], which turns a `<source>` argument into a
-//! local directory the installer can copy — lands here too (plan 006), and it
-//! is the *only* half that may fetch anything. [`current_revision`] never does:
-//! `list` must stay a read of what is already on this machine.
+//! A source is one of exactly two installable kinds (decision
+//! `009-a-release-is-an-archive-wherever-it-lives.md`): a forge release
+//! (`github:owner/repo`) and a local release archive (`<name>-<version>.tar.gz`
+//! with its `SHA256SUMS.txt` beside it). A working directory is not one —
+//! `dev <dir>` serves a tree in place, and `publish <dir> --local` is how a
+//! tree becomes an archive worth installing — so [`classify`]'s fallback and
+//! a directory named like an archive are recognised only so [`resolve`] can
+//! refuse them well, naming the route that works.
 //!
 //! For a release, "fetch" means the whole of
 //! `../plan/018-remote-sources-releases.md`'s step 3: `release::fetch_latest_release_at`
@@ -60,47 +52,19 @@ use crate::{
 pub(crate) const EXCLUDED_FROM_HASH: &[&str] =
     &[".git", "vendor", "var", "node_modules", "tfsapp_build"];
 
-/// Where a source stands now.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Revision {
-    /// The source was read, and this is what it hashes to.
-    At(String),
-    /// The source could not be read: moved, renamed, offline, or a kind
-    /// nothing resolves yet. Callers stay silent on it.
-    Unreachable,
-}
-
-/// Observe `source` without fetching or changing anything.
-pub fn current_revision(source: &Source) -> Revision {
-    match source.kind {
-        SourceKind::LocalPath => match tree_hash(Path::new(&source.location)) {
-            Ok(hash) => Revision::At(hash),
-            // Every failure lands here on purpose — a missing directory and an
-            // unreadable one are the same answer to the only question asked:
-            // can this source be compared against what was installed?
-            Err(_) => Revision::Unreachable,
-        },
-        // `list` must stay a read of what is already on this machine — it
-        // never dials out, so a release source (whose revision can only be
-        // learned by asking the forge) always answers "unreachable" here.
-        // This is not a gap step 4 fills in: it is the boundary this
-        // function exists to hold, and [`resolve`] is the only half of this
-        // module that may ever open a socket.
-        SourceKind::Release | SourceKind::LocalArchive => Revision::Unreachable,
-    }
-}
-
 /// What a `<source>` argument names, decided from the string alone.
 ///
 /// The test is on the *string*, not on what exists on disk: a URL that names
-/// no directory must still be reported as a release, never as a missing local
-/// path — the two errors send a reader in opposite directions. Anything not
-/// recognisably remote is a local path, so a plain relative directory needs
-/// no scheme and no flag.
+/// no directory must still be reported as a release, never as an unrecognised
+/// path — the two errors send a reader in opposite directions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
-    LocalPath(PathBuf),
     LocalArchive(PathBuf),
+    /// Anything the grammar does not name — recognised only so [`resolve`]
+    /// can refuse it well, like [`Origin::GitSpelling`]: an existing
+    /// directory is told the `publish --local` route, everything else is
+    /// told the two kinds of source the hub installs.
+    Unrecognised(PathBuf),
     /// A repository to fetch a release of. `index` names how it was found —
     /// `"github"`, the forge acting as its own index today — so a later,
     /// curated index has somewhere to record its own name instead
@@ -128,7 +92,9 @@ pub enum Origin {
 /// - `github:owner/repo` → the canonical [`Origin::Release`].
 /// - `https://github.com/owner/repo` → the same, normalised to it — what a
 ///   browser's address bar hands out for a public repository.
-/// - anything else → [`Origin::LocalPath`], as always.
+/// - anything ending in `.tar.gz` → [`Origin::LocalArchive`].
+/// - anything else → [`Origin::Unrecognised`], so [`resolve`] can refuse it
+///   well.
 pub fn classify(spec: &str) -> Origin {
     if spec.starts_with("git@") || spec.ends_with(".git") {
         return Origin::GitSpelling(spec.to_string());
@@ -148,7 +114,7 @@ pub fn classify(spec: &str) -> Origin {
     if spec.ends_with(".tar.gz") {
         return Origin::LocalArchive(PathBuf::from(spec));
     }
-    Origin::LocalPath(PathBuf::from(spec))
+    Origin::Unrecognised(PathBuf::from(spec))
 }
 
 /// `https://github.com/<owner>/<repo>` (an optional trailing slash and an
@@ -197,13 +163,15 @@ pub(crate) fn github_ssh_repo(spec: &str) -> Option<String> {
 /// has to record about where it came from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resolved {
-    /// The directory holding the app's tree, ready to be copied. For a local
-    /// path this *is* the source; for a git source it will be a checkout.
+    /// The extracted tree, ready to be copied into `apps/<id>` — a release
+    /// downloaded into the caller's scratch, or a local archive extracted
+    /// there.
     pub root: PathBuf,
     /// What `update` needs to resolve this same source again.
     pub source: Source,
-    /// The tree as it stood at this moment — the value `list` later compares
-    /// against to say "changed since install".
+    /// The tree as it stood at this moment — recorded as the entry's
+    /// `source_revision`, which the rollback anchor and the update journal
+    /// compare against the tree they are about to replace.
     pub revision: String,
 }
 
@@ -233,42 +201,12 @@ pub fn resolve(
 ) -> Result<Resolved, SourceError> {
     match origin {
         Origin::LocalArchive(path) => resolve_local_archive(path, reference, scratch),
-        Origin::LocalPath(path) => {
-            if let Some(reference) = reference {
-                return Err(SourceError::ReferenceOnLocalPath {
-                    reference: reference.to_string(),
-                });
+        Origin::Unrecognised(path) => {
+            if path.is_dir() {
+                return Err(SourceError::DirectoryNotASource { path: path.clone() });
             }
-
-            let root = fs::canonicalize(path).map_err(|source| match source.kind() {
-                io::ErrorKind::NotFound => SourceError::Missing { path: path.clone() },
-                _ => SourceError::Unreadable {
-                    path: path.clone(),
-                    source,
-                },
-            })?;
-            if !root.is_dir() {
-                return Err(SourceError::NotADirectory { path: root });
-            }
-
-            let revision = tree_hash(&root).map_err(|source| SourceError::Unreadable {
-                path: root.clone(),
-                source,
-            })?;
-
-            Ok(Resolved {
-                source: Source {
-                    kind: SourceKind::LocalPath,
-                    location: root.display().to_string(),
-                    // A plain directory has no selector and nothing that
-                    // selected it: recording either would be inventing a
-                    // provenance nobody asked for.
-                    reference: None,
-                    reference_kind: None,
-                    index: None,
-                },
-                root,
-                revision,
+            Err(SourceError::UnrecognisedSource {
+                spec: path.display().to_string(),
             })
         }
         Origin::Release { index, repo } => {
@@ -354,6 +292,13 @@ fn resolve_local_archive(
             source,
         },
     })?;
+    // Reached by `update <id> <dir>` — which always builds a
+    // `LocalArchive` from its argument — and by a directory whose name ends
+    // in `.tar.gz`; both are owed the `publish --local` route rather than a
+    // mystifying "not a regular archive file".
+    if archive_path.is_dir() {
+        return Err(SourceError::DirectoryNotASource { path: archive_path });
+    }
     if !archive_path.is_file() {
         return Err(SourceError::NotAFile { path: archive_path });
     }
@@ -481,8 +426,17 @@ pub enum SourceError {
     Missing {
         path: PathBuf,
     },
-    NotADirectory {
+    /// A working directory where an installable source was asked for — the
+    /// refusal names the `publish --local` route that turns a tree into an
+    /// archive worth installing.
+    DirectoryNotASource {
         path: PathBuf,
+    },
+    /// Anything `classify` could not name: not a git spelling, not a forge
+    /// spec, not an archive. The refusal states the two kinds the hub does
+    /// install.
+    UnrecognisedSource {
+        spec: String,
     },
     NotAFile {
         path: PathBuf,
@@ -503,9 +457,6 @@ pub enum SourceError {
     Unreadable {
         path: PathBuf,
         source: io::Error,
-    },
-    ReferenceOnLocalPath {
-        reference: String,
     },
     /// A git clone URL or scp-like spelling — recognised so the refusal can
     /// point at the release form instead of reporting a mystifying "no such
@@ -574,6 +525,22 @@ impl fmt::Display for SourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Missing { path } => write!(formatter, "no such source: {}", path.display()),
+            Self::DirectoryNotASource { path } => write!(
+                formatter,
+                "{} is a directory. The hub installs release archives, not working \
+                 trees: commit the project, run `tfsapp-hub publish {} --local <out-dir>`, \
+                 then install the `.tar.gz` it writes. To run a project in place while \
+                 developing, use `tfsapp-hub dev {}`.",
+                path.display(),
+                path.display(),
+                path.display()
+            ),
+            Self::UnrecognisedSource { spec } => write!(
+                formatter,
+                "{spec} is not a source the hub installs. Give `github:owner/repo`, \
+                 or the path to a `<name>-<version>.tar.gz` release archive with its \
+                 `SHA256SUMS.txt` beside it."
+            ),
             Self::NotAFile { path } => write!(
                 formatter,
                 "{} is not a regular archive file with a UTF-8 name",
@@ -603,25 +570,14 @@ impl fmt::Display for SourceError {
                 formatter,
                 "archive {archive_name} does not match its manifest — expected {expected}"
             ),
-            Self::NotADirectory { path } => write!(
-                formatter,
-                "{} is not a directory — a local source is the project root, the \
-                 directory holding tfsapp.config.json",
-                path.display()
-            ),
             Self::Unreadable { path, source } => {
                 write!(formatter, "cannot read {}: {source}", path.display())
             }
-            Self::ReferenceOnLocalPath { reference } => write!(
-                formatter,
-                "--ref {reference} selects a revision of a git source; a local \
-                 directory is installed as it stands"
-            ),
             Self::GitSpelling { spec } => write!(
                 formatter,
                 "{spec} looks like a git clone URL — the hub installs releases, not \
-                 repositories. Use github:owner/repo, or clone it yourself and install \
-                 the clone's directory."
+                 repositories. Use github:owner/repo, or publish a local release \
+                 archive from a clone with tfsapp-hub publish."
             ),
             Self::Release(error) => write!(formatter, "{error}"),
             Self::ChecksumMismatch {

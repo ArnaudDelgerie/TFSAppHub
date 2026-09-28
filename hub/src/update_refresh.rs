@@ -7,9 +7,9 @@
 //! and the app is already running — never before, so a slow or offline
 //! network can never delay a launch reaching its window. [`spawn`] is itself
 //! the guard: no thread at all unless the launch is a release install that
-//! declares `actions.update` on at least one transport. A local-path source,
-//! a `dev` session, or an app that never declares the group costs the
-//! network nothing.
+//! declares `actions.update` on at least one transport. A local-archive
+//! source, a `dev` session, or an app that never declares the group costs
+//! the network nothing.
 //!
 //! One request, one cache write, at most once per [`REFRESH_TTL`] per
 //! repository — never per app, since two apps installed from the same

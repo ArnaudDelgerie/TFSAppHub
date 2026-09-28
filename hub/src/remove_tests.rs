@@ -665,8 +665,8 @@ mod registry {
             id: id.to_string(),
             identifier: IDENTIFIER.to_string(),
             source: Source {
-                kind: SourceKind::LocalPath,
-                location: "/home/arnaud/Dev/Demo".to_string(),
+                kind: SourceKind::LocalArchive,
+                location: "/home/arnaud/Dev/demo-0.1.0.tar.gz".to_string(),
                 reference: None,
                 reference_kind: None,
                 index: None,

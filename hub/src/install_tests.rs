@@ -65,7 +65,7 @@ fn registered(id: &str, location: &str) -> RegistryEntry {
         id: id.to_string(),
         identifier: format!("dev.local.{id}"),
         source: Source {
-            kind: SourceKind::LocalPath,
+            kind: SourceKind::LocalArchive,
             location: location.to_string(),
             reference: None,
             reference_kind: None,
@@ -185,13 +185,15 @@ fn an_unusable_project_name_says_where_it_came_from() {
 fn an_id_already_installed_is_refused_naming_what_holds_it() {
     let (_base, paths) = temp_paths();
     let mut registry = Registry::default();
-    registry.upsert(registered("demo", "/home/arnaud/Dev/Demo"));
+    registry.upsert(registered("demo", "/home/arnaud/Dev/demo-0.1.0.tar.gz"));
 
     let error = check_id_free(&registry, &paths, "demo").expect_err("demo is taken");
 
     assert!(matches!(error, InstallError::IdTaken { .. }), "{error}");
     assert!(
-        error.to_string().contains("/home/arnaud/Dev/Demo"),
+        error
+            .to_string()
+            .contains("/home/arnaud/Dev/demo-0.1.0.tar.gz"),
         "{error}"
     );
     check_id_free(&registry, &paths, "other").expect("nothing holds `other`");
@@ -215,11 +217,74 @@ fn a_directory_with_no_entry_behind_it_is_refused_rather_than_reused() {
 }
 
 #[test]
+fn a_directory_is_refused_naming_the_publish_local_route() {
+    // A working tree is the author's side, not an install source (plan 066):
+    // the refusal names the `publish --local` route that replaces it.
+    let (base, paths) = temp_paths();
+    let project = base.path().join("project");
+    fs::create_dir_all(&project).expect("a project directory");
+
+    let error = crate::install::install(
+        &paths,
+        &project.display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect_err("a directory is not an install source");
+
+    assert!(
+        matches!(
+            error,
+            InstallError::Source(crate::source::SourceError::DirectoryNotASource { .. })
+        ),
+        "{error}"
+    );
+    assert!(error.to_string().contains("publish"), "{error}");
+    assert!(error.to_string().contains("dev"), "{error}");
+    assert!(
+        load(&paths).expect("a readable registry").apps.is_empty(),
+        "nothing may be registered by a refusal"
+    );
+}
+
+#[test]
+fn a_path_that_is_nothing_is_refused_as_an_unrecognised_source() {
+    // Neither a git spelling, nor `github:`, nor the forge's HTTPS URL, nor a
+    // `.tar.gz` — the fallback says what the hub does install.
+    let (base, paths) = temp_paths();
+    let nowhere = base.path().join("nonsense");
+
+    let error = crate::install::install(
+        &paths,
+        &nowhere.display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect_err("an unrecognised spec is not an install source");
+
+    assert!(
+        matches!(
+            error,
+            InstallError::Source(crate::source::SourceError::UnrecognisedSource { .. })
+        ),
+        "{error}"
+    );
+    assert!(error.to_string().contains("github:owner/repo"), "{error}");
+    assert!(error.to_string().contains("SHA256SUMS.txt"), "{error}");
+}
+
+#[test]
 fn a_second_id_for_the_same_identifier_is_refused_naming_the_first() {
     let mut registry = Registry::default();
     registry.upsert(RegistryEntry {
         identifier: "dev.local.demo".to_string(),
-        ..registered("first", "/home/arnaud/Dev/Demo")
+        ..registered("first", "/home/arnaud/Dev/demo-0.1.0.tar.gz")
     });
 
     let error = check_identifier_free(&registry, "dev.local.demo")
@@ -266,7 +331,7 @@ fn an_id_collision_keeps_its_own_message_rather_than_being_swallowed() {
     // reported as one.
     let (_base, paths) = temp_paths();
     let mut registry = Registry::default();
-    registry.upsert(registered("demo", "/home/arnaud/Dev/Demo"));
+    registry.upsert(registered("demo", "/home/arnaud/Dev/demo-0.1.0.tar.gz"));
 
     let error = check_id_free(&registry, &paths, "demo").expect_err("demo is taken");
 
@@ -631,7 +696,7 @@ fn registry_with(id: &str, app_port: Option<u16>) -> Registry {
     let mut registry = Registry::default();
     registry.upsert(RegistryEntry {
         app_port,
-        ..registered(id, "/home/arnaud/Dev/Demo")
+        ..registered(id, "/home/arnaud/Dev/demo-0.1.0.tar.gz")
     });
     registry
 }
@@ -693,11 +758,11 @@ fn a_port_claimed_since_the_first_check_refuses_registration() {
     // has written to yet. The re-check inside `registry::update`'s closure is
     // the one that answers.
     let (_base, paths) = temp_paths();
-    let mut first = registered("first", "/home/arnaud/Dev/First");
+    let mut first = registered("first", "/home/arnaud/Dev/first-0.1.0.tar.gz");
     first.app_port = Some(8123);
     update(&paths, |registry| registry.upsert(first)).expect("a seeded registry");
 
-    let mut second = registered("second", "/home/arnaud/Dev/Second");
+    let mut second = registered("second", "/home/arnaud/Dev/second-0.1.0.tar.gz");
     second.app_port = Some(8123);
     let error = register(&paths, second, "9.9.9", &stamped_platform())
         .expect_err("the port was claimed under the lock");
@@ -716,13 +781,13 @@ fn a_port_claimed_since_the_first_check_refuses_registration() {
 fn an_id_claimed_since_the_first_check_refuses_registration() {
     let (_base, paths) = temp_paths();
     update(&paths, |registry| {
-        registry.upsert(registered("demo", "/home/arnaud/Dev/First"))
+        registry.upsert(registered("demo", "/home/arnaud/Dev/first-0.1.0.tar.gz"))
     })
     .expect("a seeded registry");
 
     let error = register(
         &paths,
-        registered("demo", "/home/arnaud/Dev/Second"),
+        registered("demo", "/home/arnaud/Dev/second-0.1.0.tar.gz"),
         "9.9.9",
         &stamped_platform(),
     )
@@ -730,7 +795,9 @@ fn an_id_claimed_since_the_first_check_refuses_registration() {
 
     assert!(matches!(error, InstallError::IdTaken { .. }), "{error}");
     assert!(
-        error.to_string().contains("/home/arnaud/Dev/First"),
+        error
+            .to_string()
+            .contains("/home/arnaud/Dev/first-0.1.0.tar.gz"),
         "{error}"
     );
 
@@ -739,7 +806,7 @@ fn an_id_claimed_since_the_first_check_refuses_registration() {
     assert_eq!(loaded.apps.len(), 1, "the refusal must not add an entry");
     assert_eq!(loaded.apps[0].id, "demo");
     assert_eq!(
-        loaded.apps[0].source.location, "/home/arnaud/Dev/First",
+        loaded.apps[0].source.location, "/home/arnaud/Dev/first-0.1.0.tar.gz",
         "the refusal must not replace the entry"
     );
     assert_eq!(loaded.hub_version, None, "the refusal must not stamp");
@@ -751,7 +818,7 @@ fn a_free_id_and_port_registers() {
 
     register(
         &paths,
-        registered("demo", "/home/arnaud/Dev/Demo"),
+        registered("demo", "/home/arnaud/Dev/demo-0.1.0.tar.gz"),
         "9.9.9",
         &stamped_platform(),
     )
@@ -835,6 +902,7 @@ fn an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(
@@ -842,9 +910,10 @@ fn an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order() {
         r#"{"pre-install": ["doctrine:migrations:migrate"], "post-install": ["about"]}"#,
     );
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let id = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -877,13 +946,15 @@ fn an_install_writes_a_cache_stamp_matching_the_current_platform() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), "{}");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let id = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -917,6 +988,7 @@ fn a_failed_warm_up_does_not_fail_the_install_and_leaves_no_stamp() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     manifest_at(source.path(), "0.6.0");
@@ -935,9 +1007,10 @@ fn a_failed_warm_up_does_not_fail_the_install_and_leaves_no_stamp() {
     fs::create_dir_all(source.path().join("public")).expect("a public dir");
     fs::write(source.path().join("public/index.php"), "<?php").expect("a front controller");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let id = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -971,14 +1044,16 @@ fn a_data_dir_recording_a_newer_version_refuses_before_anything_is_copied_or_reg
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), "{}"); // app_version 0.6.0
     seed_data_record(&paths, "dev.local.demo", "9.9.9");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let error = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1010,14 +1085,16 @@ fn a_data_dir_recording_an_older_version_refuses_as_the_update_event() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), "{}"); // app_version 0.6.0
     seed_data_record(&paths, "dev.local.demo", "0.1.0");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let error = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1049,6 +1126,7 @@ fn a_record_of_the_same_version_installs_and_runs_no_lifecycle_command() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(
@@ -1057,9 +1135,10 @@ fn a_record_of_the_same_version_installs_and_runs_no_lifecycle_command() {
     );
     seed_data_record(&paths, "dev.local.demo", "0.6.0");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let id = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1097,6 +1176,7 @@ fn a_fresh_install_discards_any_rollback_anchor_left_in_the_data_directory() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), "{}"); // app_version 0.6.0
@@ -1115,9 +1195,10 @@ fn a_fresh_install_discards_any_rollback_anchor_left_in_the_data_directory() {
     )
     .expect("a seeded anchor");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1142,6 +1223,7 @@ fn a_declined_install_leaves_an_existing_rollback_anchor_intact() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     app_tree(source.path());
@@ -1160,9 +1242,10 @@ fn a_declined_install_leaves_an_existing_rollback_anchor_intact() {
     )
     .expect("a seeded anchor");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let result = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         false,
@@ -1191,13 +1274,15 @@ fn a_failing_hook_leaves_no_directory_and_nothing_registered() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), r#"{"pre-install": ["boom"]}"#);
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let error = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1229,13 +1314,15 @@ fn an_install_writes_the_desktop_entry_and_the_stable_hub_copy() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), "{}");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1264,13 +1351,15 @@ fn no_desktop_entry_writes_neither_the_entry_nor_the_copy() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), "{}");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1454,55 +1543,10 @@ fn an_install_from_a_remote_release_reaches_ready() {
     assert_eq!(entry.source.index.as_deref(), Some("github"));
 }
 
-struct ArchiveFixtureBlobs(std::collections::HashMap<String, Vec<u8>>);
-
-impl crate::publish::BlobSource for ArchiveFixtureBlobs {
-    fn copy_blob(
-        &mut self,
-        object: &str,
-        destination: &mut dyn std::io::Write,
-    ) -> Result<u64, crate::git::GitError> {
-        let bytes = &self.0[object];
-        destination.write_all(bytes).unwrap();
-        Ok(bytes.len() as u64)
-    }
-}
-
 fn built_local_release(root: &Path) -> PathBuf {
     let project = tempfile::tempdir().unwrap();
     app_tree(project.path());
-    let names = [
-        "tfsapp.config.json",
-        "composer.json",
-        "bin/console",
-        "public/index.php",
-    ];
-    let mut blobs = std::collections::HashMap::new();
-    let entries = names
-        .iter()
-        .map(|name| {
-            let bytes = fs::read(project.path().join(name)).unwrap();
-            blobs.insert((*name).to_string(), bytes);
-            crate::git::TreeEntry {
-                path: PathBuf::from(name),
-                mode: if *name == "bin/console" {
-                    0o100755
-                } else {
-                    0o100644
-                },
-                object_id: (*name).to_string(),
-            }
-        })
-        .collect::<Vec<_>>();
-    crate::publish::build_archive(
-        &entries,
-        &mut ArchiveFixtureBlobs(blobs),
-        "demo",
-        "0.6.0",
-        root,
-    )
-    .unwrap()
-    .archive_path
+    crate::test_release::release_of(project.path(), root)
 }
 
 #[test]

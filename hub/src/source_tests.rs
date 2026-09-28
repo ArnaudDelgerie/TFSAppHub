@@ -3,8 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{classify, current_revision, resolve, tree_hash, Origin, Revision, SourceError};
-use crate::registry::{Source, SourceKind};
+use super::{classify, resolve, tree_hash, Origin, SourceError};
+use crate::registry::SourceKind;
 use sha2::{Digest, Sha256};
 
 /// None of this file's `resolve` calls reach the `Origin::Release` arm — every
@@ -16,16 +16,6 @@ fn project(root: &Path) {
     fs::create_dir_all(root.join("src")).expect("a source dir");
     fs::write(root.join("tfsapp.config.json"), "{}").expect("a manifest");
     fs::write(root.join("src/Kernel.php"), "<?php class Kernel {}").expect("a class");
-}
-
-fn local(location: &Path) -> Source {
-    Source {
-        kind: SourceKind::LocalPath,
-        location: location.display().to_string(),
-        reference: None,
-        reference_kind: None,
-        index: None,
-    }
 }
 
 fn release_archive(manifest: &str) -> Vec<u8> {
@@ -285,34 +275,6 @@ fn the_directories_that_churn_are_left_out() {
 }
 
 #[test]
-fn a_local_source_that_is_gone_is_unreachable_not_an_error() {
-    let root = tempfile::tempdir().expect("a temp dir");
-    project(root.path());
-    let source = local(root.path());
-
-    assert!(matches!(current_revision(&source), Revision::At(_)));
-
-    drop(root);
-
-    assert_eq!(current_revision(&source), Revision::Unreachable);
-}
-
-#[test]
-fn a_release_source_is_unreachable_until_something_resolves_one() {
-    // `list` must not put a network call behind a listing, and no installer
-    // writes a release source yet. Silence is the honest answer.
-    let source = Source {
-        kind: SourceKind::Release,
-        location: "example/demo".to_string(),
-        reference: Some("v1.4.0".to_string()),
-        reference_kind: None,
-        index: Some("github".to_string()),
-    };
-
-    assert_eq!(current_revision(&source), Revision::Unreachable);
-}
-
-#[test]
 fn a_string_is_classified_without_touching_the_disk() {
     // git-clone spellings — recognised only so `resolve` can refuse them
     // well, pointing at the release form instead of a mystifying "no such
@@ -341,11 +303,10 @@ fn a_string_is_classified_without_touching_the_disk() {
     assert_eq!(classify("https://github.com/example/demo/"), canonical);
 
     // Anything else — including a github.com URL carrying more than
-    // owner/repo, and a non-GitHub URL this hub has no grammar row for — is a
-    // local path, as always: the two errors a bad one produces (missing vs.
-    // not-a-release) send a reader in opposite directions, so guessing wrong
-    // here would be worse than a plain "no such directory".
-    for local in [
+    // owner/repo, and a non-GitHub URL this hub has no grammar row for — is
+    // unrecognised, so `resolve` can refuse it naming the two kinds the hub
+    // does install.
+    for unrecognised in [
         "../TFSAppTest",
         "/home/arnaud/Dev/Demo",
         ".",
@@ -353,45 +314,64 @@ fn a_string_is_classified_without_touching_the_disk() {
         "https://github.com/example/demo/tree/main",
     ] {
         assert_eq!(
-            classify(local),
-            Origin::LocalPath(PathBuf::from(local)),
-            "{local}"
+            classify(unrecognised),
+            Origin::Unrecognised(PathBuf::from(unrecognised)),
+            "{unrecognised}"
         );
     }
 }
 
 #[test]
-fn a_local_directory_resolves_to_an_absolute_path_and_its_revision() {
-    // Absolute and cleaned, because the recorded location is re-read much later
-    // by a `list` or an `update` run from some other working directory — where
-    // neither a relative path nor one full of `..` still means anything.
+fn a_directory_is_refused_naming_the_publish_local_route() {
+    // A working directory is not an install source (decision 009): the
+    // refusal has to say what to do instead, or a developer with a tree in
+    // hand is left guessing.
     let root = tempfile::tempdir().expect("a temp dir");
     project(root.path());
-    let roundabout = root.path().join("src").join("..");
     let scratch = tempfile::tempdir().expect("a scratch dir");
 
-    let resolved = resolve(
-        &classify(&roundabout.display().to_string()),
+    let error = resolve(
+        &classify(&root.path().display().to_string()),
         None,
         scratch.path(),
         UNUSED_BASE_URL,
     )
-    .expect("it resolves");
+    .expect_err("a directory is not an install source");
 
-    assert!(resolved.root.is_absolute(), "{}", resolved.root.display());
-    assert_eq!(
-        resolved.source.location,
-        root.path()
-            .canonicalize()
-            .expect("a real root")
-            .display()
-            .to_string()
+    assert!(
+        matches!(error, SourceError::DirectoryNotASource { .. }),
+        "{error}"
     );
-    assert_eq!(resolved.source.kind, SourceKind::LocalPath);
-    assert_eq!(resolved.source.reference, None);
-    assert_eq!(
-        Revision::At(resolved.revision.clone()),
-        current_revision(&resolved.source)
+    let message = error.to_string();
+    assert!(message.contains("is a directory"), "{message}");
+    assert!(
+        message.contains(&format!("tfsapp-hub publish {}", root.path().display())),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("tfsapp-hub dev {}", root.path().display())),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_directory_named_like_an_archive_is_refused_the_same_way() {
+    let root = tempfile::tempdir().expect("a temp dir");
+    let shaped = root.path().join("demo-1.2.0.tar.gz");
+    fs::create_dir_all(&shaped).expect("a directory named like an archive");
+    let scratch = tempfile::tempdir().expect("a scratch dir");
+
+    let error = resolve(
+        &classify(&shaped.display().to_string()),
+        None,
+        scratch.path(),
+        UNUSED_BASE_URL,
+    )
+    .expect_err("a directory is not an install source, whatever its name");
+
+    assert!(
+        matches!(error, SourceError::DirectoryNotASource { .. }),
+        "{error}"
     );
 }
 
@@ -407,8 +387,14 @@ fn a_source_that_cannot_be_installed_says_which_kind_of_problem_it_is() {
         scratch.path(),
         UNUSED_BASE_URL,
     )
-    .expect_err("it is missing");
-    assert!(matches!(error, SourceError::Missing { .. }), "{error}");
+    .expect_err("no such source at all");
+    assert!(
+        matches!(error, SourceError::UnrecognisedSource { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("/no/such/project"), "{error}");
+    assert!(error.to_string().contains("github:owner/repo"), "{error}");
+    assert!(error.to_string().contains("SHA256SUMS.txt"), "{error}");
 
     let file = root.path().join("tfsapp.config.json");
     let error = resolve(
@@ -417,14 +403,14 @@ fn a_source_that_cannot_be_installed_says_which_kind_of_problem_it_is() {
         scratch.path(),
         UNUSED_BASE_URL,
     )
-    .expect_err("a manifest is not a project root");
+    .expect_err("a manifest file is not a source either");
     assert!(
-        matches!(error, SourceError::NotADirectory { .. }),
+        matches!(error, SourceError::UnrecognisedSource { .. }),
         "{error}"
     );
 
     // Recognised, and refused well: the message points at the release form
-    // instead of looking like a typo'd local path.
+    // instead of an unexplained refusal.
     let error = resolve(
         &classify("https://example.test/demo.git"),
         None,
@@ -433,37 +419,16 @@ fn a_source_that_cannot_be_installed_says_which_kind_of_problem_it_is() {
     )
     .expect_err("a git clone URL is not a release spec");
     assert!(matches!(error, SourceError::GitSpelling { .. }), "{error}");
-
-    // `--ref` selects a revision, and a directory has none — accepting it
-    // silently would record a selector that resolved nothing.
-    let error = resolve(
-        &classify(&root.path().display().to_string()),
-        Some("v1.4.0"),
-        scratch.path(),
-        UNUSED_BASE_URL,
-    )
-    .expect_err("a directory has no ref");
-    assert!(
-        matches!(error, SourceError::ReferenceOnLocalPath { .. }),
-        "{error}"
-    );
-}
-
-struct FixtureBlobs(Vec<u8>);
-
-impl crate::publish::BlobSource for FixtureBlobs {
-    fn copy_blob(
-        &mut self,
-        _: &str,
-        destination: &mut dyn std::io::Write,
-    ) -> Result<u64, crate::git::GitError> {
-        destination.write_all(&self.0).unwrap();
-        Ok(self.0.len() as u64)
-    }
 }
 
 fn local_archive_fixture(manifest: &str) -> tempfile::TempDir {
+    // Kept beside the shared `release_of` rather than folded into it: this
+    // fixture's whole point is control over the manifest bytes and the
+    // archive's name independently of each other, which a helper that reads
+    // both from a project tree cannot express.
     let folder = tempfile::tempdir().unwrap();
+    let mut blobs = std::collections::HashMap::new();
+    blobs.insert("manifest".to_string(), manifest.as_bytes().to_vec());
     let entries = vec![crate::git::TreeEntry {
         path: PathBuf::from("tfsapp.config.json"),
         mode: 0o100644,
@@ -471,7 +436,7 @@ fn local_archive_fixture(manifest: &str) -> tempfile::TempDir {
     }];
     crate::publish::build_archive(
         &entries,
-        &mut FixtureBlobs(manifest.as_bytes().to_vec()),
+        &mut crate::test_release::LocalBlobs(blobs),
         "demo",
         "1.2.0",
         folder.path(),
@@ -504,7 +469,6 @@ fn local_archive_classifies_and_resolves_with_canonical_location() {
     assert_eq!(resolved.source.reference, None);
     assert_eq!(resolved.source.index, None);
     assert_eq!(resolved.revision, tree_hash(&resolved.root).unwrap());
-    assert_eq!(current_revision(&resolved.source), Revision::Unreachable);
 }
 
 #[test]

@@ -107,7 +107,7 @@ The host publishes the token; the sentence a person reads belongs to the app.
 
 | token | when |
 | --- | --- |
-| `local_source` | installed from a local directory or a local release archive, or a `dev` session — no release feed exists |
+| `local_source` | installed from a local release archive, or a `dev` session — no release feed exists |
 | `no_answer_yet` | a release-installed app whose cache holds nothing usable: the first launch after install, or every refresh attempted so far has failed |
 
 Offline, rate-limited, a malformed release and a repository that 404s all
@@ -135,7 +135,7 @@ what lets an app call this on a timer without wrapping it in exception handling.
 **The hub answers `ok` for a release-installed app once it has resolved that
 release's feed at least once**, and `unavailable` / `no_answer_yet` until then
 — never by dialling out while the app waits, only from what a background
-refresh already learned. A local directory or archive install, or a `dev`
+refresh already learned. A local archive install, or a `dev`
 session, always answers `unavailable` / `local_source`: neither local source
 has a release feed to ask for the latest version. (`host_resolves_updates_itself`, an earlier reason token, is retired;
 it will not reappear.)

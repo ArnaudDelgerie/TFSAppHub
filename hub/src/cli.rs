@@ -122,7 +122,7 @@ pub const SURFACE: &[Spec] = &[
         name: "install",
         form: "install <source> [--as <id>] [--ref <tag>] [--yes] \
                [--no-desktop-entry]",
-        summary: "Install an app from a local directory, release archive or github:owner/repo.",
+        summary: "Install an app from a release archive or github:owner/repo.",
         level: Level::App,
         availability: Availability::Implemented,
     },
@@ -162,7 +162,7 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "update",
-        form: "update <id> [<archive.tar.gz>] [--ref <tag>] [--force] [--yes]",
+        form: "update <id> [<archive.tar.gz>] [--ref <tag>] [--yes]",
         summary: "Re-resolve an app's source and update it.",
         level: Level::App,
         availability: Availability::Implemented,
@@ -368,7 +368,6 @@ pub enum Command {
         id: String,
         archive: Option<String>,
         reference: Option<String>,
-        force: bool,
         /// `--yes`: skip the confirmation. `update` runs the app's own PHP —
         /// `composer install` and its lifecycle commands — exactly as
         /// `install` does, so it asks first for the same reason and takes the
@@ -630,7 +629,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             })
         }
         "update" => {
-            let mut options = options("update", rest, &["--ref"], &["--force", "--yes", "-y"])?;
+            let mut options = options("update", rest, &["--ref"], &["--yes", "-y"])?;
             if options.positionals.is_empty() || options.positionals.len() > 2 {
                 return Err(usage_error(
                     "update",
@@ -643,16 +642,21 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
                 .as_ref()
                 .is_some_and(|path| !path.ends_with(".tar.gz"))
             {
+                // String-only, like the rest of the parse: a directory lands
+                // here too, and is owed the route that turns it into an
+                // archive (decision 009) rather than a bare grammar line.
                 return Err(usage_error(
                     "update",
-                    "the second argument must be an <archive.tar.gz>".to_string(),
+                    "the second argument must be a release <archive.tar.gz>. A project \
+                     directory is not an update source: run `tfsapp-hub publish <dir> \
+                     --local <out-dir>` and pass the archive it writes."
+                        .to_string(),
                 ));
             }
             Ok(Command::Update {
                 id,
                 archive,
                 reference: options.value("--ref"),
-                force: options.flag("--force"),
                 assume_yes: options.assume_yes(),
             })
         }

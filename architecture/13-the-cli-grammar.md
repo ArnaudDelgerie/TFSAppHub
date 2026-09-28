@@ -25,7 +25,7 @@ and Unicode and option-looking names included — and a separator with nothing
 after it is the no-file form, because a declaring app's desktop entry ends in
 `-- %F` and a bare menu launch expands `%F` to zero arguments.
 
-`update <id> [<archive.tar.gz>] [--ref <tag>] [--force] [--yes]` accepts an
+`update <id> [<archive.tar.gz>] [--ref <tag>] [--yes]` accepts an
 optional second positional only when it ends in `.tar.gz`. The archive wins
 over the recorded source; `--ref` with it is refused by source resolution.
 `publish <project> [--repo owner/repo | --local <dir>] [--yes]` makes those two

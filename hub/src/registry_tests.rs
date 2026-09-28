@@ -22,8 +22,8 @@ fn entry(id: &str) -> RegistryEntry {
         id: id.to_string(),
         identifier: format!("dev.local.{id}"),
         source: Source {
-            kind: SourceKind::LocalPath,
-            location: format!("/home/arnaud/Dev/{id}"),
+            kind: SourceKind::LocalArchive,
+            location: format!("/home/arnaud/Dev/{id}-0.1.0.tar.gz"),
             reference: None,
             reference_kind: None,
             index: None,
@@ -92,6 +92,42 @@ fn an_unreadable_registry_says_so_and_names_the_file() {
     assert!(message.contains("Nothing was changed"), "{message}");
 }
 
+#[test]
+fn a_registry_holding_a_local_path_entry_is_refused_as_a_whole() {
+    // Plan 066 deleted the `local-path` kind with no migration: no user
+    // existed yet (decision 009's reason 4). What is left to pin is that an
+    // old registry is refused loudly rather than read as something strange.
+    let (_base, paths) = temp_paths();
+    std::fs::create_dir_all(paths.hub_root()).expect("the hub root");
+    std::fs::write(
+        paths.registry_path(),
+        r#"{
+  "hub_version": "0.2.0",
+  "apps": [
+    {
+      "id": "tfsapp-test",
+      "identifier": "dev.local.tfsapp-test",
+      "source": { "kind": "local-path", "location": "/home/arnaud/Dev/TFSAppTest" },
+      "app_version": "0.6.0",
+      "source_revision": "sha256:deadbeef",
+      "platform": { "php_version": "8.5", "extensions_hash": "abc" },
+      "state": "ready",
+      "installed_at": "2026-08-07T10:00:00Z",
+      "updated_at": "2026-08-07T10:00:00Z"
+    }
+  ]
+}"#,
+    )
+    .expect("a written registry");
+
+    let error = load(&paths).expect_err("a local-path entry is not a source kind");
+
+    assert!(matches!(error, RegistryError::Malformed { .. }), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("local-path"), "{message}");
+    assert!(message.contains("Nothing was changed"), "{message}");
+}
+
 /// Save `registry` and read the file back as raw JSON — the shape a *later*
 /// hub version will meet, which is what these tests are really about.
 fn saved_json(paths: &Paths, registry: &Registry) -> (String, serde_json::Value) {
@@ -138,9 +174,9 @@ fn the_file_on_disk_uses_the_names_the_design_settled_on() {
 }
 
 #[test]
-fn a_local_source_writes_its_kind_and_no_ref() {
-    // The first source kind the installer produces, and the one with no
-    // selector at all: a plain directory has a location and nothing to pin.
+fn a_local_archive_writes_its_kind_and_no_ref() {
+    // The one source kind with no selector at all: a local release archive
+    // has a location and nothing to pin.
     let (_base, paths) = temp_paths();
     let mut registry = Registry::default();
     registry.upsert(entry("tfsapp-test"));
@@ -149,7 +185,7 @@ fn a_local_source_writes_its_kind_and_no_ref() {
 
     assert_eq!(
         json["apps"][0]["source"]["kind"].as_str(),
-        Some("local-path")
+        Some("local-archive")
     );
     assert!(json["apps"][0]["source"].get("ref").is_none());
     assert!(json["apps"][0]["source"].get("reference_kind").is_none());
@@ -188,7 +224,7 @@ fn fields_a_newer_hub_wrote_survive_a_read_modify_write() {
     {
       "id": "tfsapp-test",
       "identifier": "dev.local.tfsapp-test",
-      "source": { "kind": "local-path", "location": "/src" },
+      "source": { "kind": "local-archive", "location": "/releases/demo-0.1.0.tar.gz" },
       "app_version": "0.6.0",
       "source_revision": "sha256:deadbeef",
       "platform": { "php_version": "8.5", "extensions_hash": "abc" },
@@ -376,7 +412,7 @@ fn rollback_restore_merges_the_locked_live_entries_and_their_unknown_fields() {
   "apps": [{
     "id": "kept",
     "identifier": "dev.local.kept",
-    "source": { "kind": "local-path", "location": "/source" },
+    "source": { "kind": "local-archive", "location": "/releases/demo-0.1.0.tar.gz" },
     "app_version": "2.0.0",
     "source_revision": "revision",
     "platform": { "php_version": "8.5", "extensions_hash": "new" },
