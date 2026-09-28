@@ -30,6 +30,19 @@
 //! thread, so a main-thread wait could only deadlock on the very report it
 //! is waiting for.
 //!
+//! **A running capture is visible, and a revoked one never starts.** The
+//! access this module is handed ([`MicrophoneAccess`]) is one value computed
+//! once per launch from the manifest and `data/config.json`'s `revoked` key
+//! (plan 070): a revoked microphone follows the undeclared rule — nothing is
+//! written, nothing is granted, and the denial names the revocation. An
+//! allowed one is visible while it runs: the same closure connects
+//! `microphone-capture-state-notify` and sets the toplevel's title from
+//! [`capture_title`] (`Microphone on — <product name>`, one `hub.log` line
+//! per change), writing the `gtk::HeaderBar` tao builds under Wayland too,
+//! and a second `web-process-terminated` handler — the signal `crash.rs`
+//! owns, touching nothing of the crash page — puts the plain name back so a
+//! dead web process cannot leave the indicator stuck.
+//!
 //! **Exactly two request types can ever be allowed**, both only while the
 //! microphone is declared and the requesting page is the app's own origin: a
 //! `UserMediaPermissionRequest` for an audio device and not a video device
