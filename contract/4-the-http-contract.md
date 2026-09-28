@@ -2,7 +2,9 @@
 
 The app is served over plain HTTP on `127.0.0.1` and nothing else. No HTTPS: a
 loopback origin is treated as a secure context by the webview, so the browser
-APIs that require one are available.
+APIs that require one are reachable at the platform level — reachable is not
+granted, though: device capture is gated by `actions.media` (§7), not by
+being a secure context.
 
 ### `GET /healthz` → `200`
 
@@ -83,6 +85,12 @@ toolbar is inline throughout — removing it would break real apps for a benefit
 can still run; it cannot reach the network, read another origin, or navigate the
 top frame. An app wanting nonce- or hash-based hardening emits its own policy,
 per the override rule above.
+
+**No directive here gates device capture.** `media-src` restricts *loading* a
+media resource the page already has, never *obtaining* a capture stream — a
+reader assuming `default-src 'self'` covers the microphone would be wrong. The
+microphone is a separate authorization entirely, decided by `actions.media`
+(§7).
 
 ### Same-host requests are not authenticated by the loopback
 

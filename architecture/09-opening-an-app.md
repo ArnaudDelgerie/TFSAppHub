@@ -375,3 +375,39 @@ Every window enforces the same classification:
 
 No in-app popup is ever created. An external link belongs in the browser where
 the user has their bookmarks, their sessions and an address bar.
+
+### Declared microphone capture
+
+An app that declares `actions.media.microphone` (§7, decision 007) gets the
+capability at the window, not at the backend: after `create_splash_window` or
+`create_app_window` builds a window, `media::install_permission_handler`
+reaches its webview through `with_webview` and does two things. It writes
+WebKitGTK's `enable-media-stream` setting — only when the manifest declared
+the microphone; left alone otherwise, keeping WebKitGTK's own default of no
+capture at all. And it connects one `permission-request` handler, on **every**
+window regardless of the declaration: wry itself connects none, so an
+undeclared app would otherwise fall through to whatever WebKit's own default
+turns out to be rather than an explicit, logged refusal.
+
+The handler's decision is pure and unit-tested (`media::decide`): a
+`UserMediaPermissionRequest` is allowed only when it is for an audio device
+and not a video device (WebKit grants a combined request wholly or not at
+all), a `DeviceInfoPermissionRequest` is allowed under the same two
+conditions — without it `enumerateDevices()` returns no labels — and every
+other permission kind is denied outright. Both conditions have to hold: the
+manifest declared the microphone, **and** the requesting page is the app's own
+origin at the moment of the request, read from the webview's current URI and
+compared against the published `AppOriginSlot` with the same `same_origin`
+`window.rs` already uses for navigation. Before that slot is published — the
+whole of the splash's life before hand-over — no page can be the app's own
+origin, whatever it asks for; this is what keeps the cold-start page, on its
+own scheme, from ever receiving a grant. The splash and the app share one
+webview (this file's own opening section), so the one install made on the
+splash window covers the app's whole first life — a further window from a
+second `open` (`window::create_app_window`) gets its own install, on the same
+terms.
+
+Every denied `UserMediaPermissionRequest` is logged to `hub.log` with its
+reason (undeclared, wrong origin, or video asked for) — `DeviceInfoPermissionRequest`
+and every other kind are denied silently, the same as any other navigation
+refused outside this group.

@@ -85,6 +85,7 @@ fn every_variable_the_contract_lists_is_injected() {
         &identifier,
         &state_root,
         Mode::Install,
+        false,
     )
     .expect("the environment resolves");
 
@@ -109,6 +110,7 @@ fn every_variable_the_contract_lists_is_injected() {
         "MERCURE_JWT_SECRET",
         "TFS_ASYNC_WORKER",
         "TFS_KEYRING_AVAILABLE",
+        "TFS_MEDIA_MICROPHONE",
     ] {
         assert!(!value(&environment.vars, key).is_empty(), "{key} is empty");
     }
@@ -125,6 +127,77 @@ fn every_variable_the_contract_lists_is_injected() {
             .any(|(name, _)| name.starts_with("TFS_BRIDGE")),
         "no bridge runs during an install"
     );
+}
+
+// --- `TFS_MEDIA_MICROPHONE` mirrors what was actually granted (plan 050) ---
+
+#[test]
+fn media_microphone_is_one_only_when_declared_and_the_handler_installed() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("media-declared-and-installed");
+    let state_root = state_root(&paths, &identifier);
+
+    let environment = resolve(
+        &manifest_for(
+            &identifier,
+            r#", "actions": {"media": {"microphone": true}}"#,
+        ),
+        Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
+        Mode::Install,
+        true,
+    )
+    .expect("it resolves");
+
+    assert_eq!(value(&environment.vars, "TFS_MEDIA_MICROPHONE"), "1");
+}
+
+#[test]
+fn media_microphone_is_zero_when_undeclared_even_if_the_handler_installed() {
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("media-undeclared");
+    let state_root = state_root(&paths, &identifier);
+
+    let environment = resolve(
+        &manifest_for(&identifier, ""),
+        Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
+        Mode::Install,
+        true,
+    )
+    .expect("it resolves");
+
+    assert_eq!(value(&environment.vars, "TFS_MEDIA_MICROPHONE"), "0");
+}
+
+#[test]
+fn media_microphone_is_zero_when_declared_but_the_handler_failed_to_install() {
+    // CONTRACT.md §8: a backend that cannot install the grant reports 0
+    // rather than failing the launch — the variable mirrors what actually
+    // happened, never what the manifest asked for.
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("media-failed-install");
+    let state_root = state_root(&paths, &identifier);
+
+    let environment = resolve(
+        &manifest_for(
+            &identifier,
+            r#", "actions": {"media": {"microphone": true}}"#,
+        ),
+        Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
+        Mode::Install,
+        false,
+    )
+    .expect("it resolves");
+
+    assert_eq!(value(&environment.vars, "TFS_MEDIA_MICROPHONE"), "0");
 }
 
 #[test]
@@ -144,6 +217,7 @@ fn the_data_the_app_reads_hangs_off_identifier_and_nothing_else() {
         &identifier,
         &expected,
         Mode::Install,
+        false,
     )
     .expect("the environment resolves");
 
@@ -187,6 +261,7 @@ fn the_async_worker_toggle_reaches_both_the_transport_and_the_app() {
         &identifier,
         &state_root,
         Mode::Install,
+        false,
     )
     .expect("it resolves");
     assert_eq!(value(&off.vars, "MESSENGER_TRANSPORT_DSN"), "sync://");
@@ -199,6 +274,7 @@ fn the_async_worker_toggle_reaches_both_the_transport_and_the_app() {
         &identifier,
         &state_root,
         Mode::Install,
+        false,
     )
     .expect("it resolves");
     assert_eq!(
@@ -232,6 +308,7 @@ fn declared_workers_get_the_bare_dsn_and_the_union_of_transports_in_order() {
         &identifier,
         &state_root,
         Mode::Install,
+        false,
     )
     .expect("it resolves");
 
@@ -267,6 +344,7 @@ fn a_manifest_whose_fallback_fired_still_gets_the_transport_it_actually_runs() {
         &identifier,
         &state_root,
         Mode::Install,
+        false,
     )
     .expect("it resolves");
 
@@ -295,6 +373,7 @@ fn a_pinned_port_is_honoured_and_an_absent_one_is_picked() {
         &identifier,
         &state_root,
         Mode::Install,
+        false,
     )
     .expect("it resolves");
     assert_eq!(value(&pinned.vars, "APP_PORT"), "8123");
@@ -306,6 +385,7 @@ fn a_pinned_port_is_honoured_and_an_absent_one_is_picked() {
         &identifier,
         &state_root,
         Mode::Install,
+        false,
     )
     .expect("it resolves");
     let picked: u16 = value(&dynamic.vars, "APP_PORT")
@@ -330,6 +410,7 @@ fn the_secret_is_the_same_one_the_next_command_will_read() {
         &identifier,
         &state_root,
         Mode::Install,
+        false,
     )
     .expect("it resolves");
     let second = resolve(
@@ -338,6 +419,7 @@ fn the_secret_is_the_same_one_the_next_command_will_read() {
         &identifier,
         &state_root,
         Mode::Install,
+        false,
     )
     .expect("it resolves");
 
@@ -365,6 +447,7 @@ fn a_dev_launch_roots_every_app_path_under_var() {
         &identifier,
         &state_root,
         Mode::Dev,
+        false,
     )
     .expect("the dev environment resolves");
 
@@ -424,6 +507,7 @@ fn a_dev_launch_never_wipes_cache_or_build() {
         &identifier,
         &state_root,
         Mode::Dev,
+        false,
     )
     .expect("the dev environment resolves");
 
@@ -449,6 +533,7 @@ fn app_upload_dir_is_injected_and_created_in_every_mode() {
         &install_identifier,
         &install_root,
         Mode::Install,
+        false,
     )
     .expect("install resolves");
     assert_eq!(
@@ -465,6 +550,7 @@ fn app_upload_dir_is_injected_and_created_in_every_mode() {
         &launch_identifier,
         &launch_root,
         Mode::Launch(any_cache_stamp()),
+        false,
     )
     .expect("launch resolves");
     assert_eq!(
@@ -481,6 +567,7 @@ fn app_upload_dir_is_injected_and_created_in_every_mode() {
         &run_identifier,
         &run_root,
         Mode::Run,
+        false,
     )
     .expect("run resolves");
     assert_eq!(
@@ -499,6 +586,7 @@ fn app_upload_dir_is_injected_and_created_in_every_mode() {
         &dev_identifier,
         &dev_root,
         Mode::Dev,
+        false,
     )
     .expect("dev resolves");
     assert_eq!(
@@ -538,6 +626,7 @@ fn a_mismatched_cache_stamp_wipes_cache_and_build_but_never_uploads() {
         &identifier,
         &installed_state_root,
         Mode::Launch(expected),
+        false,
     )
     .expect("the launch environment resolves");
 
@@ -575,6 +664,7 @@ fn a_matching_cache_stamp_keeps_cache_and_build() {
         &identifier,
         &installed_state_root,
         Mode::Launch(stamp.clone()),
+        false,
     )
     .expect("the launch environment resolves");
 
@@ -606,6 +696,7 @@ fn a_mismatched_cache_stamp_wipes_cache_and_build() {
         &identifier,
         &installed_state_root,
         Mode::Launch(expected),
+        false,
     )
     .expect("the launch environment resolves");
 
@@ -632,6 +723,7 @@ fn no_cache_stamp_at_all_wipes_cache_and_build() {
         &identifier,
         &installed_state_root,
         Mode::Launch(any_cache_stamp()),
+        false,
     )
     .expect("the launch environment resolves");
 
@@ -655,6 +747,7 @@ fn the_dev_secrets_store_service_carries_the_prefix() {
         &prefixed,
         &state_root,
         Mode::Dev,
+        false,
         keyring.store(&prefixed),
     )
     .expect("the dev environment resolves");
@@ -685,6 +778,7 @@ fn dev_and_installed_inject_the_same_set_of_variable_names() {
         &identifier,
         &installed_state_root,
         Mode::Launch(any_cache_stamp()),
+        false,
     )
     .expect("the installed environment resolves");
 
@@ -698,6 +792,7 @@ fn dev_and_installed_inject_the_same_set_of_variable_names() {
         &dev_identifier,
         &dev_state_root,
         Mode::Dev,
+        false,
     )
     .expect("the dev environment resolves");
 

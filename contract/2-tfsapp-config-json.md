@@ -45,7 +45,7 @@ suffix would be destroyed by another app's update.
 | `splash_bg` / `splash_text` | string, `#rgb` or `#rrggbb` | Recolour the cold-start page's background and text without authoring one. Either or both; an unset one keeps the default. |
 | `commands` | object | Lifecycle commands the hub runs around an install or an update — §6. |
 | `run` | object | Named `bin/console` aliases a user can run directly. |
-| `actions` | object | Which native capabilities the app's own code may reach, and over which transport — §7. `actions.picker` and `actions.open_files` are IPC-only: `{ "ipc": true }`. `open_files` has one further default-off option, `directories` — see "Declaring file associations" below. |
+| `actions` | object | Which native capabilities the app's own code may reach, and over which transport — §7. `actions.picker` and `actions.open_files` are IPC-only: `{ "ipc": true }`. `open_files` has one further default-off option, `directories` — see "Declaring file associations" below. `actions.media` names a device rather than a transport and need not use either: `{ "microphone": true }` — §7. |
 | `file_associations` | object | The MIME types this app declares it can open — see "Declaring file associations" below. |
 | `workers` | array of objects | Declares one or more background consumers, each an ordered list of Messenger transports plus an optional copy count — see "Declaring off-window work" below. |
 | `async_worker` | boolean | Sugar for a single worker consuming `async`; refused together with `workers` — see "Declaring off-window work" below. |

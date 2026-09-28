@@ -402,6 +402,9 @@ pub(crate) fn prepare(
         &manifest.identifier,
         &state_root,
         app_env::Mode::Install,
+        // No window is ever built here: an install runs lifecycle commands
+        // and nothing else, so no permission handler can have installed.
+        false,
     )?;
     // Named before the first command runs, because the next thing on screen is
     // a migration writing a database into it — under `identifier`, which is

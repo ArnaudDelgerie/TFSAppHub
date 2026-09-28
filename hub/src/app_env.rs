@@ -200,12 +200,22 @@ fn worker_transports(manifest: &Manifest) -> String {
 /// reason — Symfony's dev container invalidates itself on file change, which is
 /// the mechanism the whole dev loop is measured on, and a wipe on every relaunch
 /// would cost a full rebuild for nothing it buys back.
+///
+/// `media_handler_installed` is the caller's own report of whether the
+/// `webkit2gtk` permission handler was scheduled on this launch's window
+/// (`media::install_permission_handler`, CONTRACT.md §7/§8, decision 007) —
+/// `false` for every mode that builds no window at all (`Install`, `Run`),
+/// and whatever `main::open_window`'s splash install reported for
+/// `Launch`/`Dev`. `TFS_MEDIA_MICROPHONE` below is the AND of this and the
+/// manifest's own declaration: the variable mirrors what actually happened on
+/// this machine, never what was merely asked for.
 pub fn resolve(
     manifest: &Manifest,
     app_dir: &Path,
     identifier: &str,
     state_root: &Path,
     mode: Mode,
+    media_handler_installed: bool,
 ) -> Result<AppEnvironment, EnvError> {
     resolve_with_store(
         manifest,
@@ -213,16 +223,19 @@ pub fn resolve(
         identifier,
         state_root,
         mode,
+        media_handler_installed,
         crate::secrets::new_store,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_with_store<F>(
     manifest: &Manifest,
     app_dir: &Path,
     identifier: &str,
     state_root: &Path,
     mode: Mode,
+    media_handler_installed: bool,
     new_store: F,
 ) -> Result<AppEnvironment, EnvError>
 where
@@ -368,6 +381,15 @@ where
         ),
         ("TFS_APP_IDENTIFIER", identifier.to_string()),
         ("TFS_APP_VERSION", manifest.app_version.clone()),
+        (
+            "TFS_MEDIA_MICROPHONE",
+            if manifest.actions.media.microphone && media_handler_installed {
+                "1"
+            } else {
+                "0"
+            }
+            .to_string(),
+        ),
     ];
 
     // `TFS_BRIDGE_URL`/`TFS_BRIDGE_TOKEN` are deliberately absent, whatever the
@@ -388,12 +410,14 @@ where
 /// Test-only store injection for environment resolution paths that need to
 /// model a working keyring without probing the host Secret Service.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_with_secret_store_for_test(
     manifest: &Manifest,
     app_dir: &Path,
     identifier: &str,
     state_root: &Path,
     mode: Mode,
+    media_handler_installed: bool,
     secret_store: crate::secrets::SecretStore,
 ) -> Result<AppEnvironment, EnvError> {
     resolve_with_store(
@@ -402,6 +426,7 @@ pub fn resolve_with_secret_store_for_test(
         identifier,
         state_root,
         mode,
+        media_handler_installed,
         move |_, _| secret_store,
     )
 }

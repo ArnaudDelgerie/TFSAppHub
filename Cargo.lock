@@ -3758,6 +3758,7 @@ dependencies = [
  "time",
  "tiny_http",
  "ureq",
+ "webkit2gtk",
 ]
 
 [[package]]

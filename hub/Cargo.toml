@@ -31,6 +31,13 @@ rfd = { version = "0.16", default-features = false, features = ["gtk3"] }
 # the app window (uniform greyscale text antialiasing, and plan 003's per-app
 # application id).
 gtk = "0.18"
+# Already a transitive dependency via wry, at this exact version — declared
+# directly for the media-capture settings and permission handler plan 050
+# installs on every window (decision 007). `set_enable_media_stream` needs
+# `v2_4` and `is_for_audio_device`/`is_for_video_device` need `v2_8`; wry
+# already resolves this crate with `v2_38`, so declaring it directly adds no
+# feature and moves no version floor.
+webkit2gtk = "2.0.2"
 # OS keyring (Secret Service on Linux) for APP_SECRET storage — station
 # CONTRACT.md §6. Adds no new system dependency: libdbus-1-dev is already a
 # Linux build prerequisite via tao/dbus.

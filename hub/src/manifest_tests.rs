@@ -486,6 +486,91 @@ fn open_files_bridge_is_refused_even_when_false() {
 }
 
 #[test]
+fn media_microphone_is_off_when_actions_or_media_is_absent() {
+    assert!(!parse_ok(MINIMAL).manifest.actions.media.microphone);
+
+    let without_media = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"update": {"ipc": true}}"#,
+    );
+    assert!(!parse_ok(&without_media).manifest.actions.media.microphone);
+
+    let explicit_false = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"media": {"microphone": false}}"#,
+    );
+    assert!(!parse_ok(&explicit_false).manifest.actions.media.microphone);
+}
+
+#[test]
+fn media_microphone_true_is_read() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"media": {"microphone": true}}"#,
+    );
+    assert!(parse_ok(&contents).manifest.actions.media.microphone);
+}
+
+#[test]
+fn media_has_neither_transport_and_both_are_refused_even_when_false() {
+    // The group's whole point: it names a device, not a transport — there is
+    // nothing to `invoke()` and no bridge route, so both look like a grant
+    // the manifest can never honour.
+    for transport in ["ipc", "bridge"] {
+        let contents = MINIMAL.replace(
+            r#""app_version": "0.6.0""#,
+            &format!(
+                r#""app_version": "0.6.0", "actions": {{"media": {{"microphone": true, "{transport}": false}}}}"#
+            ),
+        );
+
+        let error = parse_err(&contents);
+
+        assert!(
+            matches!(
+                &error,
+                ManifestError::UnsupportedActionTransport {
+                    group: "media",
+                    transport: found,
+                    ..
+                } if *found == transport
+            ),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("actions.media.{transport}")),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("no {transport} transport")),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_media_field_warns_and_still_parses() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"media": {"microphone": true, "camera": true}}"#,
+    );
+
+    let loaded = parse_ok(&contents);
+
+    assert!(loaded.manifest.actions.media.microphone);
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+    assert!(
+        loaded.warnings[0].contains("\"actions.media.camera\""),
+        "{}",
+        loaded.warnings[0]
+    );
+}
+
+#[test]
 fn an_unknown_file_associations_field_warns_and_still_parses() {
     // One level down from the top-level rule, for the same reason: a nested
     // typo ("mime-types") must not stop the app loading, and must not silently

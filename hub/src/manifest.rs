@@ -214,6 +214,8 @@ pub struct ActionsConfig {
     pub close_guard: CloseGuardActions,
     #[serde(default)]
     pub open_files: OpenFilesActions,
+    #[serde(default)]
+    pub media: MediaActions,
 }
 
 /// The `secrets` group, per transport. `keys` is a manifest — typo-catching,
@@ -288,6 +290,18 @@ pub struct OpenFilesActions {
 pub struct FileAssociations {
     #[serde(default)]
     pub mime_types: Vec<String>,
+}
+
+/// The `media` group (CONTRACT.md §7, decision 007): the first group whose
+/// members name a **device** rather than a transport. `microphone` is the
+/// only member today, and it reaches the app only through the ordinary web
+/// platform (`getUserMedia()` on its own page) — this group grants no route
+/// to `invoke()` and has neither an `ipc` nor a `bridge` transport, which is
+/// why both are refused under it (see [`parse`]).
+#[derive(Deserialize, Default, Debug, Clone, PartialEq)]
+pub struct MediaActions {
+    #[serde(default)]
+    pub microphone: bool,
 }
 
 /// A manifest and whatever the parse wanted to say about it.
@@ -415,37 +429,25 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
         validate_workers_shape(path, value)?;
     }
 
-    // Unlike a new top-level key, `actions.picker.bridge` cannot be safely
-    // ignored: this group has no bridge transport, so accepting it would make
-    // a future-looking manifest appear to grant something it never can.
-    if object
-        .get("actions")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|actions| actions.get("picker"))
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|picker| picker.contains_key("bridge"))
-    {
-        return Err(ManifestError::UnsupportedActionTransport {
-            path: path.to_path_buf(),
-            group: "picker",
-            transport: "bridge",
-        });
-    }
-
-    // Same refusal, same reason: `open_files` is IPC-only (CONTRACT.md §7), and
-    // a manifest spelling a bridge member would look like a grant it never is.
-    if object
-        .get("actions")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|actions| actions.get("open_files"))
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|open_files| open_files.contains_key("bridge"))
-    {
-        return Err(ManifestError::UnsupportedActionTransport {
-            path: path.to_path_buf(),
-            group: "open_files",
-            transport: "bridge",
-        });
+    // Unlike a new top-level key, a transport a group's contract shape does
+    // not have cannot be safely ignored: accepting it would make a
+    // future-looking manifest appear to grant something it never can.
+    // `picker` and `open_files` are IPC-only (CONTRACT.md §7); `media` has
+    // neither transport at all — capture reaches the app through the web
+    // platform, not through `invoke()` or the bridge (decision 007).
+    for (group, transport) in [
+        ("picker", "bridge"),
+        ("open_files", "bridge"),
+        ("media", "ipc"),
+        ("media", "bridge"),
+    ] {
+        if action_group_has_transport(object, group, transport) {
+            return Err(ManifestError::UnsupportedActionTransport {
+                path: path.to_path_buf(),
+                group,
+                transport,
+            });
+        }
     }
 
     let mut warnings: Vec<String> = object
@@ -500,6 +502,29 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
                 .map(|key| {
                     format!(
                         "unknown key \"actions.open_files.{key}\" in {} — check for a typo \
+                 (CONTRACT.md §7). It is ignored, not rejected.",
+                        path.display()
+                    )
+                }),
+        );
+    }
+
+    // Same rule for `media` (plan 050): `microphone` is its only member today,
+    // and a typo here silently leaves the microphone unreachable rather than
+    // failing loudly — exactly what a warning is for.
+    if let Some(fields) = object
+        .get("actions")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|actions| actions.get("media"))
+        .and_then(serde_json::Value::as_object)
+    {
+        warnings.extend(
+            fields
+                .keys()
+                .filter(|key| key.as_str() != "microphone")
+                .map(|key| {
+                    format!(
+                        "unknown key \"actions.media.{key}\" in {} — check for a typo \
                  (CONTRACT.md §7). It is ignored, not rejected.",
                         path.display()
                     )
@@ -604,6 +629,22 @@ fn validate_file_associations(path: &Path, manifest: &Manifest) -> Result<(), Ma
     }
 
     Ok(())
+}
+
+/// Whether `actions.<group>` spells `transport`, however briefly — used to
+/// refuse a transport a group's contract shape does not have at all
+/// (`picker.bridge`, `open_files.bridge`, `media.ipc`, `media.bridge`).
+fn action_group_has_transport(
+    object: &serde_json::Map<String, serde_json::Value>,
+    group: &str,
+    transport: &str,
+) -> bool {
+    object
+        .get("actions")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|actions| actions.get(group))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|fields| fields.contains_key(transport))
 }
 
 /// RFC 6838's restricted syntax, conservative where it is permissive: both

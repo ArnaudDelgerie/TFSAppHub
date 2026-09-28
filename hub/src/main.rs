@@ -24,6 +24,7 @@ mod lifecycle;
 mod lifecycle_gate;
 mod list;
 mod manifest;
+mod media;
 mod open;
 mod open_files;
 mod paths;
@@ -477,6 +478,11 @@ fn open_window(
     // whether a file-bearing argv can be delivered at all — and whether its
     // directories opted in, which the batch validation needs the same way.
     let relaunch_receiver = open_files::Receiver::of(&spec.manifest);
+    // Read here for the same reason: a further window on an already-running
+    // backend goes through `create_app_window`, never through `serve`, so its
+    // own media grant has to be decided from this instance's declaration
+    // before `spec` moves into `setup`.
+    let relaunch_microphone_declared = spec.manifest.actions.media.microphone;
 
     // A file-bearing launch enqueues its own batch before the `Builder` exists,
     // so it is waiting in the pre-launch pool before any window — and the
@@ -551,6 +557,7 @@ fn open_window(
                 let guards = relaunch_close_guards.clone();
                 let icon_path = relaunch_icon_path.clone();
                 let receiver = relaunch_receiver;
+                let microphone_declared = relaunch_microphone_declared;
                 let arrival = cli::second_instance_files(&args);
                 let scheduler = app.clone();
                 let scheduled = move || {
@@ -597,6 +604,18 @@ fn open_window(
                                         window.set_icon(icon)?;
                                     }
                                 }
+                                // Best-effort, like the splash's own install:
+                                // a further window on an already-running
+                                // backend gets the same grant an undeclared
+                                // app already denies explicitly, and this
+                                // window's own outcome feeds nothing —
+                                // `TFS_MEDIA_MICROPHONE` was already resolved
+                                // for the sidecar this backend is serving.
+                                let _ = media::install_permission_handler(
+                                    &window,
+                                    microphone_declared,
+                                    origin.clone(),
+                                );
                                 Ok(())
                             })
                             .map_err(|error| error.to_string())
@@ -690,6 +709,20 @@ fn open_window(
             }
             let splash_label = splash.label().to_string();
 
+            // Scheduled on the splash's own webview — the same one `serve`
+            // navigates to the backend, never rebuilt for the hand-over
+            // (`architecture/09`) — so this one install covers the window for
+            // the app's whole first life. Whether the dispatch was scheduled
+            // is read here because `serve` needs it before the sidecar
+            // starts: `TFS_MEDIA_MICROPHONE` reports that, never what the
+            // manifest asked for (CONTRACT.md §3).
+            let media_installed = media::install_permission_handler(
+                &splash,
+                spec.manifest.actions.media.microphone,
+                app_origin.clone(),
+            )
+            .is_ok();
+
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 serve(
@@ -703,6 +736,7 @@ fn open_window(
                     splash_label,
                     close_guards,
                     serve_open_files,
+                    media_installed,
                 );
             });
 
@@ -739,6 +773,7 @@ fn serve(
     splash_label: String,
     close_guards: close_guard::SharedCloseGuards,
     open_files: open_files::SharedOpenFiles,
+    media_installed: bool,
 ) {
     use tauri::Manager;
 
@@ -826,6 +861,7 @@ fn serve(
         &identity.identifier,
         &spec.state_root,
         env_mode,
+        media_installed,
     ) {
         Ok(environment) => environment,
         Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),

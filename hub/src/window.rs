@@ -78,7 +78,11 @@ fn is_bundled_asset_origin(url: &Url) -> bool {
 
 /// Scheme, host and port all matching. A scheme mismatch on the same host is
 /// deliberately *not* the same origin, exactly as a browser would have it.
-fn same_origin(a: &Url, b: &Url) -> bool {
+///
+/// `pub(crate)`: `media.rs` reuses it verbatim for the same origin check
+/// (decision 007) rather than re-deriving what "the app's own origin" means a
+/// second time.
+pub(crate) fn same_origin(a: &Url, b: &Url) -> bool {
     a.scheme() == b.scheme()
         && a.host_str() == b.host_str()
         && a.port_or_known_default() == b.port_or_known_default()
