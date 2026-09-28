@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+A web process killed before its window's first page ever committed now gets
+the crash page too: the Reload link targets the URL the window was created
+with (the splash's own URL, or the bundled fallback's), so an early engine
+death has the same page in the app's colours and the same way back as any
+other. `TFS_MEDIA_MICROPHONE` now reports the microphone grant only once the
+window's `with_webview` closure really wrote the setting and connected the
+permission handler — the launch waits up to 2 s for that report before
+starting the sidecar, and a timeout, a window closed first or a webview
+without settings reports `0` with one warning line.
+
 The secret store no longer reports a failed write as a success: a set, delete,
 get, has or list that the keyring or the fallback file fails answers
 `storage_failed` over IPC and `500 {"error": "storage_failed"}` on the bridge,

@@ -21,6 +21,14 @@
 //! own origin" is defined once, by `window.rs`'s `classify_navigation`, and
 //! this module asks the same question rather than re-deriving it.
 //!
+//! **The grant is reported, not assumed.** The install's closure reports on
+//! a channel whether it really wrote the setting and connected the handler,
+//! and [`await_grant`] — with [`MICROPHONE_GRANT_DEADLINE`] — is what turns
+//! that report into `TFS_MEDIA_MICROPHONE` (decision 007 §5). Only the
+//! off-main-thread caller may wait on it: the closure runs on the main
+//! thread, so a main-thread wait could only deadlock on the very report it
+//! is waiting for.
+//!
 //! **Exactly two request types can ever be allowed**, both only while the
 //! microphone is declared and the requesting page is the app's own origin: a
 //! `UserMediaPermissionRequest` for an audio device and not a video device
