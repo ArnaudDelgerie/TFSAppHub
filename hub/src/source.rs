@@ -62,8 +62,8 @@ pub enum Origin {
     LocalArchive(PathBuf),
     /// Anything the grammar does not name — recognised only so [`resolve`]
     /// can refuse it well, like [`Origin::GitSpelling`]: an existing
-    /// directory is told the `publish --local` route, everything else that
-    /// the hub installs exactly two kinds of source.
+    /// directory is told the `publish --local` route, everything else is
+    /// told the two kinds of source the hub installs.
     Unrecognised(PathBuf),
     /// A repository to fetch a release of. `index` names how it was found —
     /// `"github"`, the forge acting as its own index today — so a later,

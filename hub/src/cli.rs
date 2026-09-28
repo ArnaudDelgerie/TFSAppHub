@@ -642,9 +642,15 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
                 .as_ref()
                 .is_some_and(|path| !path.ends_with(".tar.gz"))
             {
+                // String-only, like the rest of the parse: a directory lands
+                // here too, and is owed the route that turns it into an
+                // archive (decision 009) rather than a bare grammar line.
                 return Err(usage_error(
                     "update",
-                    "the second argument must be an <archive.tar.gz>".to_string(),
+                    "the second argument must be a release <archive.tar.gz>. A project \
+                     directory is not an update source: run `tfsapp-hub publish <dir> \
+                     --local <out-dir>` and pass the archive it writes."
+                        .to_string(),
                 ));
             }
             Ok(Command::Update {

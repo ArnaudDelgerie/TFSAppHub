@@ -782,4 +782,8 @@ fn update_accepts_optional_archive_and_rejects_other_second_word() {
         .collect::<Vec<_>>();
     let error = super::parse(&args).unwrap_err();
     assert!(error.to_string().contains("<archive.tar.gz>"));
+    assert!(
+        error.to_string().contains("publish <dir> --local"),
+        "{error}"
+    );
 }
