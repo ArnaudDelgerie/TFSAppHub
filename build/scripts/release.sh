@@ -203,10 +203,19 @@ if [[ -z "${APPIMAGE:-}" ]]; then
 fi
 
 # --- Step 4: checksums ------------------------------------------------------
+# The compatibility record the build wrote beside the AppImage — the file a
+# user downloads from the same release to read its glibc floor (see README
+# "It does not start"). A release without it is undiagnosable, so a missing
+# record is a missing build, not a warning.
+VERSIONS="${APPIMAGE%.AppImage}.versions.txt"
+[[ -f "$VERSIONS" ]] \
+  || die "no $(basename "$VERSIONS") beside $(basename "$APPIMAGE") — build this version first (\`make build\`), which writes the record, then release."
+
 # Generated from inside target/release/bundle/appimage/ so the file records a
-# bare filename and not this machine's absolute path.
+# bare filename and not this machine's absolute path. Both assets are listed:
+# the record is downloaded and checked against the same sums as the AppImage.
 SUMS="$OUTPUT_DIR/SHA256SUMS.txt"
-( cd "$OUTPUT_DIR" && sha256sum "$(basename "$APPIMAGE")" ) >"$SUMS"
+( cd "$OUTPUT_DIR" && sha256sum "$(basename "$APPIMAGE")" "$(basename "$VERSIONS")" ) >"$SUMS"
 echo "Checksums:"
 cat "$SUMS"
 
@@ -234,17 +243,17 @@ gh release create "$TAG" \
   --repo "$REPO" \
   --title "$TAG" \
   --notes-file "$NOTES_FILE" \
-  "$APPIMAGE" "$SUMS"
+  "$APPIMAGE" "$VERSIONS" "$SUMS"
 
 echo "Published $TAG to $REPO."
 
 # A reused artifact was already on disk before this run and is left alone —
 # only a build this run actually produced is offered for cleanup.
 if [[ "$FRESH_BUILD" -eq 1 ]]; then
-  read -r -p "Keep the build (AppImage + SHA256SUMS.txt) on disk? [Y/n] " KEEP
+  read -r -p "Keep the build (AppImage + .versions.txt + .source-commit + SHA256SUMS.txt) on disk? [Y/n] " KEEP
   if [[ "$KEEP" =~ ^[Nn]$ ]]; then
-    rm -f "$APPIMAGE" "$SUMS"
-    echo "Removed $APPIMAGE and $SUMS."
+    rm -f "$APPIMAGE" "$VERSIONS" "${APPIMAGE%.AppImage}.source-commit" "$SUMS"
+    echo "Removed $(basename "$APPIMAGE"), its records and $(basename "$SUMS") from $OUTPUT_DIR."
   fi
 fi
 

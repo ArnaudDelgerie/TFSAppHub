@@ -231,6 +231,11 @@ write_record() { # write_record <version> <revision> — a planted .source-commi
   printf '%s\n' "$2" >"$TREE/target/release/bundle/appimage/TFSAppHub_${1}_amd64.source-commit"
 }
 
+plant_versions() { # plant_versions <version> — a planted .versions.txt
+  printf 'glibc_floor=stub\n' \
+    >"$TREE/target/release/bundle/appimage/TFSAppHub_${1}_amd64.versions.txt"
+}
+
 tree_head() { git -C "$TREE" rev-parse HEAD; }
 
 # The script under test runs with its stdout and stderr captured, so a case
@@ -374,6 +379,7 @@ case_release_notes_name_the_revision() {
 case_reuse_when_record_matches_head() {
   new_tree "0.3.0" "[0.3.0] - 2026-09-28"
   plant_appimage "0.3.0" "existing build"
+  plant_versions "0.3.0"
   write_record "0.3.0" "$(tree_head)"
   if run_release $'y\n'; then
     assert_no_match "no cargo call — the build was reused" '^cargo ' "$LOG"
@@ -433,6 +439,91 @@ case_release_refuses_tree_moved_during_build() {
   case_result "a tree that moved during the build is refused, nothing published"
 }
 
+# --- Step 3: publish the compatibility record --------------------------------
+
+case_release_attaches_three_assets() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  if run_release $'y\n'; then
+    assert_match "release create attaches AppImage, .versions.txt and sums" \
+      'release create .*TFSAppHub_0\.3\.0_amd64\.AppImage .*TFSAppHub_0\.3\.0_amd64\.versions\.txt .*SHA256SUMS\.txt' "$LOG"
+  else
+    echo "  assertion failed: release.sh exited non-zero" >&2
+    CASE_STATUS=1
+  fi
+  case_result "the AppImage, its .versions.txt and the sums are attached to the release"
+}
+
+case_sums_list_both_files() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  if run_release $'y\n'; then
+    assert_equals "the sums list exactly two files" \
+      "$(wc -l <"$TREE/target/release/bundle/appimage/SHA256SUMS.txt")" "2"
+    assert_match "the AppImage is listed by bare name" \
+      'TFSAppHub_0\.3\.0_amd64\.AppImage$' \
+      "$TREE/target/release/bundle/appimage/SHA256SUMS.txt"
+    assert_match "the record is listed by bare name" \
+      'TFSAppHub_0\.3\.0_amd64\.versions\.txt$' \
+      "$TREE/target/release/bundle/appimage/SHA256SUMS.txt"
+    assert_no_match "no absolute paths in the sums" \
+      '[[:space:]]/tmp/' "$TREE/target/release/bundle/appimage/SHA256SUMS.txt"
+  else
+    echo "  assertion failed: release.sh exited non-zero" >&2
+    CASE_STATUS=1
+  fi
+  case_result "SHA256SUMS.txt lists both assets by bare name, two lines"
+}
+
+case_sums_verify_in_bundle_dir() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  if run_release $'y\n'; then
+    if (cd "$TREE/target/release/bundle/appimage" && sha256sum -c SHA256SUMS.txt >/dev/null 2>&1); then
+      :
+    else
+      echo "  assertion failed: sha256sum -c does not pass in the bundle directory" >&2
+      CASE_STATUS=1
+    fi
+  else
+    echo "  assertion failed: release.sh exited non-zero" >&2
+    CASE_STATUS=1
+  fi
+  case_result "sha256sum -c passes in the bundle directory"
+}
+
+case_discard_removes_every_file_of_the_version() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  if run_release $'n\n'; then
+    assert_missing "the AppImage is gone" \
+      "$TREE/target/release/bundle/appimage/TFSAppHub_0.3.0_amd64.AppImage"
+    assert_missing "the .versions.txt is gone" \
+      "$TREE/target/release/bundle/appimage/TFSAppHub_0.3.0_amd64.versions.txt"
+    assert_missing "the .source-commit is gone" \
+      "$TREE/target/release/bundle/appimage/TFSAppHub_0.3.0_amd64.source-commit"
+    assert_missing "the sums are gone" \
+      "$TREE/target/release/bundle/appimage/SHA256SUMS.txt"
+  else
+    echo "  assertion failed: release.sh exited non-zero" >&2
+    CASE_STATUS=1
+  fi
+  case_result "answering n to keep leaves no file of that version behind"
+}
+
+case_release_refuses_missing_versions_record() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  plant_appimage "0.3.0" "existing build"
+  write_record "0.3.0" "$(tree_head)"
+  rm -f "$TREE/target/release/bundle/appimage/TFSAppHub_0.3.0_amd64.versions.txt"
+  # The record matches HEAD, so the reuse prompt appears — answer y; reusing
+  # does not regenerate the .versions.txt, which is what this case removes.
+  if run_release $'y\n'; then
+    echo "  assertion failed: release.sh published without a .versions.txt" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names the build step" 'make build|build this version' "$CASE_DIR/run.err"
+    assert_no_match "no release create" 'release create' "$LOG"
+  fi
+  case_result "a build without its .versions.txt is refused, not published"
+}
+
 main() {
   case_build_with_older_appimage
   case_fix_stub_gets_current_version_only
@@ -445,6 +536,11 @@ main() {
   case_reuse_when_record_matches_head
   case_rebuild_when_record_differs_or_missing
   case_release_refuses_tree_moved_during_build
+  case_release_attaches_three_assets
+  case_sums_list_both_files
+  case_sums_verify_in_bundle_dir
+  case_discard_removes_every_file_of_the_version
+  case_release_refuses_missing_versions_record
   if [[ "$FAILED" -gt 0 ]]; then
     echo "release-chain: $FAILED case(s) failed" >&2
     exit 1
