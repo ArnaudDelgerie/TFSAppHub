@@ -920,6 +920,7 @@ fn clear_destination_cache(data_dir: &Path, data_subdir: &Path) -> Result<(), Po
     lifecycle::discard_cache_stamp(data_subdir).map_err(|source| {
         PortabilityError::CacheCleanup {
             path: lifecycle::cache_stamp_path(data_subdir),
+            stamp_discarded: false,
             source,
         }
     })?;
@@ -928,14 +929,24 @@ fn clear_destination_cache(data_dir: &Path, data_subdir: &Path) -> Result<(), Po
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(PortabilityError::CacheCleanup { path, source }),
+            Err(source) => {
+                return Err(PortabilityError::CacheCleanup {
+                    path,
+                    stamp_discarded: true,
+                    source,
+                })
+            }
         };
         let removal = if metadata.file_type().is_symlink() {
             fs::remove_file(&path)
         } else {
             fs::remove_dir_all(&path)
         };
-        removal.map_err(|source| PortabilityError::CacheCleanup { path, source })?;
+        removal.map_err(|source| PortabilityError::CacheCleanup {
+            path,
+            stamp_discarded: true,
+            source,
+        })?;
     }
     Ok(())
 }
@@ -1034,11 +1045,14 @@ pub enum PortabilityError {
     /// [`PortabilityError::ImportIncomplete`]: the database, `uploads/`, the
     /// recorded version and the rollback anchor are all still exactly as the
     /// preflight found them. What may have changed is the cache cleanup
-    /// itself — the stamp is already discarded and the directories may be
-    /// half-removed — so the message says that rather than claiming nothing
-    /// did.
+    /// itself, and `stamp_discarded` says how far it got: `false` means the
+    /// stamp removal is what failed, so the stamp is still exactly as found;
+    /// `true` means the stamp is already gone and the directories may be
+    /// half-removed. The message reports whichever is true rather than
+    /// assuming the stamp is clear.
     CacheCleanup {
         path: PathBuf,
+        stamp_discarded: bool,
         source: io::Error,
     },
     /// An import failed after its rescue dump was safely taken. The ordinary
@@ -1127,14 +1141,25 @@ impl fmt::Display for PortabilityError {
                 path.display()
             ),
             Self::Refused(refusal) => write!(formatter, "{refusal}"),
-            Self::CacheCleanup { path, source } => write!(
-                formatter,
-                "import stopped before replacing any data: clearing the previous cache failed \
-                 at {}: {source}. The cleanup may be partial (the cache stamp is already \
-                 discarded), but the database, uploads/ and the rollback anchor are untouched — \
-                 resolve the error and run the import again.",
-                path.display()
-            ),
+            Self::CacheCleanup {
+                path,
+                stamp_discarded,
+                source,
+            } => {
+                let cleanup_state = if *stamp_discarded {
+                    "the cleanup may be partial (the cache stamp is already discarded)"
+                } else {
+                    "the cache stamp itself could not be discarded, so the cleanup has not \
+                     progressed past it"
+                };
+                write!(
+                    formatter,
+                    "import stopped before replacing any data: clearing the previous cache \
+                     failed at {}: {source}. {cleanup_state}, but the database, uploads/ and the \
+                     rollback anchor are untouched — resolve the error and run the import again.",
+                    path.display()
+                )
+            }
             Self::ImportIncomplete {
                 data_subdir,
                 db_rescue_path,

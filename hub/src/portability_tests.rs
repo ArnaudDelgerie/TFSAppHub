@@ -1497,6 +1497,14 @@ fn a_stamp_that_cannot_be_removed_stops_the_import_before_any_data_changes() {
     let message = error.to_string();
     assert!(message.contains("cache.json"), "{message}");
     assert!(message.contains("before replacing any data"), "{message}");
+    // The stamp removal itself is what failed here, so the message must not
+    // claim the stamp is already discarded — that would tell the next launch
+    // the old container is reusable when it never got that far.
+    assert!(
+        message.contains("the cache stamp itself could not be discarded"),
+        "{message}"
+    );
+    assert!(!message.contains("is already discarded"), "{message}");
     assert_persistent_state_unchanged(&data_dir, &data_subdir, &app_dir);
     // The stamp removal is the cleanup's first step, so neither disposable
     // directory has been touched yet either.
