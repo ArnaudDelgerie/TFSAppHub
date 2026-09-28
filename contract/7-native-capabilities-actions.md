@@ -425,10 +425,32 @@ already gets.
 The grant belongs to the app's own origin, never to a window: the splash and
 the app share one webview (see `architecture/09-opening-an-app.md`), so the
 cold-start page can never receive it, whatever window it happens to be
-painted in. The camera and screen or display capture are not members of this
-group and are not planned as one — see
+painted in. Whether the camera and screen or display capture ever become
+members of this group is not decided — the group is named `media` precisely
+so they could fit later without a shape change, but nothing about them is
+settled here — see
 `.project/decision/007-the-microphone-is-a-declared-capability.md` for why,
 kept there rather than restated here.
+
+**Recording the granted track is not this host's to guarantee.** The hub adds
+no codec, no format and no audio stack (decision 007) — whether
+`MediaRecorder` itself works, and which `mimeType`s it accepts, depends on the
+WebKitGTK build and the GStreamer encoders on the machine it runs on, and a
+missing or broken one surfaces as `MediaRecorder` throwing
+`NotSupportedError`, the way it would on any web page with no working
+recorder. An app that wants to record must call
+`MediaRecorder.isTypeSupported()` (or handle the constructor throwing) and
+fall back rather than assume a working `MediaRecorder`; feeding
+`getUserMedia()`'s track into Web Audio (an `AudioWorkletNode`, not the
+deprecated `ScriptProcessorNode`) and encoding the raw samples itself is the
+fallback that does not depend on the platform's own recorder at all.
+
+**Playing a recorded clip back needs the app's own CSP.** A recording handed
+to an `<audio>`/`<video>` element as a `blob:` URL is subject to `media-src`,
+which the host's default response headers (§4) do not set — so it falls back
+to `default-src 'self'`, and `'self'` does not cover `blob:`. An app that
+plays a `blob:` recording back sets its own `Content-Security-Policy`
+response header with `media-src 'self' blob:` added, per §4's override rule.
 
 ### `close_guard`
 

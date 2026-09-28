@@ -133,11 +133,14 @@ fn classify_request(request: &webkit2gtk::PermissionRequest) -> MediaPermissionK
 /// grant, and what turns wry's absent-handler default into an explicit,
 /// logged deny for an app that declared nothing.
 ///
-/// Returns whatever `WebviewWindow::with_webview`'s dispatch returned: `Err`
-/// only when the runtime could not schedule the closure at all (the window is
-/// already gone, or the event loop is shutting down), which is the "handler
-/// was actually installed on this backend" signal `TFS_MEDIA_MICROPHONE`
-/// reports (CONTRACT.md §3, §8).
+/// Returns whatever `WebviewWindow::with_webview`'s dispatch returned. `Ok`
+/// means the closure was queued onto the GTK main thread, not that it has run
+/// yet — `with_webview` is fire-and-forget, so this is the closest signal
+/// available without blocking. `Err` means the runtime could not even
+/// schedule it (the window is already gone, or the event loop is shutting
+/// down). This is what `TFS_MEDIA_MICROPHONE` (CONTRACT.md §3, §8) reports as
+/// "the grant was scheduled on this backend" — on the GTK backend this is
+/// equivalent in practice, since a queued closure on a live event loop runs.
 pub fn install_permission_handler<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
     microphone_declared: bool,

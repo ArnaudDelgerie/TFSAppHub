@@ -12,10 +12,14 @@ requests are ever granted, both only on the app's own origin: an audio-only
 capture (a combined audio+video request is refused as a whole) and a
 device-info request, the second needed for `enumerateDevices()` to return
 labels at all. Every other permission kind stays denied, whatever the
-manifest says. `TFS_MEDIA_MICROPHONE` reports what was actually granted on
-this machine, never what was merely declared. No prompt and no
-capture-in-progress indicator ship yet — the declaration, readable before
-install, is the whole of the consent story for now.
+manifest says. `TFS_MEDIA_MICROPHONE` reports whether the app's page is
+granted the request in the first place, never whether hardware answers or a
+recording API works — the hub adds no audio stack, so an app should expect
+`MediaRecorder` itself to vary by machine and fall back to Web Audio, and
+must set its own CSP (`media-src 'self' blob:`) to play a recorded clip
+back. No prompt and no capture-in-progress indicator ship yet — the
+declaration, readable before install, is the whole of the consent story for
+now.
 
 An app can now declare `file_associations.mime_types` plus the
 `actions.open_files` receiver and be handed local paths — through

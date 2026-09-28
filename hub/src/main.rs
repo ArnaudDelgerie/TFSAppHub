@@ -709,14 +709,13 @@ fn open_window(
             }
             let splash_label = splash.label().to_string();
 
-            // Installed on the splash's own webview — the same one `serve`
+            // Scheduled on the splash's own webview — the same one `serve`
             // navigates to the backend, never rebuilt for the hand-over
             // (`architecture/09`) — so this one install covers the window for
-            // the app's whole first life. Whether it actually took is read
-            // here, off the main thread's own dispatch, because `serve` needs
-            // it before the sidecar starts: `TFS_MEDIA_MICROPHONE` reports
-            // what was actually granted, never what the manifest asked for
-            // (CONTRACT.md §3).
+            // the app's whole first life. Whether the dispatch was scheduled
+            // is read here because `serve` needs it before the sidecar
+            // starts: `TFS_MEDIA_MICROPHONE` reports that, never what the
+            // manifest asked for (CONTRACT.md §3).
             let media_installed = media::install_permission_handler(
                 &splash,
                 spec.manifest.actions.media.microphone,

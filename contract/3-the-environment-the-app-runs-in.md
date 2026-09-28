@@ -147,8 +147,9 @@ extend it past the window — the narrowing has to reach the app here, or an app
 ships a task due at 8 a.m., is silently narrowed, and neither its author nor
 its user ever learns it does not fire.
 
-`TFS_MEDIA_MICROPHONE` says whether `getUserMedia({audio: true})` will
-actually succeed on the app's own page (§7). It reports the grant, never the
+`TFS_MEDIA_MICROPHONE` says whether the app's own page is granted the
+`getUserMedia({audio: true})` request in the first place (§7) — not whether
+that call will actually succeed. It reports the grant, never the
 hardware: a machine with no microphone at all still reads `"1"` once the
 manifest declares it and the host installed the grant, because whether a
 device answers is exactly what `getUserMedia()` itself already fails on, the

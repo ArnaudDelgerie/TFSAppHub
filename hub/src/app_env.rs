@@ -200,11 +200,12 @@ fn worker_transports(manifest: &Manifest) -> String {
 /// reason — Symfony's dev container invalidates itself on file change, which is
 /// the mechanism the whole dev loop is measured on, and a wipe on every relaunch
 /// would cost a full rebuild for nothing it buys back.
-/// `media_handler_installed` is the caller's own report of whether it
-/// actually installed the `webkit2gtk` permission handler on this launch's
-/// window (`media::install_permission_handler`, CONTRACT.md §7/§8, decision
-/// 007) — `false` for every mode that builds no window at all (`Install`,
-/// `Run`), and whatever `main::open_window`'s splash install reported for
+///
+/// `media_handler_installed` is the caller's own report of whether the
+/// `webkit2gtk` permission handler was scheduled on this launch's window
+/// (`media::install_permission_handler`, CONTRACT.md §7/§8, decision 007) —
+/// `false` for every mode that builds no window at all (`Install`, `Run`),
+/// and whatever `main::open_window`'s splash install reported for
 /// `Launch`/`Dev`. `TFS_MEDIA_MICROPHONE` below is the AND of this and the
 /// manifest's own declaration: the variable mirrors what actually happened on
 /// this machine, never what was merely asked for.
