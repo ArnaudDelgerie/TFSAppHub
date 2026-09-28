@@ -249,6 +249,43 @@ pub fn run_entry_launcher_pid(name: &std::ffi::OsStr) -> Option<u32> {
     name.to_str()?.strip_suffix(".lock")?.parse().ok()
 }
 
+/// Owns an entry until the launcher exits. Unlink while the flock is held.
+pub struct RunEntryGuard {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+impl RunEntryGuard {
+    fn append_child_pid(&mut self, pid: u32) -> std::io::Result<()> {
+        use std::io::Write;
+        self.file.write_all(format!("\n{pid}").as_bytes())
+    }
+}
+
+impl Drop for RunEntryGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Create, lock, and record the alias before consulting any other entry.
+pub fn claim_run_entry(
+    runs_dir: &Path,
+    launcher_pid: u32,
+    alias: &str,
+) -> std::io::Result<RunEntryGuard> {
+    use std::io::{Error, ErrorKind, Write};
+    let path = runs_dir.join(run_entry_file_name(launcher_pid));
+    let file = tfsapp_core::process::try_lock_file(&path)?
+        .ok_or_else(|| Error::new(ErrorKind::WouldBlock, "entry is already locked"))?;
+    let mut guard = RunEntryGuard { file, path };
+    guard.file.set_len(0)?;
+    guard
+        .file
+        .write_all(format_run_entry(alias, None).as_bytes())?;
+    Ok(guard)
+}
+
 /// One entry's status once a scanner has tried to flock it and, if that
 /// succeeded, identity-probed the pid its record names — the exact ternary
 /// `../plan/035-the-run-record-outlives-its-flock.md` gave `run.lock` as a
@@ -656,8 +693,6 @@ pub fn launch_verdict(has_lifecycle_event: bool, active: &[ActiveRun]) -> Launch
 // on `needs-revalidation` and proves the registry's identifier and the
 // installed snapshot's agree, so none of that has to be re-derived here.
 
-use std::io::{Seek, SeekFrom, Write};
-
 use crate::{
     app_env,
     cli::{EXIT_FAILED, EXIT_OK},
@@ -1000,8 +1035,19 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
         eprintln!("tfsapp-hub: cannot create {}: {error}", runs_dir.display());
         return EXIT_FAILED;
     }
+    let entry_path = runs_dir.join(run_entry_file_name(std::process::id()));
+    let mut run_entry = match claim_run_entry(&runs_dir, std::process::id(), alias_name) {
+        Ok(entry) => entry,
+        Err(error) => {
+            eprintln!("tfsapp-hub: cannot claim {}: {error}", entry_path.display());
+            return EXIT_FAILED;
+        }
+    };
     let active = match scan_runs(&data_dir, &identifier) {
-        Ok(active) => active,
+        Ok(mut active) => {
+            active.retain(|entry| entry.path != entry_path);
+            active
+        }
         Err(error) => {
             eprintln!("tfsapp-hub: cannot scan {}: {error}", runs_dir.display());
             return EXIT_FAILED;
@@ -1034,37 +1080,6 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
         }
         return EXIT_FAILED;
     }
-
-    // This launcher's own entry, named after its own pid — never contested,
-    // since no other live process can share this pid
-    // (`../decision/005-concurrency-belongs-to-the-alias.md`, "What is lost,
-    // honestly"). Held for this process's whole lifetime (bound to
-    // `run_entry_lock`), released on drop — including if this process dies
-    // without a clean exit.
-    let entry_path = runs_dir.join(run_entry_file_name(std::process::id()));
-    let mut run_entry_lock = match tfsapp_core::process::try_lock_file(&entry_path) {
-        Ok(Some(lock)) => lock,
-        Ok(None) => {
-            eprintln!(
-                "tfsapp-hub: cannot acquire {} — already held, which should not happen for a \
-                 launcher's own pid",
-                entry_path.display()
-            );
-            return EXIT_FAILED;
-        }
-        Err(error) => {
-            eprintln!(
-                "tfsapp-hub: cannot acquire {}: {error}",
-                entry_path.display()
-            );
-            return EXIT_FAILED;
-        }
-    };
-    // Recorded so a would-be app-launch refusal (step 3) can name the active
-    // alias rather than just the lock path. No pid yet — the child hasn't
-    // been spawned; rewritten with the pid right after it is, below.
-    let _ = run_entry_lock.set_len(0);
-    let _ = run_entry_lock.write_all(format_run_entry(alias_name, None).as_bytes());
 
     // Rule 3 (CONTRACT.md §6): probe whether an app window is already live —
     // the exact same liveness lock the launcher itself uses. A window live
@@ -1146,13 +1161,13 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
     };
     let child_pid = child.id();
 
-    // Rewrite this entry's record with the now-known child pid. Reuses the
-    // same handle the lock-acquisition-time write used above, so it must
-    // `seek` back to the start in addition to `set_len(0)` — `set_len`
-    // truncates but does not move the file cursor.
-    let _ = run_entry_lock.set_len(0);
-    let _ = run_entry_lock.seek(SeekFrom::Start(0));
-    let _ = run_entry_lock.write_all(format_run_entry(alias_name, Some(child_pid)).as_bytes());
+    if let Err(error) = run_entry.append_child_pid(child_pid) {
+        eprintln!(
+            "tfsapp-hub: cannot record child pid in {}: {error}; `run --stop` will not know \
+             the child's pid",
+            entry_path.display()
+        );
+    }
 
     // Both detached threads below get their own clone of `identifier`: each
     // reacts an unbounded time after `child_pid` was recorded, so it
@@ -1162,11 +1177,7 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
     tfsapp_core::process::spawn_signal_forwarder(signal_read_fd, child_pid, identifier.clone());
 
     let status = child.wait();
-    // Unlinked on clean exit — a process that dies without reaching this
-    // line leaves its entry for the next scan to read (as a live orphan, if
-    // the child outlived it, or as stale once it hasn't).
-    let _ = std::fs::remove_file(&entry_path);
-    drop(run_entry_lock);
+    drop(run_entry);
     match status {
         Ok(status) => status.code().unwrap_or(EXIT_FAILED),
         Err(error) => {

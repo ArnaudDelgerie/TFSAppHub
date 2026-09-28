@@ -208,6 +208,113 @@ fn reaped_child_pid() -> u32 {
 }
 
 #[test]
+fn claim_run_entry_records_alias_and_removes_entry_on_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(run_entry_file_name(std::process::id()));
+    let mut guard = claim_run_entry(dir.path(), std::process::id(), "mcp-serve").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "mcp-serve");
+    assert!(tfsapp_core::process::try_lock_file(&path)
+        .unwrap()
+        .is_none());
+    guard.append_child_pid(4321).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "mcp-serve\n4321");
+    drop(guard);
+    assert!(!path.exists());
+}
+
+#[test]
+fn claim_run_entry_failure_names_entry_and_leaves_no_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(run_entry_file_name(std::process::id()));
+    std::fs::create_dir(&path).unwrap();
+    assert!(claim_run_entry(dir.path(), std::process::id(), "mcp-serve").is_err());
+    assert!(path.is_dir());
+}
+
+#[test]
+fn two_claimed_entries_each_block_the_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let runs_dir = dir.path().join("runs");
+    std::fs::create_dir(&runs_dir).unwrap();
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let own_pid = std::process::id();
+    let first = claim_run_entry(&runs_dir, own_pid, "mcp-serve").unwrap();
+    let second = claim_run_entry(&runs_dir, child.id(), "mcp-serve").unwrap();
+    for pid in [own_pid, child.id()] {
+        let own_path = runs_dir.join(run_entry_file_name(pid));
+        let mut active = scan_runs(dir.path(), "test-identifier").unwrap();
+        active.retain(|entry| entry.path != own_path);
+        assert_eq!(active.len(), 1);
+        assert!(matches!(
+            run_start_verdict(false, &resolve_active_runs(active, &BTreeMap::new())),
+            RunStartVerdict::Blocked { .. }
+        ));
+    }
+    drop(first);
+    drop(second);
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn concurrent_claims_never_both_pass_non_concurrent_verdict() {
+    const N: usize = 4;
+    let mut children: Vec<_> = (0..N)
+        .map(|_| {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let pids: Vec<_> = children.iter().map(std::process::Child::id).collect();
+    for _ in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir(&runs_dir).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let finish = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = pids
+                .iter()
+                .map(|&pid| {
+                    let start = start.clone();
+                    let finish = finish.clone();
+                    let runs_dir = runs_dir.clone();
+                    let data_dir = dir.path();
+                    scope.spawn(move || {
+                        start.wait();
+                        let guard = claim_run_entry(&runs_dir, pid, "mcp-serve").unwrap();
+                        let own_path = runs_dir.join(run_entry_file_name(pid));
+                        let mut active = scan_runs(data_dir, "test-identifier").unwrap();
+                        active.retain(|entry| entry.path != own_path);
+                        let passed = run_start_verdict(
+                            false,
+                            &resolve_active_runs(active, &BTreeMap::new()),
+                        ) == RunStartVerdict::MayStart;
+                        finish.wait();
+                        drop(guard);
+                        passed
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        assert!(results.into_iter().filter(|passed| *passed).count() <= 1);
+    }
+    for child in &mut children {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+#[test]
 fn scan_runs_preserves_empty_entry_named_after_live_launcher() {
     let dir = tempfile::tempdir().unwrap();
     let runs_dir = dir.path().join("runs");
