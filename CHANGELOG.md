@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+`install` and `update` no longer accept a working directory: every install
+and update now starts from a checksummed release archive, from a forge or
+from `publish <project> --local <dir>`. A directory argument is refused with
+the `publish --local` route (and `dev <path>` for running a project in
+place). With it, `update --force` is gone — an equal version is always
+refused — and `list` no longer shows a "changed since install" marker. A
+registry that still holds a `local-path` entry is refused as a whole; there
+is no migration, since no user exists yet (decision 009).
+
 Apps can now be published to a local folder with `publish <project> --local
 <dir>`. The folder contains a release archive, `SHA256SUMS.txt` and `NOTES.md`.
 `install <archive.tar.gz>` verifies the adjacent checksums, and `update <id>
@@ -32,7 +41,7 @@ synced temporary file, preserving the previous full pid list if a rewrite
 is interrupted.
 
 `tfsapp-hub repair <id>` is now safe against a kill at any instant of an
-interrupted `update` or forced re-sync, not only right after one of its
+interrupted `update`, not only right after one of its
 journal writes — the gap between a filesystem change and the journal record
 of it is now covered too. It also finishes rather than reverts an update
 that was killed after the registry already recorded the new version: the

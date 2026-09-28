@@ -23,7 +23,7 @@ one-to-one (`check_identifier_free`, plan 016): a second `id` for an
 `identifier` another entry already carries is refused before anything is
 written, since the two installs would otherwise share all four.
 
-Each entry's source kind can be `release`, `local-path` or `local-archive`.
+Each entry's source kind is `release` or `local-archive`.
 For `local-archive`, `location` is the canonical path used at install or the
 last update, for information only. There is no ref, reference kind or index;
 `source_revision` hashes the extracted source tree. The archive may have
