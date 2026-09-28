@@ -389,7 +389,6 @@ fn update_into(
 /// not a re-guess from a string.
 fn origin(source: &Source) -> Origin {
     match source.kind {
-        SourceKind::LocalPath => Origin::LocalPath(PathBuf::from(&source.location)),
         SourceKind::LocalArchive => Origin::LocalArchive(PathBuf::from(&source.location)),
         SourceKind::Release => Origin::Release {
             index: source.index.clone(),

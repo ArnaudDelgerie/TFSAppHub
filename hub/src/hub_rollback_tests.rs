@@ -26,8 +26,8 @@ fn app(id: &str, version: &str) -> RegistryEntry {
         id: id.into(),
         identifier: format!("org.example.{id}"),
         source: Source {
-            kind: SourceKind::LocalPath,
-            location: format!("/sources/{id}"),
+            kind: SourceKind::LocalArchive,
+            location: format!("/sources/{id}-0.1.0.tar.gz"),
             reference: None,
             reference_kind: None,
             index: None,

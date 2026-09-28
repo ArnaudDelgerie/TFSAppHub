@@ -387,8 +387,8 @@ mod tests {
             id: id.to_string(),
             identifier: "dev.local.demo".to_string(),
             source: registry::Source {
-                kind: registry::SourceKind::LocalPath,
-                location: "/dev/null".to_string(),
+                kind: registry::SourceKind::LocalArchive,
+                location: "/releases/demo-0.1.0.tar.gz".to_string(),
                 reference: None,
                 reference_kind: None,
                 index: None,

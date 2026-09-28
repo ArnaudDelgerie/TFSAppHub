@@ -215,8 +215,8 @@ fn seeded_entry() -> RegistryEntry {
         id: "demo".to_string(),
         identifier: "dev.local.demo".to_string(),
         source: Source {
-            kind: SourceKind::LocalPath,
-            location: "/dev/null".to_string(),
+            kind: SourceKind::LocalArchive,
+            location: "/releases/demo-0.1.0.tar.gz".to_string(),
             reference: None,
             reference_kind: None,
             index: None,

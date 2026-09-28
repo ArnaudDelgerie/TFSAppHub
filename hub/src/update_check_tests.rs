@@ -5,8 +5,8 @@ use crate::{paths::Paths, registry::Source, update_cache::CachedRelease};
 
 fn local_source() -> Source {
     Source {
-        kind: crate::registry::SourceKind::LocalPath,
-        location: "/home/arnaud/Dev/demo".to_string(),
+        kind: crate::registry::SourceKind::LocalArchive,
+        location: "/home/arnaud/Dev/demo-0.1.0.tar.gz".to_string(),
         reference: None,
         reference_kind: None,
         index: None,
@@ -147,7 +147,7 @@ fn the_ok_shape_carries_exactly_the_five_fields() {
 #[test]
 fn a_dev_context_is_always_unavailable_local_source() {
     // No registry entry exists for a `dev` session, so there is nothing to
-    // look up — `Context::Dev` answers the same way a local-path source does,
+    // look up — `Context::Dev` answers the same way a local archive does,
     // just without a `Source` to consult in the first place.
     let result = answer_now(&Context::Dev);
     assert_eq!(

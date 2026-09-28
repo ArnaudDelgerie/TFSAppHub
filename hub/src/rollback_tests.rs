@@ -25,7 +25,7 @@ fn seeded_entry(location: &str) -> RegistryEntry {
         id: "demo".to_string(),
         identifier: "dev.local.demo".to_string(),
         source: Source {
-            kind: SourceKind::LocalPath,
+            kind: SourceKind::LocalArchive,
             location: location.to_string(),
             reference: None,
             reference_kind: None,
@@ -83,7 +83,7 @@ fn rolling_back_an_unregistered_id_refuses() {
 #[test]
 fn refuses_with_no_anchor_at_all_naming_all_three_halves() {
     let (_base, paths) = temp_paths();
-    seed_registry(&paths, seeded_entry("/dev/null"));
+    seed_registry(&paths, seeded_entry("/releases/demo-0.1.0.tar.gz"));
 
     let error = rollback(&paths, "demo", true).expect_err("a fresh install has no anchor");
     let RollbackError::NoAnchor { missing, .. } = error else {
@@ -95,7 +95,7 @@ fn refuses_with_no_anchor_at_all_naming_all_three_halves() {
 #[test]
 fn refuses_when_only_the_retained_tree_is_missing() {
     let (base, paths) = temp_paths();
-    seed_registry(&paths, seeded_entry("/dev/null"));
+    seed_registry(&paths, seeded_entry("/releases/demo-0.1.0.tar.gz"));
     let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
     write_anchor(&data_subdir);
     fs::write(data_subdir.join("app.db.pre-update"), b"snapshot").expect("a db snapshot");
@@ -111,7 +111,7 @@ fn refuses_when_only_the_retained_tree_is_missing() {
 #[test]
 fn refuses_when_only_the_database_snapshot_is_missing() {
     let (base, paths) = temp_paths();
-    seed_registry(&paths, seeded_entry("/dev/null"));
+    seed_registry(&paths, seeded_entry("/releases/demo-0.1.0.tar.gz"));
     let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
     write_anchor(&data_subdir);
     let app_dir = paths.app_dir("demo").expect("an app dir");
@@ -128,7 +128,7 @@ fn refuses_when_only_the_database_snapshot_is_missing() {
 #[test]
 fn refuses_when_only_the_rollback_record_is_missing() {
     let (base, paths) = temp_paths();
-    seed_registry(&paths, seeded_entry("/dev/null"));
+    seed_registry(&paths, seeded_entry("/releases/demo-0.1.0.tar.gz"));
     let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
     fs::create_dir_all(&data_subdir).expect("a data subdir");
     fs::write(data_subdir.join("app.db.pre-update"), b"snapshot").expect("a db snapshot");
@@ -484,7 +484,7 @@ fn a_killed_rollback_is_refused_by_every_other_command_and_finished_by_rerunning
 #[test]
 fn a_marker_with_neither_tree_left_reports_the_lost_tree_and_keeps_the_marker() {
     let (base, paths) = temp_paths();
-    seed_registry(&paths, seeded_entry("/dev/null"));
+    seed_registry(&paths, seeded_entry("/releases/demo-0.1.0.tar.gz"));
     let data_dir = base.path().join("TFSApp/dev.local.demo");
     fs::create_dir_all(&data_dir).expect("a data dir");
     write_marker(

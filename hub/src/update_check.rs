@@ -3,7 +3,7 @@
 //! whatever [`update_cache`] holds for that source's repository.
 //!
 //! No network here, and no filesystem beyond what the caller already read —
-//! [`answer`] is the whole table CONTRACT.md §7 now states: a local-path
+//! [`answer`] is the whole table CONTRACT.md §7 now states: a local-archive
 //! source (or a `dev` session, which has none at all) answers `local_source`;
 //! a release with nothing cached yet, or a cached tag that will not parse as
 //! a version, answers `no_answer_yet`; otherwise `ok`, comparing the cached
@@ -44,8 +44,8 @@ pub enum UpdateCheckResult {
     },
 }
 
-/// Installed from a local directory, or a `dev` session — no release feed
-/// exists, and the question has no other meaning there (CONTRACT.md §7).
+/// Installed from a local release archive, or a `dev` session — no release
+/// feed exists, and the question has no other meaning there (CONTRACT.md §7).
 pub const REASON_LOCAL_SOURCE: &str = "local_source";
 
 /// A release-installed app whose cache holds nothing usable yet: the first
@@ -68,10 +68,7 @@ pub fn answer(
     app_version: &str,
     cached: Option<&update_cache::CachedRelease>,
 ) -> UpdateCheckResult {
-    if matches!(
-        source.kind,
-        registry::SourceKind::LocalPath | registry::SourceKind::LocalArchive
-    ) {
+    if matches!(source.kind, registry::SourceKind::LocalArchive) {
         return unavailable(REASON_LOCAL_SOURCE);
     }
 
@@ -108,10 +105,10 @@ fn unavailable(reason: &str) -> UpdateCheckResult {
 ///
 /// `Dev` covers a `dev` session (`launch::Source::Live`), which has no
 /// registry entry at all — [`REASON_LOCAL_SOURCE`] is the whole answer there,
-/// with nothing to look up. An app *installed* from a local directory is a
-/// different case, `Installed` with a [`registry::SourceKind::LocalPath`]
-/// source: it does have an entry, and [`answer`] is what turns that into the
-/// same reason.
+/// with nothing to look up. An app *installed* from a local release archive
+/// is a different case, `Installed` with a
+/// [`registry::SourceKind::LocalArchive`] source: it does have an entry, and
+/// [`answer`] is what turns that into the same reason.
 #[derive(Debug, Clone)]
 pub enum Context {
     Installed {

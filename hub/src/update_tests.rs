@@ -257,15 +257,15 @@ fn temp_paths() -> (tempfile::TempDir, Paths) {
     (base, paths)
 }
 
-/// A registry entry recording `dev.local.demo` at `0.6.0`, sourced from
-/// `location` — the state a real `install` would have left behind, without
-/// paying for one.
+/// A registry entry recording `dev.local.demo` at `0.6.0`, installed from
+/// the local release archive at `location` — the state a real `install`
+/// would have left behind, without paying for one.
 fn seeded_entry(location: &str) -> RegistryEntry {
     RegistryEntry {
         id: "demo".to_string(),
         identifier: "dev.local.demo".to_string(),
         source: Source {
-            kind: SourceKind::LocalPath,
+            kind: SourceKind::LocalArchive,
             location: location.to_string(),
             reference: None,
             reference_kind: None,
@@ -322,7 +322,7 @@ fn updating_an_unregistered_id_refuses() {
 #[test]
 fn a_held_maintenance_lease_refuses_update_before_source_resolution() {
     let (base, paths) = temp_paths();
-    let source = base.path().join("gone");
+    let source = base.path().join("gone-0.1.0.tar.gz");
     registry::update(&paths, |registry| {
         registry.upsert(seeded_entry(&source.display().to_string()))
     })
@@ -340,7 +340,7 @@ fn a_held_maintenance_lease_refuses_update_before_source_resolution() {
 #[test]
 fn an_interleaved_update_cannot_replace_the_first_updates_previous_tree() {
     let (base, paths) = temp_paths();
-    let source = base.path().join("gone");
+    let source = base.path().join("gone-0.1.0.tar.gz");
     registry::update(&paths, |registry| {
         registry.upsert(seeded_entry(&source.display().to_string()))
     })
@@ -375,16 +375,16 @@ fn an_interleaved_update_cannot_replace_the_first_updates_previous_tree() {
 }
 
 #[test]
-fn a_source_that_no_longer_exists_is_refused_naming_the_recorded_location() {
+fn a_missing_archive_is_refused_naming_its_path() {
     let (base, paths) = temp_paths();
-    let gone = base.path().join("gone");
+    let gone = base.path().join("gone-0.1.0.tar.gz");
     registry::update(&paths, |registry| {
         registry.upsert(seeded_entry(&gone.display().to_string()))
     })
     .expect("a seeded registry");
 
-    let error = update(&paths, "demo", None, None, false, true, "0.1.0")
-        .expect_err("the recorded source directory is gone");
+    let error = update(&paths, "demo", Some(&gone), None, false, true, "0.1.0")
+        .expect_err("the release archive is gone");
     assert!(matches!(error, UpdateError::Source(_)), "{error}");
     assert!(
         error.to_string().contains(&gone.display().to_string()),
@@ -393,16 +393,49 @@ fn a_source_that_no_longer_exists_is_refused_naming_the_recorded_location() {
 }
 
 #[test]
-fn a_source_already_at_the_recorded_version_refuses_without_force() {
-    let (_base, paths) = temp_paths();
-    let source = tempfile::tempdir().expect("a temp source");
-    minimal_app_tree(source.path(), "0.6.0");
+fn a_directory_is_refused_naming_the_publish_local_route() {
+    // `update <id> <dir>` always builds a local archive from its argument, so
+    // a directory is owed the same `publish --local` route as `install <dir>`.
+    let (base, paths) = temp_paths();
+    let project = base.path().join("project");
+    fs::create_dir_all(&project).expect("a project directory");
     registry::update(&paths, |registry| {
-        registry.upsert(seeded_entry(&source.path().display().to_string()))
+        registry.upsert(seeded_entry("/releases/demo-0.6.0.tar.gz"))
     })
     .expect("a seeded registry");
 
-    let error = update(&paths, "demo", None, None, false, true, "0.1.0")
+    let error = update(&paths, "demo", Some(&project), None, false, true, "0.1.0")
+        .expect_err("a directory is not an update source");
+
+    assert!(
+        matches!(
+            error,
+            UpdateError::Source(crate::source::SourceError::DirectoryNotASource { .. })
+        ),
+        "{error}"
+    );
+    assert!(error.to_string().contains("publish"), "{error}");
+    // The app is untouched: the refusal happens before any mutation.
+    let entry = registry::load(&paths)
+        .expect("a readable registry")
+        .get("demo")
+        .cloned()
+        .expect("the entry");
+    assert_eq!(entry.app_version, "0.6.0");
+    assert!(!journal_present(&paths));
+}
+
+#[test]
+fn a_source_already_at_the_recorded_version_refuses_without_force() {
+    let (_base, paths) = temp_paths();
+    let release = tempfile::tempdir().expect("a release directory");
+    let archive = built_archive(release.path(), "0.6.0");
+    registry::update(&paths, |registry| {
+        registry.upsert(seeded_entry(&archive.display().to_string()))
+    })
+    .expect("a seeded registry");
+
+    let error = update(&paths, "demo", Some(&archive), None, false, true, "0.1.0")
         .expect_err("an equal source refuses without --force");
     assert!(matches!(error, UpdateError::Equal { .. }), "{error}");
     assert!(
@@ -414,15 +447,16 @@ fn a_source_already_at_the_recorded_version_refuses_without_force() {
 #[test]
 fn a_downgrade_refuses_naming_both_versions() {
     let (_base, paths) = temp_paths();
-    let source = tempfile::tempdir().expect("a temp source");
-    minimal_app_tree(source.path(), "0.5.0"); // older than the recorded 0.6.0
+    let release = tempfile::tempdir().expect("a release directory");
+    // Older than the recorded 0.6.0.
+    let archive = built_archive(release.path(), "0.5.0");
     registry::update(&paths, |registry| {
-        registry.upsert(seeded_entry(&source.path().display().to_string()))
+        registry.upsert(seeded_entry(&archive.display().to_string()))
     })
     .expect("a seeded registry");
 
-    let error =
-        update(&paths, "demo", None, None, false, true, "0.1.0").expect_err("a downgrade refuses");
+    let error = update(&paths, "demo", Some(&archive), None, false, true, "0.1.0")
+        .expect_err("a downgrade refuses");
     assert!(matches!(error, UpdateError::Downgrade { .. }), "{error}");
 }
 
@@ -737,6 +771,7 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let releases = tempfile::tempdir().expect("a release directory");
     let (base, paths) = temp_paths();
 
     runnable_app_tree(
@@ -744,9 +779,10 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
         "0.6.0",
         r#"{"pre-update": ["cache:clear"], "post-update": ["about"]}"#,
     );
+    let first = crate::test_release::release_of(source.path(), releases.path());
     crate::install::install(
         &paths,
-        &source.path().display().to_string(),
+        &first.display().to_string(),
         None,
         None,
         true,
@@ -800,8 +836,9 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
         }"#,
     )
     .expect("the edited manifest");
+    let second = crate::test_release::release_of(source.path(), releases.path());
 
-    update(&paths, "demo", None, None, true, true, "0.1.0").expect("--force resyncs");
+    update(&paths, "demo", Some(&second), None, true, true, "0.1.0").expect("--force resyncs");
 
     let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
     // The initial install ran no declared hook (no `pre-install`/`post-install`
@@ -1033,16 +1070,19 @@ fn a_killed_apply_finishes_forward_from_registry_commit_on() {
     }
 }
 
-/// An installed `0.6.0` app whose source is then edited in place without a
-/// version bump — a resolvable forced re-sync — for a killed `resync_only`.
+/// An installed `0.6.0` app whose tree is then edited without a version bump
+/// and republished — a resolvable forced re-sync — for a killed `resync_only`.
 fn seeded_for_resync_kill() -> (
     tempfile::TempDir,
     Paths,
     tempfile::TempDir,
+    tempfile::TempDir,
     std::path::PathBuf,
     String,
+    std::path::PathBuf,
 ) {
     let source = tempfile::tempdir().expect("a temp source");
+    let releases = tempfile::tempdir().expect("a release directory");
     let (base, paths) = temp_paths();
 
     runnable_app_tree(
@@ -1050,9 +1090,10 @@ fn seeded_for_resync_kill() -> (
         "0.6.0",
         r#"{"pre-install": [], "post-install": []}"#,
     );
+    let first = crate::test_release::release_of(source.path(), releases.path());
     crate::install::install(
         &paths,
-        &source.path().display().to_string(),
+        &first.display().to_string(),
         None,
         None,
         true,
@@ -1072,8 +1113,17 @@ fn seeded_for_resync_kill() -> (
     // Edited without a version bump — the same content/tree marker the
     // `Apply` boundary tests above use.
     fs::write(source.path().join("README"), "new tree").expect("a tree marker");
+    let second = crate::test_release::release_of(source.path(), releases.path());
 
-    (base, paths, source, app_dir, original_revision)
+    (
+        base,
+        paths,
+        source,
+        releases,
+        app_dir,
+        original_revision,
+        second,
+    )
 }
 
 const RESYNC_REVERT_BOUNDARIES: [&str; 3] = [
@@ -1089,10 +1139,11 @@ fn a_killed_resync_reverts_to_the_outgoing_source_before_registry_commit() {
         return;
     }
     for point in RESYNC_REVERT_BOUNDARIES {
-        let (_base, paths, _source, app_dir, original_revision) = seeded_for_resync_kill();
+        let (_base, paths, _source, _releases, app_dir, original_revision, next) =
+            seeded_for_resync_kill();
 
         test_stop::arm(point);
-        let result = update(&paths, "demo", None, None, true, true, "0.1.0");
+        let result = update(&paths, "demo", Some(&next), None, true, true, "0.1.0");
         test_stop::disarm();
         assert!(result.is_err(), "{point}: the stop point should have fired");
 
@@ -1131,10 +1182,11 @@ fn a_killed_resync_finishes_forward_from_registry_commit_on() {
         return;
     }
     for point in RESYNC_FORWARD_BOUNDARIES {
-        let (_base, paths, _source, app_dir, original_revision) = seeded_for_resync_kill();
+        let (_base, paths, _source, _releases, app_dir, original_revision, next) =
+            seeded_for_resync_kill();
 
         test_stop::arm(point);
-        let result = update(&paths, "demo", None, None, true, true, "0.1.0");
+        let result = update(&paths, "demo", Some(&next), None, true, true, "0.1.0");
         test_stop::disarm();
         assert!(result.is_err(), "{point}: the stop point should have fired");
 
@@ -1457,9 +1509,7 @@ fn archive_update_refuses_bad_checksum_ref_and_downgrade_before_mutation() {
     let release = tempfile::tempdir().unwrap();
     let newer = built_archive(release.path(), "0.7.0");
     let (_base, paths) = temp_paths();
-    let source = tempfile::tempdir().unwrap();
-    minimal_app_tree(source.path(), "0.6.0");
-    let entry = seeded_entry(&source.path().display().to_string());
+    let entry = seeded_entry("/releases/demo-0.6.0.tar.gz");
     registry::update(&paths, |registry| registry.upsert(entry.clone())).unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let reference = super::update_into(
@@ -1546,7 +1596,7 @@ fn an_older_archive_is_still_a_downgrade() {
     let folder = tempfile::tempdir().unwrap();
     let archive = built_archive(folder.path(), "0.6.0");
     let (_base, paths) = temp_paths();
-    let mut entry = seeded_entry("/missing");
+    let mut entry = seeded_entry("/missing/demo-0.6.0.tar.gz");
     entry.app_version = "0.7.0".to_string();
     registry::update(&paths, |registry| registry.upsert(entry.clone())).unwrap();
     let error = update(&paths, "demo", Some(&archive), None, false, true, "0.1.0").unwrap_err();

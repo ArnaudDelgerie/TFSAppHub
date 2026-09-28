@@ -1,28 +1,21 @@
 use super::render;
-use crate::{
-    registry::{
-        now_timestamp, Platform, ReferenceKind, Registry, RegistryEntry, Source, SourceKind, State,
-    },
-    source::Revision,
+use crate::registry::{
+    now_timestamp, Platform, ReferenceKind, Registry, RegistryEntry, Source, SourceKind, State,
 };
-
-/// The installed revision every fixture entry carries, so a test says what it
-/// means by "moved" without repeating a hash.
-const INSTALLED: &str = "sha256:1111";
 
 fn entry(id: &str) -> RegistryEntry {
     RegistryEntry {
         id: id.to_string(),
         identifier: format!("dev.local.{id}"),
         source: Source {
-            kind: SourceKind::LocalPath,
-            location: format!("/home/arnaud/Dev/{id}"),
+            kind: SourceKind::LocalArchive,
+            location: "/releases/demo-0.1.0.tar.gz".to_string(),
             reference: None,
             reference_kind: None,
             index: None,
         },
         app_version: "0.6.0".to_string(),
-        source_revision: INSTALLED.to_string(),
+        source_revision: "sha256:1111".to_string(),
         app_port: None,
         platform: Platform {
             php_version: "8.5".to_string(),
@@ -42,22 +35,16 @@ fn registry(entries: impl IntoIterator<Item = RegistryEntry>) -> Registry {
     }
 }
 
-/// Every source is where it was installed from and hashes to what was
-/// recorded — the quiet case.
-fn unchanged(_: &Source) -> Revision {
-    Revision::At(INSTALLED.to_string())
-}
-
 #[test]
 fn an_empty_registry_is_an_inventory_not_an_error() {
     // The state of every machine that has never installed anything, which is
     // the first one a new user's `list` meets.
-    assert_eq!(render(&registry([]), unchanged), "no apps installed\n");
+    assert_eq!(render(&registry([])), "no apps installed\n");
 }
 
 #[test]
 fn a_ready_app_shows_what_it_is_and_where_it_came_from() {
-    let text = render(&registry([entry("tfsapp-test")]), unchanged);
+    let text = render(&registry([entry("tfsapp-test")]));
     let line = text.lines().nth(1).expect("one app line");
 
     for expected in [
@@ -66,7 +53,7 @@ fn a_ready_app_shows_what_it_is_and_where_it_came_from() {
         "0.6.0",
         "ready",
         "8.5+a1b2c3d4",
-        "/home/arnaud/Dev/tfsapp-test",
+        "/releases/demo-0.1.0.tar.gz",
     ] {
         assert!(
             line.contains(expected),
@@ -79,10 +66,7 @@ fn a_ready_app_shows_what_it_is_and_where_it_came_from() {
 
 #[test]
 fn columns_line_up_across_apps_of_different_name_lengths() {
-    let text = render(
-        &registry([entry("a"), entry("a-much-longer-id")]),
-        unchanged,
-    );
+    let text = render(&registry([entry("a"), entry("a-much-longer-id")]));
     let mut lines = text.lines();
     let header = lines
         .next()
@@ -99,31 +83,6 @@ fn columns_line_up_across_apps_of_different_name_lengths() {
 }
 
 #[test]
-fn a_moved_source_is_flagged_against_the_revision_recorded_at_install() {
-    let text = render(&registry([entry("demo")]), |_| {
-        Revision::At("sha256:2222".to_string())
-    });
-
-    assert!(
-        text.contains("changed since install"),
-        "an edited source is what the marker exists for:\n{text}"
-    );
-}
-
-#[test]
-fn an_unreachable_source_says_nothing_rather_than_a_false_stale() {
-    // A source directory that was moved or unplugged cannot be compared. The
-    // difference is unmeasured, not measured as different — reporting it would
-    // send a developer looking for an edit they never made.
-    let text = render(&registry([entry("demo")]), |_| Revision::Unreachable);
-
-    assert!(
-        !text.contains("changed"),
-        "an unread source is not a changed one:\n{text}"
-    );
-}
-
-#[test]
 fn a_release_source_shows_its_tag_and_nothing_off_about_it() {
     let mut entry = entry("demo");
     entry.source = Source {
@@ -134,7 +93,7 @@ fn a_release_source_shows_its_tag_and_nothing_off_about_it() {
         index: Some("github".to_string()),
     };
 
-    let text = render(&registry([entry]), unchanged);
+    let text = render(&registry([entry]));
 
     assert!(text.contains("owner/demo@v1.4.0"), "{text}");
     assert!(!text.contains('('), "no markers on a quiet app: {text:?}");
@@ -147,7 +106,7 @@ fn a_state_reads_the_way_the_registry_file_spells_it() {
     let mut entry = entry("demo");
     entry.state = State::NeedsRevalidation;
 
-    let text = render(&registry([entry]), unchanged);
+    let text = render(&registry([entry]));
 
     assert!(text.contains("needs-revalidation"), "{text}");
 }

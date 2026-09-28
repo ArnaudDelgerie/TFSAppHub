@@ -127,7 +127,7 @@ pub struct Source {
     /// key for the app — today that is `owner/repo`, the forge acting as its
     /// own index (see [`Source::index`]).
     pub location: String,
-    /// The selector, when there is one: a tag. A plain directory has none.
+    /// The selector, when there is one: a tag. A local archive has none.
     /// Named `ref` in the file, since that is what it is, and `reference` in
     /// Rust, where `ref` is a keyword.
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
@@ -167,11 +167,11 @@ pub enum ReferenceKind {
 /// are-releases.md`): no git client, no branch, no arbitrary commit. The hub
 /// resolves a tag through the forge's release API, verifies the published
 /// archive, and installs the extracted tree exactly as it would a local
-/// directory.
+/// release archive (`../decision/009-a-release-is-an-archive-wherever-it-
+/// lives.md`).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SourceKind {
-    LocalPath,
     LocalArchive,
     Release,
 }

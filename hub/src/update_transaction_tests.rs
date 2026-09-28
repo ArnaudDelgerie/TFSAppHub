@@ -17,8 +17,8 @@ fn entry() -> RegistryEntry {
         id: "demo".into(),
         identifier: "dev.local.demo".into(),
         source: Source {
-            kind: SourceKind::LocalPath,
-            location: "/source".into(),
+            kind: SourceKind::LocalArchive,
+            location: "/releases/demo-0.6.0.tar.gz".into(),
             reference: None,
             reference_kind: None,
             index: None,
