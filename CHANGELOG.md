@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+Archive extraction now refuses hard links, devices, fifos, sparse files and
+other unsupported entry types. Release downloads, extraction and imports
+check available disk space before writing large payloads; imports also cap
+`manifest.json` at 1 MiB. Export streams database and upload files instead
+of loading them into memory, and preserves their modification times.
+
 Simultaneous `run` starts now claim their own records before checking a
 non-`concurrent` alias's exclusion, so they cannot both launch commands.
 Scans preserve entries named for live launchers, including entries created

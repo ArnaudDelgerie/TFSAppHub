@@ -15,7 +15,7 @@ data directory that does not exist yet is never busy, there being nothing yet
 to guard.
 
 **The database is copied raw, under that guard, never through SQLite.**
-`export` byte-copies `app.db` and whichever of `app.db-wal`/`app.db-shm`
+`export` streams `app.db` and whichever of `app.db-wal`/`app.db-shm`
 exist — `lifecycle::DB_FILE_NAMES`, the same three files `snapshot_db` copies
 for an update — straight to the archive. The guard is what makes this safe:
 nothing has the files open, so there is no hot WAL to reconcile and no reader
@@ -25,9 +25,10 @@ already provides for free.
 
 **`uploads/` travels beside the database, under the same guard (plan 049 /
 decision 006).** `export` walks `<data>/uploads/` recursively, sorted at every
-level, and appends every regular file it finds under the archive's own
-`uploads/` prefix with the same fixed-header `append_bytes` the database
-uses — so two exports of identical content produce byte-identical archives. A
+level, and streams every regular file it finds under the archive's own
+`uploads/` prefix. Each disk entry records its source file's modification
+time, and the in-memory `manifest.json` has modification time zero. Two
+exports of an unchanged tree differ only in the manifest's `exported_at`. A
 symlink, socket or fifo is skipped and named on stderr rather than followed or
 embedded; an absent `uploads/` is the ordinary case for an app that has never
 written a file, not a skip and not an error.
@@ -142,6 +143,13 @@ than only in the diff: the symlink-escape depth is computed against the path
 *relative to the prefix*, not the archive's full path — the full path carries
 `data/`'s own extra depth, and checking against it would permit one level of
 escape more than is actually safe relative to the destination directory.
+Only regular files, directories and confined symbolic links are accepted;
+hard links, devices, fifos, sparse entries and other tar entry types are
+refused before extraction. The manifest is capped at 1 MiB. Before clearing
+any destination state, import walks the archive and totals its regular-file
+payload. It refuses a payload larger than the available disk space after a
+64 MiB safety margin and the live database's size, preserving room for the
+database rescue copy. The archive is then read again for extraction.
 
 **Import never touches the keyring.** The archive carries no secret, so the
 destination keeps whatever `APP_SECRET` it already had or resolves one fresh
@@ -150,4 +158,3 @@ consequence rather than leaving it to be discovered — every session in the
 imported database is invalid on the new machine, and `actions.secrets`
 values must be re-provisioned there — CONTRACT.md §5 states the guarantee
 this follows from.
-
