@@ -201,21 +201,23 @@ fn worker_transports(manifest: &Manifest) -> String {
 /// the mechanism the whole dev loop is measured on, and a wipe on every relaunch
 /// would cost a full rebuild for nothing it buys back.
 ///
-/// `media_handler_installed` is the caller's own report of whether the
-/// `webkit2gtk` permission handler was scheduled on this launch's window
-/// (`media::install_permission_handler`, CONTRACT.md §7/§8, decision 007) —
-/// `false` for every mode that builds no window at all (`Install`, `Run`),
-/// and whatever `main::open_window`'s splash install reported for
-/// `Launch`/`Dev`. `TFS_MEDIA_MICROPHONE` below is the AND of this and the
-/// manifest's own declaration: the variable mirrors what actually happened on
-/// this machine, never what was merely asked for.
+/// `microphone_granted` is the caller's own report of whether this launch's
+/// webview really had the microphone grant applied — the
+/// `webkit2gtk` setting written and the permission handler connected
+/// (`media::install_permission_handler`, CONTRACT.md §7/§8, decision 007)
+/// — `false` for every mode that builds no window at all (`Install`, `Run`),
+/// and whatever `main::serve` learned from the splash install's report,
+/// within `media::MICROPHONE_GRANT_DEADLINE`, for `Launch`/`Dev`.
+/// `TFS_MEDIA_MICROPHONE` below is the AND of this and the manifest's own
+/// declaration: the variable mirrors what actually happened on this
+/// machine, never what was merely asked for.
 pub fn resolve(
     manifest: &Manifest,
     app_dir: &Path,
     identifier: &str,
     state_root: &Path,
     mode: Mode,
-    media_handler_installed: bool,
+    microphone_granted: bool,
 ) -> Result<AppEnvironment, EnvError> {
     resolve_with_store(
         manifest,
@@ -223,7 +225,7 @@ pub fn resolve(
         identifier,
         state_root,
         mode,
-        media_handler_installed,
+        microphone_granted,
         crate::secrets::new_store,
         glib::user_special_dir,
     )
@@ -236,7 +238,7 @@ fn resolve_with_store<F, G>(
     identifier: &str,
     state_root: &Path,
     mode: Mode,
-    media_handler_installed: bool,
+    microphone_granted: bool,
     new_store: F,
     resolve_user_dir: G,
 ) -> Result<AppEnvironment, EnvError>
@@ -386,7 +388,7 @@ where
         ("TFS_APP_VERSION", manifest.app_version.clone()),
         (
             "TFS_MEDIA_MICROPHONE",
-            if manifest.actions.media.microphone && media_handler_installed {
+            if manifest.actions.media.microphone && microphone_granted {
                 "1"
             } else {
                 "0"
@@ -429,7 +431,7 @@ pub fn resolve_with_secret_store_for_test(
     identifier: &str,
     state_root: &Path,
     mode: Mode,
-    media_handler_installed: bool,
+    microphone_granted: bool,
     secret_store: crate::secrets::SecretStore,
 ) -> Result<AppEnvironment, EnvError> {
     resolve_with_store(
@@ -438,7 +440,7 @@ pub fn resolve_with_secret_store_for_test(
         identifier,
         state_root,
         mode,
-        media_handler_installed,
+        microphone_granted,
         move |_, _| secret_store,
         glib::user_special_dir,
     )
@@ -455,7 +457,7 @@ pub fn resolve_with_user_dirs_resolver_for_test(
     identifier: &str,
     state_root: &Path,
     mode: Mode,
-    media_handler_installed: bool,
+    microphone_granted: bool,
     resolve_user_dir: impl Fn(glib::UserDirectory) -> Option<PathBuf>,
 ) -> Result<AppEnvironment, EnvError> {
     resolve_with_store(
@@ -464,7 +466,7 @@ pub fn resolve_with_user_dirs_resolver_for_test(
         identifier,
         state_root,
         mode,
-        media_handler_installed,
+        microphone_granted,
         crate::secrets::new_store,
         resolve_user_dir,
     )

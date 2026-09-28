@@ -748,16 +748,18 @@ fn open_window(
             // Scheduled on the splash's own webview — the same one `serve`
             // navigates to the backend, never rebuilt for the hand-over
             // (`architecture/09`) — so this one install covers the window for
-            // the app's whole first life. Whether the dispatch was scheduled
-            // is read here because `serve` needs it before the sidecar
-            // starts: `TFS_MEDIA_MICROPHONE` reports that, never what the
-            // manifest asked for (CONTRACT.md §3).
-            let media_installed = media::install_permission_handler(
+            // the app's whole first life. The receiver is kept here and
+            // **not** waited on: this closure runs on the main thread, which
+            // is the thread the `with_webview` closure itself needs to run
+            // on, so blocking here could only deadlock. `serve` waits, off
+            // the main thread, and `TFS_MEDIA_MICROPHONE` reports what that
+            // wait learned, never what the manifest asked for (§3).
+            let media_grant_report = media::install_permission_handler(
                 &splash,
                 spec.manifest.actions.media.microphone,
                 app_origin.clone(),
             )
-            .is_ok();
+            .ok();
             let _ = crash::install_crash_recovery_handler(
                 &splash,
                 close_guards.clone(),
@@ -783,7 +785,7 @@ fn open_window(
                     splash_label,
                     close_guards,
                     serve_open_files,
-                    media_installed,
+                    media_grant_report,
                 );
             });
 
@@ -820,7 +822,7 @@ fn serve(
     splash_label: String,
     close_guards: close_guard::SharedCloseGuards,
     open_files: open_files::SharedOpenFiles,
-    media_installed: bool,
+    media_grant_report: Option<std::sync::mpsc::Receiver<bool>>,
 ) {
     use tauri::Manager;
 
@@ -902,13 +904,25 @@ fn serve(
         }
         launch::Source::Live => app_env::Mode::Dev,
     };
+    // `serve` runs off the main thread, so it may block — and this is the
+    // one place that does: the grant's report is waited for only when the
+    // manifest declares the microphone, never longer than the deadline, and
+    // never from the main thread (the `setup` closure and the
+    // second-instance callback share the thread the `with_webview` closure
+    // itself needs). An undeclared app waits for nothing; its report, if
+    // the closure ever sends one, is dropped unread.
+    let microphone_granted = if manifest.actions.media.microphone {
+        media::await_grant(media_grant_report, media::MICROPHONE_GRANT_DEADLINE)
+    } else {
+        false
+    };
     let environment = match app_env::resolve(
         manifest,
         &spec.app_dir,
         &identity.identifier,
         &spec.state_root,
         env_mode,
-        media_installed,
+        microphone_granted,
     ) {
         Ok(environment) => environment,
         Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),
