@@ -835,6 +835,7 @@ fn an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(
@@ -842,9 +843,10 @@ fn an_install_ends_with_dependencies_and_the_hooks_that_ran_in_order() {
         r#"{"pre-install": ["doctrine:migrations:migrate"], "post-install": ["about"]}"#,
     );
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let id = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -877,13 +879,15 @@ fn an_install_writes_a_cache_stamp_matching_the_current_platform() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), "{}");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let id = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -917,6 +921,7 @@ fn a_failed_warm_up_does_not_fail_the_install_and_leaves_no_stamp() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     manifest_at(source.path(), "0.6.0");
@@ -935,9 +940,10 @@ fn a_failed_warm_up_does_not_fail_the_install_and_leaves_no_stamp() {
     fs::create_dir_all(source.path().join("public")).expect("a public dir");
     fs::write(source.path().join("public/index.php"), "<?php").expect("a front controller");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let id = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -971,14 +977,16 @@ fn a_data_dir_recording_a_newer_version_refuses_before_anything_is_copied_or_reg
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), "{}"); // app_version 0.6.0
     seed_data_record(&paths, "dev.local.demo", "9.9.9");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let error = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1010,14 +1018,16 @@ fn a_data_dir_recording_an_older_version_refuses_as_the_update_event() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), "{}"); // app_version 0.6.0
     seed_data_record(&paths, "dev.local.demo", "0.1.0");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let error = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1049,6 +1059,7 @@ fn a_record_of_the_same_version_installs_and_runs_no_lifecycle_command() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(
@@ -1057,9 +1068,10 @@ fn a_record_of_the_same_version_installs_and_runs_no_lifecycle_command() {
     );
     seed_data_record(&paths, "dev.local.demo", "0.6.0");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let id = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1097,6 +1109,7 @@ fn a_fresh_install_discards_any_rollback_anchor_left_in_the_data_directory() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), "{}"); // app_version 0.6.0
@@ -1115,9 +1128,10 @@ fn a_fresh_install_discards_any_rollback_anchor_left_in_the_data_directory() {
     )
     .expect("a seeded anchor");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1142,6 +1156,7 @@ fn a_declined_install_leaves_an_existing_rollback_anchor_intact() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     app_tree(source.path());
@@ -1160,9 +1175,10 @@ fn a_declined_install_leaves_an_existing_rollback_anchor_intact() {
     )
     .expect("a seeded anchor");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let result = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         false,
@@ -1191,13 +1207,15 @@ fn a_failing_hook_leaves_no_directory_and_nothing_registered() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), r#"{"pre-install": ["boom"]}"#);
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     let error = super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1229,13 +1247,15 @@ fn an_install_writes_the_desktop_entry_and_the_stable_hub_copy() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), "{}");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1264,13 +1284,15 @@ fn no_desktop_entry_writes_neither_the_entry_nor_the_copy() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let base = tempfile::tempdir().expect("a temp data dir");
     let paths = Paths::rooted_at(base.path());
     runnable_app_tree(source.path(), "{}");
 
+    let archive = crate::test_release::release_of(source.path(), release.path());
     super::install(
         &paths,
-        &source.path().display().to_string(),
+        &archive.display().to_string(),
         None,
         None,
         true,
@@ -1454,55 +1476,10 @@ fn an_install_from_a_remote_release_reaches_ready() {
     assert_eq!(entry.source.index.as_deref(), Some("github"));
 }
 
-struct ArchiveFixtureBlobs(std::collections::HashMap<String, Vec<u8>>);
-
-impl crate::publish::BlobSource for ArchiveFixtureBlobs {
-    fn copy_blob(
-        &mut self,
-        object: &str,
-        destination: &mut dyn std::io::Write,
-    ) -> Result<u64, crate::git::GitError> {
-        let bytes = &self.0[object];
-        destination.write_all(bytes).unwrap();
-        Ok(bytes.len() as u64)
-    }
-}
-
 fn built_local_release(root: &Path) -> PathBuf {
     let project = tempfile::tempdir().unwrap();
     app_tree(project.path());
-    let names = [
-        "tfsapp.config.json",
-        "composer.json",
-        "bin/console",
-        "public/index.php",
-    ];
-    let mut blobs = std::collections::HashMap::new();
-    let entries = names
-        .iter()
-        .map(|name| {
-            let bytes = fs::read(project.path().join(name)).unwrap();
-            blobs.insert((*name).to_string(), bytes);
-            crate::git::TreeEntry {
-                path: PathBuf::from(name),
-                mode: if *name == "bin/console" {
-                    0o100755
-                } else {
-                    0o100644
-                },
-                object_id: (*name).to_string(),
-            }
-        })
-        .collect::<Vec<_>>();
-    crate::publish::build_archive(
-        &entries,
-        &mut ArchiveFixtureBlobs(blobs),
-        "demo",
-        "0.6.0",
-        root,
-    )
-    .unwrap()
-    .archive_path
+    crate::test_release::release_of(project.path(), root)
 }
 
 #[test]

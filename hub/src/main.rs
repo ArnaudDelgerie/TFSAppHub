@@ -59,6 +59,8 @@ mod window;
 mod worker;
 
 #[cfg(test)]
+mod test_release;
+#[cfg(test)]
 mod update_transaction_tests;
 
 use cli::{

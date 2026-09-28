@@ -493,6 +493,7 @@ fn an_update_runs_pre_update_then_post_update_and_no_install_hooks() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
 
     runnable_app_tree(
@@ -500,9 +501,10 @@ fn an_update_runs_pre_update_then_post_update_and_no_install_hooks() {
         "0.6.0",
         r#"{"pre-install": ["about"], "post-install": ["doctrine:migrations:migrate"]}"#,
     );
+    let first = crate::test_release::release_of(source.path(), release.path());
     crate::install::install(
         &paths,
-        &source.path().display().to_string(),
+        &first.display().to_string(),
         None,
         None,
         true,
@@ -520,8 +522,9 @@ fn an_update_runs_pre_update_then_post_update_and_no_install_hooks() {
         "0.7.0",
         r#"{"pre-update": ["cache:clear"], "post-update": ["about"]}"#,
     );
+    let second = crate::test_release::release_of(source.path(), release.path());
 
-    update(&paths, "demo", None, None, false, true, "0.1.0").expect("the update applies");
+    update(&paths, "demo", Some(&second), None, false, true, "0.1.0").expect("the update applies");
 
     let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
     // The hub's own `cache:warmup` (plan 024) closes out each event — the
@@ -559,12 +562,14 @@ fn a_failing_pre_update_leaves_the_tree_the_database_and_the_registry_entry_unch
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
 
     runnable_app_tree(source.path(), "0.6.0", "{}");
+    let first = crate::test_release::release_of(source.path(), release.path());
     crate::install::install(
         &paths,
-        &source.path().display().to_string(),
+        &first.display().to_string(),
         None,
         None,
         true,
@@ -583,8 +588,9 @@ fn a_failing_pre_update_leaves_the_tree_the_database_and_the_registry_entry_unch
     let before_registry = registry::load(&paths).expect("the outgoing registry");
 
     runnable_app_tree(source.path(), "0.7.0", r#"{"pre-update": ["boom"]}"#);
+    let second = crate::test_release::release_of(source.path(), release.path());
 
-    let error = update(&paths, "demo", None, None, false, true, "0.1.0")
+    let error = update(&paths, "demo", Some(&second), None, false, true, "0.1.0")
         .expect_err("a failing pre-update must fail the whole update");
     assert!(matches!(error, UpdateError::Reverted { .. }), "{error}");
 
@@ -631,12 +637,14 @@ fn an_update_leaves_a_cache_stamp_the_next_launch_will_match() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
 
     runnable_app_tree(source.path(), "0.6.0", "{}");
+    let first = crate::test_release::release_of(source.path(), release.path());
     crate::install::install(
         &paths,
-        &source.path().display().to_string(),
+        &first.display().to_string(),
         None,
         None,
         true,
@@ -646,7 +654,8 @@ fn an_update_leaves_a_cache_stamp_the_next_launch_will_match() {
     .expect("the first install");
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
-    update(&paths, "demo", None, None, false, true, "0.1.0").expect("the update applies");
+    let second = crate::test_release::release_of(source.path(), release.path());
+    update(&paths, "demo", Some(&second), None, false, true, "0.1.0").expect("the update applies");
 
     let app_dir = paths.app_dir("demo").expect("an app dir");
     let data_dir = base.path().join("TFSApp/dev.local.demo");
@@ -689,12 +698,14 @@ fn an_update_s_post_replacement_cache_wipe_never_reaches_uploads() {
         return;
     }
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
 
     runnable_app_tree(source.path(), "0.6.0", "{}");
+    let first = crate::test_release::release_of(source.path(), release.path());
     crate::install::install(
         &paths,
-        &source.path().display().to_string(),
+        &first.display().to_string(),
         None,
         None,
         true,
@@ -710,7 +721,8 @@ fn an_update_s_post_replacement_cache_wipe_never_reaches_uploads() {
     fs::write(uploads_dir.join("invoice.pdf"), content).expect("a planted upload");
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
-    update(&paths, "demo", None, None, false, true, "0.1.0").expect("the update applies");
+    let second = crate::test_release::release_of(source.path(), release.path());
+    update(&paths, "demo", Some(&second), None, false, true, "0.1.0").expect("the update applies");
 
     assert_eq!(
         fs::read(uploads_dir.join("invoice.pdf")).expect("the upload survives an update"),
@@ -848,17 +860,20 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
 // calls) plus every other such boundary the real pipeline has. `repair`'s own
 // behaviour, not a hand-built fixture, is what is under test.
 
-/// An installed `0.6.0` app with a seeded database and a resolvable `0.7.0`
-/// source, ready for a killed `apply`. The new tree carries a `README` the
-/// outgoing one never had — the cheap, already-proven (the resync test above)
-/// way to tell which tree is live without inspecting `tfsapp.config.json`.
+/// An installed `0.6.0` app with a seeded database and a built `0.7.0`
+/// release archive, ready for a killed `apply`. The new tree carries a
+/// `README` the outgoing one never had — the cheap, already-proven (the
+/// resync test above) way to tell which tree is live without inspecting
+/// `tfsapp.config.json`.
 fn seeded_for_apply_kill() -> (
     tempfile::TempDir,
     Paths,
     tempfile::TempDir,
     std::path::PathBuf,
+    std::path::PathBuf,
 ) {
     let source = tempfile::tempdir().expect("a temp source");
+    let release = tempfile::tempdir().expect("a release dir");
     let (base, paths) = temp_paths();
 
     runnable_app_tree(
@@ -866,9 +881,10 @@ fn seeded_for_apply_kill() -> (
         "0.6.0",
         r#"{"pre-install": [], "post-install": []}"#,
     );
+    let first = crate::test_release::release_of(source.path(), release.path());
     crate::install::install(
         &paths,
-        &source.path().display().to_string(),
+        &first.display().to_string(),
         None,
         None,
         true,
@@ -887,8 +903,9 @@ fn seeded_for_apply_kill() -> (
         r#"{"pre-update": [], "post-update": []}"#,
     );
     fs::write(source.path().join("README"), "new tree").expect("a tree marker");
+    let next = crate::test_release::release_of(source.path(), release.path());
 
-    (base, paths, source, app_dir)
+    (base, paths, release, next, app_dir)
 }
 
 /// Boundaries at which the outgoing state is still the answer: the journal is
@@ -919,11 +936,11 @@ fn a_killed_apply_reverts_to_the_outgoing_version_before_registry_commit() {
         return;
     }
     for point in APPLY_REVERT_BOUNDARIES {
-        let (base, paths, _source, app_dir) = seeded_for_apply_kill();
+        let (base, paths, _release, next, app_dir) = seeded_for_apply_kill();
         let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
 
         test_stop::arm(point);
-        let result = update(&paths, "demo", None, None, false, true, "0.1.0");
+        let result = update(&paths, "demo", Some(&next), None, false, true, "0.1.0");
         test_stop::disarm();
         assert!(result.is_err(), "{point}: the stop point should have fired");
 
@@ -967,11 +984,11 @@ fn a_killed_apply_finishes_forward_from_registry_commit_on() {
         return;
     }
     for point in APPLY_FORWARD_BOUNDARIES {
-        let (base, paths, _source, app_dir) = seeded_for_apply_kill();
+        let (base, paths, _release, next, app_dir) = seeded_for_apply_kill();
         let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
 
         test_stop::arm(point);
-        let result = update(&paths, "demo", None, None, false, true, "0.1.0");
+        let result = update(&paths, "demo", Some(&next), None, false, true, "0.1.0");
         test_stop::disarm();
         assert!(result.is_err(), "{point}: the stop point should have fired");
 
@@ -1386,51 +1403,10 @@ fn an_equal_remote_source_refuses_without_force() {
     assert!(matches!(error, UpdateError::Equal { .. }), "{error}");
 }
 
-struct LocalBlobs(std::collections::HashMap<String, Vec<u8>>);
-
-impl crate::publish::BlobSource for LocalBlobs {
-    fn copy_blob(
-        &mut self,
-        object: &str,
-        destination: &mut dyn std::io::Write,
-    ) -> Result<u64, crate::git::GitError> {
-        let bytes = &self.0[object];
-        destination.write_all(bytes).unwrap();
-        Ok(bytes.len() as u64)
-    }
-}
-
 fn built_archive(root: &Path, version: &str) -> std::path::PathBuf {
     let project = tempfile::tempdir().unwrap();
     minimal_app_tree(project.path(), version);
-    let names = [
-        "tfsapp.config.json",
-        "composer.json",
-        "bin/console",
-        "public/index.php",
-    ];
-    let mut blobs = std::collections::HashMap::new();
-    let entries = names
-        .iter()
-        .map(|name| {
-            blobs.insert(
-                (*name).to_string(),
-                fs::read(project.path().join(name)).unwrap(),
-            );
-            crate::git::TreeEntry {
-                path: std::path::PathBuf::from(name),
-                mode: if *name == "bin/console" {
-                    0o100755
-                } else {
-                    0o100644
-                },
-                object_id: (*name).to_string(),
-            }
-        })
-        .collect::<Vec<_>>();
-    crate::publish::build_archive(&entries, &mut LocalBlobs(blobs), "demo", version, root)
-        .unwrap()
-        .archive_path
+    crate::test_release::release_of(project.path(), root)
 }
 
 #[test]
@@ -1530,12 +1506,12 @@ fn forge_record_updated_from_archive_switches_its_source() {
     if !resources_present() {
         return;
     }
-    let source = tempfile::tempdir().unwrap();
-    minimal_app_tree(source.path(), "0.6.0");
+    let release = tempfile::tempdir().unwrap();
+    let first = built_archive(release.path(), "0.6.0");
     let (_base, paths) = temp_paths();
     crate::install::install(
         &paths,
-        &source.path().display().to_string(),
+        &first.display().to_string(),
         None,
         None,
         true,

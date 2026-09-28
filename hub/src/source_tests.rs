@@ -449,21 +449,14 @@ fn a_source_that_cannot_be_installed_says_which_kind_of_problem_it_is() {
     );
 }
 
-struct FixtureBlobs(Vec<u8>);
-
-impl crate::publish::BlobSource for FixtureBlobs {
-    fn copy_blob(
-        &mut self,
-        _: &str,
-        destination: &mut dyn std::io::Write,
-    ) -> Result<u64, crate::git::GitError> {
-        destination.write_all(&self.0).unwrap();
-        Ok(self.0.len() as u64)
-    }
-}
-
 fn local_archive_fixture(manifest: &str) -> tempfile::TempDir {
+    // Kept beside the shared `release_of` rather than folded into it: this
+    // fixture's whole point is control over the manifest bytes and the
+    // archive's name independently of each other, which a helper that reads
+    // both from a project tree cannot express.
     let folder = tempfile::tempdir().unwrap();
+    let mut blobs = std::collections::HashMap::new();
+    blobs.insert("manifest".to_string(), manifest.as_bytes().to_vec());
     let entries = vec![crate::git::TreeEntry {
         path: PathBuf::from("tfsapp.config.json"),
         mode: 0o100644,
@@ -471,7 +464,7 @@ fn local_archive_fixture(manifest: &str) -> tempfile::TempDir {
     }];
     crate::publish::build_archive(
         &entries,
-        &mut FixtureBlobs(manifest.as_bytes().to_vec()),
+        &mut crate::test_release::LocalBlobs(blobs),
         "demo",
         "1.2.0",
         folder.path(),
