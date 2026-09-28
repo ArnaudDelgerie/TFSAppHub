@@ -948,7 +948,13 @@ fn serve(
         println!("tfsapp-hub: delivering {claimed} file request(s) that arrived during startup.");
         open_files::notify(&app, &splash_label);
     }
-    if let Err(error) = window.navigate(url.parse().expect("a valid local backend URL")) {
+    // `window.navigate` pushes a history entry; the bundled splash on
+    // `tauri://` stays navigable forever (`window.rs`'s
+    // `is_bundled_asset_origin`), so Back would return to a cold-start page
+    // that then waits for a hand-over that already happened. `location.replace`
+    // replaces the splash's entry instead of stacking on it, and the
+    // navigation still goes through `classify_navigation` like any other.
+    if let Err(error) = window.eval(format!("location.replace({url:?})")) {
         return lifecycle::fatal_post_setup_error(app, error.to_string());
     }
 
