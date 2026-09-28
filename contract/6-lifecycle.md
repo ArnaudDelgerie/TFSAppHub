@@ -204,7 +204,11 @@ is stale and inert. Whether a newcomer alias may start is decided against
 every entry the scan finds active: a `concurrent` newcomer (§2) stacks with
 itself and with other `concurrent` entries, and is refused only by a
 non-`concurrent` one; a non-`concurrent` newcomer refuses beside anything
-active at all. Two apps running commands at once costs nothing either way —
+active at all. A launcher records and locks its own entry before scanning,
+then excludes that entry from its verdict. Two newcomers started at the same
+instant may both refuse, but cannot both start when an alias is not
+`concurrent`; rerunning after the refusal is the way out. Two apps running
+commands at once costs nothing either way —
 `runs/` is keyed on the app's own `identifier`, a different directory per
 app. `run --stop <id>` stops every active command for that app; `run --stop
 <id> <alias>` narrows it to that alias's instances. `run --stop`/
@@ -240,4 +244,3 @@ the command actually starting — is reported as such, not assumed to be
 either free or wedged. `run --replace <id> <alias>` refuses outright on a
 `concurrent` alias: there is nothing for it to replace when instances stack,
 and the message points at starting another instance instead.
-

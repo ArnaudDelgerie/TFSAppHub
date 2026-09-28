@@ -1,5 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
+    io::Write,
     os::unix::{
         fs::OpenOptionsExt,
         io::{AsRawFd, RawFd},
@@ -336,6 +337,23 @@ pub fn lock_path(pid_file: &Path) -> PathBuf {
     let mut name = pid_file.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     pid_file.with_file_name(name)
+}
+
+/// Replace the complete pid list only after its temporary copy is durable.
+pub fn write_pid_file(pid_file: &Path, contents: &str) -> std::io::Result<()> {
+    let mut name = pid_file.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let temporary = pid_file.with_file_name(name);
+    let mut file = File::create(&temporary)?;
+    let result = (|| {
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, pid_file)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Try to take a non-blocking exclusive lock on `path` (created if missing).

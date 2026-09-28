@@ -300,7 +300,7 @@ pub fn start(
     // The pid file starts with the server alone. If spawning the worker or
     // updating this file fails, `sidecar` drops and removes this partial record
     // while reaping the server it has owned since `spawn()` returned.
-    fs::write(&sidecar.pid_file, format!("{server_pid}\n"))?;
+    tfsapp_core::process::write_pid_file(&sidecar.pid_file, &format!("{server_pid}\n"))?;
 
     // Only the workers are gated on a declaration. The Mercure hub is always
     // mounted: it is a Caddy directive, not a process, and costs nothing at
