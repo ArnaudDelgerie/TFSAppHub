@@ -771,8 +771,8 @@ fn run_import(
         }
     })?;
 
-    // The switch, the version record, the forward migration, the commit —
-    // the whole run of short mutations an intent covers. `migrated_forward`
+    // The switch, the version record, the forward migration — the run of
+    // short mutations an in-process back-out can still undo. `migrated_forward`
     // only drives the success report; the migration's own failure paths
     // all go through the back-out below.
     let mutation = (|| -> Result<(), PortabilityError> {
@@ -819,16 +819,6 @@ fn run_import(
             )?;
         }
         stop_at("import_migrated")?;
-
-        let mut committed = intent.clone();
-        committed.phase = import_transaction::ImportPhase::Committed;
-        import_transaction::write_intent(&data_dir, &committed).map_err(|source| {
-            PortabilityError::Io {
-                path: import_transaction::intent_path(&data_dir),
-                source: io::Error::other(source.to_string()),
-            }
-        })?;
-        stop_at("import_committed")?;
         Ok(())
     })();
 
@@ -849,9 +839,24 @@ fn run_import(
         }
     }
 
+    // The commit, outside the back-out's reach: `write_record` can fail on
+    // its directory fsync *after* the rename landed, with `committed`
+    // already on disk. Backing out then could stop halfway and leave repair
+    // "finishing" a half-restored import. Whatever the phase on disk says,
+    // repair acts on it: back out a `staged` intent, finish a `committed` one.
+    let mut committed = intent.clone();
+    committed.phase = import_transaction::ImportPhase::Committed;
+    import_transaction::write_intent(&data_dir, &committed).map_err(|source| {
+        PortabilityError::ImportInterrupted {
+            id: id.to_string(),
+            detail: source.to_string(),
+        }
+    })?;
+    stop_at("import_committed")?;
+
     // The committed import's cleanup: consume the rollback anchor (an
     // import proceeding has already made it incoherent — see the Overview),
-    // the tree any interrupted update left staged, the staging directory,
+    // its retained `.previous` tree, the staging directory,
     // and the intent itself. An error here is not a failure of the import —
     // the data is in place and the version record written — but the intent
     // it leaves behind is exactly what `repair` finishes from.

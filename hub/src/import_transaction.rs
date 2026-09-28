@@ -292,8 +292,8 @@ pub fn back_out(data_dir: &Path, data_subdir: &Path, intent: &ImportIntent) -> i
 }
 
 /// The committed import's cleanup: consume the rollback anchor (an import
-/// proceeding has already made it incoherent), the tree any interrupted
-/// update left staged, the staging directory, and the intent itself —
+/// proceeding has already made it incoherent) with its retained `.previous`
+/// tree, the staging directory, and the intent itself —
 /// strictly, because a leftover intent keeps every command refused.
 pub fn finish_import(data_subdir: &Path, data_dir: &Path, app_dir: &Path) -> io::Result<()> {
     lifecycle::discard_rollback_anchor(data_subdir);
