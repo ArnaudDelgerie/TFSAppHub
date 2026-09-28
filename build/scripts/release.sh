@@ -142,9 +142,18 @@ CHANGELOG_FILE="$ROOT_DIR/CHANGELOG.md"
 # handed to awk through -v, which would eat the backslashes ("\." is not an
 # awk escape sequence). "." and "+" are the only ERE metacharacters a semver
 # string can contain.
+# Bracket expressions rather than backslash escapes throughout: the regex is
+# handed to awk through -v, which would eat the backslashes ("." is not an
+# awk escape sequence). "." and "+" are the only ERE metacharacters a semver
+# string can contain. The heading itself is a closed list of three spellings
+# and no others — "## 1.2.0", "## v1.2.0", "## [1.2.0]" — each optionally
+# followed by anything from a space on (a date, a link). The brackets are part
+# of the heading or absent entirely, never one without the other, and the
+# version must end at the heading's end: "## 1.2.0.1" does not answer for
+# 1.2.0.
 VERSION_RE="${APP_VERSION//+/[+]}"
 VERSION_RE="${VERSION_RE//./[.]}"
-HEADING_RE="^## [[]?v?${VERSION_RE}[]]?([[:space:]].*)?$"
+HEADING_RE="^## ([[]v?${VERSION_RE}[]]|v?${VERSION_RE})([[:space:]].*)?$"
 
 grep -qE "$HEADING_RE" "$CHANGELOG_FILE" \
   || die "CHANGELOG.md has no '## $APP_VERSION' heading for version $APP_VERSION — '## v$APP_VERSION' and '## [$APP_VERSION]' are accepted too, optionally followed by a date."

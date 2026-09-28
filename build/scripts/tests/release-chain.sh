@@ -524,6 +524,39 @@ case_release_refuses_missing_versions_record() {
   case_result "a build without its .versions.txt is refused, not published"
 }
 
+# --- Step 4: only the three changelog spellings -------------------------------
+
+case_heading_spellings_accepted() {
+  local heading
+  for heading in "0.3.0" "v0.3.0" "[0.3.0]" "[0.3.0] - 2026-09-28"; do
+    new_tree "0.3.0" "$heading"
+    if run_release $'y\n'; then
+      assert_match "release create reached for '## $heading'" 'release create' "$LOG"
+      assert_match "the section text is the notes for '## $heading'" \
+        'Notes body for 0\.3\.0' "$LOG.notes"
+    else
+      echo "  assertion failed: '## $heading' was refused at the changelog gate" >&2
+      CASE_STATUS=1
+    fi
+  done
+  case_result "the three accepted spellings (optionally dated) each reach release create"
+}
+
+case_heading_spellings_refused() {
+  local heading
+  for heading in "[0.3.0" "0.3.0]" "0.3.0.1"; do
+    new_tree "0.3.0" "$heading"
+    if run_release ""; then
+      echo "  assertion failed: '## $heading' was accepted by the changelog gate" >&2
+      CASE_STATUS=1
+    else
+      assert_match "the refusal names the changelog gate" 'CHANGELOG' "$CASE_DIR/run.err"
+      assert_no_match "no cargo call for '## $heading'" '^cargo ' "$LOG"
+    fi
+  done
+  case_result "malformed headings are refused at the gate, before any build"
+}
+
 main() {
   case_build_with_older_appimage
   case_fix_stub_gets_current_version_only
@@ -541,6 +574,8 @@ main() {
   case_sums_verify_in_bundle_dir
   case_discard_removes_every_file_of_the_version
   case_release_refuses_missing_versions_record
+  case_heading_spellings_accepted
+  case_heading_spellings_refused
   if [[ "$FAILED" -gt 0 ]]; then
     echo "release-chain: $FAILED case(s) failed" >&2
     exit 1
