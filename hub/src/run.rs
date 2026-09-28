@@ -1087,6 +1087,9 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
         &identifier,
         &data_dir,
         app_env::Mode::Run,
+        // A `run` command builds no window: no permission handler exists to
+        // report on.
+        false,
     ) {
         Ok(environment) => environment,
         Err(error) => {

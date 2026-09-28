@@ -712,12 +712,17 @@ fn open_window(
             // Installed on the splash's own webview — the same one `serve`
             // navigates to the backend, never rebuilt for the hand-over
             // (`architecture/09`) — so this one install covers the window for
-            // the app's whole first life.
-            let _ = media::install_permission_handler(
+            // the app's whole first life. Whether it actually took is read
+            // here, off the main thread's own dispatch, because `serve` needs
+            // it before the sidecar starts: `TFS_MEDIA_MICROPHONE` reports
+            // what was actually granted, never what the manifest asked for
+            // (CONTRACT.md §3).
+            let media_installed = media::install_permission_handler(
                 &splash,
                 spec.manifest.actions.media.microphone,
                 app_origin.clone(),
-            );
+            )
+            .is_ok();
 
             let handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -732,6 +737,7 @@ fn open_window(
                     splash_label,
                     close_guards,
                     serve_open_files,
+                    media_installed,
                 );
             });
 
@@ -768,6 +774,7 @@ fn serve(
     splash_label: String,
     close_guards: close_guard::SharedCloseGuards,
     open_files: open_files::SharedOpenFiles,
+    media_installed: bool,
 ) {
     use tauri::Manager;
 
@@ -855,6 +862,7 @@ fn serve(
         &identity.identifier,
         &spec.state_root,
         env_mode,
+        media_installed,
     ) {
         Ok(environment) => environment,
         Err(error) => return lifecycle::fatal_post_setup_error(app, error.to_string()),

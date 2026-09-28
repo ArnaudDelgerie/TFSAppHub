@@ -81,3 +81,13 @@ Both are covered where they belong — §3's `TFS_ASYNC_WORKER` and
 rule: the app declares the maximum, the machine delivers what it can, and the
 environment says which.
 
+### A backend that cannot install the microphone grant
+
+The same rule again, for `actions.media.microphone` (§7): a backend that
+cannot install the WebKit permission handler — today that would mean a
+non-GTK backend, since the Linux host always can — reports `TFS_MEDIA_MICROPHONE=0`
+rather than failing the launch. A missing or broken capture stack on an
+otherwise-granted machine is not this host's to catch at all: it surfaces
+through `getUserMedia()` failing at the point of use, exactly as it would on
+any ordinary web page.
+

@@ -29,6 +29,7 @@ console command. An app cannot tell them apart, and that is deliberate.
 | `TFS_ASYNC_WORKER` | `"1"` / `"0"` — see "Capabilities are reported, not assumed" | the app, to tell its user |
 | `TFS_WORKER_TRANSPORTS` | the transports actually consumed after fallbacks, in declaration order, deduplicated, comma-separated, empty when none | the app, to tell its user |
 | `TFS_KEYRING_AVAILABLE` | `"1"` when the OS keyring answered, `"0"` when secrets fell back to a file — §5 | the app, to tell its user |
+| `TFS_MEDIA_MICROPHONE` | `"1"` when `actions.media.microphone` is declared **and** the host actually granted it on this machine, `"0"` otherwise — see "Capabilities are reported, not assumed" | the app, to tell its user |
 | `PHP_BINARY` | the interpreter actually running this app | any PHP tool spawning a PHP subprocess |
 | `PATH` | prefixed so that `php` resolves to that same interpreter | the same |
 | `TFS_BRIDGE_URL` | the loopback bridge's address — **present only when a bridge is running** (§7) | the app's HTTP client |
@@ -125,8 +126,8 @@ $ DATABASE_URL="sqlite:///$(pwd)/var/data/app.db" \
 
 ### Capabilities are reported, not assumed
 
-Two variables exist purely so an app can tell its user something true about this
-machine, and they are the standing rules' third clause in practice.
+Three variables exist purely so an app can tell its user something true about
+this machine, and they are the standing rules' third clause in practice.
 
 `TFS_KEYRING_AVAILABLE` says whether the secret store is backed by the OS
 keyring or has fallen back to a file (§5). It reports what the probe actually
@@ -145,4 +146,14 @@ asked for. The day a host can be asked to narrow the declaration — or to
 extend it past the window — the narrowing has to reach the app here, or an app
 ships a task due at 8 a.m., is silently narrowed, and neither its author nor
 its user ever learns it does not fire.
+
+`TFS_MEDIA_MICROPHONE` says whether `getUserMedia({audio: true})` will
+actually succeed on the app's own page (§7). It reports the grant, never the
+hardware: a machine with no microphone at all still reads `"1"` once the
+manifest declares it and the host installed the grant, because whether a
+device answers is exactly what `getUserMedia()` itself already fails on, the
+way it would on any web page. The AND that produces it is the same shape as
+the other two — the manifest's own declaration on one side, what this launch
+actually managed on the other — so a host that cannot install the grant
+reports `"0"` rather than failing the launch (§8).
 

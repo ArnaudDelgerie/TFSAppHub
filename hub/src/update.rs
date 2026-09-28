@@ -833,6 +833,9 @@ fn resync_only(
         &entry.identifier,
         &state_root,
         app_env::Mode::Install,
+        // No window is built by an update either — see install.rs's own
+        // call.
+        false,
     )?;
     if let Err(error) = toolchain.composer_install(app_dir, &environment.vars) {
         return Err(recover_after_failure(

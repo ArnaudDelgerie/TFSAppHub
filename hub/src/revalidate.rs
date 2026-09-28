@@ -77,6 +77,9 @@ pub fn revalidate(
         &manifest.identifier,
         &state_root,
         app_env::Mode::Install,
+        // Composer runs behind the splash, but no window is built by this
+        // call itself — nothing here installs the media permission handler.
+        false,
     )?;
 
     let outcome = match toolchain.composer_install(app_dir, &environment.vars) {
