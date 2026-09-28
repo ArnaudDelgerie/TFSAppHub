@@ -180,7 +180,8 @@ pub fn snapshot_db(data_subdir: &Path, data_dir: &Path) -> io::Result<Vec<String
         let source = data_subdir.join(name);
         let target = staged_db_path(data_dir, name);
         if source.is_file() {
-            fs::copy(source, target)?;
+            fs::copy(&source, &target)?;
+            fs::File::open(&target)?.sync_all()?;
             members.push(name.to_string());
         } else {
             let _ = fs::remove_file(target);

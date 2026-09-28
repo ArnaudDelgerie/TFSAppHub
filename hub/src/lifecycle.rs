@@ -40,6 +40,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
+    io::Write,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -559,7 +560,12 @@ pub fn write_rollback_anchor(
         move |source| LifecycleError::Io { path, source }
     };
     let temporary = data_subdir.join("rollback.json.tmp");
-    fs::write(&temporary, json).map_err(io_error(&temporary))?;
+    let file = fs::File::create(&temporary).map_err(io_error(&temporary))?;
+    (&file)
+        .write_all(json.as_bytes())
+        .map_err(io_error(&temporary))?;
+    file.sync_all().map_err(io_error(&temporary))?;
+    drop(file);
     fs::rename(&temporary, &path).map_err(io_error(&path))
 }
 
