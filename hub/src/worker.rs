@@ -308,13 +308,8 @@ fn arbitrate_respawn(
     RespawnArbitration::Adopted { worker_pid }
 }
 
-/// Clear a given-up slot's pid and report whether its dialog should still show.
-///
-/// Mirrors [`arbitrate_respawn`]'s post-write recheck: the write below can land
-/// after `stop()` already removed the pid file, resurrecting it. Re-clearing
-/// the slot keeps the resurrected file honest, and `false` tells the caller to
-/// skip the dialog — nothing should pop up once teardown is already closing
-/// the app's windows.
+/// Record `slot`'s pid in the shared table, logging a failed rewrite to the
+/// slot's own `worker-<n>.log` rather than dropping it.
 fn record_worker_pid(
     pid_table: &WorkerPidTable,
     slot: usize,
@@ -332,6 +327,13 @@ fn record_worker_pid(
     }
 }
 
+/// Clear a given-up slot's pid and report whether its dialog should still show.
+///
+/// Mirrors [`arbitrate_respawn`]'s post-write recheck: the write below can land
+/// after `stop()` already removed the pid file, resurrecting it. Re-clearing
+/// the slot keeps the resurrected file honest, and `false` tells the caller to
+/// skip the dialog — nothing should pop up once teardown is already closing
+/// the app's windows.
 fn arbitrate_give_up(
     pid_table: &WorkerPidTable,
     slot: usize,

@@ -268,6 +268,10 @@ impl Drop for RunEntryGuard {
     }
 }
 
+/// How long [`claim_run_entry`] waits out a scanner's momentary flock on the
+/// entry it has just created.
+const CLAIM_LOCK_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Create, lock, and record the alias before consulting any other entry.
 pub fn claim_run_entry(
     runs_dir: &Path,
@@ -276,7 +280,10 @@ pub fn claim_run_entry(
 ) -> std::io::Result<RunEntryGuard> {
     use std::io::{Error, ErrorKind, Write};
     let path = runs_dir.join(run_entry_file_name(launcher_pid));
-    let file = tfsapp_core::process::try_lock_file(&path)?
+    // Nobody else holds an entry named after this pid for long, but another
+    // launcher's scan can flock it for an instant between its creation and
+    // this lock: wait that instant out instead of refusing over it.
+    let file = tfsapp_core::process::lock_file_exclusive_timeout(&path, CLAIM_LOCK_TIMEOUT)?
         .ok_or_else(|| Error::new(ErrorKind::WouldBlock, "entry is already locked"))?;
     let mut guard = RunEntryGuard { file, path };
     guard.file.set_len(0)?;
@@ -1035,6 +1042,11 @@ pub fn start(id: &str, alias_name: &str, args: &[String], replace: bool) -> i32 
         eprintln!("tfsapp-hub: cannot create {}: {error}", runs_dir.display());
         return EXIT_FAILED;
     }
+    // This launcher's own entry, claimed before the scan rather than after:
+    // of two launchers starting at once, whoever locks second then sees the
+    // first, so at worst both refuse and never both start. Named after this
+    // process's pid (`../decision/005-concurrency-belongs-to-the-alias.md`),
+    // held until the guard drops — which unlinks it on every exit path below.
     let entry_path = runs_dir.join(run_entry_file_name(std::process::id()));
     let mut run_entry = match claim_run_entry(&runs_dir, std::process::id(), alias_name) {
         Ok(entry) => entry,
