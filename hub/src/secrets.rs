@@ -516,8 +516,8 @@ pub fn resolve_app_secret(
 /// built on "nothing is set" behind a failing store is worse than no answer.
 #[derive(serde::Serialize, Debug, Clone, PartialEq)]
 pub struct SecretListEntry {
-    pub(crate) key: String,
-    pub(crate) set: bool,
+    key: String,
+    set: bool,
 }
 
 pub fn secret_list_entries(
@@ -565,64 +565,104 @@ pub fn keys_for_window<R: tauri::Runtime>(window: &tauri::Window<R>) -> Vec<Stri
 const KEY_NOT_DECLARED: &str = "key_not_declared";
 const NO_STORE: &str = "unavailable";
 
-// Step 068-1 transitional: the store now reports failures, the transports do
-// not yet — each command maps an `Err` to the answer the old swallowing code
-// gave, so this commit changes no transport. Step 2 replaces every mapping
-// below with `storage_failed`.
+/// The transports' one answer to a store failure: the operation did not
+/// happen, which the app must not read as "the key is not there" or "the key
+/// is gone". Checked last, after `KEY_NOT_DECLARED` and `value_too_large`,
+/// which are answered without touching the store at all.
+pub(crate) const STORAGE_FAILED: &str = "storage_failed";
 
-#[tauri::command]
-pub fn secret_has(window: tauri::Window, key: String) -> Result<bool, &'static str> {
-    let store = store_for_window(&window).ok_or(NO_STORE)?;
-    if !secret_key_allowed(&keys_for_window(&window), &key) {
-        return Err(KEY_NOT_DECLARED);
-    }
-    Ok(secrets_has(&store, &key).unwrap_or(false))
+/// Turn a store error into that answer, writing the one warning line a
+/// failure costs: `tfsapp-hub: warning: secret store: <cause>`. It names the
+/// cause and never the key or the value; a launch's stderr is `hub.log`
+/// (`open::prepare_hub_log`). Shared by both transports, so one failure is
+/// one line whatever the caller asked over.
+pub(crate) fn storage_failed(error: &StorageError) -> &'static str {
+    eprintln!("tfsapp-hub: warning: secret store: {error}");
+    STORAGE_FAILED
 }
 
-#[tauri::command]
-pub fn secret_get(window: tauri::Window, key: String) -> Result<Option<String>, &'static str> {
-    let store = store_for_window(&window).ok_or(NO_STORE)?;
-    if !secret_key_allowed(&keys_for_window(&window), &key) {
+// The five commands are thin wrappers over generic `*_for_window` helpers —
+// the same shape `open_files.rs` uses — so a test can drive the whole path
+// with a mock window: the window is still the whole address, resolved once.
+
+pub(crate) fn secret_has_for_window<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+    key: &str,
+) -> Result<bool, &'static str> {
+    let store = store_for_window(window).ok_or(NO_STORE)?;
+    if !secret_key_allowed(&keys_for_window(window), key) {
         return Err(KEY_NOT_DECLARED);
     }
-    Ok(secrets_get(&store, &key).ok().flatten())
+    secrets_has(&store, key).map_err(|error| storage_failed(&error))
 }
 
-#[tauri::command]
-pub fn secret_set(window: tauri::Window, key: String, value: String) -> Result<(), &'static str> {
-    let store = store_for_window(&window).ok_or(NO_STORE)?;
-    if !secret_key_allowed(&keys_for_window(&window), &key) {
+pub(crate) fn secret_get_for_window<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+    key: &str,
+) -> Result<Option<String>, &'static str> {
+    let store = store_for_window(window).ok_or(NO_STORE)?;
+    if !secret_key_allowed(&keys_for_window(window), key) {
+        return Err(KEY_NOT_DECLARED);
+    }
+    secrets_get(&store, key).map_err(|error| storage_failed(&error))
+}
+
+pub(crate) fn secret_set_for_window<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+    key: &str,
+    value: &str,
+) -> Result<(), &'static str> {
+    let store = store_for_window(window).ok_or(NO_STORE)?;
+    if !secret_key_allowed(&keys_for_window(window), key) {
         return Err(KEY_NOT_DECLARED);
     }
     if value.len() > MAX_SECRET_VALUE_BYTES {
         return Err("value_too_large");
     }
-    let _ = secrets_set(&store, &key, value);
-    Ok(())
+    secrets_set(&store, key, value.to_string()).map_err(|error| storage_failed(&error))
+}
+
+pub(crate) fn secret_delete_for_window<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+    key: &str,
+) -> Result<bool, &'static str> {
+    let store = store_for_window(window).ok_or(NO_STORE)?;
+    if !secret_key_allowed(&keys_for_window(window), key) {
+        return Err(KEY_NOT_DECLARED);
+    }
+    secrets_delete(&store, key).map_err(|error| storage_failed(&error))
+}
+
+pub(crate) fn secret_list_for_window<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+) -> Result<Vec<SecretListEntry>, &'static str> {
+    let store = store_for_window(window).ok_or(NO_STORE)?;
+    secret_list_entries(&store, &keys_for_window(window)).map_err(|error| storage_failed(&error))
+}
+
+#[tauri::command]
+pub fn secret_has(window: tauri::Window, key: String) -> Result<bool, &'static str> {
+    secret_has_for_window(&window, &key)
+}
+
+#[tauri::command]
+pub fn secret_get(window: tauri::Window, key: String) -> Result<Option<String>, &'static str> {
+    secret_get_for_window(&window, &key)
+}
+
+#[tauri::command]
+pub fn secret_set(window: tauri::Window, key: String, value: String) -> Result<(), &'static str> {
+    secret_set_for_window(&window, &key, &value)
 }
 
 #[tauri::command]
 pub fn secret_delete(window: tauri::Window, key: String) -> Result<bool, &'static str> {
-    let store = store_for_window(&window).ok_or(NO_STORE)?;
-    if !secret_key_allowed(&keys_for_window(&window), &key) {
-        return Err(KEY_NOT_DECLARED);
-    }
-    Ok(secrets_delete(&store, &key).unwrap_or(false))
+    secret_delete_for_window(&window, &key)
 }
 
 #[tauri::command]
 pub fn secret_list(window: tauri::Window) -> Result<Vec<SecretListEntry>, &'static str> {
-    let store = store_for_window(&window).ok_or(NO_STORE)?;
-    let keys = keys_for_window(&window);
-    Ok(secret_list_entries(&store, &keys).unwrap_or_else(|_| {
-        keys.iter()
-            .filter(|key| secret_key_allowed(&keys, key))
-            .map(|key| SecretListEntry {
-                key: key.clone(),
-                set: false,
-            })
-            .collect()
-    }))
+    secret_list_for_window(&window)
 }
 
 #[cfg(test)]

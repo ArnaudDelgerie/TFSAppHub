@@ -4,8 +4,10 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 use super::{
     is_keyring, keys_for_window, new_fake_keyring, new_fake_keyring_store, new_file_store_for_test,
-    new_store, resolve_app_secret, secret_key_allowed, secrets_delete, secrets_get, secrets_has,
-    secrets_set, store_for_window, APP_SECRET_ACCOUNT, PROBE_ACCOUNT,
+    new_store, resolve_app_secret, secret_delete_for_window, secret_get_for_window,
+    secret_has_for_window, secret_key_allowed, secret_list_for_window, secret_set_for_window,
+    secrets_delete, secrets_get, secrets_has, secrets_set, store_for_window, APP_SECRET_ACCOUNT,
+    PROBE_ACCOUNT,
 };
 
 fn file_store(directory: &Path) -> super::SecretStore {
@@ -270,6 +272,42 @@ fn a_failing_keyring_never_generates_and_falls_back_to_the_file() {
 }
 
 // --- the regression this plan must not ship ------------------------------
+
+#[test]
+fn a_failing_store_answers_storage_failed_over_ipc() {
+    // The window is the whole address: every command resolves the store from
+    // it, so a failing one reaches the app as `storage_failed` — never as a
+    // success, an absence or a `false`.
+    let app = tauri::test::mock_app();
+    app.manage(new_fake_keyring().failing_store("test.tfsapp-hub"));
+    app.manage(crate::manifest::SecretsActions {
+        ipc: true,
+        bridge: false,
+        keys: vec!["openai".to_string()],
+    });
+    let window = WebviewWindowBuilder::new(&app, "main", WebviewUrl::App("index.html".into()))
+        .build()
+        .expect("a window");
+    let handle = window.as_ref().window();
+
+    assert_eq!(
+        secret_has_for_window(&handle, "openai"),
+        Err("storage_failed")
+    );
+    assert_eq!(
+        secret_get_for_window(&handle, "openai"),
+        Err("storage_failed")
+    );
+    assert_eq!(
+        secret_set_for_window(&handle, "openai", "sk-test"),
+        Err("storage_failed")
+    );
+    assert_eq!(
+        secret_delete_for_window(&handle, "openai"),
+        Err("storage_failed")
+    );
+    assert_eq!(secret_list_for_window(&handle), Err("storage_failed"));
+}
 
 #[test]
 fn a_window_reaches_its_own_app_s_store_and_no_other() {
