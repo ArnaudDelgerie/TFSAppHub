@@ -21,6 +21,14 @@
 //! own origin" is defined once, by `window.rs`'s `classify_navigation`, and
 //! this module asks the same question rather than re-deriving it.
 //!
+//! **The grant is reported, not assumed.** The install's closure reports on
+//! a channel whether it really wrote the setting and connected the handler,
+//! and [`await_grant`] — with [`MICROPHONE_GRANT_DEADLINE`] — is what turns
+//! that report into `TFS_MEDIA_MICROPHONE` (decision 007 §5). Only the
+//! off-main-thread caller may wait on it: the closure runs on the main
+//! thread, so a main-thread wait could only deadlock on the very report it
+//! is waiting for.
+//!
 //! **Exactly two request types can ever be allowed**, both only while the
 //! microphone is declared and the requesting page is the app's own origin: a
 //! `UserMediaPermissionRequest` for an audio device and not a video device
@@ -30,9 +38,48 @@
 //! choose between a built-in microphone and a headset. Every other
 //! permission kind is denied unconditionally.
 
+use std::sync::mpsc::Receiver;
+use std::time::Duration;
+
 use tauri::Url;
 
 use crate::window::{same_origin, AppOriginSlot};
+
+/// How long [`await_grant`] waits for the `with_webview` closure's report
+/// before answering `false`: long enough for a queued closure on a live
+/// event loop to run, short enough that a stalled one cannot hold the
+/// sidecar's start hostage (`main::serve` waits before the sidecar exists).
+pub const MICROPHONE_GRANT_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Wait for the closure's report, off the main thread only. `None` is the
+/// dispatch failure case — the closure was never even scheduled, so there is
+/// nothing to wait for. A report answers whatever it said; no report — never
+/// scheduled, timed out, or a closed channel — answers `false`, with the one
+/// `hub.log` line that says so —
+/// `TFS_MEDIA_MICROPHONE` mirrors what was actually granted (decision 007
+/// §5), so an unconfirmed grant counts as no grant at all.
+pub fn await_grant(receiver: Option<Receiver<bool>>, deadline: Duration) -> bool {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let Some(receiver) = receiver else {
+        eprintln!(
+            "tfsapp-hub: warning: the microphone grant could not be scheduled; \
+             TFS_MEDIA_MICROPHONE=0"
+        );
+        return false;
+    };
+    match receiver.recv_timeout(deadline) {
+        Ok(granted) => granted,
+        Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
+            eprintln!(
+                "tfsapp-hub: warning: the microphone grant was not confirmed within {} s; \
+                 TFS_MEDIA_MICROPHONE=0",
+                deadline.as_secs()
+            );
+            false
+        }
+    }
+}
 
 /// What WebKit is asking to authorize, reduced to what [`decide`] needs to
 /// know. `Other` covers every permission kind this group does not name:
@@ -133,28 +180,48 @@ fn classify_request(request: &webkit2gtk::PermissionRequest) -> MediaPermissionK
 /// grant, and what turns wry's absent-handler default into an explicit,
 /// logged deny for an app that declared nothing.
 ///
-/// Returns whatever `WebviewWindow::with_webview`'s dispatch returned. `Ok`
-/// means the closure was queued onto the GTK main thread, not that it has run
-/// yet — `with_webview` is fire-and-forget, so this is the closest signal
-/// available without blocking. `Err` means the runtime could not even
-/// schedule it (the window is already gone, or the event loop is shutting
-/// down). This is what `TFS_MEDIA_MICROPHONE` (CONTRACT.md §3, §8) reports as
-/// "the grant was scheduled on this backend" — on the GTK backend this is
-/// equivalent in practice, since a queued closure on a live event loop runs.
+/// Returns whatever `WebviewWindow::with_webview`'s dispatch returned, with
+/// the receiver the closure will report on. `Ok` means the closure was
+/// queued onto the GTK main thread, not that it has run yet —
+/// `with_webview` is fire-and-forget, so the queue is not the grant. The
+/// closure sends `true` once it has written the setting *and* connected the
+/// handler, `false` otherwise, and [`await_grant`] — called off the main
+/// thread only, never from the `setup` closure or the second-instance
+/// callback that share the main thread the closure itself needs — turns
+/// that report, or its absence within a deadline, into the value
+/// `TFS_MEDIA_MICROPHONE` reports (CONTRACT.md §3, §8). `Err` means the
+/// runtime could not even schedule it (the window is already gone, or the
+/// event loop is shutting down): `await_grant(None, ..)` answers `false`
+/// for that receiver. A second-instance window's receiver is simply
+/// dropped — the backend it joins already has its environment.
 pub fn install_permission_handler<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
     microphone_declared: bool,
     app_origin: AppOriginSlot,
-) -> tauri::Result<()> {
+) -> tauri::Result<Receiver<bool>> {
+    let (grant_report, receiver) = std::sync::mpsc::sync_channel(1);
     window.with_webview(move |webview| {
         use webkit2gtk::{SettingsExt, WebViewExt};
 
         let webview = webview.inner();
-        if microphone_declared {
-            if let Some(settings) = webview.settings() {
-                settings.set_enable_media_stream(true);
-            }
-        }
+        // The grant is what really ran here: a webview with no `settings()`
+        // keeps WebKitGTK's default of no capture at all, and an undeclared
+        // app is left alone on purpose. Said out loud only in the first
+        // case — the second is the contract's own normal path.
+        let granted = microphone_declared
+            && match webview.settings() {
+                Some(settings) => {
+                    settings.set_enable_media_stream(true);
+                    true
+                }
+                None => {
+                    eprintln!(
+                        "tfsapp-hub: warning: the webview has no settings; the microphone \
+                         is not granted"
+                    );
+                    false
+                }
+            };
         webview.connect_permission_request(move |webview, request| {
             use webkit2gtk::PermissionRequestExt;
 
@@ -174,7 +241,13 @@ pub fn install_permission_handler<R: tauri::Runtime>(
             }
             true
         });
-    })
+        // Sent once, after the handler is connected — the grant is only
+        // whole when both halves are. A send error means the receiver is
+        // gone (the window closed before the closure ran, or the caller
+        // never waited): there is nobody left to tell.
+        let _ = grant_report.send(granted);
+    })?;
+    Ok(receiver)
 }
 
 #[cfg(test)]

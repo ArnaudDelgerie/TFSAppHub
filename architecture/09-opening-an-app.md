@@ -408,7 +408,11 @@ own scheme, from ever receiving a grant. The splash and the app share one
 webview (this file's own opening section), so the one install made on the
 splash window covers the app's whole first life — a further window from a
 second `open` (`window::create_app_window`) gets its own install, on the same
-terms.
+terms. The closure reports on a channel whether it really wrote the setting
+and connected the handler, and `serve` waits up to 2 s for that report before
+resolving the environment — never from the main thread, which is the thread
+the closure itself needs — so `TFS_MEDIA_MICROPHONE` says what actually
+happened, not what was scheduled.
 
 Every denied `UserMediaPermissionRequest` is logged to `hub.log` with its
 reason (undeclared, wrong origin, or video asked for) — `DeviceInfoPermissionRequest`
@@ -448,12 +452,14 @@ URI that died without issuing a real load, so the navigation policy above
 never sees it. The Reload link's `href` is that same dead URI, so clicking it
 is an ordinary link navigation that goes through the very same
 `classify_navigation` and `on_page_load` context rotation as any other load —
-no separate reload path exists to drift from those. There is deliberately no
-automatic reload: whatever crashed the process may crash again on the same
-input, and the user's click is what breaks that loop. If no URI had committed
-yet when the process died, there is nothing to show the page "for" and
-nothing for Reload to target, so that rare case is left as it was before this
-plan.
+no separate reload path exists to drift from those. If no URI had committed
+yet when the process died, the Reload link targets the URL the window was
+created with instead — the splash's own URL, or the bare `tauri://localhost`
+Tauri resolves the bundled fallback to — which `classify_navigation` lets
+through exactly like any other bundled-asset URL, so that early a death gets
+the same crash page and the same way back as any other. There is deliberately
+no automatic reload: whatever crashed the process may crash again on the same
+input, and the user's click is what breaks that loop.
 
 **`open_files` requests pending when the process died are untouched by any of
 this.** The queue lives in the hub process, not the webview, so it survives

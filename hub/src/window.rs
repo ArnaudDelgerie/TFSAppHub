@@ -467,6 +467,21 @@ impl SplashSource {
             SplashSource::Fallback => WebviewUrl::App("index.html".into()),
         }
     }
+
+    /// The URL the window is created showing, as a plain string — what
+    /// `crash::install_crash_recovery_handler` needs as its Reload target for
+    /// a web process killed before any page committed. `WebviewUrl::App` is
+    /// opaque (it only carries an asset path), so this spells out the URL
+    /// Tauri 2 resolves it to on Linux: the asset manager drops `index.html`
+    /// to keep the URL simple, so the window's own URL is bare
+    /// `tauri://localhost` — which the bundled-asset branch of
+    /// [`classify_navigation`] accepts before anything else is even known.
+    pub fn initial_url(&self) -> String {
+        match self {
+            SplashSource::App(url) => url.to_string(),
+            SplashSource::Fallback => "tauri://localhost".to_string(),
+        }
+    }
 }
 
 /// Decide [`SplashSource`] for `splash_path` against `snapshot_root` — the

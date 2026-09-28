@@ -1,4 +1,4 @@
-use super::{decide, render_crash_page, TerminationAction};
+use super::{decide, reload_target, render_crash_page, TerminationAction};
 use webkit2gtk::WebProcessTerminationReason;
 
 // `webkit2gtk::WebProcessTerminationReason` is a plain enum (no live WebKit
@@ -23,6 +23,54 @@ fn a_termination_the_hub_asked_for_is_not_a_crash() {
     assert_eq!(
         decide(WebProcessTerminationReason::TerminatedByApi),
         TerminationAction::Ignore
+    );
+}
+
+// --- reload_target (plan 069 step 1) ----------------------------------------
+//
+// CONTRACT.md §8 promises the crash page without excluding the start of a
+// window's life: a web process killed before any page committed still gets
+// one, with Reload pointing at the URL the window was created showing.
+
+#[test]
+fn a_live_uri_is_the_reload_target() {
+    assert_eq!(
+        reload_target(
+            Some("http://127.0.0.1:4321/orders/4"),
+            "tfsapp-splash://localhost/splash.html"
+        ),
+        "http://127.0.0.1:4321/orders/4"
+    );
+}
+
+#[test]
+fn the_creation_url_is_the_reload_target_when_no_page_committed() {
+    assert_eq!(
+        reload_target(None, "tfsapp-splash://localhost/splash.html"),
+        "tfsapp-splash://localhost/splash.html"
+    );
+}
+
+#[test]
+fn the_fallback_creation_url_is_always_an_internal_target() {
+    // A crash that leaves no live URI can land before the app origin is known
+    // (during the splash) or after (once the hand-over published it); the
+    // Reload the crash page offers must be an ordinary internal navigation in
+    // both, through the very same `classify_navigation` every other load uses,
+    // or it would be refused by the policy that governs everything else.
+    use crate::window::{classify_navigation, NavigationTarget};
+    use tauri::Url;
+
+    let fallback = Url::parse("tauri://localhost").expect("a parseable creation URL");
+
+    assert_eq!(
+        classify_navigation(None, &fallback),
+        NavigationTarget::Internal
+    );
+    let origin = Url::parse("http://127.0.0.1:4321").expect("a parseable origin");
+    assert_eq!(
+        classify_navigation(Some(&origin), &fallback),
+        NavigationTarget::Internal
     );
 }
 

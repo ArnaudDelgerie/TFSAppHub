@@ -103,7 +103,9 @@ environment says which.
 The same rule again, for `actions.media.microphone` (§7): a backend that
 cannot install the WebKit permission handler — today that would mean a
 non-GTK backend, since the Linux host always can — reports `TFS_MEDIA_MICROPHONE=0`
-rather than failing the launch. A missing or broken capture stack on an
+rather than failing the launch, and a grant the launch could not confirm
+within its 2-second wait counts as not installed, so the variable reports
+`0` for that too. A missing or broken capture stack on an
 otherwise-granted machine is not this host's to catch at all: it surfaces
 through `getUserMedia()` failing at the point of use, exactly as it would on
 any ordinary web page.

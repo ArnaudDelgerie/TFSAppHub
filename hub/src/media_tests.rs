@@ -1,5 +1,15 @@
-use super::{decide, page_is_app_origin, user_media_denial_reason, MediaPermissionKind};
+use std::sync::mpsc::sync_channel;
+use std::time::Duration;
+
+use super::{
+    await_grant, decide, page_is_app_origin, user_media_denial_reason, MediaPermissionKind,
+};
 use tauri::Url;
+
+/// Test-scale stand-in for `MICROPHONE_GRANT_DEADLINE`: long enough that a
+/// report sent before the call is already waiting, short enough that a
+/// silent-sender test still finishes in milliseconds.
+const TEST_DEADLINE: Duration = Duration::from_millis(50);
 
 fn app_origin() -> Url {
     Url::parse("http://127.0.0.1:4321").expect("a valid origin")
@@ -110,4 +120,60 @@ fn the_denial_reason_names_the_first_thing_that_failed() {
         user_media_denial_reason(true, true, false, false),
         "the request was not for an audio device"
     );
+}
+
+// --- `await_grant` (plan 069 step 2) ----------------------------------------
+//
+// The wait is the half `TFS_MEDIA_MICROPHONE` actually reports (decision 007
+// §5): what the closure really did, or nothing within the deadline. Real
+// channels throughout, so the table covers the closed channel and the
+// window-closed races the same way the launch does.
+
+#[test]
+fn a_dispatch_that_was_never_scheduled_is_not_a_grant() {
+    assert!(!await_grant(None, TEST_DEADLINE));
+}
+
+#[test]
+fn a_true_report_received_in_time_is_a_grant() {
+    let (sender, receiver) = sync_channel(1);
+    sender
+        .send(true)
+        .expect("an empty channel accepts one report");
+    drop(sender);
+
+    assert!(await_grant(Some(receiver), TEST_DEADLINE));
+}
+
+#[test]
+fn a_false_report_received_in_time_is_not_a_grant() {
+    let (sender, receiver) = sync_channel(1);
+    sender
+        .send(false)
+        .expect("an empty channel accepts one report");
+    drop(sender);
+
+    assert!(!await_grant(Some(receiver), TEST_DEADLINE));
+}
+
+#[test]
+fn a_channel_closed_before_any_report_is_not_a_grant() {
+    // The window closed before the closure ran, or the closure was never
+    // scheduled and the receiver outlived the sender either way.
+    let (sender, receiver) = sync_channel(1);
+    drop(sender);
+
+    assert!(!await_grant(Some(receiver), TEST_DEADLINE));
+}
+
+#[test]
+fn a_sender_kept_alive_but_silent_is_not_a_grant_within_the_deadline() {
+    let (sender, receiver) = sync_channel(1);
+    let start = std::time::Instant::now();
+
+    assert!(!await_grant(Some(receiver), TEST_DEADLINE));
+    // The answer came from the deadline, not from a hang: it took at least
+    // the deadline to arrive.
+    assert!(start.elapsed() >= TEST_DEADLINE);
+    drop(sender);
 }

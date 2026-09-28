@@ -284,6 +284,30 @@ fn a_declared_splash_path_escaping_the_root_is_the_fallback() {
     );
 }
 
+// --- SplashSource::initial_url (plan 069 step 1) ---------------------------
+//
+// The creation URL is the crash page's Reload target when a web process dies
+// before any page committed, so it has to be the URL the window really was
+// created showing — for the fallback, the bare origin Tauri 2 keeps after
+// dropping `index.html`.
+
+#[test]
+fn an_app_splash_s_creation_url_is_its_own_url() {
+    let splash = SplashSource::App(url("tfsapp-splash://localhost/splash.html"));
+
+    assert_eq!(
+        splash.initial_url(),
+        "tfsapp-splash://localhost/splash.html"
+    );
+}
+
+#[test]
+fn the_fallback_s_creation_url_is_what_tauri_resolves_it_to() {
+    // Tauri 2's asset manager drops `index.html` from the URL, so the window
+    // is created showing the bare origin — not `tauri://localhost/index.html`.
+    assert_eq!(SplashSource::Fallback.initial_url(), "tauri://localhost");
+}
+
 // --- window labels -------------------------------------------------------
 
 #[test]
