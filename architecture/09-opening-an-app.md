@@ -411,3 +411,49 @@ Every denied `UserMediaPermissionRequest` is logged to `hub.log` with its
 reason (undeclared, wrong origin, or video asked for) — `DeviceInfoPermissionRequest`
 and every other kind are denied silently, the same as any other navigation
 refused outside this group.
+
+### Recovering from a dead web process (plan 058)
+
+`crash::install_crash_recovery_handler` connects `web-process-terminated`
+through `with_webview`, the same shape as the microphone handler above and on
+the same two windows — one install covers the window's whole life, since the
+splash and the app share one webview across hand-over.
+
+WebKit's own reason decides what happens next (`crash::decide`, pure and
+unit-tested). `TerminatedByApi` is logged and left alone: nothing in this tree
+calls `webkit_web_view_terminate_web_process` today, but the signal fires the
+same way for it, and treating it as a crash would show the crash page over a
+termination the hub itself caused. `Crashed`, `ExceededMemoryLimit`, and any
+reason a future WebKitGTK adds — the enum is `#[non_exhaustive]` — are
+recovered from: a `hub.log` line names the window, the reason and the URI that
+was displayed, then two things happen.
+
+**The dead document's close-guard state is released.**
+`close_guard::CloseGuardState::end_document` chains `rotate_context` with the
+very `context()` fetch that erases what does not match it (`close_guard.rs`'s
+own header) — a crash ends a document as surely as a navigation does, but
+unlike a navigation, no successor page will ever make that fetch to trigger
+the usual erasure, so `end_document` forces it immediately. Without this, a
+guard the dead document held would block closing the window forever.
+
+**The hub's own crash page replaces what the dead process last painted.**
+`crash::render_crash_page` builds it inline, in the app's declared
+`splash_bg` / `splash_text` with its `product_name` — the same palette and
+fallback the cold-start page uses (`CONTRACT.md` §8) — and it is shown with
+`load_alternate_html`, not a navigation: the content is displayed *for* the
+URI that died without issuing a real load, so the navigation policy above
+never sees it. The Reload link's `href` is that same dead URI, so clicking it
+is an ordinary link navigation that goes through the very same
+`classify_navigation` and `on_page_load` context rotation as any other load —
+no separate reload path exists to drift from those. There is deliberately no
+automatic reload: whatever crashed the process may crash again on the same
+input, and the user's click is what breaks that loop. If no URI had committed
+yet when the process died, there is nothing to show the page "for" and
+nothing for Reload to target, so that rare case is left as it was before this
+plan.
+
+**`open_files` requests pending when the process died are untouched by any of
+this.** The queue lives in the hub process, not the webview, so it survives
+the crash intact; the existing reload replay (`open_files_pending`, above)
+delivers them again once the app's own listener re-registers after Reload
+brings the real page back.

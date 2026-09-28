@@ -74,6 +74,23 @@ fields recolour the host's own fallback page specifically — an app that
 supplies its own `splash_path` page styles it itself, inline, since that page
 replaces the fallback rather than layering on top of it.
 
+### The renderer can die
+
+The host's own WebKitGTK is shared across every window (above), and it can
+still crash, hit its own memory limit, or otherwise lose the process
+rendering a window's page — a decoder, a GPU driver, WebKit itself. When that
+happens outside a termination the host asked for itself, the window shows the
+host's own page in the app's declared `splash_bg` / `splash_text` with its
+`product_name`, the same colours and fallback the cold-start page above uses,
+with a Reload button. `hub.log` records the reason.
+
+The host never reloads on its own: whatever crashed the process could crash
+again on the same input, so the user's click is the only way back, and there
+is no retry count or crash-loop heuristic hiding behind it. The app is never
+told — no environment variable, no event, no query parameter marks the next
+page load as a recovery — it arrives exactly like any other load of the same
+URL.
+
 ### Off-window work, and secret storage
 
 Both are covered where they belong — §3's `TFS_ASYNC_WORKER` and

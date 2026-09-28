@@ -728,6 +728,8 @@ fn an_arrival_on_a_running_app_targets_its_window() {
     app.manage(crate::sidecar::Launch {
         url: "tauri://localhost".to_string(),
         product_name: "Demo".to_string(),
+        splash_bg: None,
+        splash_text: None,
     });
     let guards: crate::close_guard::SharedCloseGuards =
         std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
@@ -759,6 +761,8 @@ fn a_directory_arrival_is_delivered_to_a_receiver_that_opted_in() {
     app.manage(crate::sidecar::Launch {
         url: "tauri://localhost".to_string(),
         product_name: "Demo".to_string(),
+        splash_bg: None,
+        splash_text: None,
     });
     let guards: crate::close_guard::SharedCloseGuards =
         std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
@@ -796,6 +800,8 @@ fn a_directory_arrival_is_refused_whole_for_a_file_only_receiver() {
     app.manage(crate::sidecar::Launch {
         url: "tauri://localhost".to_string(),
         product_name: "Demo".to_string(),
+        splash_bg: None,
+        splash_text: None,
     });
     let guards: crate::close_guard::SharedCloseGuards =
         std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
@@ -922,6 +928,8 @@ fn a_running_app_with_no_eligible_window_refuses_the_arrival() {
     app.manage(crate::sidecar::Launch {
         url: "tauri://localhost".to_string(),
         product_name: "Demo".to_string(),
+        splash_bg: None,
+        splash_text: None,
     });
     let guards: crate::close_guard::SharedCloseGuards =
         std::sync::Arc::new(crate::close_guard::CloseGuardState::new());
@@ -959,6 +967,8 @@ fn an_arrival_while_the_first_document_settles_reaches_it() {
     app.manage(crate::sidecar::Launch {
         url: "http://127.0.0.1:8123".to_string(),
         product_name: "Demo".to_string(),
+        splash_bg: None,
+        splash_text: None,
     });
     let guards: crate::close_guard::SharedCloseGuards =
         std::sync::Arc::new(crate::close_guard::CloseGuardState::new());

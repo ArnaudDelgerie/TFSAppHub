@@ -161,6 +161,13 @@ impl Drop for Sidecar {
 pub struct Launch {
     pub url: String,
     pub product_name: String,
+    /// The app's declared splash colours, carried alongside `product_name` so
+    /// a crash on a second-instance window (plan 058) can render the hub's
+    /// crash page in the same palette the first window's splash used —
+    /// `main.rs`'s `setup` closure has `spec.manifest` in scope directly, but
+    /// this relaunch path only has whatever was managed here.
+    pub splash_bg: Option<String>,
+    pub splash_text: Option<String>,
 }
 
 /// Write the Caddyfile into `data_dir` and answer with its path.
