@@ -127,6 +127,15 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         return EXIT_UNIMPLEMENTED;
     }
 
+    // An early, advisory diagnostic only: it answers before any lease is
+    // taken, so an `update` can still write a journal after it and before the
+    // command below runs. The authoritative check is the one every lease
+    // holder runs under its lease in `lifecycle_gate` — this one exists for
+    // the commands whose first act would otherwise misreport: `open`'s parent
+    // and `run` resolve the app tree before any lease, and an update killed
+    // with its tree set aside would show up there as a missing installation
+    // instead of "run repair". A lease holder refused under the gate gets the
+    // same message this prints, with no `tfsapp-hub:` prefix of its own.
     if let Some(id) = interrupted_app_id(&command) {
         if let Ok(paths) = paths::Paths::resolve() {
             match update::repair_required(&paths, id) {

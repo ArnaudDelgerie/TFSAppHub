@@ -21,6 +21,13 @@ open. In order:
      owns (`check_data_dir_available`) — `install` is that directory's third
      writer, reading the same two locks `open`'s launch guard and `run`'s own
      rule 3 already do.
+
+   The `id` and port gates here are only a *first* answer: the maintenance
+   lease an install holds is keyed on `identifier`, so a second source
+   installing under a different one shares no lease with this one, and both
+   can pass these checks on a registry neither has written to yet. Step 9
+   re-checks both under the registry's own lock — that is the answer that
+   counts.
 4. Decide which lifecycle event (`CONTRACT.md` §6) this install may run,
    against the version the data directory's own record holds — `None` means a
    first install, and only `record == app_version` survives past this point;
@@ -28,7 +35,10 @@ open. In order:
    an older version is refused as the update event, which `install` does not
    run (see below). The confirmation prompt names the record's version when
    one exists, so it is a question the user can actually answer.
-5. Copy the tree to `apps/<id>/`, minus the app's own runtime droppings.
+5. Copy the tree to `apps/<id>/`, minus the app's own runtime droppings. The
+   copy *claims* `apps/<id>/` atomically — one `create_dir` decides the
+   winner, and an install that lost the race refuses with the directory
+   intact rather than merging into the winner's tree.
 6. Assemble the app's environment (`CONTRACT.md` §3) and create its data
    directory. The path is printed before anything writes into it, because the
    next thing on screen is a migration writing a database.
@@ -39,7 +49,12 @@ open. In order:
    equal to the app's own version (the reinstall-after-`remove` path) runs
    neither.
 9. Record the app in the registry, with the platform fingerprint of the hub that
-   installed it.
+   installed it, re-checking `id` and port inside `registry::update`'s own
+   lock — an `id` or a pinned port that appeared since step 3 is a refusal,
+   never a replacement of the entry that claimed it. A refusal there removes
+   the copied tree (as a failed `prepare` already does) but keeps the data
+   directory, as a plain `remove` does: a later install of the same app finds
+   a matching version record and takes the reinstall path.
 10. Write the version record into the data directory — **only** once every
     step above has succeeded, and every event, including an equal record
     rewriting itself.

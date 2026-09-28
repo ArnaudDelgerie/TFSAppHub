@@ -237,6 +237,13 @@ pub(crate) fn install_into(
     // Last, and under the registry's own lock: an entry written any earlier
     // would name a `ready` app whose dependencies had not resolved yet, and
     // there is no state in the registry for "installed, but do not run it".
+    // Registration re-checks `id` and `app_port` inside that lock, because the
+    // maintenance lease above is keyed on `identifier` and cannot exclude a
+    // second source installing under a different one. A refusal there removes
+    // this tree, best-effort as after `prepare` above; the data directory
+    // `prepare` populated is deliberately kept, as after a `remove` without
+    // `--purge` — a later install of the same app finds a matching version
+    // record and takes the reinstall path.
     let now = registry::now_timestamp();
     let entry = RegistryEntry {
         id: id.clone(),
@@ -251,10 +258,18 @@ pub(crate) fn install_into(
         updated_at: now,
         unknown: serde_json::Map::new(),
     };
-    registry::update(paths, |registry| {
-        registry.stamp(hub_version, platform);
-        registry.upsert(entry);
-    })?;
+    // Only a refusal removes the tree. A `Registry` error may come from the
+    // directory fsync *after* the rename landed, with the entry already
+    // registered: removing the tree then would leave an entry with no app.
+    if let Err(error) = register(paths, entry, hub_version, &platform) {
+        if matches!(
+            error,
+            InstallError::IdTaken { .. } | InstallError::PortTaken { .. }
+        ) {
+            let _ = fs::remove_dir_all(&app_dir);
+        }
+        return Err(error);
+    }
 
     // Last of all, and best-effort: an app whose entry could not be written
     // is still installed and still usable from the CLI, the entry is only a
@@ -264,6 +279,43 @@ pub(crate) fn install_into(
     }
 
     Ok(Some(id))
+}
+
+/// Register `entry`, re-checking `id` and `app_port` under the registry's own
+/// lock.
+///
+/// The maintenance lease [`install_into`] holds is keyed on `identifier`, so
+/// it excludes competing installs *of the same app* — not a second source
+/// installing under a different `identifier` but the same hub-local `id` or
+/// the same pinned port. [`check_id_free`] and [`check_port_free`] already
+/// ran there, on a registry both installs could read before either wrote;
+/// this re-check runs inside `registry::update`'s closure, where the registry
+/// cannot change between the check and the write. Install never replaces an
+/// entry, so an `id` that appeared since is a refusal, not an overwrite —
+/// and so is a port another entry claimed in between.
+///
+/// A refusal still rewrites the registry, unchanged: no stamp, no upsert,
+/// only a new file generation. That is harmless, and cheaper to reason about
+/// than threading the refusal out before the write.
+fn register(
+    paths: &Paths,
+    entry: RegistryEntry,
+    hub_version: &str,
+    platform: &registry::Platform,
+) -> Result<(), InstallError> {
+    registry::update(paths, |registry| {
+        if let Some(existing) = registry.get(&entry.id) {
+            return Err(InstallError::IdTaken {
+                id: entry.id.clone(),
+                location: existing.source.location.clone(),
+            });
+        }
+        check_port_free(registry, entry.app_port)?;
+        registry.stamp(hub_version, platform.clone());
+        registry.upsert(entry);
+        Ok(())
+    })
+    .map_err(InstallError::Registry)?
 }
 
 /// Refresh the stable hub copy and (re)write this app's desktop entry.
@@ -843,16 +895,42 @@ pub fn validate(root: &Path) -> Result<Validated, InstallError> {
 
 /// Copy `from` into `to`, minus what must not be installed.
 ///
-/// `to` must not exist: an install never merges into a tree it did not write,
-/// because a leftover file from a previous version — a migration, a compiled
-/// container, a route — is indistinguishable from one this version meant to
-/// ship. On any failure the partial copy is removed, so the caller's next
-/// attempt meets a clean root rather than half of the last one.
+/// `to` is **claimed**, not just checked: an atomic `create_dir` makes
+/// exactly one caller the owner, so two installs racing for the same
+/// `apps/<id>/` resolve as winner and refused loser rather than two trees
+/// merging into one directory. The loser refuses with
+/// [`InstallError::DirectoryInTheWay`] *before* any cleanup runs, so it never
+/// touches the winner's tree. An install never merges into a tree it did not
+/// write either way: a leftover file from a previous version — a migration, a
+/// compiled container, a route — is indistinguishable from one this version
+/// meant to ship. On any failure after the claim the partial copy is removed,
+/// so the caller's next attempt meets a clean root rather than half of the
+/// last one.
 pub fn snapshot(from: &Path, to: &Path) -> Result<(), InstallError> {
-    if to.exists() {
-        return Err(InstallError::DirectoryInTheWay {
-            path: to.to_path_buf(),
-        });
+    // Only the parent may be created unconditionally: `to` itself is the
+    // claim, and creating it here would be creating it twice.
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).map_err(|source| InstallError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    match fs::create_dir(to) {
+        Ok(()) => {}
+        // The one loser-of-the-race outcome, and the one refusal that must
+        // not fall through to the cleanup below: whatever occupies `to` is
+        // not this call's tree to remove.
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(InstallError::DirectoryInTheWay {
+                path: to.to_path_buf(),
+            });
+        }
+        Err(source) => {
+            return Err(InstallError::Io {
+                path: to.to_path_buf(),
+                source,
+            });
+        }
     }
 
     let copied = copy_tree(from, to, Path::new(""));
