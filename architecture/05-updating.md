@@ -67,12 +67,17 @@ from removing the first update's `apps/<id>.previous` anchor.
    staged tree) until it is complete, so `rollback <id>` can then undo it.
    Either way, running `repair` a second time changes nothing. A malformed or
    future journal also refuses safely. Interrupted imports and rollbacks have
-   no such recovery protocol. And the refusal is not a race the hub leaves to
-   luck: every maintenance and activity lease holder except `repair` re-reads
-   the journal once it owns its lease, so a command that wins its lease after
-   an `update` wrote its journal still refuses, naming `repair`. The
-   dispatch-side check that answers before any command runs is only the early
-   message; the one under the lease is authoritative.
+   recovery protocols of their own now — `repair <id>` puts an uncommitted
+   import's replaced data back or finishes a committed one, and a resumed
+   `rollback <id>` finishes a started rollback — and the same gate reads all
+   three records, journal first, then import intent, then rollback marker,
+   refusing on the first one it finds. And the refusal is not a race the hub
+   leaves to luck: every maintenance and activity lease holder re-reads those
+   records once it owns its lease — the journal and the intent exempt
+   `repair`, the marker exempts only `rollback` — so a command that wins its
+   lease after an `update` wrote its journal still refuses, naming `repair`.
+   The dispatch-side check that answers before any command runs is only the
+   early message; the one under the lease is authoritative.
 
 `ResyncOnly` has no lifecycle event and rotates no anchor of its own, in
 either direction: before its registry write, repair restores the outgoing
@@ -104,13 +109,26 @@ command's to handle, not the anchor's.
 
 A rollback rescue-dumps the current database first, printing its timestamped
 `app.db.rescue-<YYYYMMDDTHHMMSSZ>` path (with a numeric suffix on a collision),
-then restores the snapshot as the live database, deletes the current tree and
+then writes a durable `rollback-transaction.json` marker into the data
+directory — after the rescue, before the first mutation — and only then
+restores the snapshot as the live database, removes the current tree and
 renames `.previous` back in its place, restores `data/config.json` and the
 registry entry to the anchor's recorded version, and rewrites the desktop
 entry. It then **consumes** the anchor — the snapshot and `rollback.json`
 are discarded, and there is no new `.previous` to roll forward into. A
 rollback is one step back; a `.previous` naming the version just left would
 invite a "rollback forward" this plan does not define.
+
+The marker makes the rest of the pipeline **resumable rather than
+journaled**: every step from the restore on tolerates being run again, so a
+kill partway through is finished by running `rollback <id>` again — with no
+prompt, since the user confirmed the first run and the tree the new one
+replaced is already deleted, so there is nothing to go back to — and never
+rewound. Until the marker is gone every other command for the app, `repair`
+included, refuses, naming `rollback <id>`. The one thing a resume cannot
+recover is a tree lost from both ends — neither `apps/<id>` nor
+`apps/<id>.previous` still a directory — which it reports as such instead
+of guessing.
 
 Anchor hygiene runs both directions, so a stale one never outlives the
 install it belonged to: `remove <id>` takes `apps/<id>.previous` with it
