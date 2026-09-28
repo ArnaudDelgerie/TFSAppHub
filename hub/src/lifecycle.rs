@@ -181,8 +181,9 @@ pub fn write_data_version(data_subdir: &Path, version: &str) -> Result<(), Lifec
 /// Whether this installation's `data/config.json` revokes the declared
 /// microphone (plan 070, decision 007's dated revision). Absent file and
 /// absent key both read as `false` — "nothing revoked" is the contract's own
-/// normal path — and a file that exists but does not parse reads as `true`,
-/// with the one `hub.log` line that says so: a broken switch fails closed.
+/// normal path — and a file that exists but cannot be read or does not
+/// parse reads as `true`, with the one `hub.log` line that says so: a broken
+/// switch fails closed.
 ///
 /// Reads rather than reuses [`read_data_version`] on purpose: that half
 /// answers the version question and errors on a malformed file, while this
@@ -192,7 +193,15 @@ pub fn read_microphone_revoked(data_subdir: &Path) -> bool {
     let path = data_config_path(data_subdir);
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
-        Err(_) => return false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(error) => {
+            eprintln!(
+                "tfsapp-hub: warning: {} cannot be read ({error}); the microphone is treated \
+                 as revoked",
+                path.display()
+            );
+            return true;
+        }
     };
     match serde_json::from_str::<DataConfig>(&contents) {
         Ok(config) => config.revoked.media.microphone,

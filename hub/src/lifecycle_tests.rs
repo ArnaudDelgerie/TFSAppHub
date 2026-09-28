@@ -378,6 +378,16 @@ fn a_file_that_does_not_parse_reads_as_revoked() {
 }
 
 #[test]
+fn a_file_that_cannot_be_read_reads_as_revoked() {
+    let data_subdir = tempfile::tempdir().expect("a temp data dir");
+    // A directory in the file's place: it exists, so it is not the "absent"
+    // case, and reading it fails — the same fail-closed answer as a file
+    // that does not parse.
+    fs::create_dir(data_subdir.path().join("config.json")).expect("a directory in its place");
+    assert!(read_microphone_revoked(data_subdir.path()));
+}
+
+#[test]
 fn writing_a_version_leaves_no_temp_file_behind() {
     let data_subdir = tempfile::tempdir().expect("a temp data dir");
 

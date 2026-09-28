@@ -8,8 +8,8 @@
 //! permission. What this module does is make that call succeed only when it
 //! should: WebKitGTK's `enable-media-stream` setting is written only when the
 //! microphone is [`MicrophoneAccess::Allowed`] — declared in the manifest and
-//! not revoked in this installation's `data/config.json` (plan 070) — and a `permission-request` handler is
-//! connected on **every** window regardless — wry itself connects none, so
+//! not revoked in this installation's `data/config.json` (plan 070) — and a
+//! `permission-request` handler is connected on **every** window regardless — wry itself connects none, so
 //! installing a handler that defaults to allow-by-omission would be worse
 //! than the platform's own default; this handler makes the deny explicit and
 //! logged instead.
@@ -403,9 +403,10 @@ pub fn install_permission_handler<R: tauri::Runtime>(
         // The indicator (plan 070 step 2) — only on a window whose grant
         // really applied: an undeclared or revoked app never holds a
         // capture, so handlers here would be ones that can only ever say
-        // "stopped". The title is set from the live state, not from the
-        // notify event's timing, so even a capture already running before
-        // this closure executes is read correctly.
+        // "stopped". No capture can predate these handlers: this same
+        // closure is what enables media streams, so the first notify is
+        // always the first capture. The title is read from the live state
+        // each time, not inferred from the order of events.
         if granted {
             let capture_product_name = product_name.clone();
             webview.connect_microphone_capture_state_notify(move |webview| {
