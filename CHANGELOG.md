@@ -193,6 +193,12 @@ automatic reload and no crash-loop heuristic: the user's click is the only
 way back, and the app is never told a reload followed a crash. A close guard
 held by the document that crashed no longer blocks closing the window.
 
+The hub's own releases now carry their compatibility record and their
+provenance: the AppImage's `.versions.txt` is attached beside it and listed
+in `SHA256SUMS.txt`, and the release notes end with a
+`Built from <repo>@<sha>` line naming the exact revision the binary was
+built from.
+
 ## 0.3.0
 
 No user-facing change — this release exists to validate `tfsapp-hub --update`
