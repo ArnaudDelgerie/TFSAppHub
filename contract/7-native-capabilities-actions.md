@@ -5,9 +5,9 @@ Not what the user may do — the commands a person types are the host's, and the
 run because that person typed them, which is a different act with different
 consent. This section is about the doors application code can knock on.
 
-There are six capability groups today. `secrets`, `update` and `close_guard`
+There are seven capability groups today. `secrets`, `update` and `close_guard`
 may declare either of the two transports; `picker` and `open_files` are
-deliberately IPC-only; `media` uses neither:
+deliberately IPC-only; `media` and `paths` use neither:
 
 ```json
 {
@@ -17,7 +17,8 @@ deliberately IPC-only; `media` uses neither:
     "picker":      { "ipc": true },
     "close_guard": { "ipc": true,  "bridge": true },
     "open_files":  { "ipc": true },
-    "media":       { "microphone": true }
+    "media":       { "microphone": true },
+    "paths":       { "downloads": true, "pictures": true }
   }
 }
 ```
@@ -451,6 +452,32 @@ which the host's default response headers (§4) do not set — so it falls back
 to `default-src 'self'`, and `'self'` does not cover `blob:`. An app that
 plays a `blob:` recording back sets its own `Content-Security-Policy`
 response header with `media-src 'self' blob:` added, per §4's override rule.
+
+### `paths`
+
+Lets the app read where the person's OS user directories are, without
+hardcoding a guess. Like `media`, its members name a **resource**, not a
+transport — there is nothing to `invoke()` and no bridge route, so `ipc` or
+`bridge` spelled under it is refused the same way `media`'s are:
+
+```json
+{"paths": {"downloads": true, "pictures": true}}
+```
+
+The member set is fixed and matches GLib's eight special directories exactly:
+`desktop`, `documents`, `downloads`, `music`, `pictures`, `public_share`,
+`templates`, `videos`. `$HOME` is deliberately not a ninth member — it already
+reaches PHP through the ordinary process environment, so a variable for it
+would only duplicate a fact already available for free.
+
+A declared member is resolved through GLib's own reading of
+`~/.config/user-dirs.dirs` and reported to the app as `TFS_USER_<NAME>_DIR`
+(§3) — `downloads` → `TFS_USER_DOWNLOADS_DIR`. Declaring buys a legible line in
+the manifest, not a filesystem grant or a sandbox boundary: PHP runs with the
+user's full rights regardless, exactly as `save_path` (above) already
+disclaims. See
+`.project/decision/008-user-directories-are-a-declared-capability.md` for the
+whole why.
 
 ### `close_guard`
 

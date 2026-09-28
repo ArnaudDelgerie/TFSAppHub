@@ -571,6 +571,117 @@ fn an_unknown_media_field_warns_and_still_parses() {
 }
 
 #[test]
+fn paths_members_are_off_when_actions_or_paths_is_absent() {
+    assert!(!parse_ok(MINIMAL).manifest.actions.paths.downloads);
+
+    let without_paths = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"update": {"ipc": true}}"#,
+    );
+    assert!(!parse_ok(&without_paths).manifest.actions.paths.downloads);
+
+    let explicit_false = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"paths": {"downloads": false}}"#,
+    );
+    assert!(!parse_ok(&explicit_false).manifest.actions.paths.downloads);
+}
+
+#[test]
+fn every_paths_member_true_is_read() {
+    let members = [
+        "desktop",
+        "documents",
+        "downloads",
+        "music",
+        "pictures",
+        "public_share",
+        "templates",
+        "videos",
+    ];
+
+    for member in members {
+        let contents = MINIMAL.replace(
+            r#""app_version": "0.6.0""#,
+            &format!(r#""app_version": "0.6.0", "actions": {{"paths": {{"{member}": true}}}}"#),
+        );
+        let paths = parse_ok(&contents).manifest.actions.paths;
+
+        let declared = match member {
+            "desktop" => paths.desktop,
+            "documents" => paths.documents,
+            "downloads" => paths.downloads,
+            "music" => paths.music,
+            "pictures" => paths.pictures,
+            "public_share" => paths.public_share,
+            "templates" => paths.templates,
+            "videos" => paths.videos,
+            _ => unreachable!(),
+        };
+        assert!(declared, "{member} should be true");
+    }
+}
+
+#[test]
+fn paths_has_neither_transport_and_both_are_refused_even_when_false() {
+    // Same reasoning as `media`: `paths` names resources, not transports —
+    // there is nothing to `invoke()` and no bridge route, so both look like a
+    // grant the manifest can never honour.
+    for transport in ["ipc", "bridge"] {
+        let contents = MINIMAL.replace(
+            r#""app_version": "0.6.0""#,
+            &format!(
+                r#""app_version": "0.6.0", "actions": {{"paths": {{"downloads": true, "{transport}": false}}}}"#
+            ),
+        );
+
+        let error = parse_err(&contents);
+
+        assert!(
+            matches!(
+                &error,
+                ManifestError::UnsupportedActionTransport {
+                    group: "paths",
+                    transport: found,
+                    ..
+                } if *found == transport
+            ),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("actions.paths.{transport}")),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("no {transport} transport")),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_paths_field_warns_and_still_parses() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "actions": {"paths": {"downloads": true, "home": true}}"#,
+    );
+
+    let loaded = parse_ok(&contents);
+
+    assert!(loaded.manifest.actions.paths.downloads);
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+    assert!(
+        loaded.warnings[0].contains("\"actions.paths.home\""),
+        "{}",
+        loaded.warnings[0]
+    );
+}
+
+#[test]
 fn an_unknown_file_associations_field_warns_and_still_parses() {
     // One level down from the top-level rule, for the same reason: a nested
     // typo ("mime-types") must not stop the app loading, and must not silently
