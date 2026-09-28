@@ -32,7 +32,10 @@ Each app pays its own FrankenPHP startup. That is the cost, and it is accepted.
 4. `/healthz` is polled every 250 ms for up to 60 seconds. If the server process
    dies before answering, the wait aborts immediately instead of burning the
    timeout.
-5. The **same window** is navigated to the backend.
+5. The **same window** is navigated to the backend, via `location.replace`
+   rather than a plain navigation — it replaces the splash's history entry
+   instead of stacking on it, so the cold-start page leaves no history entry
+   behind for Back to return to.
 
 Step 2 and step 5 being one window is the point. Opening the app window only
 once the backend was healthy would leave the screen empty for the length of a
