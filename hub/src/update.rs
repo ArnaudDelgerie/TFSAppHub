@@ -444,12 +444,14 @@ fn apply(
             path: data_subdir.clone(),
             source,
         })?;
+    stop_at("snapshot_complete")?;
     transaction.advance(Phase::SnapshotComplete);
     update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
     update_transaction::retain_tree(app_dir).map_err(|source| UpdateError::Io {
         path: app_dir.to_path_buf(),
         source,
     })?;
+    stop_at("tree_retained")?;
     transaction.advance(Phase::TreeRetained);
     update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
 
@@ -462,6 +464,7 @@ fn apply(
             error,
         ));
     }
+    stop_at("replacement_installed")?;
     transaction.advance(Phase::ReplacementInstalled);
     update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
 
@@ -488,6 +491,7 @@ fn apply(
             error,
         ));
     }
+    stop_at("lifecycle_complete")?;
     transaction.advance(Phase::LifecycleComplete);
     update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
 
@@ -519,6 +523,7 @@ fn apply(
             error,
         ));
     }
+    stop_at("registry_committed")?;
     transaction.advance(Phase::RegistryCommitted);
     update_transaction::write(data_dir, &transaction).map_err(transaction_error)?;
     // The update itself is now committed — the registry names the new
@@ -534,9 +539,11 @@ fn apply(
     ) {
         return Err(committed_needs_repair(id, &manifest.app_version, error));
     }
+    stop_at("anchor_finalised")?;
     transaction.advance(Phase::AnchorFinalised);
     update_transaction::write(data_dir, &transaction)
         .map_err(|error| committed_needs_repair(id, &manifest.app_version, error))?;
+    stop_at("journal_discarded")?;
     update_transaction::discard(data_dir)
         .map_err(|error| committed_needs_repair(id, &manifest.app_version, error))?;
 
@@ -947,6 +954,7 @@ fn resync_only(
         path: app_dir.to_path_buf(),
         source,
     })?;
+    stop_at("tree_retained")?;
     transaction.advance(Phase::TreeRetained);
     update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
     if let Err(error) = install::snapshot(&resolved.root, app_dir) {
@@ -958,6 +966,7 @@ fn resync_only(
             error,
         ));
     }
+    stop_at("replacement_installed")?;
     transaction.advance(Phase::ReplacementInstalled);
     update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
     let environment = app_env::resolve(
@@ -1016,6 +1025,7 @@ fn resync_only(
             error,
         ));
     }
+    stop_at("registry_committed")?;
     transaction.advance(Phase::RegistryCommitted);
     update_transaction::write(&state_root, &transaction).map_err(transaction_error)?;
     // The resync itself is now committed — the registry names the resolved
@@ -1023,9 +1033,11 @@ fn resync_only(
     // failure is reported for `repair` to finish.
     update_transaction::discard_tree(app_dir)
         .map_err(|error| committed_needs_repair(&entry.id, &manifest.app_version, error))?;
+    stop_at("anchor_finalised")?;
     transaction.advance(Phase::AnchorFinalised);
     update_transaction::write(&state_root, &transaction)
         .map_err(|error| committed_needs_repair(&entry.id, &manifest.app_version, error))?;
+    stop_at("journal_discarded")?;
     update_transaction::discard(&state_root)
         .map_err(|error| committed_needs_repair(&entry.id, &manifest.app_version, error))?;
 
@@ -1399,6 +1411,50 @@ impl From<GateError> for UpdateError {
     fn from(error: GateError) -> Self {
         Self::Gate(error)
     }
+}
+
+/// A deterministic stand-in for killing the process right after a named
+/// mutation and before the journal write that would record it — the same
+/// boundary a real kill leaves the journal at, without needing to actually
+/// spawn and signal a child process. Test-only: in a normal build `stop_at`
+/// always returns `Ok(())` and the thread-local it would read does not exist.
+#[cfg(test)]
+pub(crate) mod test_stop {
+    use std::cell::Cell;
+
+    thread_local! {
+        static POINT: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
+
+    /// Arm the named boundary for the next `apply`/`resync_only` call on this
+    /// thread. Names match the ones passed to `stop_at` in this module.
+    pub(crate) fn arm(point: &'static str) {
+        POINT.with(|cell| cell.set(Some(point)));
+    }
+
+    pub(crate) fn disarm() {
+        POINT.with(|cell| cell.set(None));
+    }
+
+    pub(crate) fn hit(point: &'static str) -> bool {
+        POINT.with(|cell| cell.get() == Some(point))
+    }
+}
+
+#[cfg(test)]
+fn stop_at(point: &'static str) -> Result<(), UpdateError> {
+    if test_stop::hit(point) {
+        return Err(UpdateError::Io {
+            path: PathBuf::from(format!("test stop point: {point}")),
+            source: io::Error::other("simulated kill"),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn stop_at(_point: &'static str) -> Result<(), UpdateError> {
+    Ok(())
 }
 
 #[cfg(test)]

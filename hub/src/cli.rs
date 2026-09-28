@@ -170,7 +170,7 @@ pub const SURFACE: &[Spec] = &[
     Spec {
         name: "repair",
         form: "repair <id> [--yes]",
-        summary: "Restore an interrupted update before using that app again.",
+        summary: "Restore or finish an interrupted update before using that app again.",
         level: Level::App,
         availability: Availability::Implemented,
     },

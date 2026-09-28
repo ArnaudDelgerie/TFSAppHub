@@ -125,14 +125,22 @@ rollback is one step back; it leaves nothing behind to roll back a second
 time.
 
 **An interrupted update requires an explicit repair.** If the hub is stopped
-after it has started an update or a forced re-sync, it retains an outgoing-only
-recovery journal in the app data directory. Until the user runs
-`tfsapp-hub repair <id>` (and confirms it, or passes `--yes`), `open`, `run`,
-`update`, `rollback`, `export`, `import` and removal refuse for that app. Repair
-restores the pre-attempt tree, database, version record and registry entry; it
-does not resume the update or choose the partially installed version. This is
-separate from the successful-update rollback anchor and remains one generation
-only. The promise does not extend to interrupted imports or rollbacks.
+after it has started an update or a forced re-sync, it retains a recovery
+journal in the app data directory. Until the user runs `tfsapp-hub repair
+<id>` (and confirms it, or passes `--yes`), `open`, `run`, `update`,
+`rollback`, `export`, `import` and removal refuse for that app. What repair
+does depends on how far the interrupted attempt got, at the one point that
+divides its two halves cleanly: whether the registry already records the new
+version. Before that point, the update has not really happened yet, and
+repair restores the pre-attempt tree, database, version record and registry
+entry — it does not resume the update or choose the partially installed
+version. From that point on, the update *has* happened — the registry already
+names it — and repair does not undo a commit that already landed; it finishes
+promoting the outgoing tree and database into the ordinary rollback anchor
+instead, the same one `rollback <id>` (see below) consumes, so a repaired
+update can still be rolled back afterwards. Either way this remains one
+generation only. The promise does not extend to interrupted imports or
+rollbacks.
 
 That install-time placement is better than it had to be. A migration and a cache
 warm-up run once, while someone is watching a terminal that can print an error,

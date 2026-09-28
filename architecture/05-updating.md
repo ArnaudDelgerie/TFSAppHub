@@ -41,24 +41,40 @@ from removing the first update's `apps/<id>.previous` anchor.
    under the update event (`pre-update` then
    `post-update`, then the same `cache:warmup`-and-stamp `install` itself
    runs — plan 024), then — only once every step above has succeeded — stamp
-   the registry with the new one and rewrite the desktop entry. Only then is
-   the private retained tree promoted to the public one-generation
-   `apps/<id>.previous` rollback anchor, its database snapshot and its
-   outgoing registry record; the journal is then discarded.
-5. A normal failure attempts that same outgoing restoration. A kill or crash
-   leaves the journal deliberately: it is a recovery decision, not something
-   the next command silently guesses. Every ordinary command for that app
-   refuses and names `tfsapp-hub repair <id>`; `repair --yes` restores only
-   the recorded outgoing tree, database, version record and registry entry,
-   then removes the journal. It never chooses the partly-installed version,
-   never resumes the update, and never rotates the public rollback anchor.
-   A malformed or future journal also refuses safely. Interrupted imports and
-   rollbacks have no such recovery protocol.
+   the registry with the new one. Each mutation above — the snapshot's own
+   bytes included — is synced before the journal write that records it, so a
+   kill between the two never leaves a phase the journal claims durable
+   without the file it describes. Only once the registry is stamped is the
+   private retained tree promoted to the public one-generation
+   `apps/<id>.previous` rollback anchor, its database snapshot and
+   `rollback.json`; the journal is then discarded. That promotion
+   (`finalise_anchor`) is itself replayable step by step — discard the old
+   anchor and rename the tree, promote each database member, write
+   `rollback.json` — so a kill partway through it resumes on the next repair
+   instead of erroring or re-destroying what it already wrote.
+5. Recovery reads the journal's phase, not the disk, for *what happened* — but
+   for the one mutation a kill can land between and its own phase write, it
+   reads the disk for whether that one step happened, never inferring a phase
+   from it. Before the registry is stamped, a normal failure and a killed
+   process both restore the same outgoing state: `repair --yes` restores the
+   recorded outgoing tree, database, version record and registry entry, then
+   removes the journal. It never chooses the partly-installed version, never
+   resumes the update, and never rotates the public rollback anchor. Once the
+   registry is stamped, the update *has* happened, and there is nothing left to
+   revert — `apply` no longer attempts to; a failure past that point names
+   `repair` directly. `repair --yes` there instead *finishes* the update:
+   replaying the anchor promotion above (or, for `ResyncOnly`, discarding the
+   staged tree) until it is complete, so `rollback <id>` can then undo it.
+   Either way, running `repair` a second time changes nothing. A malformed or
+   future journal also refuses safely. Interrupted imports and rollbacks have
+   no such recovery protocol.
 
-`ResyncOnly` has no lifecycle event or rollback-anchor rotation. It uses the
-same journal and private retained tree, but no database snapshot; repair still
-chooses the outgoing tree and registry entry. The existing public rollback
-anchor is untouched until the re-sync is fully committed.
+`ResyncOnly` has no lifecycle event and rotates no anchor of its own, in
+either direction: before its registry write, repair restores the outgoing
+tree and registry entry, exactly as `Apply` does short of the database; after
+it, repair finishes by discarding the staged tree, and the existing public
+rollback anchor — if any — stays exactly as it was throughout, never created
+or touched by a resync.
 
 **The rollback anchor is three halves, or none.** `rollback <id>` refuses
 unless all three are present, naming whichever is missing:

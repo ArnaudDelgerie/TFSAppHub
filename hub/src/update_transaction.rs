@@ -17,6 +17,22 @@ pub const FORMAT_VERSION: u32 = 1;
 const JOURNAL_FILE: &str = "update-transaction.json";
 const STAGING_DIR: &str = ".update-transaction";
 
+/// The deterministic kill stand-in `update::stop_at` uses, shared here so
+/// `finalise_anchor`'s own sub-steps (reached through a real `apply` as well
+/// as directly) can be stopped at without a second thread-local.
+#[cfg(test)]
+fn stop_at(point: &'static str) -> io::Result<()> {
+    if crate::update::test_stop::hit(point) {
+        return Err(io::Error::other(format!("test stop point: {point}")));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn stop_at(_point: &'static str) -> io::Result<()> {
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransactionKind {
@@ -232,6 +248,7 @@ pub fn finalise_anchor(
         let _ = fs::remove_dir_all(&previous);
         fs::rename(&staged_tree, &previous)?;
     }
+    stop_at("finalise_tree_promoted")?;
 
     for name in database_members {
         let staged = staged_db_path(data_dir, name);
@@ -245,6 +262,7 @@ pub fn finalise_anchor(
             ));
         }
     }
+    stop_at("finalise_members_promoted")?;
 
     let already_finalised = lifecycle::read_rollback_anchor(data_subdir).is_some_and(|anchor| {
         anchor.app_version == entry.app_version && anchor.source_revision == entry.source_revision
@@ -260,6 +278,7 @@ pub fn finalise_anchor(
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
     }
+    stop_at("finalise_rollback_written")?;
 
     fs::File::open(data_subdir)?.sync_all()?;
     fs::File::open(app_dir.parent().expect("an app dir has a parent"))?.sync_all()
