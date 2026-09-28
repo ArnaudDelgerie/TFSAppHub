@@ -36,6 +36,21 @@ leaving `rollback <id>` usable afterwards where it previously could not be.
 Every earlier interruption still restores the outgoing version exactly as
 before.
 
+An interrupted `import` or `rollback` is now recoverable too. `import`
+extracts the archive into a staging directory before touching the live data,
+records a durable intent, and only then switches the live database and
+`uploads/` over through renames to reserved rescue names: a kill leaves a
+state the hub names, and `tfsapp-hub repair <id>` puts back exactly what the
+import replaced before its commit, or finishes the import after it. An
+import whose extraction fails never touches the live data at all, and a
+failure between the switch and the commit is backed out in-process. A
+`rollback` killed partway through is finished by running
+`tfsapp-hub rollback <id>` again, never rewound; until it finishes, every
+other command for that app, `repair` included, refuses and names it. All
+three interrupted-operation records — update journal, import intent,
+rollback marker — are now checked by every lifecycle lease holder and by
+the dispatch advisory check.
+
 An app can now declare `actions.paths` — one boolean per GLib special
 directory (`desktop`, `documents`, `downloads`, `music`, `pictures`,
 `public_share`, `templates`, `videos`) — and have the hub resolve each

@@ -124,14 +124,14 @@ being left behind aside as a named rescue dump rather than deleting it. A
 rollback is one step back; it leaves nothing behind to roll back a second
 time.
 
-**An interrupted update requires an explicit repair.** If the hub is stopped
-after it has started an update or a forced re-sync, it retains a recovery
-journal in the app data directory. Until the user runs `tfsapp-hub repair
-<id>` (and confirms it, or passes `--yes`), `open`, `run`, `update`,
-`rollback`, `export`, `import` and removal refuse for that app. What repair
-does depends on how far the interrupted attempt got, at the one point that
-divides its two halves cleanly: whether the registry already records the new
-version. Before that point, the update has not really happened yet, and
+**An interrupted update or import requires an explicit repair.** If the hub is
+stopped after it has started an update or a forced re-sync, it retains a
+recovery journal in the app data directory. Until the user runs
+`tfsapp-hub repair <id>` (and confirms it, or passes `--yes`), `open`, `run`,
+`update`, `rollback`, `export`, `import` and removal refuse for that app. What
+repair does depends on how far the interrupted attempt got, at the one point
+that divides its two halves cleanly: whether the registry already records the
+new version. Before that point, the update has not really happened yet, and
 repair restores the pre-attempt tree, database, version record and registry
 entry — it does not resume the update or choose the partially installed
 version. From that point on, the update *has* happened — the registry already
@@ -139,8 +139,26 @@ names it — and repair does not undo a commit that already landed; it finishes
 promoting the outgoing tree and database into the ordinary rollback anchor
 instead, the same one `rollback <id>` (see below) consumes, so a repaired
 update can still be rolled back afterwards. Either way this remains one
-generation only. The promise does not extend to interrupted imports or
-rollbacks.
+generation only.
+
+An interrupted import is resolved by the same `repair <id>`. The import
+extracts the archive into a staging slot under the data directory before
+touching anything live, and writes its own intent record once the whole
+payload is staged; the same list of commands refuses while that intent is
+present. Before the intent is committed — the point past which the archive's
+data is the live data — repair puts back exactly what the import replaced:
+the database, `uploads/`, the version record and the rollback anchor, as they
+were. After the commit, repair finishes the import's cleanup instead. The
+one import failure that needs no repair at all is a failed extraction: it
+happens before the intent exists and touches nothing live.
+
+An interrupted rollback is different, because the tree it replaces is already
+gone: it is finished, not repaired. `rollback <id>` writes a marker in the
+data directory before its first mutation, and while that marker is present
+every command refuses — `repair` included, since repair knows nothing about a
+rollback's steps — except `rollback <id>` itself, which resumes at the marker
+without asking again. Running `rollback <id> --yes` a second time ends in the
+same state as an uninterrupted rollback.
 
 That install-time placement is better than it had to be. A migration and a cache
 warm-up run once, while someone is watching a terminal that can print an error,

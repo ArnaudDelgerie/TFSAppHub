@@ -3,11 +3,12 @@
 //! The advisory text is useful for an actionable refusal, but the retained
 //! flock is authoritative. A stale record therefore never grants access.
 //!
-//! Holding a lease is also what makes the update-journal guard true: every
-//! holder except `repair` re-reads the journal of the identifier's data
-//! directory while it owns the lease, so a journal an `update` left behind
-//! refuses the next operation no matter which side of the dispatch check it
-//! arrived from.
+//! Holding a lease is also what makes the interrupted-operation guard true:
+//! every holder re-reads the records of the identifier's data directory —
+//! the update journal, the import intent, the rollback marker — while it owns
+//! the lease, so a record a killed command left behind refuses the next
+//! operation no matter which side of the dispatch check it arrived from.
+//! Each record exempts only the command that resolves it.
 
 use std::{
     fmt, fs, io,
@@ -15,14 +16,35 @@ use std::{
 };
 
 use crate::{
+    import_transaction,
     paths::{Paths, PathsError},
-    registry, update_transaction,
+    registry, rollback, update_transaction,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateDecision {
     Granted,
     Busy { operation: Option<String> },
+}
+
+/// Which interrupted operation a data directory is waiting on — both of its
+/// records resolve through the same `repair <id>`, so they share a refusal,
+/// but the message still names which one, because what repair will *do*
+/// differs: an update is finished or reverted, an import is finished or the
+/// data it replaced is put back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interrupted {
+    Update,
+    Import,
+}
+
+impl fmt::Display for Interrupted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Update => write!(formatter, "update"),
+            Self::Import => write!(formatter, "import"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -36,18 +58,27 @@ pub enum GateError {
         identifier: String,
         operation: Option<String>,
     },
-    /// The identifier's data directory holds an update journal, so the
-    /// operation being gated would run over an interrupted update (see
-    /// `contract/6-lifecycle.md`, "An interrupted update requires an
-    /// explicit repair"). `id` is the registry's answer for who owns that
-    /// journal, resolved best-effort: the refusal needs nothing but the
-    /// journal's presence, the id only makes the message actionable.
+    /// The identifier's data directory holds an interrupted-operation record
+    /// that only `repair` resolves — the update journal (see
+    /// `contract/6-lifecycle.md`, "An interrupted update requires an explicit
+    /// repair") or an import intent. `id` is the registry's answer for who
+    /// owns that record, resolved best-effort: the refusal needs nothing but
+    /// the record's presence, the id only makes the message actionable.
     RepairRequired {
         identifier: String,
         id: Option<String>,
+        interrupted: Interrupted,
     },
-    /// The journal's presence could not even be established — a guard that
-    /// cannot read cannot let anything through.
+    /// The identifier's data directory holds a rollback marker: a rollback
+    /// stopped partway through, and the only way out is running `rollback`
+    /// again to finish it — never `repair`, which knows nothing about a
+    /// rollback's steps.
+    RollbackRequired {
+        identifier: String,
+        id: Option<String>,
+    },
+    /// An interrupted-operation record's presence could not even be
+    /// established — a guard that cannot read cannot let anything through.
     Journal {
         identifier: String,
         source: update_transaction::JournalError,
@@ -75,21 +106,39 @@ impl fmt::Display for GateError {
                     "{identifier} is busy with another lifecycle operation"
                 )
             }
-            Self::RepairRequired { id: Some(id), .. } => write!(
+            Self::RepairRequired {
+                id: Some(id),
+                interrupted,
+                ..
+            } => write!(
                 formatter,
-                "{id} has an interrupted update; run `tfsapp-hub repair {id} --yes` first."
+                "{id} has an interrupted {interrupted}; run `tfsapp-hub repair {id} --yes` first."
             ),
             Self::RepairRequired {
                 identifier,
                 id: None,
+                interrupted,
             } => write!(
                 formatter,
-                "{identifier} has an interrupted update; run `tfsapp-hub repair <id> --yes` on \
-                 the app that owns it first."
+                "{identifier} has an interrupted {interrupted}; run `tfsapp-hub repair <id> --yes` \
+                 on the app that owns it first."
+            ),
+            Self::RollbackRequired { id: Some(id), .. } => write!(
+                formatter,
+                "{id} has an interrupted rollback; run `tfsapp-hub rollback {id} --yes` again \
+                 to finish it."
+            ),
+            Self::RollbackRequired {
+                identifier,
+                id: None,
+            } => write!(
+                formatter,
+                "{identifier} has an interrupted rollback; run `tfsapp-hub rollback <id> --yes` \
+                 again on the app that owns it, to finish it."
             ),
             Self::Journal { identifier, source } => write!(
                 formatter,
-                "cannot inspect the update journal for {identifier}: {source}"
+                "cannot inspect the interrupted-operation records for {identifier}: {source}"
             ),
         }
     }
@@ -150,30 +199,112 @@ fn gate_path(paths: &Paths, identifier: &str) -> Result<PathBuf, GateError> {
     Ok(path)
 }
 
-/// Refuse while the identifier's data directory holds an update journal —
-/// the guard every lease holder (except `repair`) runs once it owns its
-/// lease, so a journal written after the dispatch-side advisory check is
+/// Refuse while the identifier's data directory holds an interrupted-
+/// operation record — the guard every lease holder runs once it owns its
+/// lease, so a record written after the dispatch-side advisory check is
 /// still seen by whoever actually holds the lease.
 ///
-/// The id in the refusal is resolved best-effort: any registry failure gives
-/// `None`, because the refusal stands on the journal alone and the id only
+/// `operation` is the maintenance operation being gated, or `None` for an
+/// activity lease (whose holder runs no named operation). Three records,
+/// each checked in a fixed order and each exempting only the command that
+/// resolves it: `repair` may pass an update journal or an import intent
+/// (finishing or reverting the interrupted operation is its whole job),
+/// and `rollback` may pass a rollback marker (finishing the interrupted
+/// rollback is its). A rollback marker refuses `repair` like anything
+/// else: repair knows nothing about a rollback's steps.
+///
+/// The id in a refusal is resolved best-effort: any registry failure gives
+/// `None`, because the refusal stands on the record alone and the id only
 /// sharpens the message.
-fn refuse_if_interrupted(paths: &Paths, identifier: &str) -> Result<(), GateError> {
+fn refuse_if_interrupted(
+    paths: &Paths,
+    identifier: &str,
+    operation: Option<&str>,
+) -> Result<(), GateError> {
     let data_dir = paths.app_data_dir(identifier).map_err(GateError::Paths)?;
+    let owner = || {
+        registry::load(paths).ok().and_then(|registry| {
+            registry
+                .by_identifier(identifier)
+                .map(|entry| entry.id.clone())
+        })
+    };
     match update_transaction::read(&data_dir) {
-        Ok(None) => Ok(()),
-        Ok(Some(_)) => Err(GateError::RepairRequired {
-            identifier: identifier.to_string(),
-            id: registry::load(paths).ok().and_then(|registry| {
-                registry
-                    .by_identifier(identifier)
-                    .map(|entry| entry.id.clone())
-            }),
-        }),
-        Err(source) => Err(GateError::Journal {
-            identifier: identifier.to_string(),
-            source,
-        }),
+        Ok(None) => {}
+        Ok(Some(_)) if operation == Some("repair") => {}
+        Ok(Some(_)) => {
+            return Err(GateError::RepairRequired {
+                identifier: identifier.to_string(),
+                id: owner(),
+                interrupted: Interrupted::Update,
+            })
+        }
+        Err(source) => {
+            return Err(GateError::Journal {
+                identifier: identifier.to_string(),
+                source,
+            })
+        }
+    }
+    match import_transaction::read_intent(&data_dir) {
+        Ok(None) => {}
+        Ok(Some(_)) if operation == Some("repair") => {}
+        Ok(Some(_)) => {
+            return Err(GateError::RepairRequired {
+                identifier: identifier.to_string(),
+                id: owner(),
+                interrupted: Interrupted::Import,
+            })
+        }
+        Err(source) => {
+            return Err(GateError::Journal {
+                identifier: identifier.to_string(),
+                source,
+            })
+        }
+    }
+    match rollback::read_marker(&data_dir) {
+        Ok(None) => {}
+        Ok(Some(_)) if operation == Some("rollback") => {}
+        Ok(Some(_)) => {
+            return Err(GateError::RollbackRequired {
+                identifier: identifier.to_string(),
+                id: owner(),
+            })
+        }
+        Err(source) => {
+            return Err(GateError::Journal {
+                identifier: identifier.to_string(),
+                source,
+            })
+        }
+    }
+    Ok(())
+}
+
+/// The dispatch side's advisory answer: resolve `id`'s registry entry and
+/// return the refusal [`refuse_if_interrupted`] would give for `operation`
+/// — `Ok(None)` when the id is not registered, or when nothing interrupts
+/// it. The authoritative check stays the one under the lease; this exists
+/// only so a command whose first act predates its lease still says
+/// "repair"/"rollback" instead of misreporting the interrupted state.
+pub fn interruption(
+    paths: &Paths,
+    id: &str,
+    operation: Option<&str>,
+) -> Result<Option<GateError>, GateError> {
+    // A registry that cannot be read leaves nothing to resolve, and the
+    // advisory check has no business failing the command for it — the
+    // lease-held check re-reads everything under its lock anyway.
+    let Some(installed) = registry::load(paths).ok() else {
+        return Ok(None);
+    };
+    let Some(entry) = installed.get(id) else {
+        return Ok(None);
+    };
+    match refuse_if_interrupted(paths, &entry.identifier, operation) {
+        Ok(()) => Ok(None),
+        Err(error) => Ok(Some(error)),
     }
 }
 
@@ -191,10 +322,10 @@ pub fn acquire_activity(paths: &Paths, identifier: &str) -> Result<ActivityLease
             // a stale operation name.
             file.set_len(0)
                 .map_err(|source| GateError::Io { path, source })?;
-            // Under the shared flock, so the journal cannot be written or
+            // Under the shared flock, so no record can be written or
             // discarded behind this read. A refusal drops the file handle,
             // which releases the lease.
-            refuse_if_interrupted(paths, identifier)?;
+            refuse_if_interrupted(paths, identifier, None)?;
             Ok(ActivityLease { _file: file })
         }
         None => match gate_decision(false, held_operation(&path)) {
@@ -229,12 +360,11 @@ pub fn acquire_maintenance(
     };
     // Under the exclusive flock, and before the advisory operation text is
     // written — a refusal must not leave text claiming an operation that
-    // then never runs. `repair` is exempt: finishing or reverting the
-    // interrupted update is its whole job. A refusal drops the file handle,
-    // which releases the lease.
-    if operation != "repair" {
-        refuse_if_interrupted(paths, identifier)?;
-    }
+    // then never runs. Each record exempts its own resolving command inside
+    // `refuse_if_interrupted` (`repair` the journal, `rollback` the marker),
+    // which is why the call is unconditional here. A refusal drops the file
+    // handle, which releases the lease.
+    refuse_if_interrupted(paths, identifier, Some(operation))?;
     use std::io::Write;
     file.set_len(0).map_err(|source| GateError::Io {
         path: path.clone(),
@@ -299,9 +429,14 @@ mod tests {
         // No registry: the refusal stands on the journal alone, so the id is
         // only `None` — the message points at `<id>` instead of naming one.
         match acquire_maintenance(&paths, "dev.local.demo", "export") {
-            Err(GateError::RepairRequired { identifier, id }) => {
+            Err(GateError::RepairRequired {
+                identifier,
+                id,
+                interrupted,
+            }) => {
                 assert_eq!(identifier, "dev.local.demo");
                 assert_eq!(id, None);
+                assert_eq!(interrupted, Interrupted::Update);
             }
             Err(other) => panic!("the journal must refuse, not {other:?}"),
             Ok(_) => panic!("the journal must refuse the export"),
@@ -314,6 +449,68 @@ mod tests {
         ))
         .unwrap();
         assert!(acquire_maintenance(&paths, "dev.local.demo", "export").is_ok());
+    }
+
+    /// Seed the identifier's data directory with the rollback marker an
+    /// interrupted `rollback` leaves behind, through the real writer so the
+    /// guard reads exactly what production wrote.
+    fn seed_marker(paths: &Paths) {
+        let data_dir = paths.app_data_dir("dev.local.demo").unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        rollback::write_marker(
+            &data_dir,
+            &rollback::RollbackMarker {
+                format_version: rollback::MARKER_FORMAT_VERSION,
+                target_version: "1.0.0".to_string(),
+                source_revision: "sha256:previous".to_string(),
+                rescue_path: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_marker_refuses_every_operation_but_rollback_and_the_refusal_releases_the_lease() {
+        let base = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted_at(base.path());
+        seed_marker(&paths);
+
+        for operation in ["export", "repair"] {
+            match acquire_maintenance(&paths, "dev.local.demo", operation) {
+                Err(GateError::RollbackRequired { identifier, .. }) => {
+                    assert_eq!(identifier, "dev.local.demo");
+                }
+                Err(other) => panic!("the marker must refuse {operation}, not {other:?}"),
+                Ok(_) => panic!("the marker must refuse the {operation}"),
+            }
+        }
+        assert!(matches!(
+            acquire_activity(&paths, "dev.local.demo"),
+            Err(GateError::RollbackRequired { .. })
+        ));
+
+        // `rollback` is the one command that resolves a marker: granted,
+        // and it is the refusal above (not a stale flock) that blocked the
+        // others.
+        assert!(acquire_maintenance(&paths, "dev.local.demo", "rollback").is_ok());
+    }
+
+    #[test]
+    fn an_unreadable_marker_refuses_rather_than_guessing() {
+        let base = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted_at(base.path());
+        let data_dir = paths.app_data_dir("dev.local.demo").unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(rollback::marker_path(&data_dir), "not json").unwrap();
+
+        assert!(matches!(
+            acquire_maintenance(&paths, "dev.local.demo", "export"),
+            Err(GateError::Journal { .. })
+        ));
+        assert!(matches!(
+            acquire_activity(&paths, "dev.local.demo"),
+            Err(GateError::Journal { .. })
+        ));
     }
 
     #[test]
