@@ -20,6 +20,7 @@ mod hub_bin;
 mod hub_rollback;
 mod hub_update;
 mod identity;
+mod import_transaction;
 mod install;
 mod launch;
 mod lifecycle;

@@ -7,10 +7,12 @@
 //! only metadata, and [`import_decision`], the whole of what `import` refuses
 //! and why. The commands themselves — the busy guard, the tar/gzip writing
 //! and reading, the confirmation, the destination cache invalidation, the
-//! rescue dump, the anchor discard, the forward migration of an archive older
-//! than what is installed — are
+//! staging, the switch under a durable intent, the forward migration of an
+//! archive older than what is installed — are
 //! [`export`] and [`import`], added once the primitives below have their own
-//! tests.
+//! tests. `import`'s mutation phase is a run of short steps around the
+//! intent `import_transaction.rs` owns, each followed by a named boundary a
+//! kill test can stop at.
 //!
 //! **What travels, and what does not.** The archive holds `manifest.json` at
 //! its root, `data/` plus [`lifecycle::DB_FILE_NAMES`] (whichever of those
@@ -36,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     archive,
     cli::{EXIT_FAILED, EXIT_OK},
+    import_transaction,
     install::{self, InstallError},
     lifecycle::{self, LifecycleEvent},
     lifecycle_gate::{self, GateError},
@@ -44,7 +47,6 @@ use crate::{
     php::{self, PhpError},
     prompt,
     registry::{self, RegistryError},
-    update,
 };
 
 /// `manifest.json`, at the archive's root — the only metadata `export`
@@ -669,6 +671,7 @@ fn run_import(
         });
     }
     let data_subdir = data_dir.join("data");
+    let app_dir = paths.app_dir(id)?;
 
     let installed_version = semver::Version::parse(&entry.app_version)
         .expect("the registry only ever holds a canonical semver app_version");
@@ -682,23 +685,15 @@ fn run_import(
     )
     .map_err(PortabilityError::Refused)?;
 
+    // The live database stays in place while the staging directory fills,
+    // and only then moves aside by rename — so the whole payload has to fit
+    // beside it, and the budget is the room itself, nothing subtracted.
     let room = crate::disk_space::room(&data_dir).map_err(|source| PortabilityError::Io {
         path: data_dir.clone(),
         source,
     })?;
-    let mut live_db_bytes = 0_u64;
-    for name in lifecycle::DB_FILE_NAMES {
-        let path = data_subdir.join(name);
-        match fs::metadata(&path) {
-            Ok(metadata) => live_db_bytes = live_db_bytes.saturating_add(metadata.len()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(PortabilityError::Io { path, source }),
-        }
-    }
-    archive::check_payload(archive_path, room.saturating_sub(live_db_bytes)).map_err(|error| {
-        PortabilityError::Preflight {
-            detail: error.to_string(),
-        }
+    archive::check_payload(archive_path, room).map_err(|error| PortabilityError::Preflight {
+        detail: error.to_string(),
     })?;
 
     if populated {
@@ -715,162 +710,171 @@ fn run_import(
     }
 
     // The disposable-cache boundary — the first thing the import changes, and
-    // the one write that must land before the rescue/replacement boundary
-    // below. The preflight above only reads; this clears the state *derived*
-    // from the database the archive is about to replace, so that neither the
+    // the one write that must land before the staging/intent boundary below.
+    // The preflight above only reads; this clears the state *derived* from
+    // the database the archive is about to replace, so that neither the
     // forward migration below nor a command run right after the import can
     // read a container compiled from the previous database (`Mode::Run` and
     // `Mode::Install` deliberately clear nothing, and the stamp's three
     // dimensions do not include the database — the Overview's bug). Strict on
     // failure, unlike `Mode::Launch`'s best-effort wipe: the error stops the
-    // import here, before the rescue phase, with the database, `uploads/`,
-    // the version record and the rollback anchor all untouched.
+    // import here, before anything is staged or switched, with the database,
+    // `uploads/`, the version record and the rollback anchor all untouched.
     clear_destination_cache(&data_dir, &data_subdir)?;
 
-    // The rescue/replacement boundary: what follows rescue-dumps what it is
-    // about to overwrite, discards the anchor
-    // (an import proceeding has already made it incoherent — see the
-    // Overview), and then writes.
-    let rescue_path = rescue_dump(&data_subdir)?;
-    remove_live_db_files(&data_subdir).map_err(|error| {
-        import_incomplete(
-            &data_subdir,
-            rescue_path.as_deref(),
-            None,
-            "the previous database was rescued but could not be fully moved aside",
-            error,
-        )
-    })?;
-    let uploads_rescue_path = rescue_uploads(&data_dir).map_err(|error| {
-        import_incomplete(
-            &data_subdir,
-            rescue_path.as_deref(),
-            None,
-            "the previous database was rescued and removed but its uploads/ directory could \
-             not be rescued aside",
-            error,
-        )
-    })?;
-    lifecycle::discard_rollback_anchor(&data_subdir);
-    lifecycle::discard_db_snapshot(&data_subdir);
-    let app_dir = paths.app_dir(id).map_err(|error| {
-        import_incomplete(
-            &data_subdir,
-            rescue_path.as_deref(),
-            uploads_rescue_path.as_deref(),
-            "the previous database was rescued but the import could not start",
-            error,
-        )
-    })?;
-    update::discard_tree(&app_dir);
+    // A stale staging directory with no intent behind it can only be an
+    // extraction that was killed — had an intent been present, the gate
+    // under the lease would have refused this import. Clear it before
+    // extracting, best-effort, like every other staging removal.
+    import_transaction::remove_staging(&data_dir);
 
-    archive::extract_prefix(archive_path, DATA_DIR, &data_subdir).map_err(|error| {
-        import_incomplete(
-            &data_subdir,
-            rescue_path.as_deref(),
-            uploads_rescue_path.as_deref(),
-            "the data directory may be partially extracted",
-            error,
+    // Stage first, switch after: the archive is extracted under the data
+    // directory's staging slot, and nothing live has been touched by the
+    // time it is fully extracted. A failure here leaves nothing to back out
+    // and nothing to repair — the live data is exactly as the preflight
+    // found it, and the staging is removed again on the way out.
+    let extraction = archive::extract_prefix(
+        archive_path,
+        DATA_DIR,
+        &import_transaction::staged_data_dir(&data_dir),
+    )
+    .and_then(|()| {
+        archive::extract_prefix(
+            archive_path,
+            UPLOADS_DIR,
+            &import_transaction::staged_uploads_dir(&data_dir),
         )
-    })?;
-    archive::extract_prefix(archive_path, UPLOADS_DIR, &data_dir.join(UPLOADS_DIR)).map_err(
-        |error| {
-            import_incomplete(
-                &data_subdir,
-                rescue_path.as_deref(),
-                uploads_rescue_path.as_deref(),
-                "the database was extracted but uploads/ may be partially extracted",
-                error,
-            )
-        },
-    )?;
+    });
+    if let Err(error) = extraction {
+        import_transaction::remove_staging(&data_dir);
+        return Err(PortabilityError::Extraction {
+            detail: error.to_string(),
+        });
+    }
 
-    // Stamp the archive's version before any forward migration. If a hook
-    // fails now, `open` reads this older record as the same unfinished update
-    // it already knows to refuse, rather than serving an unmigrated database
-    // under the installed version's old, misleading stamp.
-    lifecycle::write_data_version(&data_subdir, &manifest.app_version).map_err(|error| {
-        import_incomplete(
-            &data_subdir,
-            rescue_path.as_deref(),
-            uploads_rescue_path.as_deref(),
-            "the database was extracted but its version record could not be written",
-            error,
-        )
+    // The intent: the rescue names were reserved *before* this record was
+    // written, so it already names where everything will go. From here to
+    // the commit, a failure is undone in-process by `back_out` — except a
+    // simulated kill, which must leave exactly what a real kill leaves for
+    // `repair` to resolve. `data/` itself is created here, not by the
+    // switch: a fresh installation that has never been opened may not have
+    // one, and the switch only renames members into it.
+    fs::create_dir_all(&data_subdir).map_err(|source| PortabilityError::Io {
+        path: data_subdir.clone(),
+        source,
+    })?;
+    let intent = import_transaction::build_intent(&data_dir, &data_subdir, &manifest.app_version)?;
+    import_transaction::write_intent(&data_dir, &intent).map_err(|source| {
+        PortabilityError::Io {
+            path: import_transaction::intent_path(&data_dir),
+            source: io::Error::other(source.to_string()),
+        }
     })?;
 
-    // `lifecycle::check_version` — the guard every `open` runs — reads only
-    // `data/config.json`; it has no way to tell "an update never finished"
-    // from "an older archive was just imported", and refuses either way. Left
-    // at the archive's own version, an older archive would make the app
-    // permanently unopenable: `open` refuses citing `update <id>`, and
-    // `update` itself cannot rescue it, because its own decision compares the
-    // registry to the freshly resolved *source*, never to the data directory
-    // (`update::update_decision`'s own doc) — so an unchanged source reads as
-    // "nothing to update" regardless of what the data directory says. Running
-    // the installed manifest's `pre-update`/`post-update` right here — the
-    // same event `update`'s own `Apply` runs — is what keeps "restore an
-    // older backup onto an already-updated installation", the ordinary
-    // cross-machine case (the plan's Overview), from landing on data nothing
-    // can ever open again.
-    let migrated_forward = if archive_version < installed_version {
-        let installed_manifest = manifest::load(&app_dir)
-            .map_err(|error| {
-                import_incomplete(
-                    &data_subdir,
-                    rescue_path.as_deref(),
-                    uploads_rescue_path.as_deref(),
-                    "the database was extracted but not migrated forward",
-                    error,
-                )
-            })?
-            .manifest;
-        let toolchain = php::toolchain(paths).map_err(|error| {
-            import_incomplete(
-                &data_subdir,
-                rescue_path.as_deref(),
-                uploads_rescue_path.as_deref(),
-                "the database was extracted but not migrated forward",
-                error,
-            )
+    // The switch, the version record, the forward migration, the commit —
+    // the whole run of short mutations an intent covers. `migrated_forward`
+    // only drives the success report; the migration's own failure paths
+    // all go through the back-out below.
+    let mutation = (|| -> Result<(), PortabilityError> {
+        stop_at("import_staged")?;
+
+        import_transaction::switch(&data_dir, &data_subdir, &intent).map_err(|source| {
+            PortabilityError::Io {
+                path: import_transaction::staging_dir(&data_dir),
+                source,
+            }
         })?;
-        install::prepare(
-            paths,
-            &toolchain,
-            &installed_manifest,
-            &app_dir,
-            LifecycleEvent::Update,
-            &entry.platform,
-        )
-        .map_err(|error| {
-            import_incomplete(
-                &data_subdir,
-                rescue_path.as_deref(),
-                uploads_rescue_path.as_deref(),
-                "the database was extracted but not migrated forward",
-                error,
-            )
-        })?;
-        true
-    } else {
-        // Equal versions only — `import_decision` already refused anything
-        // newer, and the archive's version record was written above.
-        false
-    };
 
-    if let Some(rescue_path) = rescue_path {
+        // Stamp the archive's version before any forward migration, exactly
+        // as an interrupted update would have left its own record: a back-out
+        // rewrites the outgoing version over it, and `repair` finishing a
+        // committed import leaves it as the import's own stamp.
+        lifecycle::write_data_version(&data_subdir, &manifest.app_version)?;
+        stop_at("import_version_written")?;
+
+        // `lifecycle::check_version` — the guard every `open` runs — reads only
+        // `data/config.json`; it has no way to tell "an update never finished"
+        // from "an older archive was just imported", and refuses either way. Left
+        // at the archive's own version, an older archive would make the app
+        // permanently unopenable: `open` refuses citing `update <id>`, and
+        // `update` itself cannot rescue it, because its own decision compares the
+        // registry to the freshly resolved *source*, never to the data directory
+        // (`update::update_decision`'s own doc) — so an unchanged source reads as
+        // "nothing to update" regardless of what the data directory says. Running
+        // the installed manifest's `pre-update`/`post-update` right here — the
+        // same event `update`'s own `Apply` runs — is what keeps "restore an
+        // older backup onto an already-updated installation", the ordinary
+        // cross-machine case (the plan's Overview), from landing on data nothing
+        // can ever open again.
+        if archive_version < installed_version {
+            let installed_manifest = manifest::load(&app_dir)?.manifest;
+            let toolchain = php::toolchain(paths)?;
+            install::prepare(
+                paths,
+                &toolchain,
+                &installed_manifest,
+                &app_dir,
+                LifecycleEvent::Update,
+                &entry.platform,
+            )?;
+        }
+        stop_at("import_migrated")?;
+
+        let mut committed = intent.clone();
+        committed.phase = import_transaction::ImportPhase::Committed;
+        import_transaction::write_intent(&data_dir, &committed).map_err(|source| {
+            PortabilityError::Io {
+                path: import_transaction::intent_path(&data_dir),
+                source: io::Error::other(source.to_string()),
+            }
+        })?;
+        stop_at("import_committed")?;
+        Ok(())
+    })();
+
+    match mutation {
+        Ok(()) => {}
+        // The deterministic kill stand-in skips the back-out on purpose: a
+        // stop must leave exactly what a kill leaves.
+        Err(error) if is_test_stop(&error) => return Err(error),
+        Err(error) => {
+            let detail = error.to_string();
+            return match import_transaction::back_out(&data_dir, &data_subdir, &intent) {
+                Ok(()) => Err(PortabilityError::ImportReverted { detail }),
+                Err(backed_out) => Err(PortabilityError::ImportInterrupted {
+                    id: id.to_string(),
+                    detail: backed_out.to_string(),
+                }),
+            };
+        }
+    }
+
+    // The committed import's cleanup: consume the rollback anchor (an
+    // import proceeding has already made it incoherent — see the Overview),
+    // the tree any interrupted update left staged, the staging directory,
+    // and the intent itself. An error here is not a failure of the import —
+    // the data is in place and the version record written — but the intent
+    // it leaves behind is exactly what `repair` finishes from.
+    import_transaction::finish_import(&data_subdir, &data_dir, &app_dir).map_err(|source| {
+        PortabilityError::ImportInterrupted {
+            id: id.to_string(),
+            detail: source.to_string(),
+        }
+    })?;
+
+    if let Some((_, rescue)) = intent.db_rescues.iter().find(|(name, _)| name == "app.db") {
         println!(
             "The database being replaced was saved to {}.",
-            rescue_path.display()
+            rescue.display()
         );
     }
-    if let Some(uploads_rescue_path) = uploads_rescue_path {
+    if let Some(rescue) = &intent.uploads_rescue {
         println!(
             "The uploads/ directory being replaced was saved to {}.",
-            uploads_rescue_path.display()
+            rescue.display()
         );
     }
-    if migrated_forward {
+    if archive_version < installed_version {
         println!(
             "Imported into {id} at {} and migrated forward to {} — the archive was older than \
              the installed app, so pre-update then post-update ran on it.",
@@ -886,6 +890,34 @@ fn run_import(
     );
 
     Ok(true)
+}
+
+/// The deterministic kill stand-in, on `update`'s own thread-local so one
+/// `arm` covers every pipeline: the error is an [`PortabilityError::Io`]
+/// carrying `import_transaction`'s own stop payload, so [`is_test_stop`] can
+/// tell it from a real failure and skip the in-process back-out — a stop
+/// must leave exactly what a kill leaves, for `repair` to resolve.
+#[cfg(test)]
+fn stop_at(point: &'static str) -> Result<(), PortabilityError> {
+    import_transaction::stop_at(point).map_err(|source| PortabilityError::Io {
+        path: PathBuf::from(format!("test stop point: {point}")),
+        source,
+    })
+}
+
+#[cfg(not(test))]
+fn stop_at(_point: &'static str) -> Result<(), PortabilityError> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn is_test_stop(error: &PortabilityError) -> bool {
+    matches!(error, PortabilityError::Io { source, .. } if import_transaction::is_test_stop(source))
+}
+
+#[cfg(not(test))]
+fn is_test_stop(_error: &PortabilityError) -> bool {
+    false
 }
 
 /// Read and parse `manifest.json` out of the archive at `archive_path`,
@@ -955,66 +987,6 @@ fn announce_overwrite(id: &str, data_dir: &Path, installed_version: &str, archiv
     );
 }
 
-/// Copy the *current* database aside, before it is overwritten by the
-/// archive's — a manual-recovery artefact, never auto-restored. Returns
-/// `app.db`'s own rescue path, the one named on screen; `None` when there was
-/// nothing to save (an app that never got as far as creating a database).
-///
-/// `rollback.rs`'s own `rescue_dump`, duplicated rather than shared: both are
-/// small, module-private pipeline steps over the same
-/// [`lifecycle::copy_rescue_dump`], and the two commands' error types differ.
-fn rescue_dump(data_subdir: &Path) -> Result<Option<PathBuf>, PortabilityError> {
-    let mut app_db_rescue = None;
-    for name in lifecycle::DB_FILE_NAMES {
-        let source = data_subdir.join(name);
-        if !source.is_file() {
-            continue;
-        }
-        let rescue = lifecycle::copy_rescue_dump(data_subdir, name).map_err(|error| {
-            PortabilityError::Io {
-                path: error.path,
-                source: error.source,
-            }
-        })?;
-        if name == "app.db" {
-            app_db_rescue = Some(rescue);
-        }
-    }
-    Ok(app_db_rescue)
-}
-
-/// Rename an existing, non-empty `uploads/` aside to
-/// `uploads.rescue-<YYYYMMDDTHHMMSSZ>`, following the same naming and
-/// collision rule `app.db.rescue-*` uses (plan 027). A rename, not a copy —
-/// unlike [`rescue_dump`], nothing afterwards needs the source gone on its
-/// own account, but a directory of uploads can be gigabytes and copying it
-/// would make every forced import pay for a case nobody asked for (the
-/// plan's Overview). `None` when there was nothing to rescue: an absent or
-/// empty `uploads/` needs no rescue, and extraction alone seeds it.
-fn rescue_uploads(data_dir: &Path) -> Result<Option<PathBuf>, PortabilityError> {
-    let uploads_dir = data_dir.join(UPLOADS_DIR);
-    let non_empty = match fs::read_dir(&uploads_dir) {
-        Ok(mut entries) => entries.next().is_some(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(source) => {
-            return Err(PortabilityError::Io {
-                path: uploads_dir,
-                source,
-            })
-        }
-    };
-    if !non_empty {
-        return Ok(None);
-    }
-    let rescue = lifecycle::move_rescue_dump_dir(data_dir, UPLOADS_DIR).map_err(|error| {
-        PortabilityError::Io {
-            path: error.path,
-            source: error.source,
-        }
-    })?;
-    Ok(Some(rescue))
-}
-
 /// The destination's disposable cache directories — the exact pair the launch
 /// cache policy manages (`app_env::resolve`'s `Mode::Launch` wipe), and never
 /// a third: `uploads/` is durable (decision 006) and `log/`/`sessions/` are
@@ -1038,10 +1010,17 @@ const CACHE_DIR_NAMES: [&str; 2] = ["cache", "build"];
 ///
 /// **Strict, unlike `Mode::Launch`'s best-effort wipe:** a directory the
 /// import could not remove is exactly the stale cache this exists to clear, so
-/// the error stops the import before the rescue phase. An absent path counts
-/// as already cleared, and a top-level symlink is removed as the link it is
-/// rather than traversed into whatever it points at.
-fn clear_destination_cache(data_dir: &Path, data_subdir: &Path) -> Result<(), PortabilityError> {
+/// the error stops the import before anything is staged or switched. An
+/// absent path counts as already cleared, and a top-level symlink is removed
+/// as the link it is rather than traversed into whatever it points at.
+///
+/// `pub(crate)` because a backed-out import runs it again on the way out: the
+/// forward migration may have warmed a cache against the archive's database,
+/// and the data going back is the previous one.
+pub(crate) fn clear_destination_cache(
+    data_dir: &Path,
+    data_subdir: &Path,
+) -> Result<(), PortabilityError> {
     lifecycle::discard_cache_stamp(data_subdir).map_err(|source| {
         PortabilityError::CacheCleanup {
             path: lifecycle::cache_stamp_path(data_subdir),
@@ -1074,38 +1053,6 @@ fn clear_destination_cache(data_dir: &Path, data_subdir: &Path) -> Result<(), Po
         })?;
     }
     Ok(())
-}
-
-/// Remove the live database set after [`rescue_dump`] has copied it aside and
-/// before an archive writes its replacement. Extraction only creates files it
-/// carries, so leaving an old WAL or SHM beside an archive that has only the
-/// main database could silently replay transactions from the replaced one.
-fn remove_live_db_files(data_subdir: &Path) -> Result<(), PortabilityError> {
-    for name in lifecycle::DB_FILE_NAMES {
-        let path = data_subdir.join(name);
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(PortabilityError::Io { path, source }),
-        }
-    }
-    Ok(())
-}
-
-fn import_incomplete(
-    data_subdir: &Path,
-    db_rescue_path: Option<&Path>,
-    uploads_rescue_path: Option<&Path>,
-    data_state: &'static str,
-    source: impl std::fmt::Display,
-) -> PortabilityError {
-    PortabilityError::ImportIncomplete {
-        data_subdir: data_subdir.to_path_buf(),
-        db_rescue_path: db_rescue_path.map(Path::to_path_buf),
-        uploads_rescue_path: uploads_rescue_path.map(Path::to_path_buf),
-        data_state,
-        detail: source.to_string(),
-    }
 }
 
 /// Which command [`PortabilityError::Busy`] was refusing — its message names
@@ -1169,9 +1116,9 @@ pub enum PortabilityError {
     /// [`import_decision`] refused.
     Refused(ImportRefusal),
     /// An import stopped while clearing the destination's disposable cache,
-    /// before the rescue/replacement boundary — the one import failure where
+    /// before the staging/intent boundary — the one import failure where
     /// no persistent data has been touched, which is why it is not an
-    /// [`PortabilityError::ImportIncomplete`]: the database, `uploads/`, the
+    /// [`PortabilityError::ImportInterrupted`]: the database, `uploads/`, the
     /// recorded version and the rollback anchor are all still exactly as the
     /// preflight found them. What may have changed is the cache cleanup
     /// itself, and `stamp_discarded` says how far it got: `false` means the
@@ -1184,15 +1131,27 @@ pub enum PortabilityError {
         stamp_discarded: bool,
         source: io::Error,
     },
-    /// An import failed after its rescue dump was safely taken. The ordinary
-    /// error alone is not enough: the caller also needs to know the state now
-    /// left on disk and where the data it replaced can be recovered — both
-    /// halves of it, the database and (since plan 049) `uploads/`.
-    ImportIncomplete {
-        data_subdir: PathBuf,
-        db_rescue_path: Option<PathBuf>,
-        uploads_rescue_path: Option<PathBuf>,
-        data_state: &'static str,
+    /// An import stopped while extracting the archive into staging — the
+    /// one failure after the cache cleanup that touched nothing live: no
+    /// intent was written, no member moved, so there is nothing to repair
+    /// and nothing to back out. The staging directory was removed again on
+    /// the way out, and the next import clears any leftover regardless.
+    Extraction {
+        detail: String,
+    },
+    /// An import failed after its intent was written, and the in-process
+    /// back-out put the data it replaced back: nothing changed, and the
+    /// archive can be fixed and imported again.
+    ImportReverted {
+        detail: String,
+    },
+    /// An import stopped partway and left its intent behind: either killed
+    /// (a stop leaves exactly what a kill leaves), or failed past the point
+    /// the in-process back-out could no longer finish. Every other command
+    /// refuses until `repair <id>` has resolved it — putting the replaced
+    /// data back before the commit, finishing the import after it.
+    ImportInterrupted {
+        id: String,
         detail: String,
     },
 }
@@ -1293,38 +1252,21 @@ impl fmt::Display for PortabilityError {
                     path.display()
                 )
             }
-            Self::ImportIncomplete {
-                data_subdir,
-                db_rescue_path,
-                uploads_rescue_path,
-                data_state,
-                detail,
-            } => {
-                write!(
-                    formatter,
-                    "import did not finish: {detail}. {data_state} in {}",
-                    data_subdir.display()
-                )?;
-                match db_rescue_path {
-                    Some(path) => write!(
-                        formatter,
-                        "; the database it replaced was saved to {}",
-                        path.display()
-                    )?,
-                    None => write!(formatter, "; no existing database needed a rescue dump")?,
-                }
-                match uploads_rescue_path {
-                    Some(path) => write!(
-                        formatter,
-                        "; the uploads/ directory it replaced was saved to {}",
-                        path.display()
-                    ),
-                    None => write!(
-                        formatter,
-                        "; no existing uploads/ directory needed a rescue"
-                    ),
-                }
-            }
+            Self::Extraction { detail } => write!(
+                formatter,
+                "import stopped while extracting the archive into staging ({detail}) — the \
+                 database, uploads/, the version record and the rollback anchor are all \
+                 untouched, and the leftover staging is cleared by the next import"
+            ),
+            Self::ImportReverted { detail } => write!(
+                formatter,
+                "the import failed ({detail}); the previous data was put back — nothing changed."
+            ),
+            Self::ImportInterrupted { id, detail } => write!(
+                formatter,
+                "the import of {id} stopped partway ({detail}); run `tfsapp-hub repair {id} --yes` \
+                 to resolve it"
+            ),
         }
     }
 }

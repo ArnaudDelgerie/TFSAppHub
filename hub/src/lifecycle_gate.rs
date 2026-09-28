@@ -5,10 +5,10 @@
 //!
 //! Holding a lease is also what makes the interrupted-operation guard true:
 //! every holder re-reads the records of the identifier's data directory —
-//! the update journal, the rollback marker — while it owns the lease, so a
-//! record a killed command left behind refuses the next operation no
-//! matter which side of the dispatch check it arrived from. Each record
-//! exempts only the command that resolves it.
+//! the update journal, the import intent, the rollback marker — while it owns
+//! the lease, so a record a killed command left behind refuses the next
+//! operation no matter which side of the dispatch check it arrived from.
+//! Each record exempts only the command that resolves it.
 
 use std::{
     fmt, fs, io,
@@ -16,6 +16,7 @@ use std::{
 };
 
 use crate::{
+    import_transaction,
     paths::{Paths, PathsError},
     registry, rollback, update_transaction,
 };
@@ -24,6 +25,26 @@ use crate::{
 pub enum GateDecision {
     Granted,
     Busy { operation: Option<String> },
+}
+
+/// Which interrupted operation a data directory is waiting on — both of its
+/// records resolve through the same `repair <id>`, so they share a refusal,
+/// but the message still names which one, because what repair will *do*
+/// differs: an update is finished or reverted, an import is finished or the
+/// data it replaced is put back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interrupted {
+    Update,
+    Import,
+}
+
+impl fmt::Display for Interrupted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Update => write!(formatter, "update"),
+            Self::Import => write!(formatter, "import"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -37,15 +58,16 @@ pub enum GateError {
         identifier: String,
         operation: Option<String>,
     },
-    /// The identifier's data directory holds an update journal, so the
-    /// operation being gated would run over an interrupted update (see
-    /// `contract/6-lifecycle.md`, "An interrupted update requires an
-    /// explicit repair"). `id` is the registry's answer for who owns that
-    /// journal, resolved best-effort: the refusal needs nothing but the
-    /// journal's presence, the id only makes the message actionable.
+    /// The identifier's data directory holds an interrupted-operation record
+    /// that only `repair` resolves — the update journal (see
+    /// `contract/6-lifecycle.md`, "An interrupted update requires an explicit
+    /// repair") or an import intent. `id` is the registry's answer for who
+    /// owns that record, resolved best-effort: the refusal needs nothing but
+    /// the record's presence, the id only makes the message actionable.
     RepairRequired {
         identifier: String,
         id: Option<String>,
+        interrupted: Interrupted,
     },
     /// The identifier's data directory holds a rollback marker: a rollback
     /// stopped partway through, and the only way out is running `rollback`
@@ -84,17 +106,22 @@ impl fmt::Display for GateError {
                     "{identifier} is busy with another lifecycle operation"
                 )
             }
-            Self::RepairRequired { id: Some(id), .. } => write!(
+            Self::RepairRequired {
+                id: Some(id),
+                interrupted,
+                ..
+            } => write!(
                 formatter,
-                "{id} has an interrupted update; run `tfsapp-hub repair {id} --yes` first."
+                "{id} has an interrupted {interrupted}; run `tfsapp-hub repair {id} --yes` first."
             ),
             Self::RepairRequired {
                 identifier,
                 id: None,
+                interrupted,
             } => write!(
                 formatter,
-                "{identifier} has an interrupted update; run `tfsapp-hub repair <id> --yes` on \
-                 the app that owns it first."
+                "{identifier} has an interrupted {interrupted}; run `tfsapp-hub repair <id> --yes` \
+                 on the app that owns it first."
             ),
             Self::RollbackRequired { id: Some(id), .. } => write!(
                 formatter,
@@ -178,10 +205,11 @@ fn gate_path(paths: &Paths, identifier: &str) -> Result<PathBuf, GateError> {
 /// still seen by whoever actually holds the lease.
 ///
 /// `operation` is the maintenance operation being gated, or `None` for an
-/// activity lease (whose holder runs no named operation). Two exemptions,
-/// each belonging to its own record: `repair` may pass an update journal
-/// (finishing or reverting the interrupted update is its whole job), and
-/// `rollback` may pass a rollback marker (finishing the interrupted
+/// activity lease (whose holder runs no named operation). Three records,
+/// each checked in a fixed order and each exempting only the command that
+/// resolves it: `repair` may pass an update journal or an import intent
+/// (finishing or reverting the interrupted operation is its whole job),
+/// and `rollback` may pass a rollback marker (finishing the interrupted
 /// rollback is its). A rollback marker refuses `repair` like anything
 /// else: repair knows nothing about a rollback's steps.
 ///
@@ -208,6 +236,24 @@ fn refuse_if_interrupted(
             return Err(GateError::RepairRequired {
                 identifier: identifier.to_string(),
                 id: owner(),
+                interrupted: Interrupted::Update,
+            })
+        }
+        Err(source) => {
+            return Err(GateError::Journal {
+                identifier: identifier.to_string(),
+                source,
+            })
+        }
+    }
+    match import_transaction::read_intent(&data_dir) {
+        Ok(None) => {}
+        Ok(Some(_)) if operation == Some("repair") => {}
+        Ok(Some(_)) => {
+            return Err(GateError::RepairRequired {
+                identifier: identifier.to_string(),
+                id: owner(),
+                interrupted: Interrupted::Import,
             })
         }
         Err(source) => {
@@ -383,9 +429,14 @@ mod tests {
         // No registry: the refusal stands on the journal alone, so the id is
         // only `None` — the message points at `<id>` instead of naming one.
         match acquire_maintenance(&paths, "dev.local.demo", "export") {
-            Err(GateError::RepairRequired { identifier, id }) => {
+            Err(GateError::RepairRequired {
+                identifier,
+                id,
+                interrupted,
+            }) => {
                 assert_eq!(identifier, "dev.local.demo");
                 assert_eq!(id, None);
+                assert_eq!(interrupted, Interrupted::Update);
             }
             Err(other) => panic!("the journal must refuse, not {other:?}"),
             Ok(_) => panic!("the journal must refuse the export"),

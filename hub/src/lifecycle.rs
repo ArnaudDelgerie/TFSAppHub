@@ -466,26 +466,21 @@ fn copy_rescue_dump_at(source_path: &Path, base: &Path) -> Result<PathBuf, Rescu
     unreachable!("a u32 suffix range never ends")
 }
 
-/// Rename `data_dir`/`name` aside to `<name>.rescue-<timestamp>`, the same
-/// naming and collision-avoidance rule [`copy_rescue_dump`] uses — a rename
-/// rather than a copy, for a caller whose rescued thing is a directory (or
-/// otherwise too large to double), where `import`'s own reason to copy
-/// rather than move the database (`remove_live_db_files` unlinks it right
-/// after) does not apply (plan 049 / decision 006).
+/// The first free rescue name for `dir`/`name` under the same `<name>.rescue-
+/// <timestamp>[-N]` pattern [`copy_rescue_dump`] uses — a *reservation*, not
+/// a move: the caller records the returned path in the durable intent it is
+/// about to write, and only renames onto it afterwards. Reserving before the
+/// record exists is what makes the record already name where everything will
+/// go; under the maintenance lease, nothing else creates these names.
 ///
-/// The exclusive check here is not atomic against a concurrent claimant the
-/// way [`copy_rescue_dump`]'s `create_new` is — `rename(2)` has no equivalent
+/// The exclusive check is not atomic against a concurrent claimant the way
+/// [`copy_rescue_dump`]'s `create_new` is — `rename(2)` has no equivalent
 /// reservation for a target that must not already exist — but the caller
 /// holds the maintenance lease for the whole pipeline, so a to-the-second
-/// collision between two of *its own* rescues is the only case this loop
+/// collision between two of *its own* rescues is the only case the suffix
 /// exists to survive.
-pub fn move_rescue_dump_dir(data_dir: &Path, name: &str) -> Result<PathBuf, RescueDumpError> {
-    let source_path = data_dir.join(name);
-    let base = rescue_dump_base(data_dir, name);
-    move_rescue_dump_dir_at(&source_path, &base)
-}
-
-fn move_rescue_dump_dir_at(source_path: &Path, base: &Path) -> Result<PathBuf, RescueDumpError> {
+pub fn reserve_rescue_name(dir: &Path, name: &str) -> PathBuf {
+    let base = rescue_dump_base(dir, name);
     for suffix in 1_u32.. {
         let candidate = match suffix {
             1 => base.to_path_buf(),
@@ -494,15 +489,9 @@ fn move_rescue_dump_dir_at(source_path: &Path, base: &Path) -> Result<PathBuf, R
                 base.file_name().unwrap().to_string_lossy()
             )),
         };
-        if candidate.exists() {
-            continue;
+        if !candidate.exists() {
+            return candidate;
         }
-        return fs::rename(source_path, &candidate)
-            .map(|()| candidate.clone())
-            .map_err(|source| RescueDumpError {
-                path: candidate,
-                source,
-            });
     }
     unreachable!("a u32 suffix range never ends")
 }

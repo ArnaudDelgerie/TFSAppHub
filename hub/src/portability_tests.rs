@@ -10,7 +10,7 @@ use super::{
     UPLOADS_DIR,
 };
 use crate::{
-    install, lifecycle, lifecycle_gate,
+    import_transaction, install, lifecycle, lifecycle_gate,
     paths::Paths,
     registry::{self, Platform, RegistryEntry, Source, SourceKind, State},
     run,
@@ -792,6 +792,30 @@ fn append_raw_path(
     }
     header.set_cksum();
     builder.append(&header, content).expect("append raw entry");
+}
+
+/// Append a symlink entry — `archive_tests.rs`'s own fixture trick,
+/// duplicated here rather than shared, for the one forged archive only
+/// `extract_prefix` can refuse: `check_payload` cannot see link targets, so
+/// an escaping symlink passes the preflight and fails the staging extraction
+/// instead.
+fn append_symlink(
+    builder: &mut tar::Builder<flate2::write::GzEncoder<fs::File>>,
+    path: &str,
+    target: &str,
+) {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_size(0);
+    header.set_mode(0o777);
+    header.set_path(path).expect("a valid symlink path");
+    header
+        .set_link_name(target)
+        .expect("a valid symlink target");
+    header.set_cksum();
+    builder
+        .append(&header, std::io::empty())
+        .expect("append symlink");
 }
 
 #[test]
@@ -1810,6 +1834,226 @@ fn an_unremovable_cache_directory_stops_the_import_with_the_stamp_already_gone()
 
 // --- import migrates an older archive forward --------------------------
 
+// --- the import transaction: staging, intent, kills (plan 064) ----------
+
+/// The stop points up to the version record — everything an equal-version
+/// import runs before the migration, so no PHP is needed to reach any of
+/// them. `import_migrated` and `import_committed` need a migration fixture
+/// and belong to the repair tests instead.
+const IMPORT_STOP_POINTS: [&str; 5] = [
+    "import_staged",
+    "import_db_rescued",
+    "import_uploads_rescued",
+    "import_switched",
+    "import_version_written",
+];
+
+/// The live installation an import interrupts: a database with a WAL twin, a
+/// populated `uploads/`, a version record and a complete rollback anchor —
+/// everything the intent is about to record and rename aside.
+fn interrupted_import_fixture() -> (tempfile::TempDir, Paths, std::path::PathBuf) {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    seed_persistent_state(&data_dir, &data_subdir, &app_dir);
+    fs::write(data_subdir.join("app.db-wal"), b"stale transactions").expect("a WAL twin");
+    (base, paths, data_dir)
+}
+
+#[test]
+fn a_killed_import_leaves_an_intent_that_refuses_every_other_command() {
+    for point in IMPORT_STOP_POINTS {
+        let (base, paths, data_dir) = interrupted_import_fixture();
+        let archive = base.path().join("backup.tar.gz");
+        write_test_archive(
+            &archive,
+            &[
+                (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+                (&format!("{DATA_DIR}/app.db"), b"archive database"),
+                (&format!("{UPLOADS_DIR}/new.txt"), b"new upload"),
+            ],
+        );
+
+        crate::update::test_stop::arm(point);
+        let error = run_import(&paths, "demo", &archive, true, true)
+            .expect_err("the stop point should have fired");
+        crate::update::test_stop::disarm();
+        assert!(
+            matches!(error, PortabilityError::Io { .. }),
+            "{point}: {error}"
+        );
+        assert!(
+            import_transaction::read_intent(&data_dir)
+                .expect("a readable intent")
+                .is_some(),
+            "{point}: the stop must leave the intent behind"
+        );
+
+        // The intent refuses every other command until repair resolves it —
+        // export here, as the one with no side effects of its own.
+        let export_target = base.path().join("refused.tar.gz");
+        match run_export(&paths, "demo", &export_target) {
+            Err(PortabilityError::Gate(lifecycle_gate::GateError::RepairRequired {
+                interrupted,
+                ..
+            })) => {
+                assert_eq!(
+                    interrupted,
+                    lifecycle_gate::Interrupted::Import,
+                    "{point}: the refusal must name the import"
+                );
+            }
+            Err(other) => panic!("{point}: the intent must refuse the export, not {other}"),
+            Ok(()) => panic!("{point}: the intent must refuse the export"),
+        }
+        assert!(
+            !export_target.exists(),
+            "{point}: a refused export writes nothing"
+        );
+    }
+}
+
+#[test]
+fn an_import_whose_extraction_fails_leaves_the_live_data_untouched() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join(DATA_DIR);
+    fs::create_dir_all(&data_subdir).expect("a data subdir");
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    seed_persistent_state(&data_dir, &data_subdir, &app_dir);
+    // A forged `uploads/` entry only the extraction refuses: the preflight
+    // cannot see link targets, so the archive passes `check_payload` and
+    // fails in `extract_prefix` instead — the one failure between the cache
+    // cleanup and the intent.
+    let archive = base.path().join("backup.tar.gz");
+    let file = fs::File::create(&archive).expect("create archive file");
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        file,
+        flate2::Compression::fast(),
+    ));
+    append_bytes(
+        &mut builder,
+        MANIFEST_FILE,
+        &manifest_json("dev.local.demo", "1.2.3"),
+    )
+    .expect("manifest entry");
+    append_bytes(
+        &mut builder,
+        format!("{DATA_DIR}/app.db"),
+        b"archive database",
+    )
+    .expect("database entry");
+    append_symlink(&mut builder, &format!("{UPLOADS_DIR}/evil"), "../outside");
+    let encoder = builder.into_inner().expect("finish tar layer");
+    encoder.finish().expect("finish gzip layer");
+
+    let error = run_import(&paths, "demo", &archive, true, true)
+        .expect_err("the escaping symlink is refused mid-extraction");
+    assert!(
+        matches!(error, PortabilityError::Extraction { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("untouched"), "{error}");
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("the live database"),
+        b"the live database",
+        "the live database must be byte-identical"
+    );
+    assert_eq!(
+        fs::read(data_dir.join(UPLOADS_DIR).join("old.txt")).expect("the live upload"),
+        b"an existing upload",
+        "the live uploads/ must be byte-identical"
+    );
+    assert!(
+        !import_transaction::staging_dir(&data_dir).exists(),
+        "a failed extraction leaves no staging behind"
+    );
+    assert!(
+        import_transaction::read_intent(&data_dir)
+            .expect("a readable intent")
+            .is_none(),
+        "a failed extraction leaves no intent behind — there is nothing to repair"
+    );
+}
+
+#[test]
+fn a_stale_staging_directory_from_a_killed_extraction_is_cleared_by_the_next_import() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let staging = import_transaction::staging_dir(&data_dir);
+    fs::create_dir_all(staging.join(DATA_DIR)).expect("a stale staged tree");
+    fs::write(
+        staging.join(DATA_DIR).join("half-of-a-database"),
+        b"an extraction that was killed midway",
+    )
+    .expect("a partial file");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{DATA_DIR}/app.db"), b"seeded"),
+        ],
+    );
+
+    let proceeded = run_import(&paths, "demo", &archive, false, true)
+        .expect("a stale staging directory with no intent cannot refuse an import");
+
+    assert!(proceeded);
+    assert!(
+        !staging.exists(),
+        "the next import clears the stale staging before extracting"
+    );
+    assert_eq!(
+        fs::read(data_dir.join("data/app.db")).expect("the imported database"),
+        b"seeded"
+    );
+}
+
+#[test]
+fn an_intent_refuses_activity_and_every_operation_but_repair() {
+    let (_base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+    let data_dir = paths.app_data_dir("dev.local.demo").expect("a data dir");
+    fs::create_dir_all(&data_dir).expect("a data dir");
+    // Seeded through the real writer so the guard reads exactly what a
+    // killed import left behind; the content itself is inert here — only
+    // the record's presence drives the gate.
+    import_transaction::write_intent(
+        &data_dir,
+        &import_transaction::ImportIntent {
+            format_version: import_transaction::FORMAT_VERSION,
+            phase: import_transaction::ImportPhase::Staged,
+            archive_version: "1.2.3".to_string(),
+            outgoing_version: Some("1.2.3".to_string()),
+            db_rescues: Vec::new(),
+            uploads_rescue: None,
+        },
+    )
+    .expect("a seeded intent");
+
+    assert!(matches!(
+        lifecycle_gate::acquire_activity(&paths, "dev.local.demo"),
+        Err(lifecycle_gate::GateError::RepairRequired {
+            interrupted: lifecycle_gate::Interrupted::Import,
+            ..
+        })
+    ));
+    assert!(matches!(
+        lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "export"),
+        Err(lifecycle_gate::GateError::RepairRequired { .. })
+    ));
+    assert!(
+        lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "repair").is_ok(),
+        "repair is the one command that resolves an intent"
+    );
+}
+
 /// A fixture app whose `bin/console` records what it was asked to do —
 /// `install_tests.rs`'s/`update_tests.rs`'s own `runnable_app_tree`,
 /// self-contained per this file's own convention (`seeded_entry`'s doc)
@@ -2022,7 +2266,7 @@ fn an_archive_older_than_the_installed_app_is_migrated_forward_on_import() {
 }
 
 #[test]
-fn a_failed_forward_migration_leaves_the_archive_version_and_names_the_rescue() {
+fn a_failed_forward_migration_backs_the_import_out_in_process() {
     if !resources_present() {
         return;
     }
@@ -2043,9 +2287,27 @@ fn a_failed_forward_migration_leaves_the_archive_version_and_names_the_rescue() 
 
     let data_dir = base.path().join("TFSApp/dev.local.demo");
     let data_subdir = data_dir.join("data");
+    let app_dir = paths.app_dir("demo").expect("an app dir");
     fs::write(data_subdir.join("app.db"), b"before import").expect("an existing database");
-    // The previous derived state: a failed migration must not leave any of
-    // it behind for a later launch or command to reuse.
+    // The rollback anchor is only discarded once an import commits, so a
+    // backed-out one must leave all three halves exactly where they were.
+    lifecycle::write_rollback_anchor(
+        &data_subdir,
+        &lifecycle::RollbackAnchor {
+            app_version: "1.2.0".to_string(),
+            source_revision: "sha256:previous".to_string(),
+            created_at: registry::now_timestamp(),
+        },
+    )
+    .expect("a seeded anchor");
+    fs::write(
+        lifecycle::db_snapshot_path(&data_subdir, "app.db"),
+        b"pre-update-snapshot",
+    )
+    .expect("a seeded db snapshot");
+    fs::create_dir_all(lifecycle::previous_tree_path(&app_dir)).expect("a retained tree");
+    // The previous derived state: the back-out's cache cleanup must not
+    // leave any of it behind for a later launch or command to reuse.
     fs::write(
         data_dir.join("cache/sentinel"),
         b"derived from the previous database",
@@ -2073,22 +2335,48 @@ fn a_failed_forward_migration_leaves_the_archive_version_and_names_the_rescue() 
         .expect_err("the fixture's pre-update hook fails");
     let message = error.to_string();
     assert!(
-        matches!(error, PortabilityError::ImportIncomplete { .. }),
+        matches!(error, PortabilityError::ImportReverted { .. }),
         "{message}"
     );
     assert!(
-        message.contains("extracted but not migrated forward"),
-        "{message}"
+        message.contains("nothing changed"),
+        "the refusal must say the previous data was put back: {message}"
     );
-    assert!(message.contains("app.db.rescue-"), "{message}");
     assert_eq!(
-        lifecycle::read_data_version(&data_subdir).expect("the stamped config"),
-        Some("1.2.0".to_string()),
-        "the next open must see the unfinished forward migration"
+        fs::read(data_subdir.join("app.db")).expect("the live database"),
+        b"before import",
+        "the back-out puts the pre-import database back"
+    );
+    assert_eq!(
+        lifecycle::read_data_version(&data_subdir).expect("the version record"),
+        Some("1.3.0".to_string()),
+        "the back-out rewrites the outgoing version over the archive's stamp"
+    );
+    assert!(
+        lifecycle::read_rollback_anchor(&data_subdir).is_some(),
+        "the anchor's rollback.json half must be untouched"
+    );
+    assert!(
+        lifecycle::db_snapshot_path(&data_subdir, "app.db").is_file(),
+        "the anchor's database-snapshot half must be untouched"
+    );
+    assert!(
+        lifecycle::previous_tree_path(&app_dir).is_dir(),
+        "the anchor's retained-tree half must be untouched"
+    );
+    assert!(
+        import_transaction::read_intent(&data_dir)
+            .expect("a readable intent")
+            .is_none(),
+        "the back-out removes the intent — nothing is left to repair"
+    );
+    assert!(
+        !import_transaction::staging_dir(&data_dir).exists(),
+        "the back-out removes the staging directory"
     );
     assert!(
         !data_dir.join("cache/sentinel").exists() && !data_dir.join("build/sentinel").exists(),
-        "the old cache/build sentinels must not survive a failed migration"
+        "the old cache/build sentinels must not survive a backed-out migration"
     );
     assert!(
         !lifecycle::cache_stamp_path(&data_subdir).exists(),
