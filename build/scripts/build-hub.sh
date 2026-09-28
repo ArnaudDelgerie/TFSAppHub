@@ -32,6 +32,15 @@ if [[ -z "$VERSION" ]]; then
   exit 1
 fi
 
+# The revision this build is of, captured before cargo runs, so the record
+# written beside the AppImage names the tree that produced it. A dirty tree
+# is still built — a local build stays free — but marked as such (untracked
+# files count, ignored ones don't).
+REVISION="$(git -C "$ROOT_DIR" rev-parse HEAD)"
+if [[ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]]; then
+  REVISION="$REVISION-dirty"
+fi
+
 (cd "$HUB_DIR" && cargo tauri build --bundles appimage)
 
 # The workspace's shared target/, not hub/target/ — hub/ is a member of the
@@ -48,7 +57,16 @@ if [[ ${#appimages[@]} -ne 1 ]]; then
 fi
 APPIMAGE="${appimages[0]}"
 
+# The file was just rebuilt, so any record left beside it from an earlier
+# build of this version is stale — remove it before the fix pass, and write
+# the fresh one only after that pass succeeds.
+rm -f "${APPIMAGE%.AppImage}.source-commit"
+
 "$ROOT_DIR/build/scripts/fix-appimage-bundle.sh" "$APPIMAGE"
+
+# Where this AppImage came from — release.sh reads it before offering the
+# build for reuse, and re-checks it just before publishing.
+printf '%s\n' "$REVISION" >"${APPIMAGE%.AppImage}.source-commit"
 
 SIZE="$(du -h "$APPIMAGE" | cut -f1)"
 echo "Built $APPIMAGE ($SIZE)"

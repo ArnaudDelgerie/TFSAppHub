@@ -85,6 +85,16 @@ assert_equals() { # assert_equals <description> <actual> <expected>
   echo "  assertion failed: $desc (got '$actual', expected '$expected')" >&2
   CASE_STATUS=1
 }
+assert_file_content() { # assert_file_content <description> <path> <expected>
+  local desc="$1" path="$2" expected="$3" actual=""
+  if [[ ! -f "$path" ]]; then
+    echo "  assertion failed: $desc ($path does not exist)" >&2
+    CASE_STATUS=1
+    return
+  fi
+  actual="$(<"$path")"
+  assert_equals "$desc" "$actual" "$expected"
+}
 
 case_result() { # case_result <name> — one line per case on stdout
   if [[ "$CASE_STATUS" -eq 0 ]]; then
@@ -159,6 +169,14 @@ EOF
 set -u
 echo "cargo $*" >>"$FAKE_BIN_LOG"
 if [[ "${1:-}" == "tauri" && "${2:-}" == "build" ]]; then
+  # Optional move, to prove release.sh re-checks the tree just before
+  # publishing: dirty a tracked file, or commit it and move HEAD.
+  if [[ "${FAKE_CARGO_MOVE:-}" == "dirty" ]]; then
+    printf 'moved during build\n' >>"$PWD/../CHANGELOG.md"
+  elif [[ "${FAKE_CARGO_MOVE:-}" == "commit" ]]; then
+    printf 'moved during build\n' >>"$PWD/../CHANGELOG.md"
+    git -C "$PWD/.." commit -q -am "moved during build"
+  fi
   version="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "$PWD/Cargo.toml")"
   out="$PWD/../target/release/bundle/appimage"
   mkdir -p "$out"
@@ -209,6 +227,10 @@ plant_appimage() { # plant_appimage <version> <content> — a pre-existing build
   printf '%s\n' "$2" >"$dir/TFSAppHub_${1}_amd64.AppImage"
 }
 
+write_record() { # write_record <version> <revision> — a planted .source-commit
+  printf '%s\n' "$2" >"$TREE/target/release/bundle/appimage/TFSAppHub_${1}_amd64.source-commit"
+}
+
 tree_head() { git -C "$TREE" rev-parse HEAD; }
 
 # The script under test runs with its stdout and stderr captured, so a case
@@ -226,7 +248,8 @@ run_release() { # run_release <stdin> — release.sh inside the tree
   (
     cd "$TREE"
     printf '%s' "$1" \
-      | env FAKE_BIN_LOG="$LOG" PATH="$FAKEBIN:$PATH" ./build/scripts/release.sh
+      | env FAKE_BIN_LOG="$LOG" FAKE_CARGO_MOVE="${FAKE_CARGO_MOVE:-}" \
+          PATH="$FAKEBIN:$PATH" ./build/scripts/release.sh
   ) >"$CASE_DIR/run.out" 2>"$CASE_DIR/run.err"
 }
 
@@ -260,9 +283,168 @@ case_fix_stub_gets_current_version_only() {
   case_result "only the current version's AppImage reaches the fix stub"
 }
 
+# --- Step 2: provenance — clean, pushed, recorded, re-checked, named ----------
+
+case_build_records_head() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  if run_build ""; then
+    assert_file_content "the record is HEAD on a clean tree" \
+      "$TREE/target/release/bundle/appimage/TFSAppHub_0.3.0_amd64.source-commit" \
+      "$(tree_head)"
+  else
+    echo "  assertion failed: build-hub.sh exited non-zero" >&2
+    CASE_STATUS=1
+  fi
+  case_result "a build on a clean tree records HEAD in .source-commit"
+}
+
+case_build_records_dirty_head() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  printf 'local edit\n' >>"$TREE/CHANGELOG.md"
+  if run_build ""; then
+    assert_file_content "the record is HEAD-dirty on a dirty tree" \
+      "$TREE/target/release/bundle/appimage/TFSAppHub_0.3.0_amd64.source-commit" \
+      "$(tree_head)-dirty"
+  else
+    echo "  assertion failed: build-hub.sh exited non-zero on a dirty tree" >&2
+    CASE_STATUS=1
+  fi
+  case_result "a build on a dirty tree records HEAD-dirty in .source-commit"
+}
+
+case_release_refuses_dirty_tree() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  printf 'local edit\n' >>"$TREE/CHANGELOG.md"
+  if run_release ""; then
+    echo "  assertion failed: release.sh succeeded on a dirty tree" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names the fix (commit or stash)" \
+      'commit or stash' "$CASE_DIR/run.err"
+    assert_no_match "no cargo call" '^cargo ' "$LOG"
+    assert_no_match "no release create" 'release create' "$LOG"
+  fi
+  case_result "release refuses a dirty tree before any gh call"
+}
+
+case_release_refuses_unpushed_commit() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  printf 'local edit\n' >>"$TREE/CHANGELOG.md"
+  git -C "$TREE" commit -q -am "unpushed"
+  if run_release ""; then
+    echo "  assertion failed: release.sh succeeded with an unpushed commit" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names the fix (push)" 'push' "$CASE_DIR/run.err"
+    assert_no_match "no cargo call" '^cargo ' "$LOG"
+    assert_no_match "no release create" 'release create' "$LOG"
+  fi
+  case_result "release refuses a local commit that is not pushed"
+}
+
+case_release_refuses_branch_without_upstream() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  git -C "$TREE" switch -q -c side-branch
+  if run_release ""; then
+    echo "  assertion failed: release.sh succeeded on a branch without an upstream" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names the fix (push)" 'push' "$CASE_DIR/run.err"
+    assert_no_match "no cargo call" '^cargo ' "$LOG"
+    assert_no_match "no release create" 'release create' "$LOG"
+  fi
+  case_result "release refuses a HEAD without an upstream"
+}
+
+case_release_notes_name_the_revision() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  if run_release $'y\n'; then
+    assert_equals "the notes end with Built from owner/TFSAppHub@HEAD" \
+      "$(tail -n 1 "$LOG.notes")" "Built from owner/TFSAppHub@$(tree_head)"
+    assert_match "the changelog section is the notes body" \
+      'Notes body for 0\.3\.0' "$LOG.notes"
+    assert_match "the release was created" 'release create' "$LOG"
+  else
+    echo "  assertion failed: release.sh exited non-zero on a clean, pushed tree" >&2
+    CASE_STATUS=1
+  fi
+  case_result "happy path: the notes end with Built from owner/TFSAppHub@<HEAD>"
+}
+
+case_reuse_when_record_matches_head() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  plant_appimage "0.3.0" "existing build"
+  write_record "0.3.0" "$(tree_head)"
+  if run_release $'y\n'; then
+    assert_no_match "no cargo call — the build was reused" '^cargo ' "$LOG"
+    assert_match "the release was still created" 'release create' "$LOG"
+  else
+    echo "  assertion failed: release.sh exited non-zero reusing a matching build" >&2
+    CASE_STATUS=1
+  fi
+  case_result "a build recorded from HEAD is offered for reuse (y: no rebuild)"
+}
+
+case_rebuild_when_record_differs_or_missing() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  plant_appimage "0.3.0" "existing build"
+  write_record "0.3.0" "0000000000000000000000000000000000000000"
+  if run_release $'y\n'; then
+    assert_match "a differing record forces a rebuild" '^cargo ' "$LOG"
+    assert_match "the release was still created" 'release create' "$LOG"
+  else
+    echo "  assertion failed: release.sh exited non-zero with a differing record" >&2
+    CASE_STATUS=1
+  fi
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  plant_appimage "0.3.0" "existing build"
+  if run_release $'y\n'; then
+    assert_match "a missing record forces a rebuild" '^cargo ' "$LOG"
+    assert_match "the release was still created" 'release create' "$LOG"
+  else
+    echo "  assertion failed: release.sh exited non-zero with a missing record" >&2
+    CASE_STATUS=1
+  fi
+  case_result "a build from another revision (or with no record) is rebuilt without prompting"
+}
+
+case_release_refuses_tree_moved_during_build() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  FAKE_CARGO_MOVE=dirty
+  if run_release $'y\n'; then
+    echo "  assertion failed: release.sh published after cargo dirtied the tree" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names the move" \
+      'the tree moved during the build' "$CASE_DIR/run.err"
+    assert_no_match "no release create" 'release create' "$LOG"
+  fi
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  FAKE_CARGO_MOVE=commit
+  if run_release $'y\n'; then
+    echo "  assertion failed: release.sh published after cargo moved HEAD" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names the move" \
+      'the tree moved during the build' "$CASE_DIR/run.err"
+    assert_no_match "no release create" 'release create' "$LOG"
+  fi
+  FAKE_CARGO_MOVE=
+  case_result "a tree that moved during the build is refused, nothing published"
+}
+
 main() {
   case_build_with_older_appimage
   case_fix_stub_gets_current_version_only
+  case_build_records_head
+  case_build_records_dirty_head
+  case_release_refuses_dirty_tree
+  case_release_refuses_unpushed_commit
+  case_release_refuses_branch_without_upstream
+  case_release_notes_name_the_revision
+  case_reuse_when_record_matches_head
+  case_rebuild_when_record_differs_or_missing
+  case_release_refuses_tree_moved_during_build
   if [[ "$FAILED" -gt 0 ]]; then
     echo "release-chain: $FAILED case(s) failed" >&2
     exit 1

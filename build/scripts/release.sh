@@ -59,15 +59,48 @@ if [[ -z "${RELEASES_REPO:-}" ]]; then
 fi
 
 # --- Preconditions ----------------------------------------------------------
-command -v gh >/dev/null 2>&1 \
-  || die "gh (GitHub CLI) is not installed — see https://cli.github.com"
-gh auth status >/dev/null 2>&1 \
-  || die "gh is not authenticated. Run: gh auth login"
 [[ -f "$CARGO_TOML" ]] || die "hub/Cargo.toml not found at $CARGO_TOML"
 
 APP_VERSION="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "$CARGO_TOML")"
 [[ -n "$APP_VERSION" ]] \
   || die "could not read a \"version\" line from $CARGO_TOML"
+
+# --- Provenance: clean, pushed, pinned ---------------------------------------
+# Local and cheapest first, before any gh call: a release ties its notes, its
+# tag and its binary to one known revision of this tree, the way the app
+# publish path pins a pushed commit. A dirty tree or an unpushed HEAD is
+# refused with the fix named; a detached HEAD has no upstream and is refused
+# the same way. No `git fetch` — the same local knowledge the app gates use.
+if [[ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]]; then
+  die "the working tree is dirty — commit or stash, then release."
+fi
+UPSTREAM="$(git -C "$ROOT_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" \
+  || die "HEAD has no upstream — push the branch, then release."
+if [[ "$(git -C "$ROOT_DIR" rev-list --count '@{u}..HEAD')" -ne 0 ]]; then
+  die "HEAD is not pushed to $UPSTREAM — push, then release."
+fi
+SHA="$(git -C "$ROOT_DIR" rev-parse HEAD)"
+
+# owner/name for the notes' Built from line, from the *raw* remote URL —
+# `git remote get-url` would apply insteadOf and name a stand-in. A
+# non-GitHub URL is kept verbatim.
+UPSTREAM_REMOTE="${UPSTREAM%%/*}"
+REPO_URL="$(git -C "$ROOT_DIR" config --get "remote.${UPSTREAM_REMOTE}.url")" \
+  || die "no URL recorded for remote '$UPSTREAM_REMOTE' — cannot name the source repository."
+REPO_SLUG="$REPO_URL"
+case "$REPO_URL" in
+  https://github.com/*|ssh://git@github.com/*|git@github.com:*)
+    REPO_SLUG="${REPO_SLUG#https://github.com/}"
+    REPO_SLUG="${REPO_SLUG#ssh://git@github.com/}"
+    REPO_SLUG="${REPO_SLUG#git@github.com:}"
+    REPO_SLUG="${REPO_SLUG%.git}"
+    ;;
+esac
+
+command -v gh >/dev/null 2>&1 \
+  || die "gh (GitHub CLI) is not installed — see https://cli.github.com"
+gh auth status >/dev/null 2>&1 \
+  || die "gh is not authenticated. Run: gh auth login"
 
 REPO="$RELEASES_REPO"
 if gh repo view "$REPO" >/dev/null 2>&1; then
@@ -124,6 +157,12 @@ awk -v heading_re="$HEADING_RE" '
   found { print }
 ' "$CHANGELOG_FILE" >"$NOTES_FILE"
 
+# Provenance in the notes: which repository, which revision — the link a
+# release in a separate repo has to the source that produced it. Integrity,
+# not authenticity (decision 004): the line names where the binary came
+# from; it signs nothing.
+printf '\nBuilt from %s@%s\n' "$REPO_SLUG" "$SHA" >>"$NOTES_FILE"
+
 # --- Step 3: build (or reuse) ------------------------------------------------
 OUTPUT_DIR="$ROOT_DIR/target/release/bundle/appimage"
 shopt -s nullglob
@@ -133,11 +172,25 @@ FRESH_BUILD=1
 if [[ ${#existing[@]} -gt 1 ]]; then
   die "found ${#existing[@]} AppImages matching TFSAppHub_${APP_VERSION}_*.AppImage in $OUTPUT_DIR — ambiguous, resolve by hand first."
 elif [[ ${#existing[@]} -eq 1 ]]; then
-  read -r -p "Found an existing build for $TAG — reuse it instead of rebuilding? [y/N] " REUSE
-  if [[ "$REUSE" =~ ^[Yy]$ ]]; then
-    APPIMAGE="${existing[0]}"
-    FRESH_BUILD=0
-    echo "Reusing $APPIMAGE"
+  # Reuse only a build that came from this exact HEAD: the record written
+  # beside the AppImage by build-hub.sh says which revision produced it.
+  # Anything else — an older revision, or no record at all — is rebuilt
+  # without prompting.
+  existing_image="${existing[0]}"
+  recorded=""
+  if [[ -f "${existing_image%.AppImage}.source-commit" ]]; then
+    recorded="$(<"${existing_image%.AppImage}.source-commit")"
+  fi
+  if [[ "$recorded" == "$SHA" ]]; then
+    read -r -p "Found an existing build for $TAG — reuse it instead of rebuilding? [y/N] " REUSE
+    if [[ "$REUSE" =~ ^[Yy]$ ]]; then
+      APPIMAGE="$existing_image"
+      FRESH_BUILD=0
+      echo "Reusing $APPIMAGE"
+    fi
+  else
+    [[ -n "$recorded" ]] || recorded="no record"
+    echo "existing build is from $recorded, HEAD is $SHA — rebuilding"
   fi
 fi
 
@@ -156,6 +209,22 @@ SUMS="$OUTPUT_DIR/SHA256SUMS.txt"
 ( cd "$OUTPUT_DIR" && sha256sum "$(basename "$APPIMAGE")" ) >"$SUMS"
 echo "Checksums:"
 cat "$SUMS"
+
+# --- Re-check before publishing ----------------------------------------------
+# The build ran with the tree live on disk; nothing may have moved it between
+# the provenance gate and now. Anything that did means the artifact no longer
+# corresponds to $SHA — refuse rather than publish.
+if [[ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]] \
+   || [[ "$(git -C "$ROOT_DIR" rev-parse HEAD)" != "$SHA" ]]; then
+  die "the tree moved during the build — nothing published."
+fi
+recorded_chosen=""
+if [[ -f "${APPIMAGE%.AppImage}.source-commit" ]]; then
+  recorded_chosen="$(<"${APPIMAGE%.AppImage}.source-commit")"
+fi
+if [[ "$recorded_chosen" != "$SHA" ]]; then
+  die "the tree moved during the build — nothing published."
+fi
 
 # --- Step 5: publish --------------------------------------------------------
 # Release notes are exactly the section extracted by the changelog gate
