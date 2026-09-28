@@ -132,27 +132,35 @@ pub fn read_data_version(data_subdir: &Path) -> Result<Option<String>, Lifecycle
         })
 }
 
-/// Record `version` in `data/config.json`, preserving any `port_override`
-/// (CONTRACT.md §6).
+/// Record `version` in `data/config.json`, preserving the user's own
+/// per-installation keys (CONTRACT.md §6).
 ///
 /// Same-directory temp file plus `rename`, the standard POSIX atomic write:
 /// `rename(2)` is atomic within one filesystem, so a crash or power loss can
 /// only ever leave the old or the new contents in full — never a truncated
 /// record that the next launch would read as a corrupt data dir.
 ///
-/// `port_override` is read back and carried over rather than dropped: it is the
-/// user's own per-installation escape hatch for a static `app_port` already
-/// taken on their machine, and nothing here has any business forgetting it.
+/// The existing `DataConfig` is read back and only `version` is replaced, so
+/// `port_override` and `revoked` are both carried over rather than dropped:
+/// one is the user's own per-installation escape hatch for a static
+/// `app_port` already taken on their machine, the other their per-machine
+/// revocation of a declared capability (plan 070), and nothing that merely
+/// records a version has any business forgetting either.
 pub fn write_data_version(data_subdir: &Path, version: &str) -> Result<(), LifecycleError> {
     let path = data_config_path(data_subdir);
-    let port_override = fs::read_to_string(&path)
+    let config = match fs::read_to_string(&path)
         .ok()
         .and_then(|contents| serde_json::from_str::<DataConfig>(&contents).ok())
-        .and_then(|config| config.port_override);
-
-    let config = DataConfig {
-        version: version.to_string(),
-        port_override,
+    {
+        Some(mut config) => {
+            config.version = version.to_string();
+            config
+        }
+        None => DataConfig {
+            version: version.to_string(),
+            port_override: None,
+            revoked: tfsapp_core::ports::Revoked::default(),
+        },
     };
     let json = serde_json::to_string_pretty(&config).map_err(|error| {
         LifecycleError::MalformedDataConfig {
@@ -168,6 +176,34 @@ pub fn write_data_version(data_subdir: &Path, version: &str) -> Result<(), Lifec
     let temporary = data_subdir.join("config.json.tmp");
     fs::write(&temporary, json).map_err(io_error(&temporary))?;
     fs::rename(&temporary, &path).map_err(io_error(&path))
+}
+
+/// Whether this installation's `data/config.json` revokes the declared
+/// microphone (plan 070, decision 007's dated revision). Absent file and
+/// absent key both read as `false` — "nothing revoked" is the contract's own
+/// normal path — and a file that exists but does not parse reads as `true`,
+/// with the one `hub.log` line that says so: a broken switch fails closed.
+///
+/// Reads rather than reuses [`read_data_version`] on purpose: that half
+/// answers the version question and errors on a malformed file, while this
+/// one answers "may the microphone run at all", whose fail-closed answer for
+/// the same file is `true`.
+pub fn read_microphone_revoked(data_subdir: &Path) -> bool {
+    let path = data_config_path(data_subdir);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(_) => return false,
+    };
+    match serde_json::from_str::<DataConfig>(&contents) {
+        Ok(config) => config.revoked.media.microphone,
+        Err(_) => {
+            eprintln!(
+                "tfsapp-hub: warning: {} does not parse; the microphone is treated as revoked",
+                path.display()
+            );
+            true
+        }
+    }
 }
 
 /// `<data_subdir>/cache.json` — plan 024's cache stamp: what `cache/`/`build/`

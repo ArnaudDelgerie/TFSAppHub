@@ -24,6 +24,44 @@ pub struct DataConfig {
     /// stays absent until a user adds it by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_override: Option<u16>,
+    /// Per-installation revocation of a declared capability (decision 007's
+    /// dated revision, plan 070): `"revoked": {"media": {"microphone": true}}`
+    /// makes the hub deny every capture request from this installation and
+    /// report `TFS_MEDIA_MICROPHONE=0` although the manifest declares the
+    /// microphone. Hand-edited exactly like `port_override` — never
+    /// auto-written, stays absent until a user adds it by hand.
+    #[serde(default, skip_serializing_if = "Revoked::is_empty")]
+    pub revoked: Revoked,
+}
+
+/// What one installation has revoked: nothing by default, so `{}`,
+/// `{"media": {}}` and an absent key all mean "nothing revoked". Only the
+/// microphone is read from it today (plan 070); the shape leaves room for
+/// other capabilities without a shape change.
+#[derive(Deserialize, serde::Serialize, Default, Debug, PartialEq, Eq)]
+pub struct Revoked {
+    #[serde(default, skip_serializing_if = "RevokedMedia::is_empty")]
+    pub media: RevokedMedia,
+}
+
+impl Revoked {
+    pub fn is_empty(&self) -> bool {
+        self.media.is_empty()
+    }
+}
+
+/// The `media` members one installation has revoked. `microphone: false` —
+/// like every absent member — means "not revoked".
+#[derive(Deserialize, serde::Serialize, Default, Debug, PartialEq, Eq)]
+pub struct RevokedMedia {
+    #[serde(default)]
+    pub microphone: bool,
+}
+
+impl RevokedMedia {
+    pub fn is_empty(&self) -> bool {
+        !self.microphone
+    }
 }
 
 /// Resolve the port packaged mode should actually bind: `port_override` from

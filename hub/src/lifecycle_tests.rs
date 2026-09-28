@@ -12,10 +12,10 @@ use super::{
     db_snapshot_path, decide_launch, dialog_is_warranted, discard_db_snapshot,
     discard_rollback_anchor, handle_close_answer, handle_close_request, lifecycle_decision,
     on_window_event, prepare_dev_launch, previous_tree_path, probe_run_lock, read_cache_stamp,
-    read_data_version, read_rollback_anchor, rescue_dump_pattern, restore_db_snapshot,
-    rollback_anchor_path, serving_lock_path, snapshot_db, veto_exit, write_cache_stamp,
-    write_data_version, write_rollback_anchor, Anchor, CacheStamp, CacheStatus, CloseAction,
-    CloseEffect, CloseWorld, LaunchDecision, LaunchLockError, LifecycleDecisionError,
+    read_data_version, read_microphone_revoked, read_rollback_anchor, rescue_dump_pattern,
+    restore_db_snapshot, rollback_anchor_path, serving_lock_path, snapshot_db, veto_exit,
+    write_cache_stamp, write_data_version, write_rollback_anchor, Anchor, CacheStamp, CacheStatus,
+    CloseAction, CloseEffect, CloseWorld, LaunchDecision, LaunchLockError, LifecycleDecisionError,
     LifecycleError, LifecycleEvent, RollbackAnchor, RunLockHeld, DB_FILE_NAMES,
 };
 use crate::{registry::Platform, run::format_run_entry};
@@ -294,6 +294,87 @@ fn writing_a_version_keeps_the_user_s_port_override() {
     let written = fs::read_to_string(data_subdir.path().join("config.json")).expect("the record");
     assert!(written.contains("9876"), "kept the override: {written}");
     assert!(written.contains("0.6.0"), "recorded the version: {written}");
+}
+
+#[test]
+fn writing_a_version_keeps_the_user_s_port_override_and_revocation_together() {
+    let data_subdir = tempfile::tempdir().expect("a temp data dir");
+    fs::write(
+        data_subdir.path().join("config.json"),
+        r#"{
+            "version": "0.5.0",
+            "port_override": 9876,
+            "revoked": {"media": {"microphone": true}}
+        }"#,
+    )
+    .expect("a hand-written record");
+
+    write_data_version(data_subdir.path(), "0.6.0").expect("a written record");
+
+    // Both hand-edited keys are carried over: one escape hatch, one
+    // revocation, and a version record has no business forgetting either.
+    let written = fs::read_to_string(data_subdir.path().join("config.json")).expect("the record");
+    assert!(written.contains("9876"), "kept the override: {written}");
+    assert!(
+        written.contains("revoked"),
+        "kept the revocation: {written}"
+    );
+    assert!(
+        written.contains("microphone"),
+        "kept the revoked member: {written}"
+    );
+    assert!(written.contains("0.6.0"), "recorded the version: {written}");
+}
+
+// --- `read_microphone_revoked` (plan 070 step 1) ----------------------------
+//
+// The five cases the plan names. A broken switch fails closed, and says so.
+
+#[test]
+fn a_revocation_read_from_an_absent_file_is_false() {
+    let data_subdir = tempfile::tempdir().expect("a temp data dir");
+    assert!(!read_microphone_revoked(data_subdir.path()));
+}
+
+#[test]
+fn a_revocation_read_from_an_absent_key_is_false() {
+    let data_subdir = tempfile::tempdir().expect("a temp data dir");
+    fs::write(
+        data_subdir.path().join("config.json"),
+        r#"{"version": "0.5.0"}"#,
+    )
+    .expect("a hand-written record");
+    assert!(!read_microphone_revoked(data_subdir.path()));
+}
+
+#[test]
+fn a_written_true_revocation_is_true() {
+    let data_subdir = tempfile::tempdir().expect("a temp data dir");
+    fs::write(
+        data_subdir.path().join("config.json"),
+        r#"{"version": "0.5.0", "revoked": {"media": {"microphone": true}}}"#,
+    )
+    .expect("a hand-written record");
+    assert!(read_microphone_revoked(data_subdir.path()));
+}
+
+#[test]
+fn a_written_false_revocation_is_false() {
+    let data_subdir = tempfile::tempdir().expect("a temp data dir");
+    fs::write(
+        data_subdir.path().join("config.json"),
+        r#"{"version": "0.5.0", "revoked": {"media": {"microphone": false}}}"#,
+    )
+    .expect("a hand-written record");
+    assert!(!read_microphone_revoked(data_subdir.path()));
+}
+
+#[test]
+fn a_file_that_does_not_parse_reads_as_revoked() {
+    let data_subdir = tempfile::tempdir().expect("a temp data dir");
+    fs::write(data_subdir.path().join("config.json"), "{ not json").expect("a hand-written record");
+    // Fails closed: a broken switch must not fall back to "not revoked".
+    assert!(read_microphone_revoked(data_subdir.path()));
 }
 
 #[test]

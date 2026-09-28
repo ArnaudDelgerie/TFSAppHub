@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use super::{
     await_grant, decide, page_is_app_origin, user_media_denial_reason, MediaPermissionKind,
+    MicrophoneAccess,
 };
 use tauri::Url;
 
@@ -36,40 +37,118 @@ fn audio_and_video() -> MediaPermissionKind {
     }
 }
 
+// --- `MicrophoneAccess` (plan 070 step 1) -----------------------------------
+
+#[test]
+fn access_is_allowed_only_when_declared_and_not_revoked() {
+    assert_eq!(MicrophoneAccess::of(true, false), MicrophoneAccess::Allowed);
+}
+
+#[test]
+fn a_revoked_declaration_is_revoked() {
+    assert_eq!(MicrophoneAccess::of(true, true), MicrophoneAccess::Revoked);
+}
+
+#[test]
+fn undeclared_wins_over_revoked() {
+    // An app that declared nothing has nothing to revoke: the two share a
+    // platform state but not a cause, and the denial reason names the right
+    // one.
+    assert_eq!(
+        MicrophoneAccess::of(false, true),
+        MicrophoneAccess::Undeclared
+    );
+}
+
+#[test]
+fn undeclared_and_not_revoked_is_undeclared() {
+    assert_eq!(
+        MicrophoneAccess::of(false, false),
+        MicrophoneAccess::Undeclared
+    );
+}
+
 // --- `decide`: the full table -----------------------------------------------
 
 #[test]
-fn audio_only_is_allowed_only_when_declared_and_on_the_app_origin() {
-    assert!(decide(audio_only(), true, true));
-    assert!(!decide(audio_only(), false, true));
-    assert!(!decide(audio_only(), true, false));
-    assert!(!decide(audio_only(), false, false));
+fn audio_only_is_allowed_only_when_allowed_and_on_the_app_origin() {
+    assert!(decide(audio_only(), MicrophoneAccess::Allowed, true));
+    assert!(!decide(audio_only(), MicrophoneAccess::Undeclared, true));
+    assert!(!decide(audio_only(), MicrophoneAccess::Allowed, false));
+    assert!(!decide(audio_only(), MicrophoneAccess::Undeclared, false));
 }
 
 #[test]
 fn video_only_is_always_denied() {
-    assert!(!decide(video_only(), true, true));
-    assert!(!decide(video_only(), false, true));
-    assert!(!decide(video_only(), true, false));
+    assert!(!decide(video_only(), MicrophoneAccess::Allowed, true));
+    assert!(!decide(video_only(), MicrophoneAccess::Undeclared, true));
+    assert!(!decide(video_only(), MicrophoneAccess::Allowed, false));
 }
 
 #[test]
 fn audio_and_video_together_is_always_denied() {
     // WebKit offers no partial grant on a combined request — the whole
     // request is refused, not narrowed to its audio half.
-    assert!(!decide(audio_and_video(), true, true));
+    assert!(!decide(audio_and_video(), MicrophoneAccess::Allowed, true));
 }
 
 #[test]
 fn device_info_is_allowed_under_the_same_two_conditions_as_audio() {
-    assert!(decide(MediaPermissionKind::DeviceInfo, true, true));
-    assert!(!decide(MediaPermissionKind::DeviceInfo, false, true));
-    assert!(!decide(MediaPermissionKind::DeviceInfo, true, false));
+    assert!(decide(
+        MediaPermissionKind::DeviceInfo,
+        MicrophoneAccess::Allowed,
+        true
+    ));
+    assert!(!decide(
+        MediaPermissionKind::DeviceInfo,
+        MicrophoneAccess::Undeclared,
+        true
+    ));
+    assert!(!decide(
+        MediaPermissionKind::DeviceInfo,
+        MicrophoneAccess::Allowed,
+        false
+    ));
 }
 
 #[test]
-fn every_other_kind_is_denied_even_when_declared_and_on_origin() {
-    assert!(!decide(MediaPermissionKind::Other, true, true));
+fn every_other_kind_is_denied_even_when_allowed_and_on_origin() {
+    assert!(!decide(
+        MediaPermissionKind::Other,
+        MicrophoneAccess::Allowed,
+        true
+    ));
+}
+
+#[test]
+fn every_kind_is_denied_under_revoked() {
+    // A revoked microphone follows §3's own rule — no `enable-media-stream`,
+    // no grant — but through the deny path, so `hub.log` gets a reason.
+    for kind in [
+        audio_only(),
+        video_only(),
+        audio_and_video(),
+        MediaPermissionKind::DeviceInfo,
+        MediaPermissionKind::Other,
+    ] {
+        assert!(!decide(kind, MicrophoneAccess::Revoked, true), "{kind:?}");
+    }
+}
+
+#[test]
+fn every_kind_is_denied_under_undeclared() {
+    for kind in [
+        audio_only(),
+        video_only(),
+        audio_and_video(),
+        MediaPermissionKind::DeviceInfo,
+        MediaPermissionKind::Other,
+    ] {
+        assert!(
+            !decide(kind, MicrophoneAccess::Undeclared, true),
+            "{kind:?}"
+        );
+    }
 }
 
 // --- `page_is_app_origin` ----------------------------------------------------
@@ -105,20 +184,28 @@ fn no_current_page_is_never_the_app_origin() {
 #[test]
 fn the_denial_reason_names_the_first_thing_that_failed() {
     assert_eq!(
-        user_media_denial_reason(false, true, true, false),
+        user_media_denial_reason(MicrophoneAccess::Undeclared, true, true, false),
         "this app does not declare actions.media.microphone"
     );
     assert_eq!(
-        user_media_denial_reason(true, false, true, false),
+        user_media_denial_reason(MicrophoneAccess::Allowed, false, true, false),
         "the request was not on the app's own origin"
     );
     assert_eq!(
-        user_media_denial_reason(true, true, true, true),
+        user_media_denial_reason(MicrophoneAccess::Allowed, true, true, true),
         "the request included video, and this group grants audio only"
     );
     assert_eq!(
-        user_media_denial_reason(true, true, false, false),
+        user_media_denial_reason(MicrophoneAccess::Allowed, true, false, false),
         "the request was not for an audio device"
+    );
+}
+
+#[test]
+fn a_revoked_microphone_has_its_own_denial_reason() {
+    assert_eq!(
+        user_media_denial_reason(MicrophoneAccess::Revoked, true, true, false),
+        "the microphone is revoked in data/config.json"
     );
 }
 

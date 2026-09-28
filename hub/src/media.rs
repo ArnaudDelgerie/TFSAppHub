@@ -7,7 +7,8 @@
 //! own page, exactly as it would in a browser that had granted the
 //! permission. What this module does is make that call succeed only when it
 //! should: WebKitGTK's `enable-media-stream` setting is written only when the
-//! manifest declares the microphone, and a `permission-request` handler is
+//! microphone is [`MicrophoneAccess::Allowed`] — declared in the manifest and
+//! not revoked in this installation's `data/config.json` (plan 070) — and a `permission-request` handler is
 //! connected on **every** window regardless — wry itself connects none, so
 //! installing a handler that defaults to allow-by-omission would be worse
 //! than the platform's own default; this handler makes the deny explicit and
@@ -92,18 +93,53 @@ pub enum MediaPermissionKind {
     Other,
 }
 
+/// What one launch may do with the microphone, computed once in `main`
+/// from the manifest's declaration and this installation's
+/// `data/config.json` (plan 070): an undeclared app meets the platform with
+/// no capture at all, a declared-and-revoked one the same, and only
+/// `Allowed` ever grants — `TFS_MEDIA_MICROPHONE` mirrors the value that
+/// actually ran, never what the manifest asked for (decision 007 §5, its
+/// dated revision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicrophoneAccess {
+    /// `actions.media.microphone` is absent: the capability is *absent*, not
+    /// denied — `enable-media-stream` is not written (decision 007 §3).
+    Undeclared,
+    /// Declared, but `"revoked": {"media": {"microphone": true}}` in this
+    /// installation's `data/config.json`. Follows §3's own rule: the setting
+    /// is not written either, so a revoked app meets the platform with no
+    /// capture, like an undeclared one — but its denials say *why*.
+    Revoked,
+    /// Declared and not revoked: the only value that ever grants.
+    Allowed,
+}
+
+impl MicrophoneAccess {
+    /// Pure: `Undeclared` wins over `Revoked`, because an app that declared
+    /// nothing has nothing to revoke — the two failures share a platform
+    /// state but not a cause, and `hub.log` names the right one.
+    pub fn of(declared: bool, revoked: bool) -> Self {
+        match (declared, revoked) {
+            (true, true) => MicrophoneAccess::Revoked,
+            (true, false) => MicrophoneAccess::Allowed,
+            (false, _) => MicrophoneAccess::Undeclared,
+        }
+    }
+}
+
 /// The pure decision the `permission-request` handler applies on every
 /// window (decision 007): allow only an audio-only capture request or a
-/// device-info request, and only while the app declared the microphone and
-/// the requesting page is the app's own origin. Everything else — a video or
-/// combined request, any other permission kind, an undeclared app, a page
-/// that is not (or not yet) the app's own origin — is denied.
+/// device-info request, and only while the app's microphone is
+/// [`MicrophoneAccess::Allowed`] and the requesting page is the app's own
+/// origin. Everything else — a video or combined request, any other
+/// permission kind, an undeclared app, a revoked one, a page that is not
+/// (or not yet) the app's own origin — is denied.
 pub fn decide(
     kind: MediaPermissionKind,
-    microphone_declared: bool,
+    access: MicrophoneAccess,
     page_is_app_origin: bool,
 ) -> bool {
-    if !microphone_declared || !page_is_app_origin {
+    if access != MicrophoneAccess::Allowed || !page_is_app_origin {
         return false;
     }
     match kind {
@@ -129,21 +165,22 @@ pub fn page_is_app_origin(app_origin: Option<&Url>, current_page: Option<&Url>) 
 /// knows it is a `UserMedia` kind; this only says *why* [`decide`] refused
 /// it, so `hub.log` names a cause rather than just "denied".
 pub fn user_media_denial_reason(
-    microphone_declared: bool,
+    access: MicrophoneAccess,
     page_is_app_origin: bool,
     audio: bool,
     video: bool,
 ) -> &'static str {
-    if !microphone_declared {
-        "this app does not declare actions.media.microphone"
-    } else if !page_is_app_origin {
-        "the request was not on the app's own origin"
-    } else if video {
-        "the request included video, and this group grants audio only"
-    } else if !audio {
-        "the request was not for an audio device"
-    } else {
-        "denied"
+    match access {
+        MicrophoneAccess::Undeclared => "this app does not declare actions.media.microphone",
+        MicrophoneAccess::Revoked => "the microphone is revoked in data/config.json",
+        MicrophoneAccess::Allowed if !page_is_app_origin => {
+            "the request was not on the app's own origin"
+        }
+        MicrophoneAccess::Allowed if video => {
+            "the request included video, and this group grants audio only"
+        }
+        MicrophoneAccess::Allowed if !audio => "the request was not for an audio device",
+        MicrophoneAccess::Allowed => "denied",
     }
 }
 
@@ -172,13 +209,14 @@ fn classify_request(request: &webkit2gtk::PermissionRequest) -> MediaPermissionK
 }
 
 /// Install this window's media grant: the `enable-media-stream` setting when
-/// `microphone_declared`, and the `permission-request` handler unconditionally
-/// (plan 050 step 2). Called after every window `create_splash_window` and
+/// the microphone is [`MicrophoneAccess::Allowed`], and the
+/// `permission-request` handler unconditionally (plan 050 step 2, plan 070
+/// step 1). Called after every window `create_splash_window` and
 /// `create_app_window` build, on both the splash and every later window —
 /// the splash and the app share one webview (`architecture/09`), so this is
 /// what keeps a page that is not yet the app's own origin from ever getting a
 /// grant, and what turns wry's absent-handler default into an explicit,
-/// logged deny for an app that declared nothing.
+/// logged deny for an app that declared nothing or had it revoked.
 ///
 /// Returns whatever `WebviewWindow::with_webview`'s dispatch returned, with
 /// the receiver the closure will report on. `Ok` means the closure was
@@ -196,7 +234,7 @@ fn classify_request(request: &webkit2gtk::PermissionRequest) -> MediaPermissionK
 /// dropped — the backend it joins already has its environment.
 pub fn install_permission_handler<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
-    microphone_declared: bool,
+    access: MicrophoneAccess,
     app_origin: AppOriginSlot,
 ) -> tauri::Result<Receiver<bool>> {
     let (grant_report, receiver) = std::sync::mpsc::sync_channel(1);
@@ -205,10 +243,11 @@ pub fn install_permission_handler<R: tauri::Runtime>(
 
         let webview = webview.inner();
         // The grant is what really ran here: a webview with no `settings()`
-        // keeps WebKitGTK's default of no capture at all, and an undeclared
-        // app is left alone on purpose. Said out loud only in the first
-        // case — the second is the contract's own normal path.
-        let granted = microphone_declared
+        // keeps WebKitGTK's default of no capture at all, and an app whose
+        // microphone is not `Allowed` is left alone on purpose — undeclared
+        // and revoked follow §3's same rule. Said out loud only in the
+        // first case — the second is the contract's own normal path.
+        let granted = access == MicrophoneAccess::Allowed
             && match webview.settings() {
                 Some(settings) => {
                     settings.set_enable_media_stream(true);
@@ -228,13 +267,13 @@ pub fn install_permission_handler<R: tauri::Runtime>(
             let current_page = webview.uri().and_then(|uri| Url::parse(&uri).ok());
             let is_app_origin = page_is_app_origin(app_origin.get(), current_page.as_ref());
             let kind = classify_request(request);
-            if decide(kind, microphone_declared, is_app_origin) {
+            if decide(kind, access, is_app_origin) {
                 request.allow();
             } else {
                 if let MediaPermissionKind::UserMedia { audio, video } = kind {
                     eprintln!(
                         "tfsapp-hub: denying a user-media permission request: {}",
-                        user_media_denial_reason(microphone_declared, is_app_origin, audio, video)
+                        user_media_denial_reason(access, is_app_origin, audio, video)
                     );
                 }
                 request.deny();
