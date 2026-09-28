@@ -221,11 +221,13 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         } => publish::run(&path, repo.as_deref(), local.as_deref(), assume_yes),
         Command::Update {
             id,
+            archive,
             reference,
             force,
             assume_yes,
         } => update::run(
             &id,
+            archive.as_deref().map(std::path::Path::new),
             reference.as_deref(),
             force,
             assume_yes,

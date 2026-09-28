@@ -162,7 +162,7 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "update",
-        form: "update <id> [--ref <tag>] [--force] [--yes]",
+        form: "update <id> [<archive.tar.gz>] [--ref <tag>] [--force] [--yes]",
         summary: "Re-resolve an app's source and update it.",
         level: Level::App,
         availability: Availability::Implemented,
@@ -366,6 +366,7 @@ pub enum Command {
     },
     Update {
         id: String,
+        archive: Option<String>,
         reference: Option<String>,
         force: bool,
         /// `--yes`: skip the confirmation. `update` runs the app's own PHP —
@@ -630,8 +631,26 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         }
         "update" => {
             let mut options = options("update", rest, &["--ref"], &["--force", "--yes", "-y"])?;
+            if options.positionals.is_empty() || options.positionals.len() > 2 {
+                return Err(usage_error(
+                    "update",
+                    "update needs an app id and optionally one archive".to_string(),
+                ));
+            }
+            let id = options.positionals.remove(0);
+            let archive = options.positionals.pop();
+            if archive
+                .as_ref()
+                .is_some_and(|path| !path.ends_with(".tar.gz"))
+            {
+                return Err(usage_error(
+                    "update",
+                    "the second argument must be an <archive.tar.gz>".to_string(),
+                ));
+            }
             Ok(Command::Update {
-                id: options.exactly_one("update", "an app id")?,
+                id,
+                archive,
                 reference: options.value("--ref"),
                 force: options.flag("--force"),
                 assume_yes: options.assume_yes(),

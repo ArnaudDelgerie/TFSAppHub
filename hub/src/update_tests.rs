@@ -315,7 +315,7 @@ fn updating_an_unregistered_id_refuses() {
     let (_base, paths) = temp_paths();
 
     let error =
-        update(&paths, "demo", None, false, true, "0.1.0").expect_err("nothing is installed");
+        update(&paths, "demo", None, None, false, true, "0.1.0").expect_err("nothing is installed");
     assert!(matches!(error, UpdateError::NotInstalled { .. }), "{error}");
 }
 
@@ -330,7 +330,7 @@ fn a_held_maintenance_lease_refuses_update_before_source_resolution() {
     let _held = lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "import")
         .expect("the first maintenance command owns the gate");
 
-    let error = update(&paths, "demo", None, false, true, "0.1.0")
+    let error = update(&paths, "demo", None, None, false, true, "0.1.0")
         .expect_err("update must refuse before reading the competing source");
 
     assert!(matches!(error, UpdateError::Gate(_)), "{error}");
@@ -358,7 +358,7 @@ fn an_interleaved_update_cannot_replace_the_first_updates_previous_tree() {
     let held = lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "update")
         .expect("the first update owns the gate");
 
-    let error = update(&paths, "demo", None, false, true, "0.1.0")
+    let error = update(&paths, "demo", None, None, false, true, "0.1.0")
         .expect_err("the interleaved update must refuse before source resolution");
 
     assert!(matches!(error, UpdateError::Gate(_)), "{error}");
@@ -383,7 +383,7 @@ fn a_source_that_no_longer_exists_is_refused_naming_the_recorded_location() {
     })
     .expect("a seeded registry");
 
-    let error = update(&paths, "demo", None, false, true, "0.1.0")
+    let error = update(&paths, "demo", None, None, false, true, "0.1.0")
         .expect_err("the recorded source directory is gone");
     assert!(matches!(error, UpdateError::Source(_)), "{error}");
     assert!(
@@ -402,7 +402,7 @@ fn a_source_already_at_the_recorded_version_refuses_without_force() {
     })
     .expect("a seeded registry");
 
-    let error = update(&paths, "demo", None, false, true, "0.1.0")
+    let error = update(&paths, "demo", None, None, false, true, "0.1.0")
         .expect_err("an equal source refuses without --force");
     assert!(matches!(error, UpdateError::Equal { .. }), "{error}");
     assert!(
@@ -422,7 +422,7 @@ fn a_downgrade_refuses_naming_both_versions() {
     .expect("a seeded registry");
 
     let error =
-        update(&paths, "demo", None, false, true, "0.1.0").expect_err("a downgrade refuses");
+        update(&paths, "demo", None, None, false, true, "0.1.0").expect_err("a downgrade refuses");
     assert!(matches!(error, UpdateError::Downgrade { .. }), "{error}");
 }
 
@@ -521,7 +521,7 @@ fn an_update_runs_pre_update_then_post_update_and_no_install_hooks() {
         r#"{"pre-update": ["cache:clear"], "post-update": ["about"]}"#,
     );
 
-    update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
+    update(&paths, "demo", None, None, false, true, "0.1.0").expect("the update applies");
 
     let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
     // The hub's own `cache:warmup` (plan 024) closes out each event — the
@@ -584,7 +584,7 @@ fn a_failing_pre_update_leaves_the_tree_the_database_and_the_registry_entry_unch
 
     runnable_app_tree(source.path(), "0.7.0", r#"{"pre-update": ["boom"]}"#);
 
-    let error = update(&paths, "demo", None, false, true, "0.1.0")
+    let error = update(&paths, "demo", None, None, false, true, "0.1.0")
         .expect_err("a failing pre-update must fail the whole update");
     assert!(matches!(error, UpdateError::Reverted { .. }), "{error}");
 
@@ -646,7 +646,7 @@ fn an_update_leaves_a_cache_stamp_the_next_launch_will_match() {
     .expect("the first install");
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
-    update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
+    update(&paths, "demo", None, None, false, true, "0.1.0").expect("the update applies");
 
     let app_dir = paths.app_dir("demo").expect("an app dir");
     let data_dir = base.path().join("TFSApp/dev.local.demo");
@@ -710,7 +710,7 @@ fn an_update_s_post_replacement_cache_wipe_never_reaches_uploads() {
     fs::write(uploads_dir.join("invoice.pdf"), content).expect("a planted upload");
 
     runnable_app_tree(source.path(), "0.7.0", "{}");
-    update(&paths, "demo", None, false, true, "0.1.0").expect("the update applies");
+    update(&paths, "demo", None, None, false, true, "0.1.0").expect("the update applies");
 
     assert_eq!(
         fs::read(uploads_dir.join("invoice.pdf")).expect("the upload survives an update"),
@@ -789,7 +789,7 @@ fn force_on_an_equal_source_resyncs_without_running_any_hook() {
     )
     .expect("the edited manifest");
 
-    update(&paths, "demo", None, true, true, "0.1.0").expect("--force resyncs");
+    update(&paths, "demo", None, None, true, true, "0.1.0").expect("--force resyncs");
 
     let log = base.path().join("TFSApp/dev.local.demo/log/hooks.log");
     // The initial install ran no declared hook (no `pre-install`/`post-install`
@@ -923,7 +923,7 @@ fn a_killed_apply_reverts_to_the_outgoing_version_before_registry_commit() {
         let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
 
         test_stop::arm(point);
-        let result = update(&paths, "demo", None, false, true, "0.1.0");
+        let result = update(&paths, "demo", None, None, false, true, "0.1.0");
         test_stop::disarm();
         assert!(result.is_err(), "{point}: the stop point should have fired");
 
@@ -971,7 +971,7 @@ fn a_killed_apply_finishes_forward_from_registry_commit_on() {
         let data_subdir = base.path().join("TFSApp/dev.local.demo/data");
 
         test_stop::arm(point);
-        let result = update(&paths, "demo", None, false, true, "0.1.0");
+        let result = update(&paths, "demo", None, None, false, true, "0.1.0");
         test_stop::disarm();
         assert!(result.is_err(), "{point}: the stop point should have fired");
 
@@ -1075,7 +1075,7 @@ fn a_killed_resync_reverts_to_the_outgoing_source_before_registry_commit() {
         let (_base, paths, _source, app_dir, original_revision) = seeded_for_resync_kill();
 
         test_stop::arm(point);
-        let result = update(&paths, "demo", None, true, true, "0.1.0");
+        let result = update(&paths, "demo", None, None, true, true, "0.1.0");
         test_stop::disarm();
         assert!(result.is_err(), "{point}: the stop point should have fired");
 
@@ -1117,7 +1117,7 @@ fn a_killed_resync_finishes_forward_from_registry_commit_on() {
         let (_base, paths, _source, app_dir, original_revision) = seeded_for_resync_kill();
 
         test_stop::arm(point);
-        let result = update(&paths, "demo", None, true, true, "0.1.0");
+        let result = update(&paths, "demo", None, None, true, true, "0.1.0");
         test_stop::disarm();
         assert!(result.is_err(), "{point}: the stop point should have fired");
 
@@ -1320,6 +1320,7 @@ fn an_update_with_no_ref_moves_to_the_newest_remote_release() {
         &second_url,
         "demo",
         None,
+        None,
         false,
         true,
         "0.1.0",
@@ -1374,6 +1375,7 @@ fn an_equal_remote_source_refuses_without_force() {
         &update_url,
         "demo",
         None,
+        None,
         false,
         true,
         "0.1.0",
@@ -1382,4 +1384,197 @@ fn an_equal_remote_source_refuses_without_force() {
     update_handle.join().expect("the update stub finishes");
 
     assert!(matches!(error, UpdateError::Equal { .. }), "{error}");
+}
+
+struct LocalBlobs(std::collections::HashMap<String, Vec<u8>>);
+
+impl crate::publish::BlobSource for LocalBlobs {
+    fn copy_blob(
+        &mut self,
+        object: &str,
+        destination: &mut dyn std::io::Write,
+    ) -> Result<u64, crate::git::GitError> {
+        let bytes = &self.0[object];
+        destination.write_all(bytes).unwrap();
+        Ok(bytes.len() as u64)
+    }
+}
+
+fn built_archive(root: &Path, version: &str) -> std::path::PathBuf {
+    let project = tempfile::tempdir().unwrap();
+    minimal_app_tree(project.path(), version);
+    let names = [
+        "tfsapp.config.json",
+        "composer.json",
+        "bin/console",
+        "public/index.php",
+    ];
+    let mut blobs = std::collections::HashMap::new();
+    let entries = names
+        .iter()
+        .map(|name| {
+            blobs.insert(
+                (*name).to_string(),
+                fs::read(project.path().join(name)).unwrap(),
+            );
+            crate::git::TreeEntry {
+                path: std::path::PathBuf::from(name),
+                mode: if *name == "bin/console" {
+                    0o100755
+                } else {
+                    0o100644
+                },
+                object_id: (*name).to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    crate::publish::build_archive(&entries, &mut LocalBlobs(blobs), "demo", version, root)
+        .unwrap()
+        .archive_path
+}
+
+#[test]
+fn archive_sourced_update_requires_next_archive_and_moves_forward() {
+    if !resources_present() {
+        return;
+    }
+    let release = tempfile::tempdir().unwrap();
+    let first = built_archive(release.path(), "0.6.0");
+    let (base, paths) = temp_paths();
+    crate::install::install(
+        &paths,
+        &first.display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .unwrap();
+    let before = registry::load(&paths).unwrap().get("demo").unwrap().clone();
+    let error = update(&paths, "demo", None, None, false, true, "0.1.0").unwrap_err();
+    assert!(
+        matches!(error, UpdateError::ArchiveRequired { .. }),
+        "{error}"
+    );
+    assert!(error
+        .to_string()
+        .contains("tfsapp-hub update demo <path.tar.gz>"));
+    assert_eq!(registry::load(&paths).unwrap().get("demo"), Some(&before));
+    assert!(!journal_present(&paths));
+
+    let second = built_archive(release.path(), "0.7.0");
+    assert!(update(&paths, "demo", Some(&second), None, false, true, "0.1.0").unwrap());
+    let after = registry::load(&paths).unwrap().get("demo").unwrap().clone();
+    assert_eq!(after.app_version, "0.7.0");
+    assert_eq!(after.source.kind, SourceKind::LocalArchive);
+    assert_eq!(
+        after.source.location,
+        second.canonicalize().unwrap().display().to_string()
+    );
+    assert!(!journal_present(&paths));
+    assert!(base.path().exists());
+}
+
+#[test]
+fn archive_update_refuses_bad_checksum_ref_and_downgrade_before_mutation() {
+    let release = tempfile::tempdir().unwrap();
+    let newer = built_archive(release.path(), "0.7.0");
+    let (_base, paths) = temp_paths();
+    let source = tempfile::tempdir().unwrap();
+    minimal_app_tree(source.path(), "0.6.0");
+    let entry = seeded_entry(&source.path().display().to_string());
+    registry::update(&paths, |registry| registry.upsert(entry.clone())).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let reference = super::update_into(
+        &paths,
+        scratch.path(),
+        "http://unused.invalid",
+        "demo",
+        Some(&newer),
+        Some("v0.7.0"),
+        false,
+        true,
+        "0.1.0",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        reference,
+        UpdateError::Source(crate::source::SourceError::ReferenceOnLocalArchive { .. })
+    ));
+    let mut bytes = fs::read(&newer).unwrap();
+    bytes[20] ^= 1;
+    fs::write(&newer, bytes).unwrap();
+    let error = super::update_into(
+        &paths,
+        scratch.path(),
+        "http://unused.invalid",
+        "demo",
+        Some(&newer),
+        None,
+        false,
+        true,
+        "0.1.0",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        UpdateError::Source(crate::source::SourceError::ChecksumMismatch { .. })
+    ));
+    assert_eq!(registry::load(&paths).unwrap().get("demo"), Some(&entry));
+    assert!(!journal_present(&paths));
+}
+
+#[test]
+fn forge_record_updated_from_archive_switches_its_source() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().unwrap();
+    minimal_app_tree(source.path(), "0.6.0");
+    let (_base, paths) = temp_paths();
+    crate::install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .unwrap();
+    registry::update(&paths, |registry| {
+        let entry = registry
+            .apps
+            .iter_mut()
+            .find(|entry| entry.id == "demo")
+            .unwrap();
+        entry.source.kind = SourceKind::Release;
+        entry.source.location = "example/demo".to_string();
+        entry.source.reference = Some("v0.6.0".to_string());
+        entry.source.reference_kind = Some(crate::registry::ReferenceKind::Tag);
+        entry.source.index = Some("github".to_string());
+    })
+    .unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let archive = built_archive(folder.path(), "0.7.0");
+    assert!(update(&paths, "demo", Some(&archive), None, false, true, "0.1.0").unwrap());
+    let entry = registry::load(&paths).unwrap().get("demo").unwrap().clone();
+    assert_eq!(entry.source.kind, SourceKind::LocalArchive);
+    assert_eq!(entry.source.reference, None);
+    assert_eq!(entry.source.index, None);
+}
+
+#[test]
+fn an_older_archive_is_still_a_downgrade() {
+    let folder = tempfile::tempdir().unwrap();
+    let archive = built_archive(folder.path(), "0.6.0");
+    let (_base, paths) = temp_paths();
+    let mut entry = seeded_entry("/missing");
+    entry.app_version = "0.7.0".to_string();
+    registry::update(&paths, |registry| registry.upsert(entry.clone())).unwrap();
+    let error = update(&paths, "demo", Some(&archive), None, false, true, "0.1.0").unwrap_err();
+    assert!(matches!(error, UpdateError::Downgrade { .. }), "{error}");
+    assert_eq!(registry::load(&paths).unwrap().get("demo"), Some(&entry));
+    assert!(!journal_present(&paths));
 }

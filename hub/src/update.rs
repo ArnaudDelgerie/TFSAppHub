@@ -218,6 +218,7 @@ fn discard_resync_aside(app_dir: &Path) -> Result<(), UpdateError> {
 /// exit code.
 pub fn run(
     id: &str,
+    archive: Option<&Path>,
     reference: Option<&str>,
     force: bool,
     assume_yes: bool,
@@ -231,7 +232,15 @@ pub fn run(
         }
     };
 
-    match update(&paths, id, reference, force, assume_yes, hub_version) {
+    match update(
+        &paths,
+        id,
+        archive,
+        reference,
+        force,
+        assume_yes,
+        hub_version,
+    ) {
         Ok(true) => EXIT_OK,
         // Declining is not a failure of the command, but nothing changed
         // either — a script reading 0 would conclude it did.
@@ -256,6 +265,7 @@ pub fn run(
 pub(crate) fn update(
     paths: &Paths,
     id: &str,
+    archive: Option<&Path>,
     reference: Option<&str>,
     force: bool,
     assume_yes: bool,
@@ -270,6 +280,7 @@ pub(crate) fn update(
         &scratch,
         release::GITHUB_API_BASE,
         id,
+        archive,
         reference,
         force,
         assume_yes,
@@ -289,6 +300,7 @@ fn update_into(
     scratch: &Path,
     base_url: &str,
     id: &str,
+    archive: Option<&Path>,
     reference: Option<&str>,
     force: bool,
     assume_yes: bool,
@@ -312,7 +324,17 @@ fn update_into(
         .ok_or_else(|| UpdateError::NotInstalled { id: id.to_string() })?
         .clone();
 
-    let resolved = source::resolve(&origin(&entry.source), reference, scratch, base_url)?;
+    let selected = if let Some(archive) = archive {
+        Origin::LocalArchive(archive.to_path_buf())
+    } else if entry.source.kind == SourceKind::LocalArchive {
+        return Err(UpdateError::ArchiveRequired {
+            id: id.to_string(),
+            location: entry.source.location.clone(),
+        });
+    } else {
+        origin(&entry.source)
+    };
+    let resolved = source::resolve(&selected, reference, scratch, base_url)?;
     let install::Validated {
         loaded,
         app_version,
@@ -1227,6 +1249,10 @@ fn repair_import(
 /// place to print from.
 #[derive(Debug)]
 pub enum UpdateError {
+    ArchiveRequired {
+        id: String,
+        location: String,
+    },
     Paths(PathsError),
     Registry(RegistryError),
     Source(SourceError),
@@ -1319,6 +1345,7 @@ impl UpdateError {
 impl fmt::Display for UpdateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ArchiveRequired { id, location } => write!(formatter, "{id} was last installed from {location}; supply the next archive with: tfsapp-hub update {id} <path.tar.gz>"),
             Self::Paths(error) => write!(formatter, "{error}"),
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Source(error) => write!(formatter, "{error}"),
