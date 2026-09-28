@@ -124,8 +124,10 @@ pub fn check_payload(archive_path: &Path, budget: u64) -> Result<u64, ArchiveErr
         check_safe_path(&path)?;
         check_entry_type(&path, kind)?;
         if kind.is_file() || kind == EntryType::Continuous {
+            // `Entry::size`, not the header's own field: a local pax `size`
+            // record overrides the header, and it is what `tar` then writes.
             total = total
-                .checked_add(entry.header().size().map_err(ArchiveError::Io)?)
+                .checked_add(entry.size())
                 .ok_or(ArchiveError::TooLarge { budget })?;
             if total > budget {
                 return Err(ArchiveError::TooLarge { budget });
@@ -327,8 +329,10 @@ impl fmt::Display for ArchiveError {
             ),
             Self::TooLarge { budget } => write!(
                 formatter,
-                "archive payload exceeds the available {} MiB of room",
-                budget / (1024 * 1024)
+                "archive payload exceeds the {} MiB of room left here (free space minus \
+                 a {} MiB safety margin)",
+                budget / (1024 * 1024),
+                crate::disk_space::MARGIN / (1024 * 1024)
             ),
             Self::UnsafeLink { path } => write!(
                 formatter,

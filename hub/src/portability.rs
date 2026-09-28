@@ -358,12 +358,11 @@ fn write_archive(
                 continue;
             }
             let archive_path = format!("{DATA_DIR}/{name}");
-            append_file(&mut builder, &archive_path, &source_path)
-                .map_err(io_error(&source_path))?;
+            append_file(&mut builder, &archive_path, &source_path, &temporary)?;
             database.push(name);
         }
 
-        let (uploads_count, uploads_bytes) = append_uploads(&mut builder, uploads_dir)?;
+        let (uploads_count, uploads_bytes) = append_uploads(&mut builder, uploads_dir, &temporary)?;
 
         let encoder = builder.into_inner().map_err(io_error(&temporary))?;
         encoder.finish().map_err(io_error(&temporary))?;
@@ -389,17 +388,24 @@ fn write_archive(
 /// that has never written a file. Anything that is not a regular file (a
 /// symlink, a socket, a fifo) is skipped and named on stderr rather than
 /// followed or embedded.
-///
 fn append_uploads<W: io::Write>(
     builder: &mut tar::Builder<W>,
     uploads_dir: &Path,
+    temporary: &Path,
 ) -> Result<(u64, u64), PortabilityError> {
     if !uploads_dir.is_dir() {
         return Ok((0, 0));
     }
     let mut count = 0u64;
     let mut bytes = 0u64;
-    append_uploads_dir(builder, uploads_dir, Path::new(""), &mut count, &mut bytes)?;
+    append_uploads_dir(
+        builder,
+        uploads_dir,
+        Path::new(""),
+        temporary,
+        &mut count,
+        &mut bytes,
+    )?;
     Ok((count, bytes))
 }
 
@@ -407,6 +413,7 @@ fn append_uploads_dir<W: io::Write>(
     builder: &mut tar::Builder<W>,
     uploads_dir: &Path,
     relative: &Path,
+    temporary: &Path,
     count: &mut u64,
     bytes: &mut u64,
 ) -> Result<(), PortabilityError> {
@@ -427,11 +434,17 @@ fn append_uploads_dir<W: io::Write>(
         let child_relative = relative.join(entry.file_name());
         let child_absolute = uploads_dir.join(&child_relative);
         if file_type.is_dir() {
-            append_uploads_dir(builder, uploads_dir, &child_relative, count, bytes)?;
+            append_uploads_dir(
+                builder,
+                uploads_dir,
+                &child_relative,
+                temporary,
+                count,
+                bytes,
+            )?;
         } else if file_type.is_file() {
             let archive_path = Path::new(UPLOADS_DIR).join(&child_relative);
-            let size = append_file(builder, &archive_path, &child_absolute)
-                .map_err(io_error(&child_absolute))?;
+            let size = append_file(builder, &archive_path, &child_absolute, temporary)?;
             *count += 1;
             *bytes += size;
         } else {
@@ -473,13 +486,22 @@ fn append_bytes<W: io::Write>(
 
 /// Append a regular file using only a bounded buffer. A file truncated after
 /// its metadata was read must fail rather than silently produce a short entry.
+///
+/// A failure is attributed to `source_path` when reading it failed, and to
+/// `temporary` when writing the archive did — a full disk at the export's
+/// target must not read as a problem with the upload being copied.
 fn append_file<W: io::Write>(
     builder: &mut tar::Builder<W>,
     archive_path: impl AsRef<Path>,
     source_path: &Path,
-) -> io::Result<u64> {
-    let file = fs::File::open(source_path)?;
-    let metadata = file.metadata()?;
+    temporary: &Path,
+) -> Result<u64, PortabilityError> {
+    let source_error = |source| PortabilityError::Io {
+        path: source_path.to_path_buf(),
+        source,
+    };
+    let file = fs::File::open(source_path).map_err(source_error)?;
+    let metadata = file.metadata().map_err(source_error)?;
     let size = metadata.len();
     let mtime = metadata
         .modified()
@@ -487,8 +509,23 @@ fn append_file<W: io::Write>(
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    append_reader(builder, archive_path, file, size, mtime)?;
+    append_reader(builder, archive_path, file, size, mtime).map_err(|error| match error {
+        AppendError::Source(source) => source_error(source),
+        AppendError::Archive(source) => PortabilityError::Io {
+            path: temporary.to_path_buf(),
+            source,
+        },
+    })?;
     Ok(size)
+}
+
+/// Which side of [`append_reader`]'s copy failed.
+#[derive(Debug)]
+enum AppendError {
+    /// Reading the source, including a source shorter than its recorded size.
+    Source(io::Error),
+    /// Writing the archive.
+    Archive(io::Error),
 }
 
 fn append_reader<W: io::Write, R: Read>(
@@ -497,23 +534,39 @@ fn append_reader<W: io::Write, R: Read>(
     reader: R,
     size: u64,
     mtime: u64,
-) -> io::Result<()> {
+) -> Result<(), AppendError> {
     let mut header = tar::Header::new_gnu();
     header.set_size(size);
     header.set_mode(0o644);
     header.set_mtime(mtime);
     header.set_cksum();
-    builder.append_data(&mut header, archive_path, ExactLength::new(reader, size))
+    let mut source = ExactLength::new(reader, size);
+    builder
+        .append_data(&mut header, archive_path, &mut source)
+        .map_err(|error| {
+            if source.failed {
+                AppendError::Source(error)
+            } else {
+                AppendError::Archive(error)
+            }
+        })
 }
 
 struct ExactLength<R> {
     reader: R,
     remaining: u64,
+    /// Set once a read of the source has failed, so the caller can tell a
+    /// source error from an archive write error in `append_data`'s result.
+    failed: bool,
 }
 
 impl<R> ExactLength<R> {
     fn new(reader: R, remaining: u64) -> Self {
-        Self { reader, remaining }
+        Self {
+            reader,
+            remaining,
+            failed: false,
+        }
     }
 }
 
@@ -525,8 +578,11 @@ impl<R: Read> Read for ExactLength<R> {
         let limit = buffer
             .len()
             .min(self.remaining.try_into().unwrap_or(usize::MAX));
-        let count = self.reader.read(&mut buffer[..limit])?;
+        let count = self.reader.read(&mut buffer[..limit]).inspect_err(|_| {
+            self.failed = true;
+        })?;
         if count == 0 {
+            self.failed = true;
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "source file ended before its recorded size",

@@ -49,10 +49,12 @@ impl fmt::Display for InsufficientSpace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} needs {} MiB but has {} MiB of room (64 MiB reserved margin)",
+            "{} needs at least {} MiB but has {} MiB of room (free space minus a {} MiB \
+             safety margin)",
             self.path.display(),
             self.needed.div_ceil(1024 * 1024),
-            self.available / (1024 * 1024)
+            self.available / (1024 * 1024),
+            MARGIN / (1024 * 1024)
         )
     }
 }

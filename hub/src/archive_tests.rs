@@ -216,6 +216,39 @@ fn a_huge_declared_size_is_refused_without_reading_the_missing_body() {
 }
 
 #[test]
+fn a_pax_size_record_counts_instead_of_the_header_size() {
+    use std::io::Write;
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("pax-size.tar.gz");
+    let file = fs::File::create(&archive).unwrap();
+    let mut encoder = GzEncoder::new(file, Compression::fast());
+    // `tar` reads the body length from a local pax `size` record when one
+    // precedes the entry, whatever the ustar header's own size field says.
+    let record = b"22 size=1000000000000\n";
+    let mut pax = Header::new_ustar();
+    pax.set_entry_type(EntryType::XHeader);
+    pax.set_path("PaxHeaders/huge").unwrap();
+    pax.set_size(record.len() as u64);
+    pax.set_cksum();
+    encoder.write_all(pax.as_bytes()).unwrap();
+    let mut body = [0_u8; 512];
+    body[..record.len()].copy_from_slice(record);
+    encoder.write_all(&body).unwrap();
+    let mut header = Header::new_ustar();
+    header.set_entry_type(EntryType::Regular);
+    header.set_path("demo/huge").unwrap();
+    header.set_size(0);
+    header.set_cksum();
+    encoder.write_all(header.as_bytes()).unwrap();
+    encoder.finish().unwrap();
+    let error = check_payload(&archive, 100).expect_err("the pax size exceeds room");
+    assert!(
+        matches!(error, ArchiveError::TooLarge { budget: 100 }),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_clean_archive_round_trips_into_its_top_level_directory() {
     let temp = tempfile::tempdir().expect("a temp dir");
     let archive = write_archive(temp.path(), "clean.tar.gz", |builder| {

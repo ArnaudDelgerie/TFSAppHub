@@ -6,7 +6,8 @@ use std::{
 
 use super::{
     append_bytes, append_reader, data_dir_populated, export_temp_path, import_decision, run_export,
-    run_import, ImportRefusal, Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE, UPLOADS_DIR,
+    run_import, AppendError, ImportRefusal, Manifest, PortabilityError, DATA_DIR, MANIFEST_FILE,
+    UPLOADS_DIR,
 };
 use crate::{
     install, lifecycle, lifecycle_gate,
@@ -628,7 +629,33 @@ fn an_early_eof_in_a_source_file_fails_the_archive_append() {
         0,
     )
     .expect_err("the declared file size must be supplied exactly");
-    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    assert!(
+        matches!(&error, AppendError::Source(source) if source.kind() == io::ErrorKind::UnexpectedEof),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_failed_archive_write_is_not_blamed_on_the_source() {
+    struct FullDisk;
+    impl io::Write for FullDisk {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("no space left"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut builder = tar::Builder::new(FullDisk);
+    let error = append_reader(
+        &mut builder,
+        "uploads/file.txt",
+        io::Cursor::new(b"content"),
+        7,
+        0,
+    )
+    .expect_err("the archive write fails");
+    assert!(matches!(error, AppendError::Archive(_)), "{error:?}");
 }
 
 #[test]
