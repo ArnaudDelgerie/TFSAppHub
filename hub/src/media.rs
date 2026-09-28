@@ -133,6 +133,55 @@ fn toplevel_gtk_window(webview: &webkit2gtk::WebView) -> Option<gtk::Window> {
     webview.toplevel()?.downcast::<gtk::Window>().ok()
 }
 
+/// The first `HeaderBar` in `widget`'s own subtree. Tauri's Wayland
+/// backend (tao 0.35) installs the window's titlebar as an `EventBox`
+/// holding a `HeaderBar`, so the search is general rather than one
+/// hard-coded `EventBox` step; a window without any `HeaderBar` is the
+/// server-side-decorations case, which [`set_indicator_title`]'s plain
+/// call already covers.
+fn find_header_bar(widget: &gtk::Widget) -> Option<gtk::HeaderBar> {
+    use gtk::prelude::{Cast, ContainerExt};
+
+    if let Some(header) = widget.downcast_ref::<gtk::HeaderBar>() {
+        return Some(header.clone());
+    }
+    widget
+        .downcast_ref::<gtk::Container>()
+        .into_iter()
+        .flat_map(|container| container.children())
+        .find_map(|child| find_header_bar(&child))
+}
+
+/// Set this webview's window title to `title`, through every layer that
+/// can own the visible one. `gtk_window_set_title` first: the window's own
+/// title property, and the only thing a window-manager-drawn title bar
+/// ever reads. Then tao's Wayland titlebar: its `HeaderBar` carries a
+/// snapshot of the title taken when the window was built and never follows
+/// the window's own (tao 0.35 — tauri issue 13749), so on a Wayland launch
+/// the window property alone updates a title nobody sees. Both layers get
+/// the same string, so whichever one draws, it draws one truth.
+///
+/// The one failure worth a line: no toplevel GTK window at all, which is
+/// the one way the indicator can be silently lost.
+fn set_indicator_title(webview: &webkit2gtk::WebView, title: &str) {
+    use gtk::prelude::{GtkWindowExt, HeaderBarExt};
+
+    match toplevel_gtk_window(webview) {
+        Some(window) => {
+            window.set_title(title);
+            if let Some(header) = window.titlebar().as_ref().and_then(find_header_bar) {
+                header.set_title(Some(title));
+            }
+        }
+        None => {
+            eprintln!(
+                "tfsapp-hub: warning: the webview has no GTK toplevel window; the \
+                 microphone indicator cannot set the title"
+            );
+        }
+    }
+}
+
 /// What WebKit is asking to authorize, reduced to what [`decide`] needs to
 /// know. `Other` covers every permission kind this group does not name:
 /// geolocation, notification, pointer lock, a media key system, website data
@@ -347,12 +396,8 @@ pub fn install_permission_handler<R: tauri::Runtime>(
         if granted {
             let capture_product_name = product_name.clone();
             webview.connect_microphone_capture_state_notify(move |webview| {
-                use gtk::prelude::GtkWindowExt;
-
                 let state = capture_state_of(webview.microphone_capture_state());
-                if let Some(window) = toplevel_gtk_window(webview) {
-                    window.set_title(&capture_title(&capture_product_name, state));
-                }
+                set_indicator_title(webview, &capture_title(&capture_product_name, state));
                 eprintln!(
                     "tfsapp-hub: microphone capture: {}",
                     match state {
@@ -369,11 +414,7 @@ pub fn install_permission_handler<R: tauri::Runtime>(
             // the page it was reporting on.
             let plain_product_name = product_name;
             webview.connect_web_process_terminated(move |webview, _reason| {
-                use gtk::prelude::GtkWindowExt;
-
-                if let Some(window) = toplevel_gtk_window(webview) {
-                    window.set_title(&plain_product_name);
-                }
+                set_indicator_title(webview, &plain_product_name);
             });
         }
         // Sent once, after everything is connected — the grant is only
