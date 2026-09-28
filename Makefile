@@ -27,21 +27,22 @@ composer:
 	build/scripts/download-composer.sh
 
 # Run cargo fmt --check, then clippy, then unit tests, then shellcheck over
-# build/scripts/*.sh — same four gates and same order as the station's, cheapest
-# failure first: formatting needs no compilation at all, clippy is the cheapest
-# failure to report after that. Formatting is stock rustfmt with no project
-# rustfmt.toml. The ordinary unit suite never starts or contacts a Secret
-# Service, so `make check` is safe without D-Bus or gnome-keyring-daemon. A
-# separate explicit integration target will exercise that production backend.
-# The hub test binary includes process and filesystem lifecycle probes; run it
-# in one thread so one probe's short-lived child cannot race another's cleanup.
-# No Tauri/AppImage integration here: opening a real window stays manual, as it
-# does over there.
+# build/scripts/*.sh and build/scripts/tests/*.sh, then the release-chain
+# script — five gates, cheapest failure first: formatting needs no compilation
+# at all, clippy is the cheapest failure to report after that. Formatting is
+# stock rustfmt with no project rustfmt.toml. The ordinary unit suite never
+# starts or contacts a Secret Service, so `make check` is safe without D-Bus or
+# gnome-keyring-daemon. A separate explicit integration target will exercise
+# that production backend. The hub test binary includes process and filesystem
+# lifecycle probes; run it in one thread so one probe's short-lived child cannot
+# race another's cleanup. No Tauri/AppImage integration here: opening a real
+# window stays manual, as it does over there.
 check:
 	cargo fmt --check
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo test -- --test-threads=1
-	shellcheck build/scripts/*.sh
+	shellcheck build/scripts/*.sh build/scripts/tests/*.sh
+	build/scripts/tests/release-chain.sh
 
 # The deliberately explicit production-backend smoke check. It alone starts
 # the repository-owned private D-Bus session and throwaway Secret Service; the

@@ -21,15 +21,29 @@ for name in frankenphp composer.phar; do
   fi
 done
 
+# The version being built, read from hub/Cargo.toml exactly the way
+# release.sh reads it (duplicated on purpose — one line each, not a sourced
+# library), so `make build` and `make release` can never disagree about which
+# AppImage belongs to this tree.
+CARGO_TOML="$HUB_DIR/Cargo.toml"
+VERSION="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "$CARGO_TOML")"
+if [[ -z "$VERSION" ]]; then
+  echo "build-hub: could not read a \"version\" line from $CARGO_TOML" >&2
+  exit 1
+fi
+
 (cd "$HUB_DIR" && cargo tauri build --bundles appimage)
 
 # The workspace's shared target/, not hub/target/ — hub/ is a member of the
 # root Cargo.toml's [workspace], and cargo puts every member's output there.
 BUNDLE_DIR="$ROOT_DIR/target/release/bundle/appimage"
 shopt -s nullglob
-appimages=("$BUNDLE_DIR"/*.AppImage)
+# Scoped to this version, not every *.AppImage in the directory: an older
+# build kept on disk (release.sh's reuse prompt defaults to keeping it) must
+# not make an unambiguous build ambiguous.
+appimages=("$BUNDLE_DIR"/TFSAppHub_"${VERSION}"_*.AppImage)
 if [[ ${#appimages[@]} -ne 1 ]]; then
-  echo "build-hub: expected exactly one *.AppImage under $BUNDLE_DIR, found ${#appimages[@]}." >&2
+  echo "build-hub: expected exactly one TFSAppHub_${VERSION}_*.AppImage under $BUNDLE_DIR, found ${#appimages[@]}." >&2
   exit 1
 fi
 APPIMAGE="${appimages[0]}"
