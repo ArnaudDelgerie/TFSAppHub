@@ -198,6 +198,10 @@ fn finalise_anchor_reports_a_database_member_missing_from_both_places() {
 
 #[test]
 fn recovery_restores_a_replacement_from_the_durable_outgoing_state() {
+    // The last phase at which recovery is still a revert: the registry is
+    // only ever written between `LifecycleComplete` and `RegistryCommitted`
+    // (`apply`'s own order), so this is also the last phase at which the
+    // registry entry actually needs restoring rather than already matching.
     let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
     let mut journal = Journal::prepared(TransactionKind::Apply, entry.clone());
     journal.database_members = snapshot_db(&data_dir.join("data"), &data_dir).unwrap();
@@ -208,11 +212,7 @@ fn recovery_restores_a_replacement_from_the_durable_outgoing_state() {
     fs::write(app_dir.join("public/version"), "new").unwrap();
     fs::write(data_dir.join("data/app.db"), "new-db").unwrap();
     lifecycle::write_data_version(&data_dir.join("data"), "0.7.0").unwrap();
-    registry::update(&paths, |registry| {
-        registry.get_mut("demo").unwrap().app_version = "0.7.0".into();
-    })
-    .unwrap();
-    journal.advance(Phase::RegistryCommitted);
+    journal.advance(Phase::LifecycleComplete);
     write(&data_dir, &journal).unwrap();
 
     let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
@@ -233,6 +233,101 @@ fn recovery_restores_a_replacement_from_the_durable_outgoing_state() {
     );
     assert_eq!(registry::load(&paths).unwrap().get("demo").unwrap(), &entry);
     assert!(read(&data_dir).unwrap().is_none());
+}
+
+#[test]
+fn recovery_finishes_a_registry_committed_update_forward() {
+    let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+    let mut journal = Journal::prepared(TransactionKind::Apply, entry.clone());
+    journal.database_members = snapshot_db(&data_dir.join("data"), &data_dir).unwrap();
+    journal.advance(Phase::SnapshotComplete);
+    retain_tree(&app_dir).unwrap();
+    journal.advance(Phase::TreeRetained);
+    fs::create_dir_all(app_dir.join("public")).unwrap();
+    fs::write(app_dir.join("public/version"), "new").unwrap();
+    fs::write(data_dir.join("data/app.db"), "new-db").unwrap();
+    lifecycle::write_data_version(&data_dir.join("data"), "0.7.0").unwrap();
+    registry::update(&paths, |registry| {
+        registry.get_mut("demo").unwrap().app_version = "0.7.0".into();
+    })
+    .unwrap();
+    journal.advance(Phase::RegistryCommitted);
+    write(&data_dir, &journal).unwrap();
+
+    let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+    assert!(outcome.is_complete(), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(app_dir.join("public/version")).unwrap(),
+        "new"
+    );
+    assert_eq!(
+        fs::read_to_string(data_dir.join("data/app.db")).unwrap(),
+        "new-db"
+    );
+    assert_eq!(
+        read_data_version(&data_dir.join("data"))
+            .unwrap()
+            .as_deref(),
+        Some("0.7.0")
+    );
+    let mut expected = entry.clone();
+    expected.app_version = "0.7.0".into();
+    assert_eq!(
+        registry::load(&paths).unwrap().get("demo").unwrap(),
+        &expected
+    );
+    assert!(read(&data_dir).unwrap().is_none());
+
+    let data_subdir = data_dir.join("data");
+    assert!(lifecycle::previous_tree_path(&app_dir).is_dir());
+    assert_eq!(
+        fs::read_to_string(lifecycle::previous_tree_path(&app_dir).join("public/version")).unwrap(),
+        "old"
+    );
+    assert!(lifecycle::db_snapshot_path(&data_subdir, "app.db").is_file());
+    assert_eq!(
+        fs::read_to_string(lifecycle::db_snapshot_path(&data_subdir, "app.db")).unwrap(),
+        "old-db"
+    );
+    let anchor = lifecycle::read_rollback_anchor(&data_subdir).expect("a written rollback.json");
+    assert_eq!(anchor.app_version, entry.app_version);
+    assert_eq!(anchor.source_revision, entry.source_revision);
+}
+
+#[test]
+fn recovery_finishes_a_registry_committed_resync_forward() {
+    let (_base, paths, entry, data_dir, app_dir) = seeded_paths();
+    let mut journal = Journal::prepared(TransactionKind::ResyncOnly, entry.clone());
+    retain_tree(&app_dir).unwrap();
+    journal.advance(Phase::TreeRetained);
+    fs::create_dir_all(app_dir.join("public")).unwrap();
+    fs::write(app_dir.join("public/version"), "new").unwrap();
+    journal.advance(Phase::ReplacementInstalled);
+    registry::update(&paths, |registry| {
+        registry.get_mut("demo").unwrap().source_revision = "new-rev".into();
+    })
+    .unwrap();
+    journal.advance(Phase::RegistryCommitted);
+    write(&data_dir, &journal).unwrap();
+
+    let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
+    assert!(outcome.is_complete(), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(app_dir.join("public/version")).unwrap(),
+        "new"
+    );
+    assert!(!staged_tree_path(&app_dir).is_dir());
+    assert!(read(&data_dir).unwrap().is_none());
+    // A resync rotates no anchor: the existing rollback point, if any, is
+    // left exactly as it was — recovery must not create one either.
+    assert!(!lifecycle::previous_tree_path(&app_dir).is_dir());
+    assert!(lifecycle::read_rollback_anchor(&data_dir.join("data")).is_none());
+    let mut expected = entry.clone();
+    expected.source_revision = "new-rev".into();
+    assert_eq!(
+        registry::load(&paths).unwrap().get("demo").unwrap(),
+        &expected
+    );
 }
 
 #[test]
@@ -325,30 +420,59 @@ fn recovery_obeys_each_durable_phase_without_guessing() {
         let outcome = recover_transaction(&paths, &data_dir, &app_dir, &journal);
         assert!(outcome.is_complete(), "{phase:?}: {outcome:?}");
         assert!(read(&data_dir).unwrap().is_none(), "{phase:?}");
-        if phase == Phase::AnchorFinalised {
+        // From `RegistryCommitted` on, the update already happened and
+        // recovery completes it forward instead of reverting it: the live
+        // tree/version stay "new" and the outgoing state is promoted to the
+        // ordinary rollback anchor rather than restored in place.
+        if matches!(phase, Phase::RegistryCommitted | Phase::AnchorFinalised) {
             assert_eq!(
                 fs::read_to_string(app_dir.join("public/version")).unwrap(),
-                "new"
+                "new",
+                "{phase:?}"
             );
         } else if matches!(
             phase,
-            Phase::TreeRetained
-                | Phase::ReplacementInstalled
-                | Phase::LifecycleComplete
-                | Phase::RegistryCommitted
+            Phase::TreeRetained | Phase::ReplacementInstalled | Phase::LifecycleComplete
         ) {
             assert_eq!(
                 fs::read_to_string(app_dir.join("public/version")).unwrap(),
-                "old"
+                "old",
+                "{phase:?}"
             );
         }
-        // `AnchorFinalised` is the one phase recovery must not reverse: the
-        // registry write already committed and the anchor step means the
-        // update is done, so `recover_transaction` only discards the journal
-        // (update.rs's early `AnchorFinalised` branch) and rightly leaves the
-        // new version in place — matching `public/version` staying "new"
-        // above rather than reverting to the pre-update `entry`.
-        let expected_entry = if phase == Phase::AnchorFinalised {
+        if phase == Phase::RegistryCommitted {
+            let data_subdir = data_dir.join("data");
+            assert!(
+                lifecycle::previous_tree_path(&app_dir).is_dir(),
+                "{phase:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(lifecycle::previous_tree_path(&app_dir).join("public/version"))
+                    .unwrap(),
+                "old",
+                "{phase:?}"
+            );
+            assert!(
+                lifecycle::db_snapshot_path(&data_subdir, "app.db").is_file(),
+                "{phase:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(lifecycle::db_snapshot_path(&data_subdir, "app.db")).unwrap(),
+                "old-db",
+                "{phase:?}"
+            );
+            let anchor = lifecycle::read_rollback_anchor(&data_subdir)
+                .unwrap_or_else(|| panic!("{phase:?}: a written rollback.json"));
+            assert_eq!(anchor.app_version, entry.app_version, "{phase:?}");
+        }
+        // `RegistryCommitted` and `AnchorFinalised` are the two phases
+        // recovery must not reverse: the registry write already committed
+        // and the update is done, so `recover_transaction` completes the
+        // anchor promotion (or, at `AnchorFinalised`, only discards the
+        // journal) and rightly leaves the new version registered — matching
+        // `public/version` staying "new" above rather than reverting to the
+        // pre-update `entry`.
+        let expected_entry = if matches!(phase, Phase::RegistryCommitted | Phase::AnchorFinalised) {
             RegistryEntry {
                 app_version: "0.7.0".into(),
                 ..entry.clone()
