@@ -84,10 +84,10 @@ fn render_crash_page(
 ) -> String {
     let mut vars = String::new();
     if let Some(bg) = splash_bg {
-        vars.push_str(&format!("--splash-bg:{};", escape_html(bg)));
+        vars.push_str(&format!("--splash-bg:{};", escape_css(bg)));
     }
     if let Some(text) = splash_text {
-        vars.push_str(&format!("--splash-text:{};", escape_html(text)));
+        vars.push_str(&format!("--splash-text:{};", escape_css(text)));
     }
     format!(
         "<!doctype html>\
@@ -107,6 +107,29 @@ text-decoration:none;}}\
         name = escape_html(product_name),
         uri = escape_html(reload_uri),
     )
+}
+
+/// Escapes a manifest-declared colour before it becomes a `<style>` block's
+/// custom-property value — a different grammar from [`escape_html`]'s two
+/// contexts: `;`, `{` and `}` end a declaration or a rule there, not `<` or
+/// `&`, so HTML-escaping alone would still let a malformed `splash_bg` /
+/// `splash_text` (this crate never validates either — `manifest.rs` takes
+/// them as plain strings) break out of its declaration and restyle the rest
+/// of the page. CSS's own escape syntax — backslash, the character's hex
+/// code point, then a space — turns any character into a literal in every
+/// CSS context, so the worst an unexpected character does is make the
+/// declaration compute as invalid, not reach outside it.
+fn escape_css(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '#' | '.' | '%' | ',' | '(' | ')' | '-' | ' ' => {
+                out.push(ch);
+            }
+            other => out.push_str(&format!("\\{:x} ", other as u32)),
+        }
+    }
+    out
 }
 
 /// Minimal HTML escaping for the two contexts [`render_crash_page`] ever

@@ -54,6 +54,22 @@ fn declared_colours_become_custom_properties() {
 }
 
 #[test]
+fn a_colour_carrying_css_syntax_cannot_break_out_of_its_declaration() {
+    let page = render_crash_page(
+        "App",
+        Some("red; } body { display:none"),
+        None,
+        "https://app.local/",
+    );
+    assert!(!page.contains("red; }"));
+    assert!(!page.contains("display:none}"));
+    assert_eq!(page.matches("red").count(), 1);
+    assert!(page.contains("\\3b ")); // `;`
+    assert!(page.contains("\\7b ")); // `{`
+    assert!(page.contains("\\7d ")); // `}`
+}
+
+#[test]
 fn undeclared_colours_leave_no_custom_property_and_keep_the_fallback() {
     let page = render_crash_page("App", None, None, "https://app.local/");
     assert!(page.contains(":root{}"));
