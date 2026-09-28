@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf};
 use flate2::{write::GzEncoder, Compression};
 use tar::{Builder, EntryType, Header};
 
-use super::{extract, extract_prefix, ArchiveError};
+use super::{check_payload, extract, extract_prefix, ArchiveError};
 
 fn write_archive(
     dir: &std::path::Path,
@@ -63,6 +63,23 @@ fn append_symlink(builder: &mut Builder<GzEncoder<fs::File>>, path: &str, target
         .expect("append symlink");
 }
 
+fn append_special(builder: &mut Builder<GzEncoder<fs::File>>, path: &str, kind: EntryType) {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(kind);
+    header.set_size(0);
+    header.set_mode(0o644);
+    header.set_path(path).expect("a valid entry path");
+    if kind == EntryType::Link {
+        header.set_link_name("victim").expect("a link target");
+    } else if kind == EntryType::GNUSparse {
+        header.as_gnu_mut().expect("GNU header").set_real_size(0);
+    }
+    header.set_cksum();
+    builder
+        .append(&header, std::io::empty())
+        .expect("append entry");
+}
+
 /// Append an entry whose path bypasses [`Header::set_path`]'s own
 /// "relative, no `..`" validation — the only way to build a fixture archive
 /// that this crate's *builder* would refuse to write honestly, needed to
@@ -112,6 +129,7 @@ fn a_git_archive_style_pax_global_header_is_ignored() {
         append_pax_global_header(builder);
         append_dir(builder, "demo-1.0.0/");
         append_file(builder, "demo-1.0.0/composer.json", b"{}");
+        append_symlink(builder, "demo-1.0.0/alias.json", "composer.json");
     });
 
     let destination = temp.path().join("out");
@@ -121,6 +139,112 @@ fn a_git_archive_style_pax_global_header_is_ignored() {
     assert_eq!(
         fs::read_to_string(root.join("composer.json")).expect("composer.json on disk"),
         "{}"
+    );
+    assert_eq!(
+        fs::read_link(root.join("alias.json")).unwrap(),
+        PathBuf::from("composer.json")
+    );
+}
+
+#[test]
+fn unsupported_entries_are_refused_on_both_extraction_paths() {
+    for (kind, label) in [
+        (EntryType::Link, "hard link"),
+        (EntryType::Fifo, "fifo"),
+        (EntryType::GNUSparse, "sparse file"),
+    ] {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let archive = write_archive(temp.path(), "special.tar.gz", |builder| {
+            append_dir(builder, "data/");
+            append_special(builder, "data/hard", kind);
+        });
+        let out = temp.path().join("out");
+        let error = extract(&archive, &out).expect_err("unsupported entry");
+        assert!(
+            matches!(error, ArchiveError::UnsupportedEntry { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains(label), "{error}");
+        assert!(!out.join("data/hard").exists());
+
+        let prefix_out = temp.path().join("prefix-out");
+        let error = extract_prefix(&archive, "data", &prefix_out).expect_err("unsupported entry");
+        assert!(
+            matches!(error, ArchiveError::UnsupportedEntry { .. }),
+            "{error}"
+        );
+        assert!(!prefix_out.join("hard").exists());
+    }
+}
+
+#[test]
+fn extract_rejects_an_over_budget_payload_before_writing_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = write_archive(temp.path(), "large.tar.gz", |builder| {
+        append_file(builder, "demo/file", b"123456");
+    });
+    let destination = temp.path().join("out");
+    let error = crate::disk_space::with_available_bytes(crate::disk_space::MARGIN + 5, || {
+        extract(&archive, &destination).expect_err("six bytes exceed the five byte room")
+    });
+    assert!(
+        matches!(error, ArchiveError::TooLarge { budget: 5 }),
+        "{error}"
+    );
+    assert!(!destination.join("demo").exists());
+}
+
+#[test]
+fn a_huge_declared_size_is_refused_without_reading_the_missing_body() {
+    use std::io::Write;
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("truncated.tar.gz");
+    let file = fs::File::create(&archive).unwrap();
+    let mut encoder = GzEncoder::new(file, Compression::fast());
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::Regular);
+    header.set_path("demo/huge").unwrap();
+    header.set_size(1_000_000_000_000);
+    header.set_cksum();
+    encoder.write_all(header.as_bytes()).unwrap();
+    encoder.finish().unwrap();
+    let error = check_payload(&archive, 100).expect_err("header alone exceeds room");
+    assert!(
+        matches!(error, ArchiveError::TooLarge { budget: 100 }),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_pax_size_record_counts_instead_of_the_header_size() {
+    use std::io::Write;
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("pax-size.tar.gz");
+    let file = fs::File::create(&archive).unwrap();
+    let mut encoder = GzEncoder::new(file, Compression::fast());
+    // `tar` reads the body length from a local pax `size` record when one
+    // precedes the entry, whatever the ustar header's own size field says.
+    let record = b"22 size=1000000000000\n";
+    let mut pax = Header::new_ustar();
+    pax.set_entry_type(EntryType::XHeader);
+    pax.set_path("PaxHeaders/huge").unwrap();
+    pax.set_size(record.len() as u64);
+    pax.set_cksum();
+    encoder.write_all(pax.as_bytes()).unwrap();
+    let mut body = [0_u8; 512];
+    body[..record.len()].copy_from_slice(record);
+    encoder.write_all(&body).unwrap();
+    let mut header = Header::new_ustar();
+    header.set_entry_type(EntryType::Regular);
+    header.set_path("demo/huge").unwrap();
+    header.set_size(0);
+    header.set_cksum();
+    encoder.write_all(header.as_bytes()).unwrap();
+    encoder.finish().unwrap();
+    let error = check_payload(&archive, 100).expect_err("the pax size exceeds room");
+    assert!(
+        matches!(error, ArchiveError::TooLarge { budget: 100 }),
+        "{error}"
     );
 }
 

@@ -28,7 +28,7 @@ use std::{
     fmt, fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,7 @@ pub struct Manifest {
 
 /// The manifest's filename at the archive's root.
 pub const MANIFEST_FILE: &str = "manifest.json";
+const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 
 /// The archive's internal directory holding the curated database files —
 /// [`lifecycle::DB_FILE_NAMES`] joined under it, never a separate list.
@@ -356,9 +357,8 @@ fn write_archive(
             if !source_path.is_file() {
                 continue;
             }
-            let bytes = fs::read(&source_path).map_err(io_error(&source_path))?;
             let archive_path = format!("{DATA_DIR}/{name}");
-            append_bytes(&mut builder, &archive_path, &bytes).map_err(io_error(&temporary))?;
+            append_file(&mut builder, &archive_path, &source_path, &temporary)?;
             database.push(name);
         }
 
@@ -383,16 +383,11 @@ fn write_archive(
 
 /// Walk `uploads_dir` and append every regular file it holds under an
 /// `uploads/`-prefixed archive path, sorted at every level so two exports of
-/// identical content produce byte-identical archives (the same determinism
-/// the fixed header in [`append_bytes`] exists for). A directory that does
+/// identical content produce entries in the same order. A directory that does
 /// not exist is not a skip and not an error — the ordinary case for an app
 /// that has never written a file. Anything that is not a regular file (a
 /// symlink, a socket, a fifo) is skipped and named on stderr rather than
 /// followed or embedded.
-///
-/// `io_error`s are attributed to `temporary` — `append_bytes`'s own failure
-/// is always a write to the archive being built, never to the source file
-/// just read, matching the database loop just above this call.
 fn append_uploads<W: io::Write>(
     builder: &mut tar::Builder<W>,
     uploads_dir: &Path,
@@ -448,11 +443,10 @@ fn append_uploads_dir<W: io::Write>(
                 bytes,
             )?;
         } else if file_type.is_file() {
-            let data = fs::read(&child_absolute).map_err(io_error(&child_absolute))?;
             let archive_path = Path::new(UPLOADS_DIR).join(&child_relative);
-            append_bytes(builder, &archive_path, &data).map_err(io_error(temporary))?;
+            let size = append_file(builder, &archive_path, &child_absolute, temporary)?;
             *count += 1;
-            *bytes += data.len() as u64;
+            *bytes += size;
         } else {
             eprintln!(
                 "skipping {}: not a regular file ({})",
@@ -476,9 +470,7 @@ fn export_temp_path(target: &Path) -> PathBuf {
     PathBuf::from(temporary)
 }
 
-/// Append one in-memory file to `builder` at `archive_path`, with an ordinary
-/// `0644` mode and this process's own start-adjacent mtime — nothing here
-/// reads back a timestamp so any fixed, valid one does.
+/// Append the in-memory manifest with a stable header.
 fn append_bytes<W: io::Write>(
     builder: &mut tar::Builder<W>,
     archive_path: impl AsRef<Path>,
@@ -487,13 +479,118 @@ fn append_bytes<W: io::Write>(
     let mut header = tar::Header::new_gnu();
     header.set_size(data.len() as u64);
     header.set_mode(0o644);
-    let mtime = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    header.set_mtime(mtime);
+    header.set_mtime(0);
     header.set_cksum();
     builder.append_data(&mut header, archive_path, data)
+}
+
+/// Append a regular file using only a bounded buffer. A file truncated after
+/// its metadata was read must fail rather than silently produce a short entry.
+///
+/// A failure is attributed to `source_path` when reading it failed, and to
+/// `temporary` when writing the archive did — a full disk at the export's
+/// target must not read as a problem with the upload being copied.
+fn append_file<W: io::Write>(
+    builder: &mut tar::Builder<W>,
+    archive_path: impl AsRef<Path>,
+    source_path: &Path,
+    temporary: &Path,
+) -> Result<u64, PortabilityError> {
+    let source_error = |source| PortabilityError::Io {
+        path: source_path.to_path_buf(),
+        source,
+    };
+    let file = fs::File::open(source_path).map_err(source_error)?;
+    let metadata = file.metadata().map_err(source_error)?;
+    let size = metadata.len();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    append_reader(builder, archive_path, file, size, mtime).map_err(|error| match error {
+        AppendError::Source(source) => source_error(source),
+        AppendError::Archive(source) => PortabilityError::Io {
+            path: temporary.to_path_buf(),
+            source,
+        },
+    })?;
+    Ok(size)
+}
+
+/// Which side of [`append_reader`]'s copy failed.
+#[derive(Debug)]
+enum AppendError {
+    /// Reading the source, including a source shorter than its recorded size.
+    Source(io::Error),
+    /// Writing the archive.
+    Archive(io::Error),
+}
+
+fn append_reader<W: io::Write, R: Read>(
+    builder: &mut tar::Builder<W>,
+    archive_path: impl AsRef<Path>,
+    reader: R,
+    size: u64,
+    mtime: u64,
+) -> Result<(), AppendError> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(size);
+    header.set_mode(0o644);
+    header.set_mtime(mtime);
+    header.set_cksum();
+    let mut source = ExactLength::new(reader, size);
+    builder
+        .append_data(&mut header, archive_path, &mut source)
+        .map_err(|error| {
+            if source.failed {
+                AppendError::Source(error)
+            } else {
+                AppendError::Archive(error)
+            }
+        })
+}
+
+struct ExactLength<R> {
+    reader: R,
+    remaining: u64,
+    /// Set once a read of the source has failed, so the caller can tell a
+    /// source error from an archive write error in `append_data`'s result.
+    failed: bool,
+}
+
+impl<R> ExactLength<R> {
+    fn new(reader: R, remaining: u64) -> Self {
+        Self {
+            reader,
+            remaining,
+            failed: false,
+        }
+    }
+}
+
+impl<R: Read> Read for ExactLength<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || buffer.is_empty() {
+            return Ok(0);
+        }
+        let limit = buffer
+            .len()
+            .min(self.remaining.try_into().unwrap_or(usize::MAX));
+        let count = self.reader.read(&mut buffer[..limit]).inspect_err(|_| {
+            self.failed = true;
+        })?;
+        if count == 0 {
+            self.failed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "source file ended before its recorded size",
+            ));
+        }
+        self.remaining -= count as u64;
+        Ok(count)
+    }
 }
 
 /// `tfsapp-hub import <id> <path> [--force] [--yes]` — resolve `Paths`, run
@@ -584,6 +681,25 @@ fn run_import(
         force,
     )
     .map_err(PortabilityError::Refused)?;
+
+    let room = crate::disk_space::room(&data_dir).map_err(|source| PortabilityError::Io {
+        path: data_dir.clone(),
+        source,
+    })?;
+    let mut live_db_bytes = 0_u64;
+    for name in lifecycle::DB_FILE_NAMES {
+        let path = data_subdir.join(name);
+        match fs::metadata(&path) {
+            Ok(metadata) => live_db_bytes = live_db_bytes.saturating_add(metadata.len()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(PortabilityError::Io { path, source }),
+        }
+    }
+    archive::check_payload(archive_path, room.saturating_sub(live_db_bytes)).map_err(|error| {
+        PortabilityError::Preflight {
+            detail: error.to_string(),
+        }
+    })?;
 
     if populated {
         announce_overwrite(
@@ -787,14 +903,23 @@ fn read_manifest(archive_path: &Path) -> Result<Manifest, PortabilityError> {
     let entries = archive.entries().map_err(io_error)?;
 
     for entry in entries {
-        let mut entry = entry.map_err(io_error)?;
+        let entry = entry.map_err(io_error)?;
         let path = entry.path().map_err(io_error)?.into_owned();
         if path != Path::new(MANIFEST_FILE) {
             continue;
         }
 
         let mut contents = String::new();
-        entry.read_to_string(&mut contents).map_err(io_error)?;
+        entry
+            .take(MANIFEST_MAX_BYTES + 1)
+            .read_to_string(&mut contents)
+            .map_err(io_error)?;
+        if contents.len() as u64 > MANIFEST_MAX_BYTES {
+            return Err(PortabilityError::MalformedManifest {
+                path: archive_path.to_path_buf(),
+                detail: "manifest.json exceeds the 1 MiB limit".to_string(),
+            });
+        }
         return serde_json::from_str(&contents).map_err(|error| {
             PortabilityError::MalformedManifest {
                 path: archive_path.to_path_buf(),
@@ -1037,6 +1162,10 @@ pub enum PortabilityError {
         path: PathBuf,
         detail: String,
     },
+    /// A preflight archive check failed before import changed any state.
+    Preflight {
+        detail: String,
+    },
     /// [`import_decision`] refused.
     Refused(ImportRefusal),
     /// An import stopped while clearing the destination's disposable cache,
@@ -1139,6 +1268,10 @@ impl fmt::Display for PortabilityError {
                 "{}: its manifest.json is unreadable ({detail}) — this does not look like an \
                  archive `export` wrote.",
                 path.display()
+            ),
+            Self::Preflight { detail } => write!(
+                formatter,
+                "import refused before changing anything: {detail}"
             ),
             Self::Refused(refusal) => write!(formatter, "{refusal}"),
             Self::CacheCleanup {

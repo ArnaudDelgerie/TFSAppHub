@@ -31,6 +31,53 @@ fn stub_once(
     (format!("http://127.0.0.1:{port}"), handle)
 }
 
+fn raw_download(
+    body: &'static [u8],
+    content_length: bool,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut request)
+            .unwrap();
+        let length = if content_length {
+            format!("Content-Length: {}\r\n", body.len())
+        } else {
+            String::new()
+        };
+        let response = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{length}\r\n");
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+    });
+    (format!("http://{address}/asset"), handle)
+}
+
+#[test]
+fn download_refuses_a_body_larger_than_room_with_or_without_content_length() {
+    for content_length in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("asset.tar.gz");
+        let (url, server) = raw_download(b"0123456789", content_length);
+        let error = crate::disk_space::with_available_bytes(crate::disk_space::MARGIN + 5, || {
+            download_to(&url, &target).expect_err("body exceeds room")
+        });
+        server.join().unwrap();
+        assert!(error.to_string().contains("room"), "{error}");
+        if content_length {
+            assert!(
+                !target.exists(),
+                "Content-Length is rejected before writing"
+            );
+        } else {
+            assert_eq!(fs::read(&target).unwrap(), b"012345");
+        }
+    }
+}
+
 fn release(tag: &str, assets: Vec<GitHubAsset>) -> GitHubRelease {
     GitHubRelease {
         tag_name: tag.to_string(),

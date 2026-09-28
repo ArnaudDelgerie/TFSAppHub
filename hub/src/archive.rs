@@ -11,8 +11,8 @@
 //! naive extractor would happily write outside the tree it was asked for.
 //!
 //! **Every entry is checked before it is written.** A path that is absolute,
-//! that contains a `..` component, or a symlink/hard link whose target
-//! resolves outside the extraction root, is a refusal — not a skip, not a
+//! that contains a `..` component, an unsupported entry type, or a symlink
+//! whose target resolves outside the extraction root, is a refusal — not a skip, not a
 //! sanitised rewrite. The Overview's "the archive is a `.tar.gz` with exactly
 //! one top-level directory" is enforced the same way: every entry's first
 //! path component must name the same directory, and an archive with none (a
@@ -41,6 +41,8 @@ use tar::{Archive, EntryType};
 /// extraction, since nothing here merges with existing content.
 pub fn extract(archive_path: &Path, destination: &Path) -> Result<PathBuf, ArchiveError> {
     fs::create_dir_all(destination).map_err(ArchiveError::Io)?;
+    let budget = crate::disk_space::room(destination).map_err(ArchiveError::Io)?;
+    check_payload(archive_path, budget)?;
 
     let file = fs::File::open(archive_path).map_err(ArchiveError::Io)?;
     let mut archive = Archive::new(GzDecoder::new(file));
@@ -81,8 +83,9 @@ pub fn extract(archive_path: &Path, destination: &Path) -> Result<PathBuf, Archi
             saw_nested_entry = true;
         }
 
-        if entry_type.is_symlink() || entry_type.is_hard_link() {
-            check_safe_link(&mut entry, &path, entry_type)?;
+        check_entry_type(&path, entry_type)?;
+        if entry_type.is_symlink() {
+            check_safe_link(&mut entry, &path)?;
         }
 
         let out_path = destination.join(&path);
@@ -102,6 +105,36 @@ pub fn extract(archive_path: &Path, destination: &Path) -> Result<PathBuf, Archi
         Some(name) if saw_nested_entry => Ok(destination.join(name)),
         _ => Err(ArchiveError::NoTopLevelDirectory),
     }
+}
+
+/// Validate paths and entry types, and total the bytes regular entries would write.
+/// This pass does not need the extraction prefix and therefore cannot validate
+/// symlink depth; each extraction path checks that immediately before writing.
+pub fn check_payload(archive_path: &Path, budget: u64) -> Result<u64, ArchiveError> {
+    let file = fs::File::open(archive_path).map_err(ArchiveError::Io)?;
+    let mut archive = Archive::new(GzDecoder::new(file));
+    let mut total = 0_u64;
+    for entry in archive.entries().map_err(ArchiveError::Io)? {
+        let entry = entry.map_err(ArchiveError::Io)?;
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() || kind.is_pax_local_extensions() {
+            continue;
+        }
+        let path = entry.path().map_err(ArchiveError::Io)?.into_owned();
+        check_safe_path(&path)?;
+        check_entry_type(&path, kind)?;
+        if kind.is_file() || kind == EntryType::Continuous {
+            // `Entry::size`, not the header's own field: a local pax `size`
+            // record overrides the header, and it is what `tar` then writes.
+            total = total
+                .checked_add(entry.size())
+                .ok_or(ArchiveError::TooLarge { budget })?;
+            if total > budget {
+                return Err(ArchiveError::TooLarge { budget });
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// Extract every entry under `prefix` from the `.tar.gz` at `archive_path`
@@ -152,11 +185,12 @@ pub fn extract_prefix(
             continue;
         }
 
-        if entry_type.is_symlink() || entry_type.is_hard_link() {
+        check_entry_type(&path, entry_type)?;
+        if entry_type.is_symlink() {
             // Checked against `relative`, not `path`: what matters is
             // whether the link escapes `destination` once written there,
             // and `path` still carries `prefix`'s own extra depth.
-            check_safe_link(&mut entry, relative, entry_type)?;
+            check_safe_link(&mut entry, relative)?;
         }
 
         let out_path = destination.join(relative);
@@ -190,7 +224,7 @@ fn check_safe_path(path: &Path) -> Result<&std::ffi::OsStr, ArchiveError> {
     Ok(first)
 }
 
-/// Reject a symlink or hard link whose recorded target, resolved lexically
+/// Reject a symlink whose recorded target, resolved lexically
 /// against `path`'s own directory, would leave the extraction root — an
 /// absolute target is rejected outright, since nothing about the archive's
 /// own layout can vouch for what lives at an absolute path on the machine
@@ -198,7 +232,6 @@ fn check_safe_path(path: &Path) -> Result<&std::ffi::OsStr, ArchiveError> {
 fn check_safe_link<R: Read>(
     entry: &mut tar::Entry<'_, R>,
     path: &Path,
-    entry_type: EntryType,
 ) -> Result<(), ArchiveError> {
     let target = entry.link_name().map_err(ArchiveError::Io)?;
     let escapes = match &target {
@@ -208,14 +241,27 @@ fn check_safe_link<R: Read>(
     if escapes {
         return Err(ArchiveError::UnsafeLink {
             path: path.to_path_buf(),
-            kind: if entry_type.is_symlink() {
-                "symlink"
-            } else {
-                "hard link"
-            },
         });
     }
     Ok(())
+}
+
+/// Only these entry types have predictable writes confined to their path.
+fn check_entry_type(path: &Path, entry_type: EntryType) -> Result<(), ArchiveError> {
+    let kind = match entry_type {
+        EntryType::Regular | EntryType::Continuous | EntryType::Directory | EntryType::Symlink => {
+            return Ok(());
+        }
+        EntryType::Link => "hard link".to_owned(),
+        EntryType::GNUSparse => "sparse file".to_owned(),
+        EntryType::Char | EntryType::Block => "device".to_owned(),
+        EntryType::Fifo => "fifo".to_owned(),
+        other => format!("type byte 0x{:02x}", other.as_byte()),
+    };
+    Err(ArchiveError::UnsupportedEntry {
+        path: path.to_path_buf(),
+        kind,
+    })
 }
 
 /// Whether a link recorded at `path` (its own location within the tree),
@@ -253,9 +299,12 @@ pub enum ArchiveError {
     Io(io::Error),
     /// An entry's path is absolute or contains a `..` component.
     UnsafePath { path: PathBuf },
-    /// A symlink or hard link whose target resolves outside the extraction
-    /// root.
-    UnsafeLink { path: PathBuf, kind: &'static str },
+    /// An entry type which can write outside its path or an unknown type.
+    UnsupportedEntry { path: PathBuf, kind: String },
+    /// Declared regular-file payload exceeds the available budget.
+    TooLarge { budget: u64 },
+    /// A symlink whose target resolves outside the extraction root.
+    UnsafeLink { path: PathBuf },
     /// The archive has no top-level directory: it is empty, or every entry
     /// sits directly at the root with nothing nested under it.
     NoTopLevelDirectory,
@@ -273,9 +322,21 @@ impl fmt::Display for ArchiveError {
                  source archive",
                 path.display()
             ),
-            Self::UnsafeLink { path, kind } => write!(
+            Self::UnsupportedEntry { path, kind } => write!(
                 formatter,
-                "refusing to extract {}: this {kind} points outside the archive",
+                "refusing to extract {}: unsupported archive entry ({kind})",
+                path.display()
+            ),
+            Self::TooLarge { budget } => write!(
+                formatter,
+                "archive payload exceeds the {} MiB of room left here (free space minus \
+                 a {} MiB safety margin)",
+                budget / (1024 * 1024),
+                crate::disk_space::MARGIN / (1024 * 1024)
+            ),
+            Self::UnsafeLink { path } => write!(
+                formatter,
+                "refusing to extract {}: this symlink points outside the archive",
                 path.display()
             ),
             Self::NoTopLevelDirectory => write!(

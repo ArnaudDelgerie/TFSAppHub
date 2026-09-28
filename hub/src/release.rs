@@ -30,7 +30,14 @@
 //! because it is generic tar handling with nothing GitHub-specific left in
 //! it once the bytes are on disk.
 
-use std::{collections::HashMap, fmt, fs::File, io, path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    fs::File,
+    io::{self, Read},
+    path::Path,
+    time::Duration,
+};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -274,20 +281,53 @@ fn download_agent() -> ureq::Agent {
 /// before it is trusted"), so a second cleanup here would only be a second
 /// place for that guarantee to drift from the first.
 pub fn download_to(url: &str, path: &Path) -> Result<(), ReleaseError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let room = crate::disk_space::room(parent).map_err(|error| {
+        ReleaseError::Io(format!(
+            "cannot measure free space for {}: {error}",
+            path.display()
+        ))
+    })?;
     let response = download_agent()
         .get(url)
         .set("User-Agent", GITHUB_USER_AGENT)
         .call()
         .map_err(|error| ReleaseError::Io(format!("download failed: {error}")))?;
-    let mut reader = response.into_reader();
+    if let Some(length) = response
+        .header("Content-Length")
+        .and_then(|text| text.parse::<u64>().ok())
+    {
+        if length > room {
+            return Err(ReleaseError::Io(
+                crate::disk_space::InsufficientSpace {
+                    path: path.to_path_buf(),
+                    needed: length,
+                    available: room,
+                }
+                .to_string(),
+            ));
+        }
+    }
+    let reader = response.into_reader();
     let mut file = File::create(path)
         .map_err(|error| ReleaseError::Io(format!("cannot create {}: {error}", path.display())))?;
-    io::copy(&mut reader, &mut file).map_err(|error| {
-        ReleaseError::Io(format!(
-            "download failed while writing {}: {error}",
-            path.display()
-        ))
-    })?;
+    let copied =
+        io::copy(&mut reader.take(room.saturating_add(1)), &mut file).map_err(|error| {
+            ReleaseError::Io(format!(
+                "download failed while writing {}: {error}",
+                path.display()
+            ))
+        })?;
+    if copied > room {
+        return Err(ReleaseError::Io(
+            crate::disk_space::InsufficientSpace {
+                path: path.to_path_buf(),
+                needed: copied,
+                available: room,
+            }
+            .to_string(),
+        ));
+    }
     Ok(())
 }
 
