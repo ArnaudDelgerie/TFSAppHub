@@ -6,12 +6,15 @@ use std::{
 
 use super::{
     check_data_dir_available, check_id_free, check_identifier_allowed, check_identifier_free,
-    check_port_free, lifecycle_event_for_install, resolve_id, snapshot, validate, InstallError,
+    check_port_free, lifecycle_event_for_install, register, resolve_id, snapshot, validate,
+    InstallError,
 };
 use crate::{
     lifecycle::LifecycleEvent,
     paths::Paths,
-    registry::{now_timestamp, Platform, Registry, RegistryEntry, Source, SourceKind, State},
+    registry::{
+        load, now_timestamp, update, Platform, Registry, RegistryEntry, Source, SourceKind, State,
+    },
 };
 
 /// The smallest tree the installer accepts: a manifest with the four required
@@ -670,6 +673,95 @@ fn a_pinned_port_nothing_can_bind_is_refused() {
         matches!(error, InstallError::UnusablePort { .. }),
         "{error}"
     );
+}
+
+// --- register: id and port re-checked under the registry lock (plan 063) ---
+
+/// The platform `register` stamps, matching the fingerprint the other fixtures
+/// build by hand — only the stamp's presence is ever asserted.
+fn stamped_platform() -> Platform {
+    Platform {
+        php_version: "8.5".to_string(),
+        extensions_hash: "a1b2c3d4".repeat(8),
+    }
+}
+
+#[test]
+fn a_port_claimed_since_the_first_check_refuses_registration() {
+    // Audit 020's scenario: two sources, different identifiers, so different
+    // maintenance leases — both pass `check_port_free` on a registry neither
+    // has written to yet. The re-check inside `registry::update`'s closure is
+    // the one that answers.
+    let (_base, paths) = temp_paths();
+    let mut first = registered("first", "/home/arnaud/Dev/First");
+    first.app_port = Some(8123);
+    update(&paths, |registry| registry.upsert(first)).expect("a seeded registry");
+
+    let mut second = registered("second", "/home/arnaud/Dev/Second");
+    second.app_port = Some(8123);
+    let error = register(&paths, second, "9.9.9", &stamped_platform())
+        .expect_err("the port was claimed under the lock");
+
+    assert!(matches!(error, InstallError::PortTaken { .. }), "{error}");
+    assert!(error.to_string().contains("first"), "{error}");
+
+    // The registry keeps the first app, and this call stamped nothing.
+    let loaded = load(&paths).expect("a readable registry");
+    assert_eq!(loaded.apps.len(), 1, "the refusal must not add an entry");
+    assert_eq!(loaded.apps[0].id, "first");
+    assert_eq!(loaded.hub_version, None, "the refusal must not stamp");
+}
+
+#[test]
+fn an_id_claimed_since_the_first_check_refuses_registration() {
+    let (_base, paths) = temp_paths();
+    update(&paths, |registry| {
+        registry.upsert(registered("demo", "/home/arnaud/Dev/First"))
+    })
+    .expect("a seeded registry");
+
+    let error = register(
+        &paths,
+        registered("demo", "/home/arnaud/Dev/Second"),
+        "9.9.9",
+        &stamped_platform(),
+    )
+    .expect_err("the id was claimed under the lock");
+
+    assert!(matches!(error, InstallError::IdTaken { .. }), "{error}");
+    assert!(
+        error.to_string().contains("/home/arnaud/Dev/First"),
+        "{error}"
+    );
+
+    // The first entry survives unchanged — install never replaces one.
+    let loaded = load(&paths).expect("a readable registry");
+    assert_eq!(loaded.apps.len(), 1, "the refusal must not add an entry");
+    assert_eq!(loaded.apps[0].id, "demo");
+    assert_eq!(
+        loaded.apps[0].source.location, "/home/arnaud/Dev/First",
+        "the refusal must not replace the entry"
+    );
+    assert_eq!(loaded.hub_version, None, "the refusal must not stamp");
+}
+
+#[test]
+fn a_free_id_and_port_registers() {
+    let (_base, paths) = temp_paths();
+
+    register(
+        &paths,
+        registered("demo", "/home/arnaud/Dev/Demo"),
+        "9.9.9",
+        &stamped_platform(),
+    )
+    .expect("a free id and port register");
+
+    let loaded = load(&paths).expect("a readable registry");
+    assert_eq!(loaded.apps.len(), 1);
+    assert_eq!(loaded.apps[0].id, "demo");
+    assert_eq!(loaded.hub_version.as_deref(), Some("9.9.9"));
+    assert_eq!(loaded.platform, Some(stamped_platform()));
 }
 
 /// A fixture app whose `bin/console` records what it was asked to do, and fails
