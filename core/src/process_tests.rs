@@ -55,6 +55,20 @@ fn cleanup_previous_sidecar_zero_budget_is_the_old_non_blocking_behaviour() {
 }
 
 #[test]
+fn cleanup_previous_sidecar_ignores_leftover_temporary_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("sidecar.pid");
+    let temporary = dir.path().join("sidecar.pid.tmp");
+    fs::write(&temporary, "999999999\n").unwrap();
+
+    let lock = cleanup_previous_sidecar(&pid_file, "test-identifier", Duration::ZERO);
+
+    assert!(lock.is_some());
+    assert_eq!(fs::read_to_string(&temporary).unwrap(), "999999999\n");
+    assert!(!pid_file.exists());
+}
+
+#[test]
 fn cleanup_previous_sidecar_waits_for_a_lock_released_mid_flight_then_reaps() {
     let dir = tempfile::tempdir().unwrap();
     let pid_file = dir.path().join("sidecar.pid");

@@ -28,7 +28,6 @@
 //! tearing anything down.
 
 use std::{
-    fs,
     path::{Path, PathBuf},
     process::Child,
     sync::{
@@ -244,7 +243,7 @@ impl WorkerPidTable {
         for pid in pids.iter().flatten() {
             contents.push_str(&format!("{pid}\n"));
         }
-        fs::write(&self.pid_file, contents)
+        tfsapp_core::process::write_pid_file(&self.pid_file, &contents)
     }
 }
 
@@ -316,10 +315,32 @@ fn arbitrate_respawn(
 /// the slot keeps the resurrected file honest, and `false` tells the caller to
 /// skip the dialog — nothing should pop up once teardown is already closing
 /// the app's windows.
-fn arbitrate_give_up(pid_table: &WorkerPidTable, slot: usize, shutting_down: &AtomicBool) -> bool {
-    let _ = pid_table.set(slot, None);
+fn record_worker_pid(
+    pid_table: &WorkerPidTable,
+    slot: usize,
+    pid: Option<u32>,
+    worker_log_path: &Path,
+) {
+    if let Err(error) = pid_table.set(slot, pid) {
+        log::append_log(
+            worker_log_path,
+            &format!(
+                "Cannot update sidecar.pid for Messenger worker {}: {error}",
+                slot + 1
+            ),
+        );
+    }
+}
+
+fn arbitrate_give_up(
+    pid_table: &WorkerPidTable,
+    slot: usize,
+    shutting_down: &AtomicBool,
+    worker_log_path: &Path,
+) -> bool {
+    record_worker_pid(pid_table, slot, None, worker_log_path);
     if shutting_down.load(Ordering::SeqCst) {
-        let _ = pid_table.set(slot, None);
+        record_worker_pid(pid_table, slot, None, worker_log_path);
         return false;
     }
     true
@@ -415,7 +436,7 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
                         log::append_log(&worker_log_path, &line);
                         // Only this slot's pid leaves the table; a sibling
                         // still running keeps its own line.
-                        if !arbitrate_give_up(&pid_table, slot, &shutting_down) {
+                        if !arbitrate_give_up(&pid_table, slot, &shutting_down, &worker_log_path) {
                             return;
                         }
                         if claim_dialog(&dialog_shown) {
@@ -454,9 +475,9 @@ pub fn spawn_worker_supervisor(config: WorkerSupervisorConfig) {
                             // clearing this slot again below covers the race
                             // where this write lands after teardown already
                             // read the table for its own last rewrite.
-                            let _ = pid_table.set(slot, Some(worker_pid));
+                            record_worker_pid(&pid_table, slot, Some(worker_pid), &worker_log_path);
                             if shutting_down.load(Ordering::SeqCst) {
-                                let _ = pid_table.set(slot, None);
+                                record_worker_pid(&pid_table, slot, None, &worker_log_path);
                                 return;
                             }
 
