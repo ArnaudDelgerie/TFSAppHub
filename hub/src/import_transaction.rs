@@ -243,11 +243,12 @@ pub fn back_out(data_dir: &Path, data_subdir: &Path, intent: &ImportIntent) -> i
         }
     }
 
-    // `uploads/`: a rescue that exists is renamed back over the archive's
-    // tree; one that does not means the rename never happened, so the live
-    // tree is already the previous one. No rescue at all means the previous
-    // `uploads/` was empty or absent — an empty directory is what goes
-    // back, so the archive's tree, if any, is removed first.
+    // `uploads/`: a rescue that exists was renamed out of the way, so it
+    // goes back over whatever the archive left live. A rescue that does
+    // not exist was never renamed out, so the live tree is still the
+    // previous one — nothing to do. No rescue at all means the previous
+    // `uploads/` was empty or absent: an empty directory is what goes
+    // back, whatever the archive put live.
     let live_uploads = data_dir.join(UPLOADS_DIR);
     match &intent.uploads_rescue {
         Some(rescue) if rescue.exists() => {
@@ -256,7 +257,10 @@ pub fn back_out(data_dir: &Path, data_subdir: &Path, intent: &ImportIntent) -> i
             }
             fs::rename(rescue, &live_uploads).map_err(|source| named(&live_uploads, source))?;
         }
-        _ => {
+        // Reserved but never renamed out of the way: the live tree is the
+        // previous one already.
+        Some(_) => {}
+        None => {
             if live_uploads.exists() {
                 fs::remove_dir_all(&live_uploads).map_err(|source| named(&live_uploads, source))?;
             }

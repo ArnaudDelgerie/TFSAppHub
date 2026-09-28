@@ -25,6 +25,7 @@ use std::{
 use crate::{
     app_env::{self, EnvError},
     cli::{EXIT_FAILED, EXIT_OK},
+    import_transaction,
     install::{self, InstallError},
     lifecycle::{self, LifecycleDecisionError, LifecycleError, LifecycleEvent},
     lifecycle_gate::{self, GateError},
@@ -1075,7 +1076,9 @@ pub fn repair(id: &str, assume_yes: bool) -> i32 {
     }
 }
 
-fn repair_at(paths: &Paths, id: &str, assume_yes: bool) -> Result<bool, UpdateError> {
+/// `pub(crate)` so `portability_tests.rs` can drive the import half of the
+/// same command against its own fixtures.
+pub(crate) fn repair_at(paths: &Paths, id: &str, assume_yes: bool) -> Result<bool, UpdateError> {
     let installed = registry::load(paths)?;
     let entry = installed
         .get(id)
@@ -1088,9 +1091,18 @@ fn repair_at(paths: &Paths, id: &str, assume_yes: bool) -> Result<bool, UpdateEr
         .ok_or_else(|| UpdateError::NotInstalled { id: id.to_string() })?
         .clone();
     let data_dir = paths.app_data_dir(&entry.identifier)?;
-    let journal = update_transaction::read(&data_dir)
-        .map_err(transaction_error)?
-        .ok_or_else(|| UpdateError::NoJournal { id: id.to_string() })?;
+    // Three records, one command: the update journal first, then the import
+    // intent, and only then "nothing to repair" — an interrupted import is
+    // resolved by the same `repair <id>` as an interrupted update.
+    let journal = match update_transaction::read(&data_dir).map_err(transaction_error)? {
+        Some(journal) => journal,
+        None => {
+            return match import_transaction::read_intent(&data_dir).map_err(transaction_error)? {
+                Some(intent) => repair_import(paths, id, &data_dir, &intent, assume_yes),
+                None => Err(UpdateError::NoJournal { id: id.to_string() }),
+            };
+        }
+    };
     if journal.outgoing.identifier != entry.identifier || journal.outgoing.id != entry.id {
         return Err(UpdateError::JournalMismatch {
             path: update_transaction::journal_path(&data_dir),
@@ -1152,6 +1164,60 @@ fn repair_at(paths: &Paths, id: &str, assume_yes: bool) -> Result<bool, UpdateEr
             )
         }
         (false, _) => println!("Repaired {id} to {}.", journal.outgoing.app_version),
+    }
+    Ok(true)
+}
+
+/// The import half of `repair`: no update journal is present, but an import
+/// intent is. Before its commit, the intent's rescues can still be renamed
+/// back, so repair puts the data the interrupted import replaced back;
+/// after it, the data is already live and repair only finishes the cleanup
+/// the import would have run. The same confirmation as the update half,
+/// and the intent stays behind on failure, so repair can simply be run
+/// again once whatever failed is resolved.
+fn repair_import(
+    paths: &Paths,
+    id: &str,
+    data_dir: &Path,
+    intent: &import_transaction::ImportIntent,
+    assume_yes: bool,
+) -> Result<bool, UpdateError> {
+    let data_subdir = data_dir.join("data");
+    match intent.phase {
+        import_transaction::ImportPhase::Staged => {
+            println!("Repairing {id}: this puts back the data the interrupted import replaced.")
+        }
+        import_transaction::ImportPhase::Committed => println!(
+            "Repairing {id}: this finishes the import of {}.",
+            intent.archive_version
+        ),
+    }
+    if !prompt::confirmed(assume_yes) {
+        println!("Aborted — nothing was changed.");
+        return Ok(false);
+    }
+    let outcome = match intent.phase {
+        import_transaction::ImportPhase::Staged => {
+            import_transaction::back_out(data_dir, &data_subdir, intent)
+        }
+        import_transaction::ImportPhase::Committed => {
+            let app_dir = paths.app_dir(id)?;
+            import_transaction::finish_import(&data_subdir, data_dir, &app_dir)
+        }
+    };
+    if let Err(detail) = outcome {
+        return Err(UpdateError::ImportRepair {
+            detail: detail.to_string(),
+        });
+    }
+    match intent.phase {
+        import_transaction::ImportPhase::Staged => {
+            println!("Repaired {id}: put back the data the interrupted import replaced.")
+        }
+        import_transaction::ImportPhase::Committed => println!(
+            "Repaired {id}: finished the import of {}.",
+            intent.archive_version
+        ),
     }
     Ok(true)
 }
@@ -1219,6 +1285,12 @@ pub enum UpdateError {
     Reverted {
         detail: String,
         outcome: RevertOutcome,
+    },
+    /// Repairing an interrupted import failed; the intent is still in
+    /// place, still refusing every other command, and `repair` can be run
+    /// again once whatever failed is resolved.
+    ImportRepair {
+        detail: String,
     },
 }
 
@@ -1323,6 +1395,12 @@ impl fmt::Display for UpdateError {
                 }
                 Ok(())
             }
+            Self::ImportRepair { detail } => write!(
+                formatter,
+                "repair could not resolve the interrupted import ({detail}); the import \
+                 record is still in place — run `tfsapp-hub repair <id> --yes` again once \
+                 the underlying error is fixed."
+            ),
         }
     }
 }

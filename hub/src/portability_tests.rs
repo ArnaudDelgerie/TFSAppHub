@@ -13,7 +13,7 @@ use crate::{
     import_transaction, install, lifecycle, lifecycle_gate,
     paths::Paths,
     registry::{self, Platform, RegistryEntry, Source, SourceKind, State},
-    run,
+    run, update,
 };
 
 fn version(text: &str) -> semver::Version {
@@ -2052,6 +2052,261 @@ fn an_intent_refuses_activity_and_every_operation_but_repair() {
         lifecycle_gate::acquire_maintenance(&paths, "dev.local.demo", "repair").is_ok(),
         "repair is the one command that resolves an intent"
     );
+}
+
+#[test]
+fn repair_puts_back_the_data_an_interrupted_import_replaced() {
+    for point in IMPORT_STOP_POINTS {
+        let (base, paths, data_dir) = interrupted_import_fixture();
+        let data_subdir = data_dir.join(DATA_DIR);
+        let app_dir = paths.app_dir("demo").expect("an app dir");
+        let archive = base.path().join("backup.tar.gz");
+        write_test_archive(
+            &archive,
+            &[
+                (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+                (&format!("{DATA_DIR}/app.db"), b"archive database"),
+                (&format!("{UPLOADS_DIR}/new.txt"), b"new upload"),
+            ],
+        );
+        crate::update::test_stop::arm(point);
+        let stopped = run_import(&paths, "demo", &archive, true, true);
+        crate::update::test_stop::disarm();
+        assert!(
+            stopped.is_err(),
+            "{point}: the stop point should have fired"
+        );
+
+        assert!(
+            update::repair_at(&paths, "demo", true)
+                .unwrap_or_else(|error| panic!("{point}: the repair failed: {error}")),
+            "{point}: the repair must report success"
+        );
+
+        assert_eq!(
+            fs::read(data_subdir.join("app.db")).expect("the restored database"),
+            b"the live database",
+            "{point}: the database goes back byte-identical"
+        );
+        assert_eq!(
+            fs::read(data_subdir.join("app.db-wal")).expect("the restored WAL"),
+            b"stale transactions",
+            "{point}: the WAL twin goes back byte-identical"
+        );
+        assert_eq!(
+            fs::read(data_dir.join(UPLOADS_DIR).join("old.txt")).expect("the restored upload"),
+            b"an existing upload",
+            "{point}: the uploads/ tree goes back"
+        );
+        assert_eq!(
+            lifecycle::read_data_version(&data_subdir).expect("the version record"),
+            Some("1.2.3".to_string()),
+            "{point}: the outgoing version goes back"
+        );
+        assert!(
+            lifecycle::read_rollback_anchor(&data_subdir).is_some(),
+            "{point}: the anchor's rollback.json half must be back"
+        );
+        assert!(
+            lifecycle::db_snapshot_path(&data_subdir, "app.db").is_file(),
+            "{point}: the anchor's database-snapshot half must be back"
+        );
+        assert!(
+            lifecycle::previous_tree_path(&app_dir).is_dir(),
+            "{point}: the anchor's retained-tree half must be back"
+        );
+        assert!(
+            import_transaction::read_intent(&data_dir)
+                .expect("a readable intent")
+                .is_none(),
+            "{point}: the repair consumes the intent"
+        );
+        assert!(
+            !import_transaction::staging_dir(&data_dir).exists(),
+            "{point}: the repair removes the staging directory"
+        );
+        for directory in [&data_subdir, &data_dir] {
+            assert!(
+                !fs::read_dir(directory)
+                    .expect("a readable directory")
+                    .any(|entry| {
+                        entry
+                            .expect("a directory entry")
+                            .file_name()
+                            .to_string_lossy()
+                            .contains(".rescue-")
+                    }),
+                "{point}: no rescue may survive the repair"
+            );
+        }
+
+        // The gate agrees the app is whole again: an export runs, and
+        // writes the restored database out.
+        let export_target = base.path().join("after-repair.tar.gz");
+        run_export(&paths, "demo", &export_target)
+            .unwrap_or_else(|error| panic!("{point}: the export after the repair failed: {error}"));
+        assert!(export_target.is_file(), "{point}");
+    }
+}
+
+#[test]
+fn repair_after_the_commit_finishes_the_import_instead() {
+    let (base, paths, data_dir) = interrupted_import_fixture();
+    let data_subdir = data_dir.join(DATA_DIR);
+    let app_dir = paths.app_dir("demo").expect("an app dir");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.3")),
+            (&format!("{DATA_DIR}/app.db"), b"archive database"),
+            (&format!("{UPLOADS_DIR}/new.txt"), b"new upload"),
+        ],
+    );
+    crate::update::test_stop::arm("import_committed");
+    let stopped = run_import(&paths, "demo", &archive, true, true);
+    crate::update::test_stop::disarm();
+    assert!(stopped.is_err(), "the stop point should have fired");
+
+    assert!(
+        update::repair_at(&paths, "demo", true).expect("the repair finishes the committed import"),
+        "the repair must report success"
+    );
+
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("the archive's database"),
+        b"archive database",
+        "the committed data is what stays"
+    );
+    assert_eq!(
+        fs::read(data_dir.join(UPLOADS_DIR).join("new.txt")).expect("the archive's upload"),
+        b"new upload",
+        "the committed uploads/ is what stays"
+    );
+    assert_eq!(
+        lifecycle::read_data_version(&data_subdir).expect("the version record"),
+        Some("1.2.3".to_string()),
+        "the version record stays at the archive's version"
+    );
+    assert!(
+        lifecycle::read_rollback_anchor(&data_subdir).is_none(),
+        "the anchor's rollback.json half is consumed"
+    );
+    assert!(
+        !lifecycle::db_snapshot_path(&data_subdir, "app.db").is_file(),
+        "the anchor's database-snapshot half is consumed"
+    );
+    assert!(
+        !lifecycle::previous_tree_path(&app_dir).is_dir(),
+        "the anchor's retained-tree half is consumed"
+    );
+    assert!(
+        import_transaction::read_intent(&data_dir)
+            .expect("a readable intent")
+            .is_none(),
+        "the repair consumes the intent"
+    );
+    assert!(
+        !import_transaction::staging_dir(&data_dir).exists(),
+        "the repair removes the staging directory"
+    );
+    // The rescues survive as the manual-recovery artefacts they are: the
+    // committed import keeps what it replaced on disk, named.
+    assert!(
+        fs::read_dir(&data_subdir)
+            .expect("the data directory")
+            .any(|entry| {
+                entry
+                    .expect("a directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("app.db.rescue-")
+            }),
+        "the replaced database's rescue must survive"
+    );
+    assert!(
+        fs::read_dir(&data_dir)
+            .expect("the data directory")
+            .any(|entry| {
+                entry
+                    .expect("a directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("uploads.rescue-")
+            }),
+        "the replaced uploads/ rescue must survive"
+    );
+}
+
+#[test]
+fn repair_backs_out_a_migrated_older_import_to_the_installed_version() {
+    if !resources_present() {
+        return;
+    }
+    let source = tempfile::tempdir().expect("a temp source");
+    let (base, paths) = temp_paths();
+    runnable_app_tree(source.path(), "1.3.0", r#"{"pre-update": ["about"]}"#);
+    install::install(
+        &paths,
+        &source.path().display().to_string(),
+        None,
+        None,
+        true,
+        true,
+        "0.1.0",
+    )
+    .expect("the initial install succeeds")
+    .expect("the user did not decline");
+
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    let data_subdir = data_dir.join("data");
+    fs::write(data_subdir.join("app.db"), b"before import").expect("an existing database");
+    let archive = base.path().join("backup.tar.gz");
+    write_test_archive(
+        &archive,
+        &[
+            (MANIFEST_FILE, &manifest_json("dev.local.demo", "1.2.0")),
+            (&format!("{DATA_DIR}/app.db"), b"archive database"),
+        ],
+    );
+    crate::update::test_stop::arm("import_migrated");
+    let stopped = run_import(&paths, "demo", &archive, true, true);
+    crate::update::test_stop::disarm();
+    assert!(stopped.is_err(), "the stop point should have fired");
+
+    assert!(
+        update::repair_at(&paths, "demo", true).expect("the repair backs the import out"),
+        "the repair must report success"
+    );
+
+    assert_eq!(
+        fs::read(data_subdir.join("app.db")).expect("the restored database"),
+        b"before import",
+        "even a fully migrated import is reversible before its commit"
+    );
+    assert_eq!(
+        lifecycle::read_data_version(&data_subdir).expect("the version record"),
+        Some("1.3.0".to_string()),
+        "the back-out rewrites the installed version over the archive's stamp"
+    );
+    assert!(
+        import_transaction::read_intent(&data_dir)
+            .expect("a readable intent")
+            .is_none(),
+        "the repair consumes the intent"
+    );
+}
+
+#[test]
+fn repair_without_any_record_still_has_nothing_to_do() {
+    let (_base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry());
+
+    match update::repair_at(&paths, "demo", true) {
+        Err(update::UpdateError::NoJournal { id }) => assert_eq!(id, "demo"),
+        Err(other) => panic!("the refusal must be NoJournal, not {other}"),
+        Ok(_) => panic!("an app with neither record has nothing to repair"),
+    }
 }
 
 /// A fixture app whose `bin/console` records what it was asked to do —
