@@ -19,11 +19,10 @@ set -euo pipefail
 #
 # 2. The display backend. linuxdeploy-plugin-gtk writes
 #    apprun-hooks/linuxdeploy-plugin-gtk.sh into the AppDir, and that generated
-#    hook — sourced by AppRun before the launcher ever runs — hard-forces
-#    `export GDK_BACKEND=x11`. On a Wayland session that pins the whole app to
-#    XWayland, whose synthetic kinetic scrolling makes a touchpad scroll
-#    overshoot where the fingers stopped by 100-200px. We rewrite that one line
-#    to defer to the session's own backend (see HOOK_PATCH below).
+#    hook is sourced by AppRun. Older versions hard-force `export GDK_BACKEND=x11`,
+#    pinning Wayland sessions to XWayland and causing touchpad scroll overshoot.
+#    We rewrite that line to defer to the session backend (HOOK_PATCH below).
+#    Newer versions comment that export out; accept that native behavior too.
 #
 # 3. `.DirIcon`. linuxdeploy writes it as an *absolute* symlink into the
 #    build machine's own AppDir directory, which does not exist once the
@@ -101,8 +100,9 @@ if [[ ! -x "$APPIMAGETOOL" ]]; then
   exit 1
 fi
 
-# Echoes "patched" when the hook already carries our line, "stale" when it
-# still carries the plugin's; anything else is fatal (see HOOK_ORIGINAL_RE).
+# Echoes "patched" for our line, "stale" for the active upstream X11 line,
+# or "native" when upstream itself comments out the X11 line. Anything else
+# is fatal (see HOOK_ORIGINAL_RE).
 hook_state() {
   local hook="$1"
   if [[ ! -f "$hook" ]]; then
@@ -113,6 +113,9 @@ hook_state() {
     echo "patched"
   elif grep -Eq "$HOOK_ORIGINAL_RE" "$hook"; then
     echo "stale"
+  elif grep -Eq '^[[:space:]]*#[[:space:]]*export GDK_BACKEND=x11([[:space:]]|$)' "$hook" \
+       && ! grep -Eq '^[[:space:]]*export[[:space:]]+GDK_BACKEND=' "$hook"; then
+    echo "native"
   else
     echo "No recognised GDK_BACKEND line in $HOOK_REL — linuxdeploy-plugin-gtk" >&2
     echo "must have changed it. Expected a line matching $HOOK_ORIGINAL_RE," >&2
@@ -144,7 +147,7 @@ FROZEN_SONAMES=(
 # True (exit 0) when no `libwayland-*` file survives anywhere under AppDir
 # root $1.
 no_bundled_wayland() {
-  [[ -z "$(find "$1" -iname 'libwayland-*' -print -quit)" ]]
+  [[ -z "$(find "$1" \( -type f -o -type l \) -iname 'libwayland-*' -print -quit)" ]]
 }
 
 # The highest GLIBC_x.y symbol version any ELF file under AppDir root $1
@@ -242,7 +245,7 @@ for appimage in "${appimages[@]}"; do
   # Repack only when something actually needs fixing — but "already fixed" has
   # to mean *all four* repairs, otherwise an already-pristine sidecar would
   # short-circuit the pass and quietly drop one of the others.
-  if cmp -s "${bundled[0]}" "$PRISTINE" && [[ "$hook_state" == "patched" ]] && [[ "$dir_icon_ok" == true ]] && [[ "$wayland_ok" == true ]]; then
+  if cmp -s "${bundled[0]}" "$PRISTINE" && [[ "$hook_state" != "stale" ]] && [[ "$dir_icon_ok" == true ]] && [[ "$wayland_ok" == true ]]; then
     echo "$(basename "$appimage"): sidecar, GTK hook, .DirIcon and the absence of libwayland-* already correct, skipping."
   else
     cp "$PRISTINE" "${bundled[0]}"
@@ -281,7 +284,7 @@ for appimage in "${appimages[@]}"; do
     if [[ "$wayland_ok" == false ]]; then
       while IFS= read -r -d '' lib; do
         rm -f "$lib"
-      done < <(find "$workdir/squashfs-root" -iname 'libwayland-*' -print0)
+      done < <(find "$workdir/squashfs-root" \( -type f -o -type l \) -iname 'libwayland-*' -print0)
     fi
     OUTPUT="$workdir/fixed.AppImage" ARCH="$(uname -m)" APPIMAGE_EXTRACT_AND_RUN=1 \
       "$APPIMAGETOOL" --appdir "$workdir/squashfs-root" > "$workdir/repack.log" 2>&1 \
@@ -298,7 +301,8 @@ for appimage in "${appimages[@]}"; do
   verify=("$verify_root"/usr/lib/*/resources/frankenphp)
   cmp -s "${verify[0]}" "$PRISTINE" \
     || { echo "Verification failed: sidecar in $appimage still differs from $PRISTINE." >&2; exit 1; }
-  grep -Fxq "$HOOK_PATCHED_LINE" "$verify_root/$HOOK_REL" \
+  verified_hook_state="$(hook_state "$verify_root/$HOOK_REL")"
+  [[ "$verified_hook_state" != "stale" ]] \
     || { echo "Verification failed: $HOOK_REL in $appimage still forces GDK_BACKEND." >&2; exit 1; }
   case "$(readlink "$verify_root/.DirIcon")" in
     /*) echo "Verification failed: .DirIcon in $appimage is still an absolute symlink." >&2; exit 1 ;;
