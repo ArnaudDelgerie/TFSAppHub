@@ -86,6 +86,12 @@ an ordinary launch, not when the cache stamp above mismatches, not on an
 update or a rollback. A file an app writes there stays there until the app
 itself removes it.
 
+One operation does replace it: a forced `import` extracts the archive's own
+`uploads/` over the destination's (§5). Even that is a replacement, not a
+destruction — the directory that was there is moved aside as
+`uploads.rescue-*`, its path printed beside the database's rescue, so nothing
+the app's user put there is lost to it.
+
 It is a sibling of `data/`, not a child of it (§5's layout), so nothing that
 touches the database — the rollback anchor, the rescue-dump machinery — reaches
 it either, with one accepted exception the rollback clause states on its own
