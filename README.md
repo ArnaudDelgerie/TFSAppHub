@@ -106,8 +106,11 @@ for building it.
   - **Rust** + the Tauri CLI (`cargo install tauri-cli`, or `cargo tauri` v2).
   - Linux build deps for Tauri v2 / WebKitGTK (`libwebkit2gtk-4.1-dev`,
     `libgtk-3-dev`, `libdbus-1-dev`, `librsvg2-dev`, `build-essential`, `curl`,
-    `file` — `appimagetool` shells out to it, and so does this repo's own
-    `fix-appimage-bundle.sh`, …).
+    `pkg-config`, `git`, `patchelf`, and `file` — `appimagetool` shells out to
+    it, and so does this repo's own `fix-appimage-bundle.sh`).
+  - GStreamer plugins from the build host: `gstreamer1.0-plugins-base`,
+    `gstreamer1.0-plugins-good`, and either `gstreamer1.0-pipewire` or
+    `gstreamer1.0-pulseaudio`. The AppImage freezes the installed plugins.
   - **curl** (to fetch the FrankenPHP sidecar and composer.phar).
   - **rustfmt** and **clippy** (`rustup component add rustfmt clippy`) and
     **shellcheck** — needed for `make check`. A missing Rust component fails
