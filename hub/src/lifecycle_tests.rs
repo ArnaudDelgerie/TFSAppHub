@@ -889,6 +889,7 @@ fn a_written_rollback_anchor_reads_back() {
     let anchor = RollbackAnchor {
         app_version: "0.5.0".to_string(),
         source_revision: "sha256:deadbeef".to_string(),
+        source: None,
         created_at: "2026-08-10T00:00:00Z".to_string(),
     };
 
@@ -917,6 +918,7 @@ fn an_unknown_key_does_not_make_a_rollback_anchor_unreadable() {
         Some(RollbackAnchor {
             app_version: "0.5.0".to_string(),
             source_revision: "sha256:deadbeef".to_string(),
+            source: None,
             created_at: "2026-08-10T00:00:00Z".to_string(),
         })
     );
@@ -930,6 +932,7 @@ fn writing_a_rollback_anchor_leaves_no_temp_file_behind() {
         &RollbackAnchor {
             app_version: "0.5.0".to_string(),
             source_revision: "sha256:deadbeef".to_string(),
+            source: None,
             created_at: "2026-08-10T00:00:00Z".to_string(),
         },
     )
@@ -946,6 +949,7 @@ fn discarding_the_anchor_record_leaves_it_unreadable() {
         &RollbackAnchor {
             app_version: "0.5.0".to_string(),
             source_revision: "sha256:deadbeef".to_string(),
+            source: None,
             created_at: "2026-08-10T00:00:00Z".to_string(),
         },
     )
@@ -969,6 +973,7 @@ fn write_complete_anchor(data_subdir: &Path, app_dir: &Path) {
         &RollbackAnchor {
             app_version: "0.5.0".to_string(),
             source_revision: "sha256:deadbeef".to_string(),
+            source: None,
             created_at: "2026-08-10T00:00:00Z".to_string(),
         },
     )
@@ -987,6 +992,31 @@ fn all_three_halves_present_reads_as_complete() {
         Anchor::Complete {
             app_version: "0.5.0".to_string(),
             source_revision: "sha256:deadbeef".to_string(),
+            source: None,
+            created_at: "2026-08-10T00:00:00Z".to_string(),
+        }
+    );
+}
+
+#[test]
+fn an_anchor_file_without_a_source_reads_as_complete_with_none() {
+    let data_subdir = tempfile::tempdir().expect("a temp data subdir");
+    let apps_root = tempfile::tempdir().expect("a temp apps root");
+    let app_dir = apps_root.path().join("demo");
+    write_complete_anchor(data_subdir.path(), &app_dir);
+    // An anchor as a hub older than plan 073 wrote it: no `source` key.
+    fs::write(
+        rollback_anchor_path(data_subdir.path()),
+        r#"{"app_version": "0.5.0", "source_revision": "sha256:deadbeef", "created_at": "2026-08-10T00:00:00Z"}"#,
+    )
+    .expect("a hand-written old anchor");
+
+    assert_eq!(
+        anchor_state(data_subdir.path(), &app_dir),
+        Anchor::Complete {
+            app_version: "0.5.0".to_string(),
+            source_revision: "sha256:deadbeef".to_string(),
+            source: None,
             created_at: "2026-08-10T00:00:00Z".to_string(),
         }
     );

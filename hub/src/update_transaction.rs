@@ -289,7 +289,9 @@ pub fn finalise_anchor(
     stop_at("finalise_members_promoted")?;
 
     let already_finalised = lifecycle::read_rollback_anchor(data_subdir).is_some_and(|anchor| {
-        anchor.app_version == entry.app_version && anchor.source_revision == entry.source_revision
+        anchor.app_version == entry.app_version
+            && anchor.source_revision == entry.source_revision
+            && anchor.source.as_ref() == Some(&entry.source)
     });
     if !already_finalised {
         lifecycle::write_rollback_anchor(
@@ -297,6 +299,7 @@ pub fn finalise_anchor(
             &lifecycle::RollbackAnchor {
                 app_version: entry.app_version.clone(),
                 source_revision: entry.source_revision.clone(),
+                source: Some(entry.source.clone()),
                 created_at: crate::registry::now_timestamp(),
             },
         )

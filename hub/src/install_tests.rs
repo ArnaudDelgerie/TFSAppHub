@@ -1190,6 +1190,7 @@ fn a_fresh_install_discards_any_rollback_anchor_left_in_the_data_directory() {
         &crate::lifecycle::RollbackAnchor {
             app_version: "0.5.0".to_string(),
             source_revision: "sha256:stale".to_string(),
+            source: None,
             created_at: now_timestamp(),
         },
     )
@@ -1237,6 +1238,7 @@ fn a_declined_install_leaves_an_existing_rollback_anchor_intact() {
         &crate::lifecycle::RollbackAnchor {
             app_version: "0.5.0".to_string(),
             source_revision: "sha256:stale".to_string(),
+            source: None,
             created_at: now_timestamp(),
         },
     )

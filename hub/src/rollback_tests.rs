@@ -61,6 +61,7 @@ fn write_anchor(data_subdir: &Path) {
         &RollbackAnchor {
             app_version: "0.6.0".to_string(),
             source_revision: "sha256:previous".to_string(),
+            source: None,
             created_at: registry::now_timestamp(),
         },
     )

@@ -50,6 +50,7 @@ use tfsapp_core::ports::DataConfig;
 
 use crate::close_guard::{CloseFlow, Resolution, SharedCloseGuards};
 use crate::manifest::RunAlias;
+use crate::registry::Source;
 
 /// Which lifecycle event (CONTRACT.md §6), if any, a launch represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -563,6 +564,11 @@ pub fn previous_tree_path(app_dir: &Path) -> PathBuf {
 pub struct RollbackAnchor {
     pub app_version: String,
     pub source_revision: String,
+    /// The outgoing entry's source, so a rollback puts back the provenance of
+    /// the version it restores. Optional because an anchor written before
+    /// this field existed has none: such a rollback keeps the current source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
     /// RFC 3339, UTC — same convention as the registry's own timestamps
     /// ([`crate::registry::now_timestamp`]).
     pub created_at: String,
@@ -630,6 +636,7 @@ pub enum Anchor {
     Complete {
         app_version: String,
         source_revision: String,
+        source: Option<Source>,
         created_at: String,
     },
     Missing,
@@ -643,6 +650,7 @@ pub fn anchor_state(data_subdir: &Path, app_dir: &Path) -> Anchor {
         (true, true, Some(record)) => Anchor::Complete {
             app_version: record.app_version,
             source_revision: record.source_revision,
+            source: record.source,
             created_at: record.created_at,
         },
         _ => Anchor::Missing,

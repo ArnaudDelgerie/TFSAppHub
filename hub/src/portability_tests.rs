@@ -1204,6 +1204,7 @@ fn a_forced_import_rescue_dumps_the_replaced_database_and_discards_the_anchor() 
         &lifecycle::RollbackAnchor {
             app_version: "1.1.0".to_string(),
             source_revision: "sha256:previous".to_string(),
+            source: None,
             created_at: registry::now_timestamp(),
         },
     )
@@ -1707,6 +1708,7 @@ fn seed_persistent_state(data_dir: &Path, data_subdir: &Path, app_dir: &Path) {
         &lifecycle::RollbackAnchor {
             app_version: "1.1.0".to_string(),
             source_revision: "sha256:previous".to_string(),
+            source: None,
             created_at: registry::now_timestamp(),
         },
     )
@@ -2621,6 +2623,7 @@ fn a_failed_forward_migration_backs_the_import_out_in_process() {
         &lifecycle::RollbackAnchor {
             app_version: "1.2.0".to_string(),
             source_revision: "sha256:previous".to_string(),
+            source: None,
             created_at: registry::now_timestamp(),
         },
     )
