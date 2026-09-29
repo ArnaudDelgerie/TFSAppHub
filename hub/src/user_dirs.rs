@@ -12,10 +12,12 @@
 //! A declared member the lookup cannot resolve contributes nothing: no empty
 //! string, no fallback guess, the same shape §3 already uses for
 //! `TFS_KEYRING_AVAILABLE`/`TFS_MEDIA_MICROPHONE` (CONTRACT.md §8).
+//!
+//! A resolved path that is not valid UTF-8 is injected as its own raw bytes,
+//! not lossily: a replacement character is a different path, and a wrong path
+//! is the one thing decision 008 forbids.
 
-use std::path::PathBuf;
-
-use tfsapp_core::sidecar::path_to_string;
+use std::{ffi::OsString, path::PathBuf};
 
 use crate::manifest::PathsActions;
 
@@ -71,16 +73,19 @@ const ENTRIES: [Entry; 8] = [
 /// Every declared member of `paths` that `resolve_dir` can resolve, as
 /// `(TFS_USER_<NAME>_DIR, path)` pairs in table order. An undeclared member is
 /// skipped outright; a declared member `resolve_dir` answers `None` for is
-/// skipped too, rather than reported empty.
+/// skipped too, rather than reported empty. The value is the path's raw
+/// bytes (`OsString`), not a lossy string: a user directory that is not valid
+/// UTF-8 reaches the app as itself, never as a different path wearing the
+/// replacement character (decision 008: the right bytes, never a wrong path).
 pub fn resolve(
     paths: &PathsActions,
     resolve_dir: impl Fn(glib::UserDirectory) -> Option<PathBuf>,
-) -> Vec<(&'static str, String)> {
+) -> Vec<(&'static str, OsString)> {
     ENTRIES
         .iter()
         .filter(|entry| (entry.declared)(paths))
         .filter_map(|entry| {
-            resolve_dir(entry.directory).map(|path| (entry.var_name, path_to_string(&path)))
+            resolve_dir(entry.directory).map(|path| (entry.var_name, path.into_os_string()))
         })
         .collect()
 }

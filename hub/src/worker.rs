@@ -28,6 +28,7 @@
 //! tearing anything down.
 
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Child,
     sync::{
@@ -52,7 +53,7 @@ use tfsapp_core::{log, sidecar::command_with_env};
 pub fn setup_transports(
     toolchain: &crate::php::Toolchain,
     app_dir: &Path,
-    envs: &[(&str, String)],
+    envs: &[(&str, OsString)],
     log_dir: &Path,
 ) -> Result<(), crate::php::PhpError> {
     toolchain.console_logged(
@@ -115,7 +116,7 @@ pub fn worker_log(log_dir: &Path, slot: usize) -> PathBuf {
 pub fn spawn_worker(
     frankenphp: &Path,
     app_dir: &Path,
-    envs: &[(&str, String)],
+    envs: &[(&str, OsString)],
     log_dir: &Path,
     transports: &[String],
     slot: usize,
@@ -256,7 +257,7 @@ pub struct WorkerSupervisorConfig {
     pub shutting_down: Arc<AtomicBool>,
     pub frankenphp: PathBuf,
     pub app_dir: PathBuf,
-    pub envs: Vec<(&'static str, String)>,
+    pub envs: Vec<(&'static str, OsString)>,
     pub transports: Vec<String>,
     /// The shared table behind this slot's `sidecar.pid` line, and this
     /// slot's index into it.

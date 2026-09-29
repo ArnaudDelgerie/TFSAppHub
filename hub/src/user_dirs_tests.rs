@@ -1,7 +1,27 @@
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 use super::resolve;
 use crate::manifest::PathsActions;
+
+#[test]
+fn a_resolved_member_outside_utf8_is_injected_as_its_raw_bytes() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let paths = PathsActions {
+        downloads: true,
+        ..Default::default()
+    };
+    let raw = OsString::from_vec(b"/home/fake/T\xc3\xa9l\xc3\xa9chargements/\xff".to_vec());
+
+    let directory = PathBuf::from(raw.clone());
+    let resolved = resolve(&paths, move |_| Some(directory.clone()));
+    assert_eq!(
+        resolved,
+        vec![("TFS_USER_DOWNLOADS_DIR", raw)],
+        "a non-UTF-8 user directory must reach the app as its own bytes, never \
+         as a lossy look-alike path"
+    );
+}
 
 #[test]
 fn a_declared_and_resolved_member_reports_its_variable() {
@@ -14,7 +34,7 @@ fn a_declared_and_resolved_member_reports_its_variable() {
 
     assert_eq!(
         resolved,
-        vec![("TFS_USER_DOWNLOADS_DIR", "/home/fake/Downloads".to_string())]
+        vec![("TFS_USER_DOWNLOADS_DIR", "/home/fake/Downloads".into())]
     );
 }
 
@@ -58,8 +78,8 @@ fn several_declared_members_each_report_independently() {
     assert_eq!(
         resolved,
         vec![
-            ("TFS_USER_DOWNLOADS_DIR", "/home/fake/Downloads".to_string()),
-            ("TFS_USER_VIDEOS_DIR", "/home/fake/Videos".to_string()),
+            ("TFS_USER_DOWNLOADS_DIR", "/home/fake/Downloads".into()),
+            ("TFS_USER_VIDEOS_DIR", "/home/fake/Videos".into()),
         ],
         "pictures is declared but unresolved, so it must be absent, not empty"
     );
@@ -88,7 +108,7 @@ fn every_member_resolves_to_its_own_variable_name() {
 
         assert_eq!(
             resolved,
-            vec![(expected_var, "/home/fake/dir".to_string())],
+            vec![(expected_var, "/home/fake/dir".into())],
             "declaring only this member must report exactly {expected_var}"
         );
     }

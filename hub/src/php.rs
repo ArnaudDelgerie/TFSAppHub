@@ -36,12 +36,13 @@
 //! `exec frankenphp php-cli "$@"` shim fails on the very first script.
 
 use std::{
+    ffi::OsString,
     fmt, fs, io,
     path::{Path, PathBuf},
     process::Command,
 };
 
-use tfsapp_core::sidecar::{command_with_env, path_to_string};
+use tfsapp_core::sidecar::command_with_env;
 
 use crate::{
     paths::{Paths, PathsError},
@@ -169,7 +170,7 @@ impl Toolchain {
     pub fn composer_install(
         &self,
         app_dir: &Path,
-        envs: &[(&str, String)],
+        envs: &[(&str, OsString)],
     ) -> Result<(), PhpError> {
         let mut command = self.php(envs);
         command
@@ -192,7 +193,7 @@ impl Toolchain {
     pub fn console(
         &self,
         app_dir: &Path,
-        envs: &[(&str, String)],
+        envs: &[(&str, OsString)],
         arguments: &str,
     ) -> Result<(), PhpError> {
         let arguments: Vec<&str> = arguments.split_whitespace().collect();
@@ -225,7 +226,7 @@ impl Toolchain {
     pub fn console_logged(
         &self,
         app_dir: &Path,
-        envs: &[(&str, String)],
+        envs: &[(&str, OsString)],
         arguments: &str,
         log_file: &Path,
         event: &str,
@@ -280,8 +281,8 @@ impl Toolchain {
     /// interpreter — or, on the machine with no PHP at all that the hub exists
     /// to serve, on nothing. Measured, not assumed: see ARCHITECTURE.md's
     /// "The `PHP_BINARY` shim".
-    pub fn shim_env(&self) -> Vec<(&'static str, String)> {
-        let mut variables = vec![("PHP_BINARY", path_to_string(&self.shim))];
+    pub fn shim_env(&self) -> Vec<(&'static str, OsString)> {
+        let mut variables = vec![("PHP_BINARY", self.shim.as_os_str().to_owned())];
         if let Some(directory) = self.shim.parent() {
             let path = match std::env::var_os("PATH") {
                 Some(existing) => {
@@ -291,13 +292,15 @@ impl Toolchain {
                 }
                 None => directory.as_os_str().to_os_string(),
             };
-            variables.push(("PATH", path.to_string_lossy().into_owned()));
+            // Raw bytes, not lossy: a PATH entry outside UTF-8 is a real
+            // directory, and a replacement character is not its name.
+            variables.push(("PATH", path));
         }
         variables
     }
 
     /// A `frankenphp php-cli` command carrying `envs` plus the shim.
-    fn php(&self, envs: &[(&str, String)]) -> Command {
+    fn php(&self, envs: &[(&str, OsString)]) -> Command {
         let mut command = command_with_env(&self.frankenphp, envs);
         command.arg("php-cli");
         for (key, value) in self.shim_env() {

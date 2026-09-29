@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
     process::Command,
@@ -62,7 +63,12 @@ pub fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-pub fn command_with_env(binary: &Path, envs: &[(&str, String)]) -> Command {
+/// Environment pairs for the processes the hub starts. The value is raw
+/// bytes (`OsString`), not a lossy string: a path that is not valid UTF-8
+/// reaches the child as itself, never as a different path wearing the
+/// replacement character (decision 008 — omit rather than a wrong path; the
+/// hub instead passes the right bytes).
+pub fn command_with_env(binary: &Path, envs: &[(&str, OsString)]) -> Command {
     let mut command = Command::new(binary);
     for (key, value) in envs {
         command.env(key, value);
