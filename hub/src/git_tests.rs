@@ -432,7 +432,7 @@ exit 1
 fn tree_entries_enumerates_a_project_nested_inside_its_repository() {
     // A real repository, not a fake `git`: the pathspec under test is the
     // exact one a project below the repository root (Papermark's `app/`)
-    // makes Git misread, and only real Git proves `:/` fixes it.
+    // makes Git misread, and only real Git proves `:(top)` fixes it.
     let repository = tempfile::tempdir().expect("a temp repo dir");
     let project = repository.path().join("apps/demo");
     fs::create_dir_all(&project).expect("a nested project dir");
@@ -473,4 +473,43 @@ fn tree_entries_enumerates_a_project_nested_inside_its_repository() {
         !paths.iter().any(|path| path.starts_with("apps/")),
         "no path outside the project's subtree: {paths:?}"
     );
+}
+
+#[test]
+fn tree_entries_reads_a_nested_prefix_literally_not_as_a_glob() {
+    // `apps/d[e]mo` read as a glob would also match its sibling
+    // `apps/demo`, whose files are not the project's.
+    let repository = tempfile::tempdir().expect("a temp repo dir");
+    let project = repository.path().join("apps/d[e]mo");
+    let sibling = repository.path().join("apps/demo");
+    fs::create_dir_all(&project).expect("a nested project dir");
+    fs::create_dir_all(&sibling).expect("a sibling dir");
+    fs::write(project.join("tfsapp.config.json"), "{}").expect("a manifest");
+    fs::write(sibling.join("other.txt"), "not the project's").expect("a sibling file");
+    for arguments in [
+        Vec::from(["init", "--quiet"]),
+        Vec::from(["config", "user.email", "test.invalid"]),
+        Vec::from(["config", "user.name", "TFSApp test"]),
+        Vec::from(["add", "."]),
+        Vec::from(["commit", "--quiet", "-m", "source"]),
+    ] {
+        assert!(
+            Command::new("git")
+                .args(arguments)
+                .current_dir(repository.path())
+                .status()
+                .expect("git to run")
+                .success(),
+            "git fixture setup must succeed"
+        );
+    }
+    let git = Git::new();
+    let snapshot = git
+        .local_snapshot(&project)
+        .expect("a clean local work tree");
+    let entries = git
+        .tree_entries(&project, &snapshot)
+        .expect("the nested project's tree");
+    let paths: Vec<&Path> = entries.iter().map(|entry| entry.path.as_path()).collect();
+    assert_eq!(paths, [Path::new("tfsapp.config.json")]);
 }

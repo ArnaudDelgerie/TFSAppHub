@@ -78,7 +78,8 @@ pub struct DeclaredOutput {
     pub declared: String,
     pub files: Vec<DeclaredFile>,
     pub total_size: u64,
-    pub newest: Option<SystemTime>,
+    /// Never absent: an output with no file is refused before one is built.
+    pub newest: SystemTime,
 }
 
 impl DeclaredOutput {
@@ -89,15 +90,12 @@ impl DeclaredOutput {
     /// stale needs its inputs declared, which is a build tool's job — so
     /// the line states what is on disk instead.
     pub fn stats_line(&self) -> String {
-        let count = self.files.len();
         format!(
-            "build_outputs: {} — {} file{}, {}, newest {}",
+            "build_outputs: {} — {}, {}, newest {}",
             self.declared,
-            count,
-            if count == 1 { "" } else { "s" },
+            counted(self.files.len() as u64, "file"),
             format_size(self.total_size),
-            self.newest
-                .map_or_else(|| "just built".to_string(), format_age),
+            format_age(self.newest),
         )
     }
 }
@@ -295,7 +293,11 @@ fn check_build_output(
     }
 
     let total_size = files.iter().map(|file| file.size).sum();
-    let newest = files.iter().map(|file| file.modified).max();
+    let newest = files
+        .iter()
+        .map(|file| file.modified)
+        .max()
+        .expect("an output with no file was refused above");
     Ok(DeclaredOutput {
         declared: declared.to_string(),
         files,
@@ -330,14 +332,13 @@ fn walk_declared_files(
         if file_type.is_dir() {
             walk_declared_files(project, declared, &relative, files)?;
         } else if file_type.is_file() {
+            let modified = metadata.modified().map_err(io_error(source.clone()))?;
             files.push(DeclaredFile {
                 path: relative,
                 source,
                 size: metadata.len(),
                 executable: metadata.permissions().mode() & 0o111 != 0,
-                modified: metadata
-                    .modified()
-                    .map_err(io_error(project.to_path_buf()))?,
+                modified,
             });
         } else {
             return Err(PublishError::BuildOutputIrregularEntry {
@@ -376,11 +377,21 @@ fn format_age(newest: SystemTime) -> String {
     if seconds < 60 {
         "less than a minute ago".to_string()
     } else if seconds < 3600 {
-        format!("{} minutes ago", seconds / 60)
+        format!("{} ago", counted(seconds / 60, "minute"))
     } else if seconds < 86_400 {
-        format!("{} hours ago", seconds / 3600)
+        format!("{} ago", counted(seconds / 3600, "hour"))
     } else {
-        format!("{} days ago", seconds / 86_400)
+        format!("{} ago", counted(seconds / 86_400, "day"))
+    }
+}
+
+/// `1 file`, `2 files` — the stats line's counts, singular when there is
+/// one.
+fn counted(count: u64, unit: &str) -> String {
+    if count == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{count} {unit}s")
     }
 }
 
@@ -666,25 +677,42 @@ fn append_blob_entry<W: Write>(
 /// pinned commit's (plan 071). The same header scheme as a tracked blob:
 /// mode from the file's own executable bit as the gate-time walk read it,
 /// no mtime, no owner.
+///
+/// The header's size is the walk's, and `tar` copies whatever the reader
+/// yields without checking it against the header: a file a still-running
+/// build rewrote since the walk would desynchronise the archive, and the
+/// checksum computed afterwards would vouch for it. So exactly the walk's
+/// size is read, and a file that turns out shorter or longer is refused —
+/// the archive is then discarded with its scratch directory.
 fn append_declared_file<W: Write>(
     builder: &mut tar::Builder<W>,
     archive_path: &Path,
     file: &DeclaredFile,
 ) -> Result<(), PublishError> {
-    let mut source = fs::File::open(&file.source).map_err(|source| PublishError::Io {
+    let io_error = |source| PublishError::Io {
         path: file.source.clone(),
         source,
-    })?;
+    };
+    let mut source = fs::File::open(&file.source).map_err(io_error)?;
     let mut header = tar::Header::new_gnu();
     header.set_mode(if file.executable { 0o755 } else { 0o644 });
     header.set_size(file.size);
     header.set_cksum();
+    let mut limited = (&mut source).take(file.size);
     builder
-        .append_data(&mut header, archive_path, &mut source)
+        .append_data(&mut header, archive_path, &mut limited)
         .map_err(|source| PublishError::Io {
             path: archive_path.to_path_buf(),
             source,
-        })
+        })?;
+    let shorter = limited.limit() != 0;
+    let longer = source.read(&mut [0; 1]).map_err(io_error)? != 0;
+    if shorter || longer {
+        return Err(PublishError::BuildOutputChanged {
+            file: file.path.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Whether a Git-tracked path is still excluded from the archive because a
@@ -1155,6 +1183,11 @@ pub enum PublishError {
         declared: String,
         entry: PathBuf,
     },
+    /// A declared build-output file changed size between the gate-time
+    /// walk and the archive — a build still running while publishing.
+    BuildOutputChanged {
+        file: PathBuf,
+    },
     /// Reading the project tree, or writing the archive or its checksums,
     /// failed.
     Io {
@@ -1261,6 +1294,12 @@ impl fmt::Display for PublishError {
                  nor a directory — the hub's own installer would refuse to extract an \
                  archive carrying it, so publish refuses to build one (CONTRACT.md §2).",
                 entry.display()
+            ),
+            Self::BuildOutputChanged { file } => write!(
+                formatter,
+                "{} changed while publish was reading it — nothing was published; \
+                 let the build finish, then publish again.",
+                file.display()
             ),
             Self::Io { path, source } => {
                 write!(formatter, "{}: {source}", path.display())

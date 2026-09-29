@@ -336,9 +336,10 @@ impl Git {
         if !snapshot.project_prefix.as_os_str().is_empty() {
             // A bare prefix would be read relative to the project directory
             // Git runs in, so a project nested inside its repository would
-            // enumerate nothing. `:/` pins the pathspec to the repository
-            // root, where `--show-prefix` measured it.
-            let mut pathspec = OsString::from(":/");
+            // enumerate nothing. `top` pins the pathspec to the repository
+            // root, where `--show-prefix` measured it; `literal` keeps a
+            // directory name holding `*`, `?` or `[` from matching as a glob.
+            let mut pathspec = OsString::from(":(top,literal)");
             pathspec.push(&snapshot.project_prefix);
             command.arg(pathspec);
         }

@@ -1600,3 +1600,48 @@ fn a_declared_output_ships_in_the_archive_with_its_stats_line() {
         "the archive must round-trip to the tracked tree plus the declared output"
     );
 }
+
+#[test]
+fn a_declared_file_that_changes_size_after_the_walk_is_refused() {
+    // A build still running while publishing: the walk measured one size,
+    // the archive would read another. Both directions are refused rather
+    // than written into a header that no longer matches its bytes.
+    for (label, rewritten) in [("shorter", "short"), ("longer", "a much longer body")] {
+        let project = tempfile::tempdir().expect("a temp project dir");
+        let root = project.path();
+        real_git_project(root, declared_output(), "/public/build\n");
+        let build = root.join("public/build");
+        fs::create_dir_all(&build).expect("a build dir");
+        fs::write(build.join("app.js"), "console.log(1);\n").expect("a script");
+
+        let mut gates = local_gates(root).expect("every gate to pass");
+        fs::write(build.join("app.js"), rewritten).expect("the build rewrites it");
+
+        let scratch = tempfile::tempdir().expect("a temp scratch dir");
+        let error = build_archive(
+            &gates.entries,
+            &mut gates.blobs,
+            &gates.build_outputs,
+            "demo",
+            "1.2.0",
+            scratch.path(),
+        )
+        .unwrap_err();
+        match &error {
+            PublishError::BuildOutputChanged { file } => {
+                assert_eq!(file, &PathBuf::from("public/build/app.js"), "{label}");
+            }
+            other => panic!("{label}: expected BuildOutputChanged, got {other}"),
+        }
+    }
+}
+
+#[test]
+fn the_stats_line_counts_in_the_singular_when_there_is_one() {
+    assert_eq!(super::counted(1, "file"), "1 file");
+    assert_eq!(super::counted(2, "file"), "2 files");
+    let one_hour_ago = SystemTime::now()
+        .checked_sub(Duration::from_secs(3600 + 30))
+        .expect("a computable instant");
+    assert_eq!(super::format_age(one_hour_ago), "1 hour ago");
+}
