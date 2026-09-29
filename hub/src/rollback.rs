@@ -33,7 +33,7 @@ use crate::{
     lifecycle_gate::{self, GateError},
     paths::{Paths, PathsError},
     prompt,
-    registry::{self, RegistryEntry, RegistryError},
+    registry::{self, RegistryEntry, RegistryError, Source},
     update::restore_tree,
     update_transaction::{self, JournalError},
 };
@@ -58,6 +58,13 @@ pub(crate) struct RollbackMarker {
     pub target_version: String,
     /// The source revision the registry entry goes back to.
     pub source_revision: String,
+    /// The source the registry entry goes back to — the anchor's own, copied
+    /// here for the same reason as `target_version`. Optional with a serde
+    /// default so a marker left by the previous binary still reads, and so an
+    /// anchor that predates source tracking leaves the recorded source alone;
+    /// `MARKER_FORMAT_VERSION` stays 1 for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
     /// `app.db`'s own rescue dump, the path named on screen — `None` when
     /// there was no live database to save.
     pub rescue_path: Option<PathBuf>,
@@ -183,23 +190,25 @@ fn rollback(paths: &Paths, id: &str, assume_yes: bool) -> Result<bool, RollbackE
         return Ok(true);
     }
 
-    let (target_version, source_revision) = match lifecycle::anchor_state(&data_subdir, &app_dir) {
-        Anchor::Complete {
-            app_version,
-            source_revision,
-            ..
-        } => (app_version, source_revision),
-        Anchor::Missing => {
-            return Err(RollbackError::NoAnchor {
-                id: id.to_string(),
-                missing: missing_halves(&data_subdir, &app_dir),
-            })
-        }
-    };
+    let (target_version, source_revision, source) =
+        match lifecycle::anchor_state(&data_subdir, &app_dir) {
+            Anchor::Complete {
+                app_version,
+                source_revision,
+                source,
+                ..
+            } => (app_version, source_revision, source),
+            Anchor::Missing => {
+                return Err(RollbackError::NoAnchor {
+                    id: id.to_string(),
+                    missing: missing_halves(&data_subdir, &app_dir),
+                })
+            }
+        };
 
     install::check_data_dir_available(id, &entry.identifier, &data_dir)?;
 
-    announce(id, &entry, &target_version);
+    announce(id, &entry, &target_version, source.as_ref());
     if !prompt::confirmed(assume_yes) {
         println!("Aborted — nothing was changed.");
         return Ok(false);
@@ -214,6 +223,7 @@ fn rollback(paths: &Paths, id: &str, assume_yes: bool) -> Result<bool, RollbackE
         format_version: MARKER_FORMAT_VERSION,
         target_version: target_version.clone(),
         source_revision: source_revision.clone(),
+        source,
         rescue_path: rescue_path.clone(),
     };
     write_marker(&data_dir, &marker).map_err(marker_error)?;
@@ -336,6 +346,9 @@ fn finish(
         if let Some(existing) = registry.get_mut(id) {
             existing.app_version = marker.target_version.clone();
             existing.source_revision = marker.source_revision.clone();
+            if let Some(source) = &marker.source {
+                existing.source = source.clone();
+            }
             existing.updated_at = now.clone();
         }
     })
@@ -414,8 +427,20 @@ fn rescue_dump(data_subdir: &Path) -> Result<Option<std::path::PathBuf>, Rollbac
 
 /// Say what is about to happen, in the terms the user will have to reason
 /// about afterwards — `update`'s own `announce` for the reverse direction.
-fn announce(id: &str, entry: &RegistryEntry, target_version: &str) {
+fn announce(id: &str, entry: &RegistryEntry, target_version: &str, target: Option<&Source>) {
     println!("Roll back {id}: {} -> {target_version}", entry.app_version);
+    match target {
+        Some(target) if *target != entry.source => println!(
+            "  source: {} -> {}",
+            crate::list::describe_source(&entry.source),
+            crate::list::describe_source(target)
+        ),
+        Some(_) => {}
+        None => println!(
+            "  the recorded source stays as it is: this update's rollback record \
+             predates source tracking"
+        ),
+    }
     println!(
         "  its database will be restored to its state before that update — anything \
          written since is set aside, not kept, in a rescue copy"

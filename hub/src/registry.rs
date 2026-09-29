@@ -120,7 +120,7 @@ pub struct RegistryEntry {
 /// `install` copies the resolved tree into `apps/<id>/`, always — there is no
 /// live link back to the source, and editing it changes nothing until
 /// `update <id>` runs. What this records is how to resolve that source again.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     pub kind: SourceKind,
     /// A filesystem path for a local source. For a release, the index's own

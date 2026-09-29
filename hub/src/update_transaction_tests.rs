@@ -104,6 +104,11 @@ fn assert_anchor_complete(
     let anchor = lifecycle::read_rollback_anchor(&data_subdir).expect("a written rollback.json");
     assert_eq!(anchor.app_version, entry.app_version);
     assert_eq!(anchor.source_revision, entry.source_revision);
+    assert_eq!(
+        anchor.source.as_ref(),
+        Some(&entry.source),
+        "the anchor records the outgoing source"
+    );
     assert!(
         !staged_tree_path(app_dir).is_dir(),
         "staged tree left behind"
@@ -126,6 +131,22 @@ fn finalise_anchor_from_a_fresh_start_completes_the_promotion() {
     )
     .unwrap();
     assert_anchor_complete(&entry, &data_dir, &app_dir);
+}
+
+#[test]
+fn finalise_anchor_rewrites_an_anchor_recorded_with_a_different_source() {
+    let (_base, _paths, entry, data_dir, app_dir, members) = ready_to_finalise();
+    let data_subdir = data_dir.join("data");
+    finalise_anchor(&data_subdir, &data_dir, &app_dir, &entry, &members).unwrap();
+    // The same version and revision, recorded without a source (or another).
+    let mut stale = lifecycle::read_rollback_anchor(&data_subdir).unwrap();
+    stale.source = None;
+    lifecycle::write_rollback_anchor(&data_subdir, &stale).unwrap();
+
+    finalise_anchor(&data_subdir, &data_dir, &app_dir, &entry, &members).unwrap();
+
+    let anchor = lifecycle::read_rollback_anchor(&data_subdir).unwrap();
+    assert_eq!(anchor.source.as_ref(), Some(&entry.source));
 }
 
 #[test]

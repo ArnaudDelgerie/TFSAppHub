@@ -85,7 +85,7 @@ pub fn render(registry: &Registry) -> String {
 }
 
 /// The source column: where it came from, and at what ref.
-fn describe_source(source: &Source) -> String {
+pub(crate) fn describe_source(source: &Source) -> String {
     let mut described = source.location.clone();
     if let Some(reference) = &source.reference {
         described.push('@');

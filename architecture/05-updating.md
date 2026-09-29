@@ -86,12 +86,16 @@ unless all three are present, naming whichever is missing:
 | --- | --- |
 | the retained source tree | `apps/<id>.previous` |
 | the pre-update database snapshot | `<data>/data/app.db.pre-update` (+ `-wal`/`-shm` twins) |
-| the outgoing registry state | `<data>/data/rollback.json` (`app_version`, `source_revision`, `created_at`) |
+| the outgoing registry state | `<data>/data/rollback.json` (`app_version`, `source_revision`, `source`, `created_at`) |
 
-Rollback restores the outgoing version, tree, database and source revision.
-It does not restore the source kind: after a forge-to-archive update and
-rollback, the recorded source remains `local-archive` and the next update
-still requires an explicit archive.
+Rollback restores the outgoing version, tree, database, source revision and
+source. The registry describes what is installed, as `update` already applies
+to the tag, so the source comes back with the version it installed. After a
+forge-to-archive update and rollback the recorded source is the forge again,
+and a bare `update <id>` queries the forge again instead of requiring an
+archive. `source` is a field of the third half, not a fourth: it is optional,
+because an anchor written before it existed has none. Such a rollback keeps the
+current source and says so, and the anchor stays complete.
 
 The third half exists because the first two cannot answer what it does:
 `source_revision` is hashed over the *source*, while the retained tree was

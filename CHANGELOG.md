@@ -254,6 +254,15 @@ in `SHA256SUMS.txt`, and the release notes end with a
 `Built from <repo>@<sha>` line naming the exact revision the binary was
 built from.
 
+`rollback` now restores the recorded source along with the version, tree,
+database and source revision: after an update and a rollback, `list` and
+`registry.json` name the tag, location and kind the restored version was
+installed from, for a forge release and a local archive alike. A bare `update
+<id>` after a forge → archive → rollback therefore queries the forge again.
+The rollback anchor records the outgoing source; an anchor written by an
+earlier hub has none, and its rollback keeps the current source and says so.
+`rollback` prints the source change it is about to make.
+
 ## 0.3.0
 
 No user-facing change — this release exists to validate `tfsapp-hub --update`
