@@ -1046,7 +1046,10 @@ fn a_count_above_the_cap_falls_back_to_the_cap_and_says_so() {
 
     let loaded = parse_ok(&contents);
 
-    assert_eq!(loaded.manifest.workers[0].count, super::WORKER_COUNT_CAP);
+    assert_eq!(
+        loaded.manifest.workers[0].count,
+        u64::from(super::WORKER_COUNT_CAP)
+    );
     assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
     assert!(
         loaded.warnings[0].contains("workers[0].count"),
@@ -1054,6 +1057,28 @@ fn a_count_above_the_cap_falls_back_to_the_cap_and_says_so() {
         loaded.warnings[0]
     );
     assert!(loaded.warnings[0].contains('9'), "{}", loaded.warnings[0]);
+}
+
+#[test]
+fn a_count_above_u8_still_falls_back_to_the_cap_and_says_so() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "workers": [{"transports": ["fond"], "count": 256}]"#,
+    );
+
+    let loaded = parse_ok(&contents);
+
+    assert_eq!(
+        loaded.manifest.workers[0].count,
+        u64::from(super::WORKER_COUNT_CAP)
+    );
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+    assert!(
+        loaded.warnings[0].contains("workers[0].count"),
+        "{}",
+        loaded.warnings[0]
+    );
+    assert!(loaded.warnings[0].contains("256"), "{}", loaded.warnings[0]);
 }
 
 #[test]

@@ -167,10 +167,10 @@ pub struct Manifest {
 pub struct WorkerDeclaration {
     pub transports: Vec<String>,
     #[serde(default = "default_worker_count")]
-    pub count: u8,
+    pub count: u64,
 }
 
-fn default_worker_count() -> u8 {
+fn default_worker_count() -> u64 {
     1
 }
 
@@ -783,9 +783,11 @@ fn validate_workers_shape(path: &Path, value: &serde_json::Value) -> Result<(), 
         }
 
         if let Some(count) = object.get("count") {
-            let is_positive_integer = count
-                .as_u64()
-                .is_some_and(|n| (1..=u8::MAX as u64).contains(&n));
+            // Any positive integer parses; the cap above 4 is a fallback
+            // (apply_worker_fallbacks), not a refusal, so a `u8`-shaped
+            // bound here would reject what the contract promises to warn
+            // about.
+            let is_positive_integer = count.as_u64().is_some_and(|n| n >= 1);
             if !is_positive_integer {
                 return Err(invalid(format!(
                     "workers[{index}].count must be a positive integer, found {}",
@@ -824,13 +826,13 @@ fn duplicate_worker_transport(workers: &[WorkerDeclaration]) -> Option<String> {
 fn apply_worker_fallbacks(workers: &mut [WorkerDeclaration]) -> Vec<String> {
     let mut warnings = Vec::new();
     for (index, declaration) in workers.iter_mut().enumerate() {
-        if declaration.count > WORKER_COUNT_CAP {
+        if declaration.count > u64::from(WORKER_COUNT_CAP) {
             warnings.push(format!(
                 "workers[{index}].count {} exceeds the cap of {WORKER_COUNT_CAP}; using \
                  {WORKER_COUNT_CAP} instead (CONTRACT.md §2).",
                 declaration.count
             ));
-            declaration.count = WORKER_COUNT_CAP;
+            declaration.count = u64::from(WORKER_COUNT_CAP);
         }
         if declaration.count > 1
             && declaration
