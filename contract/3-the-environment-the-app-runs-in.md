@@ -27,7 +27,7 @@ console command. An app cannot tell them apart, and that is deliberate.
 | `MERCURE_PUBLIC_URL` | identical to `MERCURE_URL` — same origin, loopback | the browser, subscribing |
 | `MERCURE_JWT_SECRET` | fresh random value every launch, never persisted | Symfony and the hub |
 | `TFS_ASYNC_WORKER` | `"1"` / `"0"` — see "Capabilities are reported, not assumed" | the app, to tell its user |
-| `TFS_WORKER_TRANSPORTS` | the transports actually consumed after fallbacks, in declaration order, deduplicated, comma-separated, empty when none | the app, to tell its user |
+| `TFS_WORKER_TRANSPORTS` | the transports the hub set out to run, after fallbacks, in declaration order, deduplicated, comma-separated, empty when none | the app, to tell its user |
 | `TFS_KEYRING_AVAILABLE` | `"1"` when the OS keyring answered, `"0"` when secrets fell back to a file — §5 | the app, to tell its user |
 | `TFS_MEDIA_MICROPHONE` | `"1"` when `actions.media.microphone` is declared **and** the host actually granted it on this machine, `"0"` otherwise — see "Capabilities are reported, not assumed" | the app, to tell its user |
 | `PHP_BINARY` | the interpreter actually running this app | any PHP tool spawning a PHP subprocess |
@@ -148,16 +148,18 @@ keyring or has fallen back to a file (§5). It reports what the probe actually
 picked, not whether a keyring is installed: a keyring that is present but locked
 has already fallen back, and an app is entitled to warn on that basis.
 
-`TFS_ASYNC_WORKER` says whether at least one worker is consuming any of the
-app's transports. Today the answer is exact and its scope is the window's
-lifetime: declaring `workers` (or the legacy `async_worker`) gets one or more
-workers for as long as the app is open, and closing the window ends all of
-them. `TFS_WORKER_TRANSPORTS` names which transports specifically, so an app
-with several declarations can tell a still-running one apart from one that
-gave up (§6's supervisor). The rule that binds any future change to either
-variable: they mirror **what is actually running**, never what the manifest
-asked for. The day a host can be asked to narrow the declaration — or to
-extend it past the window — the narrowing has to reach the app here, or an app
+`TFS_ASYNC_WORKER` and `TFS_WORKER_TRANSPORTS` describe the workers the hub
+set out to run: whether at least one declaration survives to launch, and
+which transports each contributes after fallbacks. They are computed once,
+at start, from the manifest, and never change afterwards — they are not a
+live report. A slot's later fate — a restart, or a give-up after five
+consecutive failed starts (§6's supervisor) — reaches no environment
+variable: it is written to that slot's own `worker-<n>.log` under
+`APP_LOG_DIR`, where an app or its author can read it. The rule that binds
+any future change to either variable: they mirror **what is actually set
+out to run**, never what the manifest asked for before fallbacks. The day a
+host can be asked to narrow the declaration — or to extend it past the
+window — the narrowing has to reach the app here, or an app
 ships a task due at 8 a.m., is silently narrowed, and neither its author nor
 its user ever learns it does not fire.
 

@@ -139,9 +139,11 @@ fn messenger_transport_dsn(manifest: &Manifest) -> String {
     }
 }
 
-/// `TFS_WORKER_TRANSPORTS`: every transport actually consumed after
+/// `TFS_WORKER_TRANSPORTS`: every transport the hub set out to run, after
 /// fallbacks, in declaration order, deduplicated, comma-separated, empty when
-/// none. The union across workers rather than a per-worker grouping — §3's
+/// none. Computed once at launch from the manifest — never a live report; a
+/// slot's later fate is `worker-<n>.log`'s to tell. The union across workers
+/// rather than a per-worker grouping — §3's
 /// question is whether *this* transport is consumed, not which process
 /// consumes it (parse-time refuses a transport repeated across declarations,
 /// so the dedup here only ever guards the invariant, never masks a

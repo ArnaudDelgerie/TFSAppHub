@@ -176,8 +176,9 @@ grants itself a permanent process. Today nothing outlives the window, so the
 question does not yet arise; when it does, it arrives as a consent step and not
 as a manifest key.
 
-**The app is told what is actually running, not what it asked for.** §3 injects
-the effective worker state, and the question it answers is the one a user
+**The app is told what the hub actually set out to run, not what it asked
+for.** §3 injects the worker state as of launch, and the question it answers
+is the one a user
 message needs — *does my scheduled work continue once I close the window?* — not
 "is something consuming right now". An app whose 8 a.m. task will not fire
 because the window will be closed is entitled to say so, and can only say it if
