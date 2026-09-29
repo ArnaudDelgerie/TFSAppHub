@@ -2,6 +2,7 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use super::{parse_branch_line, parse_ls_files, parse_ls_tree, parse_status, Git, GitError};
@@ -425,4 +426,51 @@ exit 1
         reader.copy_blob("bad", &mut Vec::new()),
         Err(GitError::MalformedBatch { .. })
     ));
+}
+
+#[test]
+fn tree_entries_enumerates_a_project_nested_inside_its_repository() {
+    // A real repository, not a fake `git`: the pathspec under test is the
+    // exact one a project below the repository root (Papermark's `app/`)
+    // makes Git misread, and only real Git proves `:/` fixes it.
+    let repository = tempfile::tempdir().expect("a temp repo dir");
+    let project = repository.path().join("apps/demo");
+    fs::create_dir_all(&project).expect("a nested project dir");
+    fs::write(project.join("tfsapp.config.json"), "{}").expect("a manifest");
+    // Git runs from the repository root here, so `apps/demo` stays a
+    // subdirectory of one repository rather than a repository of its own.
+    for arguments in [
+        Vec::from(["init", "--quiet"]),
+        Vec::from(["config", "user.email", "test.invalid"]),
+        Vec::from(["config", "user.name", "TFSApp test"]),
+        Vec::from(["add", "."]),
+        Vec::from(["commit", "--quiet", "-m", "source"]),
+    ] {
+        assert!(
+            Command::new("git")
+                .args(arguments)
+                .current_dir(repository.path())
+                .status()
+                .expect("git to run")
+                .success(),
+            "git fixture setup must succeed"
+        );
+    }
+    let git = Git::new();
+    let snapshot = git
+        .local_snapshot(&project)
+        .expect("a clean local work tree");
+    assert_eq!(snapshot.project_prefix, PathBuf::from("apps/demo/"));
+    let entries = git
+        .tree_entries(&project, &snapshot)
+        .expect("the nested project's tree");
+    let paths: Vec<&Path> = entries.iter().map(|entry| entry.path.as_path()).collect();
+    assert!(
+        paths.contains(&Path::new("tfsapp.config.json")),
+        "the project's own tree, project-relative: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|path| path.starts_with("apps/")),
+        "no path outside the project's subtree: {paths:?}"
+    );
 }

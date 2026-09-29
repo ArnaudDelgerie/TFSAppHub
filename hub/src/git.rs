@@ -315,19 +315,32 @@ impl Git {
     }
 
     /// Enumerate the pinned commit's project-relative tree, never the index
-    /// or files currently on disk.
+    /// or files currently on disk. `--full-name` keeps the printed paths
+    /// relative to the repository root whatever directory Git runs in, which
+    /// [`parse_ls_tree`] strips the project prefix from — ls-tree without it
+    /// prints relative to the current directory instead.
     pub fn tree_entries(
         &self,
         project: &Path,
         snapshot: &Snapshot,
     ) -> Result<Vec<TreeEntry>, GitError> {
         let mut command = Command::new(&self.program);
-        command
-            .arg("-C")
-            .arg(project)
-            .args(["ls-tree", "-r", "-z", &snapshot.commit.sha, "--"]);
+        command.arg("-C").arg(project).args([
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-name",
+            &snapshot.commit.sha,
+            "--",
+        ]);
         if !snapshot.project_prefix.as_os_str().is_empty() {
-            command.arg(&snapshot.project_prefix);
+            // A bare prefix would be read relative to the project directory
+            // Git runs in, so a project nested inside its repository would
+            // enumerate nothing. `:/` pins the pathspec to the repository
+            // root, where `--show-prefix` measured it.
+            let mut pathspec = OsString::from(":/");
+            pathspec.push(&snapshot.project_prefix);
+            command.arg(pathspec);
         }
         let output =
             spawn_with_retry(&mut command).map_err(|source| GitError::NotInstalled { source })?;
