@@ -42,7 +42,10 @@ itself to being installed, which is exactly what §3 exists to avoid.
 
 **Frontend assets ship built.** The host resolves PHP dependencies with its own
 interpreter at install time; it does not run Node, and it never builds assets.
-An app with a frontend build step commits its output, or its pages arrive
+An app with a frontend build step builds its output itself and declares the
+directories it produces under `build_outputs` in its manifest (§2); `publish`
+copies them into the release archive as they stand on the author's machine.
+An app that neither commits nor declares its output ships pages that arrive
 without it. This is the same boundary the lifecycle draws in §6 — the developer
 builds on their machine, the host installs and serves — and it is what keeps an
 app's prerequisites down to "a Symfony project".
@@ -76,17 +79,20 @@ cannot be installed. On a forge, the release also has:
   or a commit;
 - an asset named `<project_name>-<app_version>.tar.gz`, holding the permitted
   Git-tracked source tree at that commit: no `vendor/`, `var/`, `node_modules/`
-  or `.git/`, built frontend assets committed like any other tracked file. When
-  the hub publishes it, the archive's paths, bytes, executable and symlink
+  or `.git/`, plus the directories the manifest declares under `build_outputs`.
+  When the hub publishes it, the archive's paths, bytes, executable and symlink
   modes, manifest and changelog all come from that one pushed commit — never a
   later working-tree state — so no step of the pipeline gets a remote special
-  case;
+  case. The declared `build_outputs` are the one stated exception: the author's
+  bytes as they stand at publish time, gitignored in the project, embedded
+  as-is and covered by the same checksum;
 - a `SHA256SUMS.txt` beside it, one `<sha256>  <filename>` line naming the
   archive, checked before a single byte of it reaches the app root;
 - a `## <version>` heading in `CHANGELOG.md` naming what changed.
 
 All four are reachable by hand — `git archive` starts from the same tracked
-tree, with the stated exclusions applied before `sha256sum` names the result.
+tree, with the stated exclusions applied, the declared `build_outputs`
+directories appended beside it, before `sha256sum` names the result.
 `tfsapp-hub publish path/to/project` automates exactly this sequence and is the
 convenience, never the requirement.
 

@@ -32,6 +32,8 @@ use std::{
 
 use serde::Deserialize;
 
+use crate::source;
+
 /// The contract-defined manifest filename at the project root.
 pub const MANIFEST_FILE: &str = "tfsapp.config.json";
 
@@ -39,9 +41,10 @@ pub const MANIFEST_FILE: &str = "tfsapp.config.json";
 ///
 /// `splash_bg`, `splash_text` and `splash_path` are all honoured by the hub.
 /// `releases_repo` remains a known, inert legacy key so old manifests do not
-/// produce a warning. Anything outside this list is far more likely a typo
-/// (`"app-port"` for `"app_port"`) than a deliberate extension, which is what
-/// the warning is for.
+/// produce a warning. `build_outputs` is read by `publish` alone. Anything
+/// outside this list is far more likely a typo (`"app-port"` for
+/// `"app_port"`) than a deliberate extension, which is what the warning is
+/// for.
 pub const KNOWN_KEYS: &[&str] = &[
     "product_name",
     "identifier",
@@ -57,6 +60,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "workers",
     "actions",
     "file_associations",
+    "build_outputs",
     "releases_repo",
     "run",
 ];
@@ -156,6 +160,15 @@ pub struct Manifest {
     /// git remote; install and update never let a source steer its own fetch.
     #[serde(default)]
     pub releases_repo: Option<String>,
+    /// Project-relative directories of build output that `publish` — and
+    /// `publish` alone — embeds in the release archive beside the tracked
+    /// tree (CONTRACT.md §2, plan 071). The app builds them with its own
+    /// tool, gitignored; absent or empty means today's behaviour, an archive
+    /// from the pinned tracked tree only. `install`, `update` and `dev`
+    /// never read it, and the parser never refuses on its values — only
+    /// `publish` does, through [`build_output_shape`].
+    #[serde(default)]
+    pub build_outputs: Vec<String>,
 }
 
 /// One declared worker: an ordered, non-empty transport list plus how many
@@ -456,6 +469,15 @@ pub fn parse(path: &Path, contents: &str) -> Result<Loaded, ManifestError> {
 
     if let Some(value) = object.get("workers") {
         validate_workers_shape(path, value)?;
+    }
+
+    // Same reasoning as `workers`: serde's own error would report a wrong
+    // element type without ever naming the key. The *values* are a
+    // different matter — a syntactically valid path that names, say, a
+    // directory outside the project is publish's to refuse, never the
+    // parser's (see `build_output_shape`).
+    if let Some(value) = object.get("build_outputs") {
+        validate_build_outputs_shape(path, value)?;
     }
 
     // Unlike a new top-level key, a transport a group's contract shape does
@@ -800,6 +822,116 @@ fn validate_workers_shape(path: &Path, value: &serde_json::Value) -> Result<(), 
     Ok(())
 }
 
+/// The type checks `build_outputs` needs at parse time: an array of
+/// strings, nothing more. A value a string can spell but publish cannot
+/// embed (empty, absolute, escaping the project, …) belongs to
+/// [`build_output_shape`] — checked by `publish`, never here, so an older
+/// hub still installs an app whose declared output it knows nothing about.
+fn validate_build_outputs_shape(
+    path: &Path,
+    value: &serde_json::Value,
+) -> Result<(), ManifestError> {
+    let array = value.as_array().ok_or_else(|| ManifestError::WrongType {
+        path: path.to_path_buf(),
+        field: "build_outputs",
+        expected: "an array of project-relative directory paths",
+        found: json_type(value),
+    })?;
+    for entry in array {
+        if !entry.is_string() {
+            return Err(ManifestError::WrongType {
+                path: path.to_path_buf(),
+                field: "build_outputs",
+                expected: "an array of project-relative directory paths",
+                found: json_type(entry),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The lexical half of a `build_outputs` entry's validation (CONTRACT.md
+/// §2, plan 071): the shape a declared directory must have before `publish`
+/// looks at the filesystem at all. Pure — no filesystem, no Git.
+///
+/// Refused, each with its own reason: an empty string; an absolute path;
+/// any `..` or `.` component, since a declaration that climbs is not a
+/// project-relative directory; and a first component Git and `tree_hash`
+/// both exclude (`source::EXCLUDED_FROM_HASH`), since an output there can
+/// never reach an archive. Returns the normalized project-relative path.
+pub fn build_output_shape(declared: &str) -> Result<PathBuf, ManifestError> {
+    let invalid = |detail: String| ManifestError::BuildOutputInvalid {
+        declared: declared.to_string(),
+        detail,
+    };
+
+    if declared.is_empty() {
+        return Err(invalid("it is empty".to_string()));
+    }
+    let path = Path::new(declared);
+    if path.is_absolute() {
+        return Err(invalid(
+            "it is absolute — a declared output is project-relative".to_string(),
+        ));
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(invalid(
+                    "it has a \"..\" component, which would leave the project".to_string(),
+                ))
+            }
+            std::path::Component::CurDir => {
+                return Err(invalid(
+                    "it has a \".\" component — declare the directory itself".to_string(),
+                ))
+            }
+            _ => {}
+        }
+    }
+    if let Some(first) = path.components().next() {
+        let name = first.as_os_str();
+        if source::EXCLUDED_FROM_HASH
+            .iter()
+            .any(|excluded| name == *excluded)
+        {
+            return Err(invalid(format!(
+                "its first component is {name:?}, which the release archive never carries"
+            )));
+        }
+    }
+    Ok(path.components().collect())
+}
+
+/// Every declared output's normalized project-relative path, or the first
+/// refusal among them. A second pass beyond [`build_output_shape`], because
+/// nesting is a property of the whole declaration, not of one entry: a
+/// path equal to or nested in another declared one (duplicates included)
+/// would ship the same files twice, and which entry's stats line described
+/// them would be arbitrary.
+pub fn build_output_shapes(declared: &[String]) -> Result<Vec<PathBuf>, ManifestError> {
+    let paths: Vec<PathBuf> = declared
+        .iter()
+        .map(|entry| build_output_shape(entry))
+        .collect::<Result<_, _>>()?;
+    for (index, path) in paths.iter().enumerate() {
+        if let Some((other_index, _)) = paths
+            .iter()
+            .enumerate()
+            .find(|(other_index, other)| *other_index != index && path.starts_with(other))
+        {
+            return Err(ManifestError::BuildOutputInvalid {
+                declared: declared[index].to_string(),
+                detail: format!(
+                    "it is equal to or nested in \"{}\", another declared output",
+                    paths[other_index].display()
+                ),
+            });
+        }
+    }
+    Ok(paths)
+}
+
 /// The first transport spelled by more than one declaration, if any — a
 /// consumer is what `count` spells, so this is refused rather than
 /// fallen back on, unlike the two cases below.
@@ -916,6 +1048,15 @@ pub enum ManifestError {
         path: PathBuf,
         detail: String,
     },
+    /// A `build_outputs` entry `publish` cannot embed — the lexical shape
+    /// only, checked by [`build_output_shape`]/[`build_output_shapes`],
+    /// never by [`parse`]. Carries the declared string rather than the
+    /// manifest's path because the refusal is about the declaration, not
+    /// about the file it lives in.
+    BuildOutputInvalid {
+        declared: String,
+        detail: String,
+    },
     Invalid {
         path: PathBuf,
         detail: String,
@@ -1004,6 +1145,10 @@ impl fmt::Display for ManifestError {
                 formatter,
                 "\"file_associations\" in {} is invalid: {detail} (CONTRACT.md §2).",
                 path.display()
+            ),
+            Self::BuildOutputInvalid { declared, detail } => write!(
+                formatter,
+                "\"build_outputs\" entry {declared:?} is invalid: {detail} (CONTRACT.md §2)."
             ),
             Self::Invalid { path, detail } => {
                 write!(formatter, "invalid {}: {detail}", path.display())

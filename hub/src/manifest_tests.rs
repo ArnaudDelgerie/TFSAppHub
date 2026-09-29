@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::{load, parse, ManifestError, MANIFEST_FILE};
+use super::{build_output_shape, build_output_shapes, load, parse, ManifestError, MANIFEST_FILE};
 
 /// Where a real manifest would be, so every message these tests assert on is
 /// the one a user would actually read.
@@ -1162,4 +1162,156 @@ fn an_app_with_no_icon_declares_none_rather_than_a_guess() {
     let identity = manifest.identity(Path::new("/apps/tfsapp-test"));
 
     assert_eq!(identity.icon_path, None);
+}
+
+// --- build_outputs (publish-only, plan 071) -------------------------------
+
+#[test]
+fn build_outputs_is_empty_when_absent_and_warns_about_nothing() {
+    let loaded = parse_ok(MINIMAL);
+
+    assert!(loaded.manifest.build_outputs.is_empty());
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+}
+
+#[test]
+fn an_empty_build_outputs_declaration_parses_and_warns_about_nothing() {
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "build_outputs": []"#,
+    );
+
+    let loaded = parse_ok(&contents);
+
+    assert!(loaded.manifest.build_outputs.is_empty());
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+}
+
+#[test]
+fn a_declared_build_output_parses_without_a_warning() {
+    // The one key `publish` alone reads: known to the unknown-key rule, so
+    // declaring it must not warn any more than omitting it does.
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "build_outputs": ["public/build"]"#,
+    );
+
+    let loaded = parse_ok(&contents);
+
+    assert_eq!(loaded.manifest.build_outputs, ["public/build"]);
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+}
+
+#[test]
+fn a_wrongly_typed_build_outputs_declaration_is_refused() {
+    for wrong in [
+        r#""build_outputs": "public/build""#,
+        r#""build_outputs": {"dir": "public/build"}"#,
+        r#""build_outputs": [1]"#,
+        r#""build_outputs": [null]"#,
+    ] {
+        let contents = MINIMAL.replace(
+            r#""app_version": "0.6.0""#,
+            &format!(r#""app_version": "0.6.0", {wrong}"#),
+        );
+        let error = parse_err(&contents);
+        match &error {
+            ManifestError::WrongType { field, .. } => assert_eq!(*field, "build_outputs"),
+            other => panic!("expected WrongType, got {other}"),
+        }
+        assert!(error.to_string().contains("build_outputs"), "{error}");
+    }
+}
+
+#[test]
+fn parse_never_refuses_a_build_output_value_publish_would() {
+    // The parser checks types, never values: an older hub must still
+    // install an app whose declared output it cannot embed, and only
+    // `publish` — which is about to build the archive — refuses.
+    let contents = MINIMAL.replace(
+        r#""app_version": "0.6.0""#,
+        r#""app_version": "0.6.0", "build_outputs": ["/etc", "", "vendor"]"#,
+    );
+
+    let loaded = parse_ok(&contents);
+
+    assert_eq!(
+        loaded.manifest.build_outputs,
+        ["/etc", "", "vendor"].map(String::from)
+    );
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+}
+
+#[test]
+fn accepted_build_output_shapes_normalize_to_project_relative_paths() {
+    for accepted in ["public/build", "dist", "a/deeply/nested/output"] {
+        assert_eq!(
+            build_output_shape(accepted).expect("an accepted shape"),
+            PathBuf::from(accepted),
+            "{accepted:?} should have been accepted"
+        );
+    }
+}
+
+#[test]
+fn each_refused_build_output_shape_names_the_entry_and_its_reason() {
+    for (declared, reason) in [
+        ("", "it is empty"),
+        ("/public/build", "it is absolute"),
+        ("../outside", "\"..\" component"),
+        ("public/../build", "\"..\" component"),
+        ("./build", "\".\" component"),
+        (".", "\".\" component"),
+        ("vendor/x", "\"vendor\""),
+        (".git", "\".git\""),
+        ("var/cache", "\"var\""),
+        ("node_modules/pkg", "\"node_modules\""),
+        ("tfsapp_build", "\"tfsapp_build\""),
+    ] {
+        let error = build_output_shape(declared).expect_err("a refused shape");
+        match &error {
+            ManifestError::BuildOutputInvalid {
+                declared: found,
+                detail,
+            } => {
+                assert_eq!(found, declared);
+                assert!(detail.contains(reason), "{error}");
+            }
+            other => panic!("expected BuildOutputInvalid, got {other}"),
+        }
+    }
+}
+
+#[test]
+fn equal_or_nested_build_outputs_are_refused_across_the_declaration() {
+    // Whichever entry comes first, the nested one is the refusal's subject
+    // — it is the entry that would ship the other's files a second time.
+    for declared in [
+        vec!["public/build", "public/build"],
+        vec!["public", "public/build"],
+        vec!["public/build", "public"],
+    ] {
+        let declared: Vec<String> = declared.iter().map(|entry| entry.to_string()).collect();
+        let error =
+            build_output_shapes(&declared).expect_err("an overlapping declaration is refused");
+        match &error {
+            ManifestError::BuildOutputInvalid {
+                declared: found,
+                detail,
+            } => {
+                assert_eq!(found, "public/build");
+                assert!(detail.contains("equal to or nested in"), "{error}");
+            }
+            other => panic!("expected BuildOutputInvalid, got {other}"),
+        }
+    }
+
+    let separate: Vec<String> = ["public/build", "dist"]
+        .iter()
+        .map(|e| e.to_string())
+        .collect();
+    assert_eq!(
+        build_output_shapes(&separate).expect("disjoint declarations"),
+        [PathBuf::from("public/build"), PathBuf::from("dist")]
+    );
 }

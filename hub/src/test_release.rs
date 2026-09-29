@@ -44,6 +44,7 @@ pub(crate) fn release_of(project: &Path, out: &Path) -> PathBuf {
     crate::publish::build_archive(
         &entries,
         &mut LocalBlobs(blobs),
+        &[],
         &manifest.manifest.project_name,
         &manifest.manifest.app_version,
         out,

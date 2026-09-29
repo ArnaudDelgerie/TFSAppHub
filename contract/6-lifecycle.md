@@ -184,8 +184,9 @@ from source with a bundled interpreter — and the boundary is deliberate:
 restarts.** A host that ran an app's build commands would be a build tool with a
 window attached, and every asset pipeline in the world already has a `--watch`.
 
-Nothing is lost by it. Assets belong in the app's repository, built and
-committed by whatever built them; `composer install` runs at install time with
+Nothing is lost by it. Assets belong in the app's repository, built by
+whatever builds them and declared in `build_outputs` (§2) — `publish` embeds
+the declared directories in the release archive as they stand; `composer install` runs at install time with
 the very interpreter that will later serve the app. If that interpreter later
 changes, the next open re-runs it against the existing lock behind the app's
 splash, after its launch locks are held. Those are the only build-like steps

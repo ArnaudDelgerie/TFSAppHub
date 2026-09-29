@@ -49,6 +49,7 @@ suffix would be destroyed by another app's update.
 | `file_associations` | object | The MIME types this app declares it can open — see "Declaring file associations" below. |
 | `workers` | array of objects | Declares one or more background consumers, each an ordered list of Messenger transports plus an optional copy count — see "Declaring off-window work" below. |
 | `async_worker` | boolean | Sugar for a single worker consuming `async`; refused together with `workers` — see "Declaring off-window work" below. |
+| `build_outputs` | array of strings | Project-relative directories the author's own frontend build step produces, gitignored in the project. `publish` alone reads this key — `install`, `update` and `dev` ignore it — and refuses a declared path that escapes the project, sits under an excluded component, is absent or empty, holds a tracked file, is not gitignored, or holds anything but regular files and directories, before embedding it in the release archive as it stands — see §1's "Publishing a release". |
 
 A minimal manifest is four lines:
 
