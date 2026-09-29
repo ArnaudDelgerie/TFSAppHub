@@ -88,7 +88,7 @@ itself removes it.
 
 One operation does replace it: a forced `import` extracts the archive's own
 `uploads/` over the destination's (§5). Even that is a replacement, not a
-destruction — the directory that was there is moved aside as
+destruction — a non-empty directory that was there is moved aside as
 `uploads.rescue-*`, its path printed beside the database's rescue, so nothing
 the app's user put there is lost to it.
 
