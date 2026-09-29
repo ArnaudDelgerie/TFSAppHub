@@ -20,8 +20,9 @@ FROM ${BASE_IMAGE}
 # dbus + gnome-keyring (test-only — the ephemeral Secret Service
 # run-tests.sh stands up, never the host's real login keyring).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential curl ca-certificates pkg-config file \
+      build-essential curl ca-certificates pkg-config file git \
       libwebkit2gtk-4.1-dev libgtk-3-dev libdbus-1-dev librsvg2-dev \
+      gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-pipewire \
       dbus gnome-keyring shellcheck \
     && rm -rf /var/lib/apt/lists/*
 
@@ -49,6 +50,11 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && cargo install tauri-cli --version "^2" \
     && mkdir -p "$CARGO_HOME/registry" "$HOME/.cache/tauri" \
     && chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME" "$HOME"
+
+# linuxdeploy-plugin-gstreamer invokes patchelf directly when it rewrites the
+# bundled plugin binaries; the Tauri CLI does not install that host tool.
+RUN apt-get update && apt-get install -y --no-install-recommends patchelf \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 CMD ["make", "build"]

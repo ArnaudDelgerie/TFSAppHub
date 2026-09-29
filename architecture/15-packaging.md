@@ -2,13 +2,15 @@
 
 The hub is packaged once, as an AppImage, and that build decides the
 compatibility floor for the entire fleet — it is the only binary anyone links.
-An AppImage's portability comes down to two numbers, the glibc it was linked
-against and the WebKitGTK ABI it expects, and both come from the builder's
-machine. Rather than fighting that with a pinned build base of its own, the
-floor is simply **a property of whatever built the image**, measured and
+An AppImage's portability starts with the glibc it was linked against and
+the WebKitGTK ABI it expects; both come from the builder's machine. Its
+GStreamer plugins also come from that machine and can require compatible
+graphics and audio libraries from the user's session. Rather than fighting
+that with a pinned build base of its own, the floor is simply **a property
+of whatever built the image**, measured and
 recorded beside the artifact in `.versions.txt` — the highest `GLIBC_x.y`
 symbol version any bundled ELF imports, the build host's own glibc, the OS,
-and the frozen version of every WebKit/GTK/GLib library the bundle carries.
+and the frozen versions of its WebKit/GTK/GLib and GStreamer libraries.
 No single release covers every distribution a user might be on; the answer
 offered to whoever it fails is `build/compose.yaml`'s `docker compose run --rm
 build`, with `BASE_IMAGE` set to a base older than the one that produced the
@@ -36,6 +38,21 @@ dynamic linker is left to fall through to the session's own copy instead.
 Every repair is verified against the repacked artifact, not assumed from the
 input to the repack.
 
+`bundleMediaFramework` makes linuxdeploy copy the build host's GStreamer
+plugins and helpers into the AppImage. Its `apprun-hooks` script points
+GStreamer at those bundled plugins, so WebKit loads plugins built for the
+same frozen GStreamer core library. The final-artifact check refuses an image
+without `libgstapp.so`, `libgstcoreelements.so`, or an audio source plugin
+(`libgstpulseaudio.so` or `libgstpipewire.so`). The repair pass removes
+bundled `libpipewire-*` and `libpulse*` client libraries: their protocol and
+PipeWire SPA modules belong to the running audio session. `.versions.txt`
+records the frozen `libgstreamer-1.0.so.0` package version. The plugin set
+did not raise the measured glibc floor on Ubuntu 24.04 (2.39), and a real
+Debian 12 build recorded 2.36 and ran on Ubuntu 24.04. Optional plugins can
+still depend on host graphics, X11/Wayland, ALSA, USB, or C++ libraries; a
+Docker build on an older base reduces symbol-version risk but cannot supply
+an absent host service or device.
+
 ### Text rendering
 
 Every WebView this process creates renders text with greyscale antialiasing
@@ -60,4 +77,3 @@ non-event. The ecosystem took the same direction anyway — GTK4 dropped
 subpixel text rendering outright, and macOS has shipped greyscale-only since
 Mojave — so this trades a resolution gain few displays still cash in for a
 rendering mode that no longer silently switches mid-screen.
-

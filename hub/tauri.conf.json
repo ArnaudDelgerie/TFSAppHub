@@ -13,6 +13,11 @@
     "active": true,
     "targets": ["appimage"],
     "icon": ["icons/icon.png"],
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    },
     "resources": ["resources/frankenphp", "resources/composer.phar"]
   }
 }

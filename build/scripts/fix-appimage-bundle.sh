@@ -19,11 +19,10 @@ set -euo pipefail
 #
 # 2. The display backend. linuxdeploy-plugin-gtk writes
 #    apprun-hooks/linuxdeploy-plugin-gtk.sh into the AppDir, and that generated
-#    hook — sourced by AppRun before the launcher ever runs — hard-forces
-#    `export GDK_BACKEND=x11`. On a Wayland session that pins the whole app to
-#    XWayland, whose synthetic kinetic scrolling makes a touchpad scroll
-#    overshoot where the fingers stopped by 100-200px. We rewrite that one line
-#    to defer to the session's own backend (see HOOK_PATCH below).
+#    hook is sourced by AppRun. Older versions hard-force `export GDK_BACKEND=x11`,
+#    pinning Wayland sessions to XWayland and causing touchpad scroll overshoot.
+#    We rewrite that line to defer to the session backend (HOOK_PATCH below).
+#    Newer versions comment that export out; accept that native behavior too.
 #
 # 3. `.DirIcon`. linuxdeploy writes it as an *absolute* symlink into the
 #    build machine's own AppDir directory, which does not exist once the
@@ -50,10 +49,18 @@ set -euo pipefail
 #    own copy — the one built for it — the same way it would for any other
 #    library this AppImage does not carry.
 #
+# 5. The media framework. Tauri's GStreamer plugin freezes the build host's
+#    plugins and helpers alongside WebKit and libgstreamer, so the plugin ABI
+#    matches the core library in the image. It also pulls in PulseAudio and
+#    PipeWire client libraries. Those speak to the running session's audio
+#    server, and PipeWire loads SPA modules from the host's own paths, so leave
+#    these client libraries to the session instead. Capture-critical plugins
+#    are verified in the final artifact below.
+#
 # Usage: build/scripts/fix-appimage-bundle.sh [appimage-path...]
 # Defaults to every *.AppImage under the hub's own bundle dir when no path is
 # given; a no-op when no AppImage is found there, or when the sidecar, the
-# hook, .DirIcon and the absence of libwayland-* are already correct.
+# hook, .DirIcon and the absence of session-owned libraries are already correct.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PRISTINE="$ROOT_DIR/hub/resources/frankenphp"
@@ -101,8 +108,9 @@ if [[ ! -x "$APPIMAGETOOL" ]]; then
   exit 1
 fi
 
-# Echoes "patched" when the hook already carries our line, "stale" when it
-# still carries the plugin's; anything else is fatal (see HOOK_ORIGINAL_RE).
+# Echoes "patched" for our line, "stale" for the active upstream X11 line,
+# or "native" when upstream itself comments out the X11 line. Anything else
+# is fatal (see HOOK_ORIGINAL_RE).
 hook_state() {
   local hook="$1"
   if [[ ! -f "$hook" ]]; then
@@ -113,6 +121,9 @@ hook_state() {
     echo "patched"
   elif grep -Eq "$HOOK_ORIGINAL_RE" "$hook"; then
     echo "stale"
+  elif grep -Eq '^[[:space:]]*#[[:space:]]*export GDK_BACKEND=x11([[:space:]]|$)' "$hook" \
+       && ! grep -Eq '^[[:space:]]*export[[:space:]]+GDK_BACKEND=' "$hook"; then
+    echo "native"
   else
     echo "No recognised GDK_BACKEND line in $HOOK_REL — linuxdeploy-plugin-gtk" >&2
     echo "must have changed it. Expected a line matching $HOOK_ORIGINAL_RE," >&2
@@ -132,19 +143,46 @@ symlink_resolves_inside() {
   [[ "$resolved" == "$root"/* ]]
 }
 
-# WebKit/GTK/GLib libraries the bundle freezes, at minimum. libwayland-client
+# WebKit/GTK/GLib/GStreamer libraries the bundle freezes. libwayland-client
 # is deliberately not here — it is deleted below, never frozen (defect 4).
 FROZEN_SONAMES=(
   libwebkit2gtk-4.1.so.0
   libjavascriptcoregtk-4.1.so.0
   libgtk-3.so.0
   libglib-2.0.so.0
+  libgstreamer-1.0.so.0
 )
 
 # True (exit 0) when no `libwayland-*` file survives anywhere under AppDir
 # root $1.
 no_bundled_wayland() {
-  [[ -z "$(find "$1" -iname 'libwayland-*' -print -quit)" ]]
+  [[ -z "$(find "$1" \( -type f -o -type l \) -iname 'libwayland-*' -print -quit)" ]]
+}
+
+# Audio server clients belong to the running session, not the frozen media
+# framework. PipeWire in particular loads SPA modules from the host's paths.
+no_bundled_audio_clients() {
+  [[ -z "$(find "$1" \( -type f -o -type l \) \( -name 'libpipewire-*' -o -name 'libpulse*' \) -print -quit)" ]]
+}
+
+# Refuse an image whose copied GStreamer set cannot supply the elements WebKit
+# needs for microphone capture. Name the build-host package to install.
+verify_capture_plugins() {
+  local plugins="$1/usr/lib/gstreamer-1.0" name package
+  for name in libgstapp.so libgstcoreelements.so; do
+    case "$name" in
+      libgstapp.so) package=gstreamer1.0-plugins-base ;;
+      libgstcoreelements.so) package=libgstreamer1.0-0 ;;
+    esac
+    if [[ ! -f "$plugins/$name" ]]; then
+      echo "Verification failed: missing GStreamer plugin $name in $plugins; install build-host package $package." >&2
+      return 1
+    fi
+  done
+  if [[ ! -f "$plugins/libgstpulseaudio.so" && ! -f "$plugins/libgstpipewire.so" ]]; then
+    echo "Verification failed: missing GStreamer audio source plugin libgstpulseaudio.so (build-host package gstreamer1.0-pulseaudio) or libgstpipewire.so (build-host package gstreamer1.0-pipewire) in $plugins." >&2
+    return 1
+  fi
 }
 
 # The highest GLIBC_x.y symbol version any ELF file under AppDir root $1
@@ -238,12 +276,14 @@ for appimage in "${appimages[@]}"; do
 
   wayland_ok=true
   no_bundled_wayland "$workdir/squashfs-root" || wayland_ok=false
+  audio_clients_ok=true
+  no_bundled_audio_clients "$workdir/squashfs-root" || audio_clients_ok=false
 
   # Repack only when something actually needs fixing — but "already fixed" has
-  # to mean *all four* repairs, otherwise an already-pristine sidecar would
+  # to mean every repair, otherwise an already-pristine sidecar would
   # short-circuit the pass and quietly drop one of the others.
-  if cmp -s "${bundled[0]}" "$PRISTINE" && [[ "$hook_state" == "patched" ]] && [[ "$dir_icon_ok" == true ]] && [[ "$wayland_ok" == true ]]; then
-    echo "$(basename "$appimage"): sidecar, GTK hook, .DirIcon and the absence of libwayland-* already correct, skipping."
+  if cmp -s "${bundled[0]}" "$PRISTINE" && [[ "$hook_state" != "stale" ]] && [[ "$dir_icon_ok" == true ]] && [[ "$wayland_ok" == true ]] && [[ "$audio_clients_ok" == true ]]; then
+    echo "$(basename "$appimage"): sidecar, GTK hook, .DirIcon and session-owned libraries already correct, skipping."
   else
     cp "$PRISTINE" "${bundled[0]}"
     chmod 755 "${bundled[0]}"
@@ -281,7 +321,12 @@ for appimage in "${appimages[@]}"; do
     if [[ "$wayland_ok" == false ]]; then
       while IFS= read -r -d '' lib; do
         rm -f "$lib"
-      done < <(find "$workdir/squashfs-root" -iname 'libwayland-*' -print0)
+      done < <(find "$workdir/squashfs-root" \( -type f -o -type l \) -iname 'libwayland-*' -print0)
+    fi
+    if [[ "$audio_clients_ok" == false ]]; then
+      while IFS= read -r -d '' lib; do
+        rm -f "$lib"
+      done < <(find "$workdir/squashfs-root" \( -type f -o -type l \) \( -name 'libpipewire-*' -o -name 'libpulse*' \) -print0)
     fi
     OUTPUT="$workdir/fixed.AppImage" ARCH="$(uname -m)" APPIMAGE_EXTRACT_AND_RUN=1 \
       "$APPIMAGETOOL" --appdir "$workdir/squashfs-root" > "$workdir/repack.log" 2>&1 \
@@ -298,13 +343,17 @@ for appimage in "${appimages[@]}"; do
   verify=("$verify_root"/usr/lib/*/resources/frankenphp)
   cmp -s "${verify[0]}" "$PRISTINE" \
     || { echo "Verification failed: sidecar in $appimage still differs from $PRISTINE." >&2; exit 1; }
-  grep -Fxq "$HOOK_PATCHED_LINE" "$verify_root/$HOOK_REL" \
+  verified_hook_state="$(hook_state "$verify_root/$HOOK_REL")"
+  [[ "$verified_hook_state" != "stale" ]] \
     || { echo "Verification failed: $HOOK_REL in $appimage still forces GDK_BACKEND." >&2; exit 1; }
   case "$(readlink "$verify_root/.DirIcon")" in
     /*) echo "Verification failed: .DirIcon in $appimage is still an absolute symlink." >&2; exit 1 ;;
   esac
   no_bundled_wayland "$verify_root" \
     || { echo "Verification failed: $appimage still bundles a libwayland-*." >&2; exit 1; }
+  no_bundled_audio_clients "$verify_root" \
+    || { echo "Verification failed: $appimage still bundles a libpipewire-* or libpulse* client library." >&2; exit 1; }
+  verify_capture_plugins "$verify_root" || exit 1
 
   # Belt-and-braces beyond the three known defects above: nothing else
   # linuxdeploy produced should be an absolute or dangling symlink either.
@@ -359,7 +408,7 @@ for appimage in "${appimages[@]}"; do
     done
   } >"$version_record.tmp"
   mv "$version_record.tmp" "$version_record"
-  echo "$(basename "$appimage"): sidecar verified pristine, GTK hook defers to the session backend, .DirIcon is relative, no libwayland-* bundled, frozen versions recorded to $(basename "$version_record")."
+  echo "$(basename "$appimage"): sidecar verified pristine, GTK hook defers to the session backend, .DirIcon is relative, no session-owned client libraries bundled, GStreamer capture plugins present, frozen versions recorded to $(basename "$version_record")."
   rm -rf "$workdir"
   trap - EXIT
 done

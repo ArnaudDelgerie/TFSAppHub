@@ -106,8 +106,11 @@ for building it.
   - **Rust** + the Tauri CLI (`cargo install tauri-cli`, or `cargo tauri` v2).
   - Linux build deps for Tauri v2 / WebKitGTK (`libwebkit2gtk-4.1-dev`,
     `libgtk-3-dev`, `libdbus-1-dev`, `librsvg2-dev`, `build-essential`, `curl`,
-    `file` — `appimagetool` shells out to it, and so does this repo's own
-    `fix-appimage-bundle.sh`, …).
+    `pkg-config`, `git`, `patchelf`, and `file` — `appimagetool` shells out to
+    it, and so does this repo's own `fix-appimage-bundle.sh`).
+  - GStreamer plugins from the build host: `gstreamer1.0-plugins-base`,
+    `gstreamer1.0-plugins-good`, and either `gstreamer1.0-pipewire` or
+    `gstreamer1.0-pulseaudio`. The AppImage freezes the installed plugins.
   - **curl** (to fetch the FrankenPHP sidecar and composer.phar).
   - **rustfmt** and **clippy** (`rustup component add rustfmt clippy`) and
     **shellcheck** — needed for `make check`. A missing Rust component fails
@@ -161,6 +164,13 @@ use. The result lands at
 with its own `.versions.txt` recording the lower floor it now needs — chasing
 the *lowest possible* base is deliberately not this project's job (see
 `ARCHITECTURE.md`'s "Packaging"); one older base, chosen by you, is.
+
+If the hub starts but microphone capture fails, check the installed app's
+`log/hub.log` for GStreamer element or plugin loading errors. The AppImage
+carries the build host's GStreamer plugins, while some optional graphics and
+audio libraries and the audio server come from your machine. A Docker build
+on an older compatible base can avoid newer symbol requirements; it cannot
+provide a missing host audio service or device.
 
 ## Writing an app for it
 
