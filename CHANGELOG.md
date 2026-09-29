@@ -2,6 +2,13 @@
 
 ## 0.4.0
 
+The AppImage now bundles the build host's GStreamer plugins and helpers, so
+apps that declare microphone access can record inside the AppImage. The build
+refuses an image missing a capture plugin and records its frozen GStreamer
+version beside the artifact. Bundling raised the initial image size by
+86,482,944 bytes against the 0.4.0 candidate measured before this change;
+the final repaired image is 226,601,464 bytes.
+
 An app's frontend build output now ships in its release archive without being
 committed: `"build_outputs": ["public/build"]` in `tfsapp.config.json` names
 the project-relative, gitignored directories the author's own build step

@@ -165,6 +165,13 @@ with its own `.versions.txt` recording the lower floor it now needs — chasing
 the *lowest possible* base is deliberately not this project's job (see
 `ARCHITECTURE.md`'s "Packaging"); one older base, chosen by you, is.
 
+If the hub starts but microphone capture fails, check the installed app's
+`log/hub.log` for GStreamer element or plugin loading errors. The AppImage
+carries the build host's GStreamer plugins, while some optional graphics and
+audio libraries and the audio server come from your machine. A Docker build
+on an older compatible base can avoid newer symbol requirements; it cannot
+provide a missing host audio service or device.
+
 ## Writing an app for it
 
 An app is a Symfony project with three files and one route: `bin/console`,
