@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 An app's frontend build output now ships in its release archive without being
 committed: `"build_outputs": ["public/build"]` in `tfsapp.config.json` names
