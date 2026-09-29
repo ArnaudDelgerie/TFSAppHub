@@ -859,7 +859,6 @@ fn validate_build_outputs_shape(
 /// project-relative directory; and a first component Git and `tree_hash`
 /// both exclude (`source::EXCLUDED_FROM_HASH`), since an output there can
 /// never reach an archive. Returns the normalized project-relative path.
-#[allow(dead_code)] // The publish-only seam is consumed by publish in plan 071, step 2.
 pub fn build_output_shape(declared: &str) -> Result<PathBuf, ManifestError> {
     let invalid = |detail: String| ManifestError::BuildOutputInvalid {
         declared: declared.to_string(),
@@ -910,7 +909,6 @@ pub fn build_output_shape(declared: &str) -> Result<PathBuf, ManifestError> {
 /// path equal to or nested in another declared one (duplicates included)
 /// would ship the same files twice, and which entry's stats line described
 /// them would be arbitrary.
-#[allow(dead_code)] // The publish-only seam is consumed by publish in plan 071, step 2.
 pub fn build_output_shapes(declared: &[String]) -> Result<Vec<PathBuf>, ManifestError> {
     let paths: Vec<PathBuf> = declared
         .iter()

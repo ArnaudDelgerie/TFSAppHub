@@ -437,6 +437,7 @@ fn local_archive_fixture(manifest: &str) -> tempfile::TempDir {
     crate::publish::build_archive(
         &entries,
         &mut crate::test_release::LocalBlobs(blobs),
+        &[],
         "demo",
         "1.2.0",
         folder.path(),

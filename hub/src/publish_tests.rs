@@ -6,6 +6,7 @@ use std::{
     os::unix::fs::{symlink, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, SystemTime},
 };
 
 use super::{
@@ -577,7 +578,7 @@ fn the_archive_extracts_to_a_tree_hashing_the_same_as_the_source() {
     let tracked_paths = tracked_source_paths();
     let (entries, mut blobs) = tree_from_paths(project.path(), &tracked_paths);
 
-    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+    let assets = build_archive(&entries, &mut blobs, &[], "demo", "1.2.0", scratch.path())
         .expect("the archive to build");
     assert_eq!(assets.archive_name, "demo-1.2.0.tar.gz");
     assert!(assets.archive_path.is_file());
@@ -625,7 +626,7 @@ fn the_archive_uses_the_captured_blobs_even_if_the_worktree_changes_afterwards()
     fs::remove_file(project.path().join("link-to-main")).expect("a later worktree removal");
 
     let scratch = tempfile::tempdir().expect("a temp scratch dir");
-    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+    let assets = build_archive(&entries, &mut blobs, &[], "demo", "1.2.0", scratch.path())
         .expect("the pinned archive to build");
     let root = archive::extract(&assets.archive_path, &scratch.path().join("extracted"))
         .expect("the archive to extract");
@@ -659,7 +660,7 @@ fn archive_exclusions_are_applied_before_a_blob_is_requested() {
     });
 
     let scratch = tempfile::tempdir().expect("a temp scratch dir");
-    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+    let assets = build_archive(&entries, &mut blobs, &[], "demo", "1.2.0", scratch.path())
         .expect("an excluded blob must not be requested");
     let root = archive::extract(&assets.archive_path, &scratch.path().join("extracted"))
         .expect("the archive to extract");
@@ -686,7 +687,7 @@ fn ignored_files_on_disk_are_not_written_to_the_archive() {
     let tracked_paths = tracked_source_paths();
     let (entries, mut blobs) = tree_from_paths(project.path(), &tracked_paths);
 
-    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+    let assets = build_archive(&entries, &mut blobs, &[], "demo", "1.2.0", scratch.path())
         .expect("the archive to build");
     let root = archive::extract(&assets.archive_path, &scratch.path().join("extracted"))
         .expect("the archive to extract");
@@ -751,7 +752,7 @@ fn a_real_repository_archive_contains_exactly_its_tracked_paths() {
         .collect();
     let scratch = tempfile::tempdir().expect("a temp scratch dir");
     let (entries, mut blobs) = tree_from_paths(root, &archive_paths);
-    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+    let assets = build_archive(&entries, &mut blobs, &[], "demo", "1.2.0", scratch.path())
         .expect("the archive to build");
 
     let file = fs::File::open(&assets.archive_path).expect("a readable archive");
@@ -857,7 +858,7 @@ fn a_real_pinned_repository_ignores_later_tracked_changes_and_ignored_secrets() 
 
     let scratch = tempfile::tempdir().expect("a temp scratch dir");
     let mut blobs = git.blob_reader(root).expect("a pinned blob reader");
-    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+    let assets = build_archive(&entries, &mut blobs, &[], "demo", "1.2.0", scratch.path())
         .expect("an archive from the pinned commit");
     let extracted = archive::extract(&assets.archive_path, &scratch.path().join("extracted"))
         .expect("the archive to extract");
@@ -895,7 +896,7 @@ fn the_sums_file_verifies_against_the_archive_it_names() {
     let tracked_paths = tracked_source_paths();
     let (entries, mut blobs) = tree_from_paths(project.path(), &tracked_paths);
 
-    let assets = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path())
+    let assets = build_archive(&entries, &mut blobs, &[], "demo", "1.2.0", scratch.path())
         .expect("the archive to build");
 
     let sums_body = fs::read_to_string(&assets.sums_path).expect("a readable sums file");
@@ -927,7 +928,8 @@ fn an_escaping_symlink_is_refused_before_anything_is_uploaded() {
     tracked_paths.push(PathBuf::from("evil"));
     let (entries, mut blobs) = tree_from_paths(project.path(), &tracked_paths);
 
-    let error = build_archive(&entries, &mut blobs, "demo", "1.2.0", scratch.path()).unwrap_err();
+    let error =
+        build_archive(&entries, &mut blobs, &[], "demo", "1.2.0", scratch.path()).unwrap_err();
     match &error {
         PublishError::EscapingSymlink { path } => {
             assert_eq!(path, &PathBuf::from("evil"));
@@ -1320,4 +1322,281 @@ fn local_publish_refuses_dirty_or_missing_destination_and_cleans_up_on_decline()
         Err(PublishError::Git(GitError::Dirty { .. }))
     ));
     assert_eq!(fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+// --- declared build outputs (plan 071) -------------------------------------
+
+/// A committed, clean project in a real temporary Git repository — the
+/// shape the working-tree checks need, since only real Git answers
+/// `check-ignore`. The `.gitignore` is written before the one commit, so
+/// it is tracked with everything else.
+fn real_git_project(root: &Path, manifest_extra: &str, gitignore: &str) {
+    write_manifest(root, "1.2.0", manifest_extra);
+    write_changelog(root, CHANGELOG);
+    fs::write(root.join(".gitignore"), gitignore).expect("a gitignore");
+    for arguments in [
+        Vec::from(["init", "--quiet"]),
+        Vec::from(["config", "user.email", "test.invalid"]),
+        Vec::from(["config", "user.name", "TFSApp test"]),
+        Vec::from(["add", "."]),
+        Vec::from(["commit", "--quiet", "-m", "source"]),
+    ] {
+        assert!(
+            Command::new("git")
+                .args(arguments)
+                .current_dir(root)
+                .status()
+                .expect("git to run")
+                .success(),
+            "git fixture setup must succeed"
+        );
+    }
+}
+
+/// Run every gate the working-tree way: a local snapshot of a real,
+/// already-committed repository.
+fn local_gates(root: &Path) -> Result<super::LocalGates, PublishError> {
+    run_local_gates(root, PublishTarget::Local, &Git::new())
+}
+
+fn declared_output() -> &'static str {
+    r#", "build_outputs": ["public/build"]"#
+}
+
+#[test]
+fn a_declared_output_that_is_absent_is_refused_naming_the_path() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    real_git_project(project.path(), declared_output(), "/public/build\n");
+
+    let error = local_gates(project.path()).unwrap_err();
+    match &error {
+        PublishError::BuildOutputAbsent { declared } => assert_eq!(declared, "public/build"),
+        other => panic!("expected BuildOutputAbsent, got {other}"),
+    }
+    assert!(error.to_string().contains("public/build"), "{error}");
+}
+
+#[test]
+fn a_declared_output_that_is_empty_is_refused() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    real_git_project(project.path(), declared_output(), "/public/build\n");
+    fs::create_dir_all(project.path().join("public/build")).expect("an empty build dir");
+
+    let error = local_gates(project.path()).unwrap_err();
+    assert!(
+        matches!(error, PublishError::BuildOutputEmpty { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("public/build"), "{error}");
+}
+
+#[test]
+fn a_declared_output_that_is_not_a_directory_is_refused() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    // No trailing slash, so the rule covers a plain file too and the tree
+    // stays clean.
+    real_git_project(project.path(), declared_output(), "/public/build\n");
+    fs::create_dir_all(project.path().join("public")).expect("a public dir");
+    fs::write(project.path().join("public/build"), "not a directory").expect("a plain file");
+
+    let error = local_gates(project.path()).unwrap_err();
+    assert!(
+        matches!(error, PublishError::BuildOutputNotADirectory { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_declared_output_resolving_outside_the_project_is_refused() {
+    // The declared path itself never climbs — a symlinked parent does the
+    // escaping, and only resolution can see it.
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let outside = tempfile::tempdir().expect("a temp dir outside the project");
+    real_git_project(project.path(), declared_output(), "/public\n");
+    fs::create_dir_all(outside.path().join("build")).expect("an outside build dir");
+    fs::write(outside.path().join("build/app.css"), "body {}").expect("a file");
+    symlink(outside.path(), project.path().join("public")).expect("a symlinked parent");
+
+    let error = local_gates(project.path()).unwrap_err();
+    assert!(
+        matches!(error, PublishError::BuildOutputEscapes { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("public/build"), "{error}");
+}
+
+#[test]
+fn a_declared_output_the_ignore_rules_do_not_cover_is_refused() {
+    // Every file inside is ignored, so the tree stays clean — but the
+    // declared directory itself matches no rule, and a declared output
+    // must be ignored, not merely full of ignored files.
+    let project = tempfile::tempdir().expect("a temp project dir");
+    real_git_project(project.path(), declared_output(), "*.css\n");
+    let build = project.path().join("public/build");
+    fs::create_dir_all(&build).expect("a build dir");
+    fs::write(build.join("app.css"), "body {}").expect("an ignored file");
+
+    let error = local_gates(project.path()).unwrap_err();
+    assert!(
+        matches!(error, PublishError::BuildOutputNotIgnored { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_declared_output_holding_a_tracked_file_is_refused_naming_the_file() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let root = project.path();
+    real_git_project(root, declared_output(), "/public/build\n");
+    let tracked = root.join("public/build/tracked.css");
+    fs::create_dir_all(tracked.parent().expect("a build dir")).expect("a build dir");
+    fs::write(&tracked, "body {}").expect("a tracked file");
+    for arguments in [
+        Vec::from(["add", "-f", "public/build/tracked.css"]),
+        Vec::from(["commit", "--quiet", "-m", "tracked output"]),
+    ] {
+        assert!(
+            Command::new("git")
+                .args(arguments)
+                .current_dir(root)
+                .status()
+                .expect("git to run")
+                .success(),
+            "git fixture setup must succeed"
+        );
+    }
+
+    let error = local_gates(root).unwrap_err();
+    match &error {
+        PublishError::BuildOutputTrackedFile { declared, file } => {
+            assert_eq!(declared, "public/build");
+            assert_eq!(file, &PathBuf::from("public/build/tracked.css"));
+        }
+        other => panic!("expected BuildOutputTrackedFile, got {other}"),
+    }
+}
+
+#[test]
+fn a_symlink_inside_a_declared_output_is_refused() {
+    // The same extraction rule install applies (plan 062), applied before
+    // a byte of the archive is written.
+    let project = tempfile::tempdir().expect("a temp project dir");
+    real_git_project(project.path(), declared_output(), "/public/build\n");
+    let build = project.path().join("public/build");
+    fs::create_dir_all(&build).expect("a build dir");
+    fs::write(build.join("app.css"), "body {}").expect("a file");
+    symlink("../CHANGELOG.md", build.join("link")).expect("a symlink inside");
+
+    let error = local_gates(project.path()).unwrap_err();
+    match &error {
+        PublishError::BuildOutputIrregularEntry { entry, .. } => {
+            assert_eq!(entry, &PathBuf::from("public/build/link"));
+        }
+        other => panic!("expected BuildOutputIrregularEntry, got {other}"),
+    }
+}
+
+#[test]
+fn the_pinned_manifest_decides_what_is_declared_not_the_worktrees() {
+    // The working tree's manifest declares an output that does not exist;
+    // the pinned commit's declares nothing. Only the pinned declaration
+    // counts, so no working-tree check ever runs (plan 071's "Important
+    // rules": the declaring manifest is the pinned one, never the working
+    // tree's).
+    let project = tempfile::tempdir().expect("a temp project dir");
+    write_manifest(project.path(), "1.2.0", declared_output());
+    write_changelog(project.path(), CHANGELOG);
+
+    let scripts = tempfile::tempdir().expect("a temp dir for the fake git");
+    let git = Git::at(write_fake(scripts.path(), "git", GIT_CLEAN_AND_PUSHED));
+
+    let gates = run_local_gates(
+        project.path(),
+        PublishTarget::Forge(Some("owner/repo")),
+        &git,
+    )
+    .expect("the pinned declaration is the one that counts");
+    assert!(gates.build_outputs.is_empty());
+}
+
+#[test]
+fn a_declared_output_ships_in_the_archive_with_its_stats_line() {
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let root = project.path();
+    real_git_project(root, declared_output(), "/public/build\n");
+    let build = root.join("public/build");
+    fs::create_dir_all(&build).expect("a build dir");
+    fs::write(build.join("entrypoints.json"), "0123456789").expect("an entrypoints file");
+    let script = build.join("app.js");
+    fs::write(&script, "console.log(1);\n").expect("a script");
+    let mut permissions = fs::metadata(&script)
+        .expect("script metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("an executable script");
+
+    // A known age, so the stats line is assertable: every file in the
+    // output exactly three days old.
+    let three_days_ago = SystemTime::now()
+        .checked_sub(Duration::from_secs(3 * 86_400))
+        .expect("a computable instant");
+    let epoch = three_days_ago
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("an epoch")
+        .as_secs();
+    for file in [&build.join("entrypoints.json"), &script] {
+        assert!(
+            Command::new("touch")
+                .arg("-d")
+                .arg(format!("@{epoch}"))
+                .arg(file)
+                .status()
+                .expect("touch to run")
+                .success(),
+            "touch fixture must succeed"
+        );
+    }
+
+    let mut gates = local_gates(root).expect("every gate to pass");
+    assert_eq!(gates.build_outputs.len(), 1);
+    let output = &gates.build_outputs[0];
+    assert_eq!(output.declared, "public/build");
+    assert_eq!(output.files.len(), 2);
+    assert_eq!(output.total_size, 26);
+    assert_eq!(
+        output.stats_line(),
+        "build_outputs: public/build — 2 files, 26 B, newest 3 days ago"
+    );
+
+    let scratch = tempfile::tempdir().expect("a temp scratch dir");
+    let assets = build_archive(
+        &gates.entries,
+        &mut gates.blobs,
+        &gates.build_outputs,
+        "demo",
+        "1.2.0",
+        scratch.path(),
+    )
+    .expect("the archive to build");
+    let extracted = archive::extract(&assets.archive_path, &scratch.path().join("extracted"))
+        .expect("the archive to extract");
+
+    assert_eq!(
+        fs::read_to_string(extracted.join("public/build/entrypoints.json"))
+            .expect("the entrypoints file"),
+        "0123456789"
+    );
+    assert_eq!(
+        fs::metadata(extracted.join("public/build/app.js"))
+            .expect("script metadata")
+            .permissions()
+            .mode()
+            & 0o111,
+        0o111
+    );
+    assert_eq!(
+        source::tree_hash(&extracted).expect("a hash of the extracted tree"),
+        source::tree_hash(root).expect("a hash of the source tree"),
+        "the archive must round-trip to the tracked tree plus the declared output"
+    );
 }

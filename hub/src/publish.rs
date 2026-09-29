@@ -15,7 +15,9 @@ use std::{
     fmt, fs, io,
     io::{Read, Seek, SeekFrom, Write},
     os::unix::ffi::OsStringExt,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use crate::{
@@ -35,13 +37,65 @@ pub const CHANGELOG_FILE: &str = "CHANGELOG.md";
 
 /// What gates 1–8 produce for the steps after them.  The entries and their
 /// reader stay together with the metadata they supplied: all three are from
-/// the one commit [`Git::snapshot`] pinned.
+/// the one commit [`Git::snapshot`] pinned. The declared build outputs are
+/// the deliberate exception — the only archive input that is not that
+/// commit's, read from the working tree because the contract says the
+/// author's own tool builds them (plan 071).
 pub struct LocalGates {
     pub loaded: Loaded,
     pub commit: Commit,
     pub notes: String,
+    pub build_outputs: Vec<DeclaredOutput>,
     entries: Vec<TreeEntry>,
     blobs: BlobReader,
+}
+
+/// One file under a declared build output, ready for the archive: its
+/// project-relative path, the disk file its bytes stream from, and the
+/// facts the tar header and the stats line need. Captured by the gate-time
+/// walk, so what the confirmation describes is what ships.
+#[derive(Debug)]
+pub struct DeclaredFile {
+    pub path: PathBuf,
+    pub source: PathBuf,
+    pub size: u64,
+    pub executable: bool,
+    pub modified: SystemTime,
+}
+
+/// One declared `build_outputs` directory, walked and measured once the
+/// manifest gates have passed: the files the archive gains beside the
+/// pinned tree, plus the stats printed before the confirmation. Nothing
+/// here is re-read later — this list is what the archive writes.
+#[derive(Debug)]
+pub struct DeclaredOutput {
+    /// The entry exactly as the manifest spells it, for the messages an
+    /// author reads.
+    pub declared: String,
+    pub files: Vec<DeclaredFile>,
+    pub total_size: u64,
+    pub newest: Option<SystemTime>,
+}
+
+impl DeclaredOutput {
+    /// The one line the announcement prints per output (plan 071's
+    /// settled format):
+    /// `build_outputs: public/build — 42 files, 1.3 MiB, newest 3 days ago`.
+    /// Staleness is deliberately not detected — knowing whether a build is
+    /// stale needs its inputs declared, which is a build tool's job — so
+    /// the line states what is on disk instead.
+    pub fn stats_line(&self) -> String {
+        let count = self.files.len();
+        format!(
+            "build_outputs: {} — {} file{}, {}, newest {}",
+            self.declared,
+            count,
+            if count == 1 { "" } else { "s" },
+            format_size(self.total_size),
+            self.newest
+                .map_or_else(|| "just built".to_string(), format_age),
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -57,6 +111,7 @@ impl fmt::Debug for LocalGates {
             .field("loaded", &self.loaded)
             .field("commit", &self.commit)
             .field("notes", &self.notes)
+            .field("build_outputs", &self.build_outputs)
             .field("entries", &self.entries)
             .finish_non_exhaustive()
     }
@@ -115,6 +170,12 @@ pub fn run_local_gates(
     loaded.report_warnings();
     validate_version(&loaded.manifest, &manifest_path)?;
 
+    // Plan 071's working-tree checks, on the pinned manifest's declaration:
+    // the declared outputs are the only bytes in the archive that are not
+    // the pinned commit's, so each is proved embeddable before anything is
+    // built. `install`, `update` and `dev` never come near them.
+    let build_outputs = collect_build_outputs(project_path, &loaded.manifest, &entries, git)?;
+
     let changelog_path = project_path.join(CHANGELOG_FILE);
     let changelog = pinned_file(&entries, &mut blobs, CHANGELOG_FILE)?.ok_or_else(|| {
         PublishError::MissingChangelog {
@@ -128,9 +189,195 @@ pub fn run_local_gates(
         loaded,
         commit: snapshot.commit,
         notes,
+        build_outputs,
         entries,
         blobs,
     })
+}
+
+/// Walk every directory the pinned manifest declares under
+/// `build_outputs` and prove each one is publishable (plan 071): the
+/// lexical shape first — pure, and the only half that never touches the
+/// working tree — then the filesystem, then Git's ignore rules and the
+/// pinned tracked tree. The walk's product is the archive's second source
+/// and the stats line the confirmation shows.
+fn collect_build_outputs(
+    project: &Path,
+    manifest: &Manifest,
+    entries: &[TreeEntry],
+    git: &Git,
+) -> Result<Vec<DeclaredOutput>, PublishError> {
+    let paths = manifest::build_output_shapes(&manifest.build_outputs)?;
+    let mut outputs = Vec::with_capacity(paths.len());
+    for (declared, path) in manifest.build_outputs.iter().zip(paths) {
+        outputs.push(check_build_output(project, declared, &path, entries, git)?);
+    }
+    Ok(outputs)
+}
+
+/// One declared output's gate: a project-relative directory that exists,
+/// stays inside the project once resolved, holds files, is gitignored,
+/// holds no tracked file the pinned tree already carries, and holds
+/// nothing `install` would refuse to extract. Each refusal names the
+/// declared path and its own reason.
+fn check_build_output(
+    project: &Path,
+    declared: &str,
+    path: &Path,
+    entries: &[TreeEntry],
+    git: &Git,
+) -> Result<DeclaredOutput, PublishError> {
+    let on_disk = project.join(path);
+    let metadata = match fs::symlink_metadata(&on_disk) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(PublishError::BuildOutputAbsent {
+                declared: declared.to_string(),
+            });
+        }
+        Err(source) => {
+            return Err(PublishError::Io {
+                path: on_disk.clone(),
+                source,
+            });
+        }
+    };
+    // `symlink_metadata`, so a symlink where a directory is declared is
+    // refused as what it is rather than followed into whatever it points
+    // at.
+    if !metadata.is_dir() {
+        return Err(PublishError::BuildOutputNotADirectory {
+            declared: declared.to_string(),
+        });
+    }
+    // "Inside the project once resolved": the shape check already refused
+    // every lexical escape, so what remains is a symlinked parent — the
+    // one case a join cannot see and only resolution can.
+    let project_root = fs::canonicalize(project).map_err(|source| PublishError::Io {
+        path: project.to_path_buf(),
+        source,
+    })?;
+    let resolved = fs::canonicalize(&on_disk).map_err(|source| PublishError::Io {
+        path: on_disk.clone(),
+        source,
+    })?;
+    if !resolved.starts_with(&project_root) {
+        return Err(PublishError::BuildOutputEscapes {
+            declared: declared.to_string(),
+        });
+    }
+
+    let mut files = Vec::new();
+    walk_declared_files(project, declared, path, &mut files)?;
+    if files.is_empty() {
+        return Err(PublishError::BuildOutputEmpty {
+            declared: declared.to_string(),
+        });
+    }
+    // Tracked before ignored, and not only for the message: `git
+    // check-ignore` answers "not ignored" for any path with tracked
+    // content beneath it, so the question is only honest once no tracked
+    // file lives under the declaration.
+    if let Some(tracked) = entries.iter().find(|entry| entry.path.starts_with(path)) {
+        return Err(PublishError::BuildOutputTrackedFile {
+            declared: declared.to_string(),
+            file: tracked.path.clone(),
+        });
+    }
+    if !git.is_ignored(project, path)? {
+        return Err(PublishError::BuildOutputNotIgnored {
+            declared: declared.to_string(),
+        });
+    }
+
+    let total_size = files.iter().map(|file| file.size).sum();
+    let newest = files.iter().map(|file| file.modified).max();
+    Ok(DeclaredOutput {
+        declared: declared.to_string(),
+        files,
+        total_size,
+        newest,
+    })
+}
+
+/// Collect one declared output's files, refusing anything that is not a
+/// regular file or a directory. The walk never follows symlinks — a
+/// symlink is refused as an entry, and a symlinked parent was already
+/// refused by the resolution check above.
+fn walk_declared_files(
+    project: &Path,
+    declared: &str,
+    directory: &Path,
+    files: &mut Vec<DeclaredFile>,
+) -> Result<(), PublishError> {
+    let io_error = |path: PathBuf| move |source: io::Error| PublishError::Io { path, source };
+    let directory_on_disk = project.join(directory);
+    let entries = fs::read_dir(&directory_on_disk).map_err(io_error(directory_on_disk.clone()))?;
+    for entry in entries {
+        let entry = entry.map_err(io_error(directory_on_disk.clone()))?;
+        let name = entry.file_name();
+        let relative = directory.join(&name);
+        let source = project.join(&relative);
+        // `DirEntry::metadata` does not follow the entry itself, so a
+        // symlink stays a symlink here rather than becoming whatever it
+        // points at.
+        let metadata = entry.metadata().map_err(io_error(source.clone()))?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            walk_declared_files(project, declared, &relative, files)?;
+        } else if file_type.is_file() {
+            files.push(DeclaredFile {
+                path: relative,
+                source,
+                size: metadata.len(),
+                executable: metadata.permissions().mode() & 0o111 != 0,
+                modified: metadata
+                    .modified()
+                    .map_err(io_error(project.to_path_buf()))?,
+            });
+        } else {
+            return Err(PublishError::BuildOutputIrregularEntry {
+                declared: declared.to_string(),
+                entry: relative,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `<size>` in the one binary unit that describes it, one decimal wide —
+/// the stats line is for a human deciding whether to publish, not for a
+/// parser.
+fn format_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let size = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if size < KIB * KIB {
+        format!("{:.1} KiB", size / KIB)
+    } else if size < KIB * KIB * KIB {
+        format!("{:.1} MiB", size / (KIB * KIB))
+    } else {
+        format!("{:.1} GiB", size / (KIB * KIB * KIB))
+    }
+}
+
+/// `newest <age> ago`, in the one unit that describes the age. A clock
+/// that answers with the future (skew, a touched file) reads as brand new
+/// rather than as an error: the line is information, not a gate.
+fn format_age(newest: SystemTime) -> String {
+    let seconds = SystemTime::now()
+        .duration_since(newest)
+        .map_or(0, |age| age.as_secs());
+    if seconds < 60 {
+        "less than a minute ago".to_string()
+    } else if seconds < 3600 {
+        format!("{} minutes ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{} hours ago", seconds / 3600)
+    } else {
+        format!("{} days ago", seconds / 86_400)
+    }
 }
 
 /// Copy a named project-root file from the pinned tree.  Metadata is small
@@ -174,18 +421,23 @@ impl BlobSource for BlobReader {
 }
 
 /// Build `<project_name>-<app_version>.tar.gz` and its `SHA256SUMS.txt` into
-/// `destination`, from explicit entries and blobs in one pinned Git tree.
+/// `destination`, from explicit entries and blobs in one pinned Git tree,
+/// plus the declared build outputs walked at gate time (plan 071) — the
+/// archive's one deliberate second source, streamed from the working tree.
 ///
-/// The entries are filtered with [`source::EXCLUDED_FROM_HASH`] before any
-/// blob is requested, which is what buys the property this step exists for:
-/// `tree_hash` of the archive, once extracted, equals `tree_hash` of the
-/// pinned tree minus those standing exclusions. A symlink whose target would
-/// resolve outside the extracted tree is refused before anything is uploaded,
-/// with the exact lexical rule `archive::extract` applies at the other end
+/// The tracked entries are filtered with [`source::EXCLUDED_FROM_HASH`]
+/// before any blob is requested, which is what buys the property this step
+/// exists for: `tree_hash` of the archive, once extracted, equals
+/// `tree_hash` of the pinned tree minus those standing exclusions — plus
+/// the declared outputs, which the walk proved to hold nothing
+/// `tree_hash` cannot hash. A symlink whose target would resolve outside
+/// the extracted tree is refused before anything is uploaded, with the
+/// exact lexical rule `archive::extract` applies at the other end
 /// (`archive::link_target_escapes`).
 pub fn build_archive(
     entries: &[TreeEntry],
     blobs: &mut impl BlobSource,
+    declared_outputs: &[DeclaredOutput],
     project_name: &str,
     app_version: &str,
     destination: &Path,
@@ -215,10 +467,17 @@ pub fn build_archive(
     let archive_root = PathBuf::from(&prefix);
     append_directory(&mut builder, &archive_root)?;
 
-    for (relative_path, entry) in archive_paths(entries) {
+    for (relative_path, source) in archive_paths(entries, declared_outputs) {
         let archive_path = archive_root.join(&relative_path);
-        if let Some(entry) = entry {
-            append_blob_entry(&mut builder, &archive_path, entry, blobs)?;
+        if let Some(source) = source {
+            match source {
+                ArchiveSource::Tracked(entry) => {
+                    append_blob_entry(&mut builder, &archive_path, entry, blobs)?
+                }
+                ArchiveSource::Declared(file) => {
+                    append_declared_file(&mut builder, &archive_path, file)?
+                }
+            }
             continue;
         }
         append_directory(&mut builder, &archive_path)?;
@@ -258,15 +517,31 @@ pub fn build_archive(
     })
 }
 
-/// Sorted archive entries derived from Git's tracked files: every parent
-/// directory once, before files below it. Git does not track empty directories,
-/// so deriving them loses nothing.
-fn archive_paths(entries: &[TreeEntry]) -> Vec<(PathBuf, Option<&TreeEntry>)> {
-    let files: BTreeSet<PathBuf> = entries
+/// Where one archive entry's bytes and header come from: a pinned Git
+/// blob, or a declared build-output file streamed from the working tree.
+#[derive(Clone, Copy)]
+enum ArchiveSource<'a> {
+    Tracked(&'a TreeEntry),
+    Declared(&'a DeclaredFile),
+}
+
+/// Sorted archive entries derived from Git's tracked files plus the
+/// declared build outputs: every parent directory once, before files
+/// below it. Git does not track empty directories, and a declared output
+/// with no file in it never reaches the archive, so deriving them loses
+/// nothing.
+fn archive_paths<'a>(
+    entries: &'a [TreeEntry],
+    declared_outputs: &'a [DeclaredOutput],
+) -> Vec<(PathBuf, Option<ArchiveSource<'a>>)> {
+    let mut files: BTreeSet<PathBuf> = entries
         .iter()
         .filter(|entry| !excluded_from_archive(&entry.path))
         .map(|entry| entry.path.clone())
         .collect();
+    for output in declared_outputs {
+        files.extend(output.files.iter().map(|file| file.path.clone()));
+    }
     let mut directories = BTreeSet::new();
     for path in &files {
         let mut parent = path.parent();
@@ -279,23 +554,31 @@ fn archive_paths(entries: &[TreeEntry]) -> Vec<(PathBuf, Option<&TreeEntry>)> {
         }
     }
 
-    let mut entries: Vec<_> = directories
+    let mut sorted: Vec<_> = directories
         .into_iter()
         .map(|path| (path, None))
         .chain(files.into_iter().map(|path| {
-            let entry = entries
+            let source = entries
                 .iter()
                 .find(|entry| entry.path == path)
-                .expect("every archive path came from a tree entry");
-            (path, Some(entry))
+                .map(ArchiveSource::Tracked)
+                .or_else(|| {
+                    declared_outputs
+                        .iter()
+                        .flat_map(|output| output.files.iter())
+                        .find(|file| file.path == path)
+                        .map(ArchiveSource::Declared)
+                })
+                .expect("every archive path came from a tree entry or a declared output");
+            (path, Some(source))
         }))
         .collect();
-    entries.sort_by(|(left_path, left_entry), (right_path, right_entry)| {
+    sorted.sort_by(|(left_path, left_source), (right_path, right_source)| {
         left_path
             .cmp(right_path)
-            .then_with(|| right_entry.is_none().cmp(&left_entry.is_none()))
+            .then_with(|| right_source.is_none().cmp(&left_source.is_none()))
     });
-    entries
+    sorted
 }
 
 fn append_directory<W: Write>(
@@ -368,6 +651,32 @@ fn append_blob_entry<W: Write>(
     header.set_cksum();
     builder
         .append_data(&mut header, archive_path, blob)
+        .map_err(|source| PublishError::Io {
+            path: archive_path.to_path_buf(),
+            source,
+        })
+}
+
+/// One declared build-output file, streamed from the working tree — the
+/// author's bytes at publish time, the one archive input that is not the
+/// pinned commit's (plan 071). The same header scheme as a tracked blob:
+/// mode from the file's own executable bit as the gate-time walk read it,
+/// no mtime, no owner.
+fn append_declared_file<W: Write>(
+    builder: &mut tar::Builder<W>,
+    archive_path: &Path,
+    file: &DeclaredFile,
+) -> Result<(), PublishError> {
+    let mut source = fs::File::open(&file.source).map_err(|source| PublishError::Io {
+        path: file.source.clone(),
+        source,
+    })?;
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(if file.executable { 0o755 } else { 0o644 });
+    header.set_size(file.size);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, archive_path, &mut source)
         .map_err(|source| PublishError::Io {
             path: archive_path.to_path_buf(),
             source,
@@ -480,6 +789,7 @@ fn publish_into(
     let assets = build_archive(
         &gates.entries,
         &mut gates.blobs,
+        &gates.build_outputs,
         &manifest.project_name,
         &manifest.app_version,
         scratch,
@@ -548,6 +858,7 @@ pub(crate) fn publish_local(
     let assets = build_archive(
         &gates.entries,
         &mut gates.blobs,
+        &gates.build_outputs,
         &manifest.project_name,
         &manifest.app_version,
         temporary.path(),
@@ -580,6 +891,10 @@ pub(crate) fn publish_local(
         "Commit      {} (branch {})",
         gates.commit.sha, gates.commit.branch
     );
+    println!("Inputs      {}", inputs_description(&gates.build_outputs));
+    for output in &gates.build_outputs {
+        println!("{}", output.stats_line());
+    }
     println!("Destination {}", folder.display());
     println!(
         "Archive     {} ({} bytes)",
@@ -619,7 +934,9 @@ pub(crate) fn publish_local(
 /// Say what is about to be published, in the terms the user will have to
 /// reason about afterwards — `update::announce`'s counterpart for `publish`.
 /// Names the repository, branch and commit the Git gate proved is on the
-/// forge. Every displayed release input was read from that pinned commit.
+/// forge. Every displayed release input was read from that pinned commit,
+/// except the declared build outputs, named on their own lines as the
+/// author's bytes at publish time.
 fn announce(gates: &LocalGates, tag: &str, assets: &Assets) {
     println!(
         "Repository  {}",
@@ -635,7 +952,10 @@ fn announce(gates: &LocalGates, tag: &str, assets: &Assets) {
         gates.commit.branch
     );
     println!("Tag         {tag}");
-    println!("Inputs      pinned Git tree");
+    println!("Inputs      {}", inputs_description(&gates.build_outputs));
+    for output in &gates.build_outputs {
+        println!("{}", output.stats_line());
+    }
     println!(
         "Archive     {} ({} bytes)",
         assets.archive_name, assets.archive_size
@@ -646,6 +966,17 @@ fn announce(gates: &LocalGates, tag: &str, assets: &Assets) {
     println!("Notes:");
     for line in gates.notes.lines() {
         println!("  {line}");
+    }
+}
+
+/// The `Inputs` line: the pinned Git tree alone, or with the declared
+/// build outputs appended — the archive's two sources, named so the cost
+/// of the declaration is stated, not hidden.
+fn inputs_description(build_outputs: &[DeclaredOutput]) -> &'static str {
+    if build_outputs.is_empty() {
+        "pinned Git tree"
+    } else {
+        "pinned Git tree + build outputs"
     }
 }
 
@@ -784,6 +1115,42 @@ pub enum PublishError {
     EscapingSymlink {
         path: PathBuf,
     },
+    /// A declared `build_outputs` directory resolves outside the project —
+    /// the shape check already refused every lexical escape, so this one
+    /// is a symlinked parent, which only resolution can see.
+    BuildOutputEscapes {
+        declared: String,
+    },
+    /// A declared `build_outputs` directory does not exist on disk.
+    BuildOutputAbsent {
+        declared: String,
+    },
+    /// A declared `build_outputs` path exists but is not a directory.
+    BuildOutputNotADirectory {
+        declared: String,
+    },
+    /// A declared `build_outputs` directory holds no file at all.
+    BuildOutputEmpty {
+        declared: String,
+    },
+    /// A declared `build_outputs` directory is not covered by Git's
+    /// ignore rules.
+    BuildOutputNotIgnored {
+        declared: String,
+    },
+    /// A declared `build_outputs` directory holds a file the pinned
+    /// tracked tree already carries.
+    BuildOutputTrackedFile {
+        declared: String,
+        file: PathBuf,
+    },
+    /// A symlink or special file under a declared `build_outputs`
+    /// directory — the extraction rule `install` applies (plan 062),
+    /// applied here first.
+    BuildOutputIrregularEntry {
+        declared: String,
+        entry: PathBuf,
+    },
     /// Reading the project tree, or writing the archive or its checksums,
     /// failed.
     Io {
@@ -850,6 +1217,46 @@ impl fmt::Display for PublishError {
                  would refuse to extract an archive carrying it, so publish refuses to build \
                  one.",
                 path.display()
+            ),
+            Self::BuildOutputEscapes { declared } => write!(
+                formatter,
+                "\"build_outputs\" entry {declared:?} resolves outside the project — the \
+                 archive would reach outside it, so publish refuses to build one \
+                 (CONTRACT.md §2)."
+            ),
+            Self::BuildOutputAbsent { declared } => write!(
+                formatter,
+                "\"build_outputs\" entry {declared:?} does not exist in the project — build \
+                 the output before publishing (CONTRACT.md §2)."
+            ),
+            Self::BuildOutputNotADirectory { declared } => write!(
+                formatter,
+                "\"build_outputs\" entry {declared:?} is not a directory (CONTRACT.md §2)."
+            ),
+            Self::BuildOutputEmpty { declared } => write!(
+                formatter,
+                "\"build_outputs\" entry {declared:?} is empty — build the output before \
+                 publishing (CONTRACT.md §2)."
+            ),
+            Self::BuildOutputNotIgnored { declared } => write!(
+                formatter,
+                "\"build_outputs\" entry {declared:?} is not gitignored — a declared output \
+                 and a tracked file are two different things, and an unignored directory \
+                 would also make the tree dirty (CONTRACT.md §2)."
+            ),
+            Self::BuildOutputTrackedFile { declared, file } => write!(
+                formatter,
+                "\"build_outputs\" entry {declared:?} holds tracked file {}, which the \
+                 archive already carries from the pinned commit — untrack it or undeclare \
+                 it (CONTRACT.md §2).",
+                file.display()
+            ),
+            Self::BuildOutputIrregularEntry { declared, entry } => write!(
+                formatter,
+                "{} under \"build_outputs\" entry {declared:?} is neither a regular file \
+                 nor a directory — the hub's own installer would refuse to extract an \
+                 archive carrying it, so publish refuses to build one (CONTRACT.md §2).",
+                entry.display()
             ),
             Self::Io { path, source } => {
                 write!(formatter, "{}: {source}", path.display())
