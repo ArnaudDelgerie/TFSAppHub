@@ -135,10 +135,12 @@ where §3 already puts them; only *when* two of them are emptied changed.
 Three processes write output during a launch, and each has a different
 audience (plan 015):
 
-- **The app's own sidecar** — FrankenPHP and the Messenger worker — always
+- **The app's own sidecar** — FrankenPHP — always
   writes to `<state_root>/log/sidecar.log`. It never had a terminal to write
   to in the first place: it is a grandchild, spawned by the child long after
-  the parent that had one has returned.
+  the parent that had one has returned. Each Messenger worker writes to its
+  own `<state_root>/log/worker-<n>.log` instead (plan 046): a consumer's PHP
+  fatals or stack traces would defeat parsing `sidecar.log` as JSON.
 - **`open`'s own detached child** writes its routine lines — `is listening
   at`, the teardown lines — to `<state_root>/log/hub.log`, beside
   `sidecar.log`. Its parent returns as soon as it has the pid, so by the time

@@ -241,9 +241,9 @@ pub fn start(
         .map_err(|error| format!("Cannot start the actions bridge: {error}"))?;
         envs.push((
             "TFS_BRIDGE_URL",
-            format!("http://127.0.0.1:{}", bridge.port),
+            format!("http://127.0.0.1:{}", bridge.port).into(),
         ));
-        envs.push(("TFS_BRIDGE_TOKEN", bridge.token));
+        envs.push(("TFS_BRIDGE_TOKEN", bridge.token.into()));
     }
 
     // The server's own stdout and stderr have nowhere to go when it was

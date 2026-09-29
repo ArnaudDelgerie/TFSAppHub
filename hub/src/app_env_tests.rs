@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    ffi::OsString,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
@@ -60,14 +61,14 @@ fn state_root(paths: &Paths, identifier: &str) -> PathBuf {
         .expect("a created data dir")
 }
 
-fn value<'a>(vars: &'a [(&'static str, String)], key: &str) -> &'a str {
+fn value<'a>(vars: &'a [(&'static str, OsString)], key: &str) -> &'a str {
     vars.iter()
         .find(|(name, _)| *name == key)
-        .map(|(_, value)| value.as_str())
+        .map(|(_, value)| value.to_str().expect("a UTF-8 env value"))
         .unwrap_or_else(|| panic!("{key} should be injected — CONTRACT.md §3 lists it"))
 }
 
-fn var_names(vars: &[(&'static str, String)]) -> BTreeSet<&'static str> {
+fn var_names(vars: &[(&'static str, OsString)]) -> BTreeSet<&'static str> {
     vars.iter().map(|(name, _)| *name).collect()
 }
 
@@ -229,6 +230,45 @@ fn a_declared_and_resolved_paths_member_reports_its_variable() {
     assert_eq!(
         value(&environment.vars, "TFS_USER_DOWNLOADS_DIR"),
         "/home/fake/Downloads"
+    );
+}
+
+#[test]
+fn a_declared_paths_member_outside_utf8_is_injected_as_its_raw_bytes() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let base = tempfile::tempdir().expect("a temp data dir");
+    let paths = Paths::rooted_at(base.path());
+    let identifier = identifier_for("paths-declared-outside-utf8");
+    let state_root = state_root(&paths, &identifier);
+
+    let raw = OsString::from_vec(b"/home/fake/T\xc3\xa9l\xc3\xa9chargements/\xff".to_vec());
+    let directory = PathBuf::from(raw.clone());
+
+    let environment = resolve_with_user_dirs_resolver_for_test(
+        &manifest_for(
+            &identifier,
+            r#", "actions": {"paths": {"downloads": true}}"#,
+        ),
+        Path::new("/apps/demo"),
+        &identifier,
+        &state_root,
+        Mode::Install,
+        false,
+        move |_| Some(directory.clone()),
+    )
+    .expect("it resolves");
+
+    let injected = environment
+        .vars
+        .iter()
+        .find(|(name, _)| *name == "TFS_USER_DOWNLOADS_DIR")
+        .map(|(_, value)| value)
+        .expect("the variable must be injected, not omitted");
+    assert_eq!(
+        injected, &raw,
+        "a non-UTF-8 user directory must reach the app as its own bytes, never as a \
+         lossy look-alike pointing somewhere else"
     );
 }
 

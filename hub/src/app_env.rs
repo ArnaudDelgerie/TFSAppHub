@@ -33,6 +33,7 @@
 //! here ever clears it.
 
 use std::{
+    ffi::OsString,
     fmt, fs, io,
     path::{Path, PathBuf},
 };
@@ -88,8 +89,10 @@ const DEV_APP_SECRET: &str = "tfsapp-dev-app-secret-0123456789abcdef";
 
 /// The §3 variables, plus the paths a caller needs in their own right.
 pub struct AppEnvironment {
-    /// Ready for `core`'s `command_with_env`.
-    pub vars: Vec<(&'static str, String)>,
+    /// Ready for `core`'s `command_with_env`. The values are raw bytes
+    /// (`OsString`), so a user directory outside UTF-8 reaches the app as
+    /// itself rather than as a lossy look-alike.
+    pub vars: Vec<(&'static str, OsString)>,
     /// This launch's `state_root`, as handed in: `<OS data dir>/TFSApp/<identifier>/`
     /// for an installed app, `<project>/var/` for a dev session — either way,
     /// what an install or a `dev` launch has to be able to name to the user.
@@ -136,9 +139,11 @@ fn messenger_transport_dsn(manifest: &Manifest) -> String {
     }
 }
 
-/// `TFS_WORKER_TRANSPORTS`: every transport actually consumed after
+/// `TFS_WORKER_TRANSPORTS`: every transport the hub set out to run, after
 /// fallbacks, in declaration order, deduplicated, comma-separated, empty when
-/// none. The union across workers rather than a per-worker grouping — §3's
+/// none. Computed once at launch from the manifest — never a live report; a
+/// slot's later fate is `worker-<n>.log`'s to tell. The union across workers
+/// rather than a per-worker grouping — §3's
 /// question is whether *this* transport is consumed, not which process
 /// consumes it (parse-time refuses a transport repeated across declarations,
 /// so the dedup here only ever guards the invariant, never masks a
@@ -348,25 +353,31 @@ where
     };
 
     let mut vars = vec![
-        ("APP_ENV", app_env.to_string()),
-        ("APP_DEBUG", app_debug.to_string()),
-        ("APP_SECRET", app_secret),
-        ("APP_PORT", port.to_string()),
-        ("APP_ORIGIN", origin),
-        ("APP_PUBLIC_DIR", path_to_string(&app_dir.join("public"))),
-        ("APP_CACHE_DIR", path_to_string(&cache_dir)),
-        ("APP_BUILD_DIR", path_to_string(&build_dir)),
-        ("APP_LOG_DIR", path_to_string(&log_dir)),
-        ("APP_SESSION_DIR", path_to_string(&sessions_dir)),
-        ("APP_UPLOAD_DIR", path_to_string(&uploads_dir)),
+        ("APP_ENV", app_env.into()),
+        ("APP_DEBUG", app_debug.into()),
+        ("APP_SECRET", app_secret.into()),
+        ("APP_PORT", port.to_string().into()),
+        ("APP_ORIGIN", origin.into()),
+        (
+            "APP_PUBLIC_DIR",
+            path_to_string(&app_dir.join("public")).into(),
+        ),
+        ("APP_CACHE_DIR", path_to_string(&cache_dir).into()),
+        ("APP_BUILD_DIR", path_to_string(&build_dir).into()),
+        ("APP_LOG_DIR", path_to_string(&log_dir).into()),
+        ("APP_SESSION_DIR", path_to_string(&sessions_dir).into()),
+        ("APP_UPLOAD_DIR", path_to_string(&uploads_dir).into()),
         (
             "DATABASE_URL",
-            format!("sqlite:///{}", data_subdir.join("app.db").display()),
+            format!("sqlite:///{}", data_subdir.join("app.db").display()).into(),
         ),
-        ("MESSENGER_TRANSPORT_DSN", messenger_transport_dsn(manifest)),
-        ("MERCURE_URL", mercure_url.clone()),
-        ("MERCURE_PUBLIC_URL", mercure_url),
-        ("MERCURE_JWT_SECRET", mercure_secret),
+        (
+            "MESSENGER_TRANSPORT_DSN",
+            messenger_transport_dsn(manifest).into(),
+        ),
+        ("MERCURE_URL", mercure_url.clone().into()),
+        ("MERCURE_PUBLIC_URL", mercure_url.into()),
+        ("MERCURE_JWT_SECRET", mercure_secret.into()),
         (
             "TFS_ASYNC_WORKER",
             if manifest.workers.is_empty() {
@@ -374,18 +385,20 @@ where
             } else {
                 "1"
             }
-            .to_string(),
+            .into(),
         ),
-        ("TFS_WORKER_TRANSPORTS", worker_transports(manifest)),
+        ("TFS_WORKER_TRANSPORTS", worker_transports(manifest).into()),
         // What the probe above actually picked, not whether a keyring is
         // installed: a present-but-locked one has already fallen back to the
         // file, and an app is entitled to warn its user on that basis.
         (
             "TFS_KEYRING_AVAILABLE",
-            crate::secrets::keyring_env_value(&secret_store).to_string(),
+            crate::secrets::keyring_env_value(&secret_store)
+                .to_string()
+                .into(),
         ),
-        ("TFS_APP_IDENTIFIER", identifier.to_string()),
-        ("TFS_APP_VERSION", manifest.app_version.clone()),
+        ("TFS_APP_IDENTIFIER", identifier.into()),
+        ("TFS_APP_VERSION", manifest.app_version.clone().into()),
         (
             "TFS_MEDIA_MICROPHONE",
             if manifest.actions.media.microphone && microphone_granted {
@@ -393,7 +406,7 @@ where
             } else {
                 "0"
             }
-            .to_string(),
+            .into(),
         ),
     ];
 
