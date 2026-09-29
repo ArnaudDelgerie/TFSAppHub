@@ -111,8 +111,9 @@ release archive needs `tfsapp-hub update <id> <archive.tar.gz>` each time;
 the archive is supplied explicitly because there is no release feed to query.
 An archive passed to update also replaces any other recorded source kind. The
 registry records the source of the last successful update. `rollback <id>`
-restores the previous version, tree, database and source revision, while the
-recorded source kind remains the one from that update.
+restores the previous version, tree, database and recorded source, as of before
+that update. An update made by a hub older than this change leaves an anchor
+without a source, and its rollback keeps the current one.
 
 With either form, the hub supplies the one guarantee
 this section states on its own behalf rather than an app author's: **an
