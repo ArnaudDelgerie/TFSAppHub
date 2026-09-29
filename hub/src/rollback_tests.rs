@@ -420,6 +420,8 @@ fn a_killed_rollback_is_refused_by_every_other_command_and_finished_by_rerunning
         let app_dir = paths.app_dir("demo").expect("an app dir");
         let data_dir = base.path().join("TFSApp/dev.local.demo");
 
+        let outgoing = lifecycle::read_rollback_anchor(&data_subdir).expect("an anchor");
+
         test_stop::arm(point);
         let result = rollback(&paths, "demo", true);
         test_stop::disarm();
@@ -467,6 +469,12 @@ fn a_killed_rollback_is_refused_by_every_other_command_and_finished_by_rerunning
             .cloned()
             .expect("the entry survives");
         assert_eq!(entry.app_version, "0.6.0", "{point}");
+        assert_eq!(
+            Some(&entry.source),
+            outgoing.source.as_ref(),
+            "{point}: the resume restores the recorded source"
+        );
+        assert_eq!(entry.source_revision, outgoing.source_revision, "{point}");
 
         // Nothing of the interruption or the anchor remains.
         assert!(!marker_path(&data_dir).exists(), "{point}");
@@ -494,6 +502,7 @@ fn a_marker_with_neither_tree_left_reports_the_lost_tree_and_keeps_the_marker() 
             format_version: MARKER_FORMAT_VERSION,
             target_version: "0.6.0".to_string(),
             source_revision: "sha256:previous".to_string(),
+            source: None,
             rescue_path: None,
         },
     )
@@ -506,18 +515,19 @@ fn a_marker_with_neither_tree_left_reports_the_lost_tree_and_keeps_the_marker() 
     assert!(marker_path(&data_dir).exists());
 }
 
-#[test]
-fn rollback_after_forge_to_archive_keeps_archive_source_kind() {
-    if !resources_present() {
-        return;
-    }
+/// Install `0.6.0` from a fresh local archive, seed its database, then
+/// update to `0.7.0` from another archive. Returns the registry entry as it
+/// stood before the update — the state a rollback must put back.
+fn installed_then_updated(
+    paths: &Paths,
+    tweak_installed: impl FnOnce(&mut RegistryEntry),
+) -> RegistryEntry {
     let source = tempfile::tempdir().unwrap();
     let release = tempfile::tempdir().unwrap();
     runnable_app_tree(source.path(), "0.6.0", "{}");
     let first = crate::test_release::release_of(source.path(), release.path());
-    let (_base, paths) = temp_paths();
     crate::install::install(
-        &paths,
+        paths,
         &first.display().to_string(),
         None,
         None,
@@ -526,31 +536,148 @@ fn rollback_after_forge_to_archive_keeps_archive_source_kind() {
         "0.1.0",
     )
     .unwrap();
-    registry::update(&paths, |registry| {
-        let entry = registry
-            .apps
-            .iter_mut()
-            .find(|entry| entry.id == "demo")
-            .unwrap();
+    registry::update(paths, |registry| {
+        tweak_installed(
+            registry
+                .apps
+                .iter_mut()
+                .find(|entry| entry.id == "demo")
+                .unwrap(),
+        );
+    })
+    .unwrap();
+    let before = registry::load(paths).unwrap().get("demo").unwrap().clone();
+    let data_subdir = paths.app_data_dir("dev.local.demo").unwrap().join("data");
+    fs::write(data_subdir.join("app.db"), b"pre-update-bytes").unwrap();
+    runnable_app_tree(source.path(), "0.7.0", "{}");
+    let second = crate::test_release::release_of(source.path(), release.path());
+    assert!(crate::update::update(paths, "demo", Some(&second), None, true, "0.1.0").unwrap());
+    before
+}
+
+#[test]
+fn rollback_after_forge_to_archive_restores_the_forge_source() {
+    if !resources_present() {
+        return;
+    }
+    let (_base, paths) = temp_paths();
+    let before = installed_then_updated(&paths, |entry| {
         entry.source.kind = SourceKind::Release;
         entry.source.location = "example/demo".to_string();
         entry.source.reference = Some("v0.6.0".to_string());
         entry.source.reference_kind = Some(crate::registry::ReferenceKind::Tag);
         entry.source.index = Some("github".to_string());
-    })
-    .unwrap();
-    let data_dir = paths.app_data_dir("dev.local.demo").unwrap().join("data");
-    fs::write(data_dir.join("app.db"), b"pre-update-bytes").unwrap();
-    runnable_app_tree(source.path(), "0.7.0", "{}");
-    let archive = crate::test_release::release_of(source.path(), release.path());
-    assert!(crate::update::update(&paths, "demo", Some(&archive), None, true, "0.1.0").unwrap());
+    });
+    let updated = registry::load(&paths).unwrap().get("demo").unwrap().clone();
+    assert_eq!(updated.source.kind, SourceKind::LocalArchive);
+
     assert!(rollback(&paths, "demo", true).unwrap());
+
     let entry = registry::load(&paths).unwrap().get("demo").unwrap().clone();
     assert_eq!(entry.app_version, "0.6.0");
-    assert_eq!(entry.source.kind, SourceKind::LocalArchive);
+    assert_eq!(entry.source.kind, SourceKind::Release);
+    assert_eq!(entry.source.location, "example/demo");
+    assert_eq!(entry.source.reference.as_deref(), Some("v0.6.0"));
+    assert_eq!(
+        entry.source.reference_kind,
+        Some(crate::registry::ReferenceKind::Tag)
+    );
+    assert_eq!(entry.source.index.as_deref(), Some("github"));
+    assert_eq!(entry.source, before.source);
+    assert_eq!(entry.source_revision, before.source_revision);
     assert!(
         fs::read_to_string(paths.app_dir("demo").unwrap().join("tfsapp.config.json"))
             .unwrap()
             .contains("0.6.0")
     );
+}
+
+#[test]
+fn rollback_after_archive_to_archive_restores_the_first_archive() {
+    if !resources_present() {
+        return;
+    }
+    let (_base, paths) = temp_paths();
+    let before = installed_then_updated(&paths, |_| {});
+    let updated = registry::load(&paths).unwrap().get("demo").unwrap().clone();
+    assert_ne!(updated.source.location, before.source.location);
+
+    assert!(rollback(&paths, "demo", true).unwrap());
+
+    let entry = registry::load(&paths).unwrap().get("demo").unwrap().clone();
+    assert_eq!(entry.source, before.source);
+    assert_eq!(entry.source_revision, before.source_revision);
+}
+
+#[test]
+fn rollback_with_an_anchor_that_predates_source_tracking_keeps_the_current_source() {
+    if !resources_present() {
+        return;
+    }
+    let (_base, paths) = temp_paths();
+    installed_then_updated(&paths, |_| {});
+    let data_subdir = paths.app_data_dir("dev.local.demo").unwrap().join("data");
+    let mut anchor = lifecycle::read_rollback_anchor(&data_subdir).unwrap();
+    assert!(anchor.source.is_some(), "the update records the source");
+    anchor.source = None;
+    lifecycle::write_rollback_anchor(&data_subdir, &anchor).unwrap();
+    let updated = registry::load(&paths).unwrap().get("demo").unwrap().clone();
+
+    assert!(rollback(&paths, "demo", true).unwrap());
+
+    let entry = registry::load(&paths).unwrap().get("demo").unwrap().clone();
+    assert_eq!(entry.app_version, "0.6.0");
+    assert_eq!(entry.source, updated.source);
+}
+
+#[test]
+fn a_marker_carrying_a_source_restores_it_on_resume() {
+    let (base, paths) = temp_paths();
+    seed_registry(&paths, seeded_entry("/releases/demo-0.7.0.tar.gz"));
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    fs::create_dir_all(data_dir.join("data")).expect("a data subdir");
+    app_tree(&paths.app_dir("demo").expect("an app dir"), "restored");
+    let forge = Source {
+        kind: SourceKind::Release,
+        location: "example/demo".to_string(),
+        reference: Some("v0.6.0".to_string()),
+        reference_kind: Some(crate::registry::ReferenceKind::Tag),
+        index: Some("github".to_string()),
+    };
+    write_marker(
+        &data_dir,
+        &RollbackMarker {
+            format_version: MARKER_FORMAT_VERSION,
+            target_version: "0.6.0".to_string(),
+            source_revision: "sha256:previous".to_string(),
+            source: Some(forge.clone()),
+            rescue_path: None,
+        },
+    )
+    .expect("a seeded marker");
+
+    assert!(rollback(&paths, "demo", false).expect("the resume finishes"));
+
+    let entry = registry::load(&paths).unwrap().get("demo").unwrap().clone();
+    assert_eq!(entry.source, forge);
+    assert_eq!(entry.source_revision, "sha256:previous");
+    assert!(!marker_path(&data_dir).exists());
+}
+
+#[test]
+fn a_marker_without_a_source_reads_and_leaves_the_source_alone() {
+    let (base, _paths) = temp_paths();
+    let data_dir = base.path().join("TFSApp/dev.local.demo");
+    fs::create_dir_all(&data_dir).expect("a data dir");
+    // A marker as the previous binary wrote it: no `source` key.
+    fs::write(
+        marker_path(&data_dir),
+        r#"{"format_version": 1, "target_version": "0.6.0", "source_revision": "sha256:previous", "rescue_path": null}"#,
+    )
+    .expect("a hand-written marker");
+
+    let marker = super::read_marker(&data_dir)
+        .expect("a readable marker")
+        .expect("a marker");
+    assert_eq!(marker.source, None);
 }

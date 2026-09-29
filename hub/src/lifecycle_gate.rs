@@ -463,6 +463,7 @@ mod tests {
                 format_version: rollback::MARKER_FORMAT_VERSION,
                 target_version: "1.0.0".to_string(),
                 source_revision: "sha256:previous".to_string(),
+                source: None,
                 rescue_path: None,
             },
         )
