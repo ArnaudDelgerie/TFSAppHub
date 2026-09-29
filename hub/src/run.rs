@@ -382,8 +382,8 @@ pub fn scan_runs(data_dir: &Path, identifier: &str) -> std::io::Result<Vec<Activ
         if !path.is_file() {
             continue;
         }
-        match tfsapp_core::process::try_lock_file(&path)? {
-            Some(_lock) => {
+        match tfsapp_core::process::try_lock_file_observing(&path) {
+            Ok(Some(_lock)) => {
                 let record = std::fs::read_to_string(&path)
                     .ok()
                     .and_then(|contents| parse_run_entry(&contents));
@@ -416,7 +416,7 @@ pub fn scan_runs(data_dir: &Path, identifier: &str) -> std::io::Result<Vec<Activ
                     }
                 }
             }
-            None => {
+            Ok(None) => {
                 let record = std::fs::read_to_string(&path)
                     .ok()
                     .and_then(|contents| parse_run_entry(&contents));
@@ -430,6 +430,11 @@ pub fn scan_runs(data_dir: &Path, identifier: &str) -> std::io::Result<Vec<Activ
                     _ => unreachable!("a free flock always decides as a live launcher"),
                 }
             }
+            // An entry the launcher unlinked between the `read_dir` and this
+            // probe is nothing running, not an error — and, the probe being
+            // non-creating, nothing to resurrect either (plan 061).
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
         }
     }
     active.sort_by(|left, right| left.path.cmp(&right.path));

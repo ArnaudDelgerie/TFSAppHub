@@ -157,6 +157,13 @@ fn is_owner_live_false_when_lock_is_free() {
     let dir = tempfile::tempdir().unwrap();
     let pid_file = dir.path().join("sidecar.pid");
     assert!(!is_owner_live(&pid_file).unwrap());
+    // The probe only observes: a lock file nothing ever wrote must not be
+    // resurrected by the reading of it (plan 061) — no file, no holder, and
+    // no file afterwards either.
+    assert!(
+        !lock_path(&pid_file).exists(),
+        "is_owner_live must not create the lock file it probes"
+    );
 }
 
 #[test]
@@ -354,6 +361,41 @@ fn wait_for_lock_release_true_once_the_holder_is_killed_and_reaped() {
     child.wait().unwrap();
 
     assert!(wait_for_lock_release(&lock_file, Duration::from_secs(2)).unwrap());
+}
+
+#[test]
+fn wait_for_lock_release_treats_a_missing_entry_as_released_and_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    // No holder ever existed, so no file does either: released, and the wait
+    // must not write the entry it was only ever observing (plan 061).
+    let lock_file = dir.path().join("run.lock");
+
+    assert!(wait_for_lock_release(&lock_file, Duration::from_millis(100)).unwrap());
+    assert!(
+        !lock_file.exists(),
+        "the wait must not recreate a lock file that was never there"
+    );
+}
+
+#[test]
+fn wait_for_lock_release_leaves_no_empty_file_behind_when_unlinked_mid_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock_file = dir.path().join("run.lock");
+    let mut child = spawn_lock_holder(&lock_file);
+
+    // What a launcher's teardown does while `run --stop` is waiting on the
+    // lock: unlink the entry, then release the lock by dying. The old
+    // `O_CREAT` probe recreated the file empty at exactly this point and
+    // left it littering `runs/` (plan 061's e2e observation).
+    fs::remove_file(&lock_file).unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert!(wait_for_lock_release(&lock_file, Duration::from_secs(2)).unwrap());
+    assert!(
+        !lock_file.exists(),
+        "the wait must not resurrect the entry its launcher unlinked"
+    );
 }
 
 // --- signal_target -----------------------------------------------------------

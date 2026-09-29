@@ -361,21 +361,25 @@ pub fn write_pid_file(pid_file: &Path, contents: &str) -> std::io::Result<()> {
 /// the lock must be held, it releases on drop. `Ok(None)` means another live
 /// process already holds it.
 pub fn try_lock_file(path: &Path) -> std::io::Result<Option<File>> {
-    try_lock_file_with_mode(path, libc::LOCK_EX)
+    try_lock_file_with_mode(path, libc::LOCK_EX, true)
 }
 
 /// Try to take a non-blocking shared lock on `path` (created if missing).
 /// The returned handle retains the lock until it is dropped. Shared holders
 /// may coexist, but an exclusive holder excludes both kinds of acquisition.
 pub fn try_lock_file_shared(path: &Path) -> std::io::Result<Option<File>> {
-    try_lock_file_with_mode(path, libc::LOCK_SH)
+    try_lock_file_with_mode(path, libc::LOCK_SH, true)
 }
 
-fn try_lock_file_with_mode(path: &Path, mode: libc::c_int) -> std::io::Result<Option<File>> {
+fn try_lock_file_with_mode(
+    path: &Path,
+    mode: libc::c_int,
+    create: bool,
+) -> std::io::Result<Option<File>> {
     // This handle only ever holds an flock; it never reads or writes the
     // file's bytes, so truncating on open is neither meaningful nor harmful.
     let file = OpenOptions::new()
-        .create(true)
+        .create(create)
         .write(true)
         .truncate(false)
         // A retained lifecycle gate belongs to the hub process. Composer,
@@ -392,6 +396,34 @@ fn try_lock_file_with_mode(path: &Path, mode: libc::c_int) -> std::io::Result<Op
             Some(libc::EWOULDBLOCK) => Ok(None),
             _ => Err(error),
         }
+    }
+}
+
+/// The observing counterpart of [`try_lock_file`]: the same non-blocking
+/// exclusive probe, but the open carries no `O_CREAT`. A probe that only
+/// *observes* an entry — `wait_for_lock_release`, `is_owner_live`, a
+/// `runs/` scan — must not resurrect a file its launcher has just unlinked
+/// on teardown: a creating open that races the unlink leaves an empty file
+/// behind, littering `runs/` until the next scan cleans it up (plan 061).
+/// `Ok(None)` keeps its meaning (a live process holds the lock); a missing
+/// file surfaces as `Err(NotFound)`, which the probes translate as free —
+/// no file, no holder.
+pub fn try_lock_file_observing(path: &Path) -> std::io::Result<Option<File>> {
+    try_lock_file_with_mode(path, libc::LOCK_EX, false)
+}
+
+/// Whether the lock on an existing `path` is observed free — the probe
+/// shared by [`wait_for_lock_release`] and [`is_owner_live`]. `Ok(true)`
+/// means free: either the momentary lock taken to see this was acquired
+/// (and is dropped within this call, never held), or the file does not
+/// exist at all, which is the same answer since no file means no holder —
+/// and nothing here ever creates it.
+fn lock_observed_free(path: &Path) -> std::io::Result<bool> {
+    match try_lock_file_observing(path) {
+        Ok(Some(_momentary)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
     }
 }
 
@@ -466,12 +498,17 @@ pub fn lock_file_exclusive_timeout(
 /// was observed free before the deadline — the momentary lock this function
 /// itself takes to observe that is dropped immediately, exactly like
 /// `is_owner_live` above, never retained. `Ok(false)` means the deadline
-/// passed with the lock still held. Only an `Err` from `try_lock_file`
-/// itself (not "still held") short-circuits the wait.
+/// passed with the lock still held. Only an `Err` from the probe itself
+/// (not "still held") short-circuits the wait.
+///
+/// The probe never creates `path` (unlike [`try_lock_file`], a launcher
+/// takes that lock and unlinks it on teardown): an entry unlinked mid-wait
+/// is `NotFound`, which reads as released — the launcher finished — and
+/// leaves nothing behind, rather than recreating the file empty (plan 061).
 pub fn wait_for_lock_release(path: &Path, timeout: Duration) -> std::io::Result<bool> {
     let deadline = Instant::now() + timeout;
     loop {
-        if try_lock_file(path)?.is_some() {
+        if lock_observed_free(path)? {
             return Ok(true);
         }
         if Instant::now() >= deadline {
@@ -489,11 +526,11 @@ pub fn wait_for_lock_release(path: &Path, timeout: Duration) -> std::io::Result<
 /// launch's reap does. `Ok(true)` means a live owner holds the lock;
 /// `Ok(false)` means the lock was free — no live owner — and the
 /// momentarily-acquired lock is dropped immediately rather than held.
+/// A missing lock file is free, the same way: no file, no holder — and the
+/// probe never creates it, so a `runs/` scan cannot resurrect a lock file a
+/// launcher just unlinked on teardown (plan 061).
 pub fn is_owner_live(pid_file: &Path) -> std::io::Result<bool> {
-    match try_lock_file(&lock_path(pid_file))? {
-        Some(_lock) => Ok(false),
-        None => Ok(true),
-    }
+    Ok(!lock_observed_free(&lock_path(pid_file))?)
 }
 
 /// Terminate `pid` only if it still carries `identifier`'s exact
