@@ -7,7 +7,11 @@
 //! the project directory, 3–6 one `git.rs` call each ([`run_local_gates`]);
 //! gates 9–11 are `gh.rs`'s `Gh`; then the archive and its sums
 //! ([`build_archive`]), the announcement, the confirmation, and
-//! `gh release create`. [`run`] is the command `main.rs` reaches.
+//! `gh release create`. Between the manifest gates (1–2) and the changelog
+//! gate (7), the pinned manifest's declared `build_outputs` are checked and
+//! walked on the working tree (plan 071): those directories are the archive's
+//! one source that is not the pinned commit. [`run`] is the command
+//! `main.rs` reaches.
 
 use std::{
     collections::BTreeSet,

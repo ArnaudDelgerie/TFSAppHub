@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+An app's frontend build output now ships in its release archive without being
+committed: `"build_outputs": ["public/build"]` in `tfsapp.config.json` names
+the project-relative, gitignored directories the author's own build step
+produces, and `publish` — forge and `--local` alike — copies them into the
+archive as they stand at publish time, after refusing, before building
+anything, a declared path that escapes the project, sits under an excluded
+top-level component, is absent or empty, is not gitignored, holds a tracked
+file, or holds anything but regular files and directories. The pinned-commit
+guarantee now covers the tracked files; the declared outputs are the author's
+bytes at publish time, under the same `SHA256SUMS.txt`. `install`, `update`
+and `dev` ignore the key. The announcement prints `Inputs  pinned Git tree +
+build outputs` when any are declared, plus one line per output with its file
+count, total size and newest mtime.
+
 The microphone can now be switched off per installation, and a running capture
 is visible in the window's title. `"revoked": {"media": {"microphone":
 true}}` in an app's `data/config.json` — hand-edited, like `port_override`,
