@@ -9,16 +9,19 @@
 //! hub has no manifest to read its own next version from the way an app
 //! does; the tag is the only place it lives.
 //!
-//! `run` wires the pure halves above into the Overview's ten-step order:
-//! `$APPIMAGE` guard, check, refresh the stable copy, confirm, download,
-//! verify, snapshot the registry, swap the binary, swap `$APPIMAGE`, report.
-//! Steps 1–6 abort cleanly with nothing on disk touched; from step 7 on, the
+//! `run` extends plan 020's ten-step order with a probe after verification:
+//! `$APPIMAGE` guard, check, confirm, download, verify, probe, refresh the
+//! stable copy, snapshot the registry, swap the binary, swap `$APPIMAGE`, report.
+//! Before refreshing the stable copy, failures leave installed files untouched.
+//! From the snapshot on, the
 //! anchor is what makes the change reversible (`--rollback`,
 //! `hub_rollback.rs`, this plan's step 7).
 
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -62,6 +65,82 @@ pub enum HubUpdateCheck<'a> {
 /// read.md`) reuses this rather than growing a second one.
 pub(crate) fn parse_tag_version(tag: &str) -> Result<semver::Version, semver::Error> {
     semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag))
+}
+
+/// Run an AppImage far enough to exercise its loader and all of its direct
+/// dependencies. The expected name comes from the running Tauri package info,
+/// which is also the source of our own `--version` output.
+fn probe(
+    path: &Path,
+    expected_name: &str,
+    timeout: Duration,
+) -> Result<semver::Version, ProbeError> {
+    // Anonymous files rather than pipes: nothing reads a pipe while the loop
+    // below waits, so a chatty image would block on a full one and pass for a
+    // timeout, and a grandchild keeping a pipe open (the AppImage runtime's
+    // FUSE daemon) would hold a read past the timeout.
+    let does_not_run = |error: io::Error| ProbeError::DoesNotRun(error.to_string());
+    let mut stdout_file = tempfile::tempfile().map_err(does_not_run)?;
+    let mut stderr_file = tempfile::tempfile().map_err(does_not_run)?;
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(stdout_file.try_clone().map_err(does_not_run)?)
+        .stderr(stderr_file.try_clone().map_err(does_not_run)?)
+        .spawn()
+        .map_err(does_not_run)?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProbeError::TimedOut);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(does_not_run(error));
+            }
+        }
+    };
+    let read_capped = |file: &mut fs::File| -> io::Result<Vec<u8>> {
+        use std::io::{Read, Seek};
+        file.rewind()?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    let stdout_bytes = read_capped(&mut stdout_file).map_err(does_not_run)?;
+    if !status.success() {
+        let stderr_bytes = read_capped(&mut stderr_file).map_err(does_not_run)?;
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        let detail = stderr.lines().take(3).collect::<Vec<_>>().join("; ");
+        return Err(ProbeError::DoesNotRun(if detail.is_empty() {
+            status.to_string()
+        } else {
+            detail
+        }));
+    }
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let line = stdout.trim();
+    let Some(version) = line
+        .strip_prefix(expected_name)
+        .and_then(|rest| rest.strip_prefix(' '))
+    else {
+        return Err(ProbeError::NotTheHub(line.to_string()));
+    };
+    semver::Version::parse(version).map_err(|_| ProbeError::NotTheHub(line.to_string()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeError {
+    DoesNotRun(String),
+    TimedOut,
+    NotTheHub(String),
 }
 
 /// Compare `current` — the running hub's own version — against `release`,
@@ -176,7 +255,12 @@ pub(crate) enum UpdateOutcome {
 
 /// `tfsapp-hub --update [--yes]` — resolve `Paths`, read `$APPIMAGE`, and turn
 /// the pipeline's outcome into an exit code.
-pub fn run(current: &semver::Version, assume_yes: bool) -> i32 {
+pub fn run(
+    current: &semver::Version,
+    expected_name: &str,
+    from: Option<&Path>,
+    assume_yes: bool,
+) -> i32 {
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
         Err(error) => {
@@ -186,7 +270,14 @@ pub fn run(current: &semver::Version, assume_yes: bool) -> i32 {
     };
     let appimage_env = std::env::var("APPIMAGE").ok();
 
-    match update(&paths, appimage_env.as_deref(), current, assume_yes) {
+    match update(
+        &paths,
+        appimage_env.as_deref(),
+        current,
+        expected_name,
+        from,
+        assume_yes,
+    ) {
         Ok(UpdateOutcome::UpToDate { current }) => {
             println!("tfsapp-hub {current} is already the latest release.");
             EXIT_OK
@@ -217,17 +308,31 @@ pub(crate) fn update(
     paths: &Paths,
     appimage_env: Option<&str>,
     current: &semver::Version,
+    expected_name: &str,
+    from: Option<&Path>,
     assume_yes: bool,
 ) -> Result<UpdateOutcome, HubUpdateError> {
     let scratch = paths.scratch_dir();
-    let result = update_at(
-        paths,
-        &scratch,
-        release::GITHUB_API_BASE,
-        appimage_env,
-        current,
-        assume_yes,
-    );
+    let result = match from {
+        Some(source) => update_from_at(
+            paths,
+            &scratch,
+            appimage_env,
+            current,
+            expected_name,
+            source,
+            assume_yes,
+        ),
+        None => update_at(
+            paths,
+            &scratch,
+            release::GITHUB_API_BASE,
+            appimage_env,
+            current,
+            expected_name,
+            assume_yes,
+        ),
+    };
     let _ = fs::remove_dir_all(&scratch);
     result
 }
@@ -238,10 +343,11 @@ pub(crate) fn update(
 /// always calls this with [`release::GITHUB_API_BASE`], through [`update`]
 /// above.
 ///
-/// The Overview's ten-step order, verbatim: 1–6 can each abort with nothing
-/// on disk touched; the registry snapshot (7) lands before the binary swap
-/// (8) so a failure mid-swap never anchors a registry the new hub had
-/// already begun to rewrite; `$APPIMAGE` (9) is swapped last because a
+/// Plan 020's order with a probe after checksum verification: the refresh is
+/// deferred until the candidate has run, so probe failure changes no installed
+/// file. The registry snapshot lands before the binary swap, so a failure
+/// mid-swap never anchors a registry the new hub had
+/// already begun to rewrite; `$APPIMAGE` (10) is swapped last because a
 /// launcher pointing at the stale `bin/tfsapp-hub` is the worse of the two
 /// possible partial failures (the plan's "Two files, not one").
 fn update_at(
@@ -250,6 +356,7 @@ fn update_at(
     base_url: &str,
     appimage_env: Option<&str>,
     current: &semver::Version,
+    expected_name: &str,
     assume_yes: bool,
 ) -> Result<UpdateOutcome, HubUpdateError> {
     update_at_after_anchor(
@@ -258,17 +365,20 @@ fn update_at(
         base_url,
         appimage_env,
         current,
+        expected_name,
         assume_yes,
         |_| {},
     )
 }
 
+#[allow(clippy::too_many_arguments)] // The final callback is a test-only swap failure seam.
 fn update_at_after_anchor(
     paths: &Paths,
     scratch: &Path,
     base_url: &str,
     appimage_env: Option<&str>,
     current: &semver::Version,
+    expected_name: &str,
     assume_yes: bool,
     after_anchor: impl FnOnce(&Paths),
 ) -> Result<UpdateOutcome, HubUpdateError> {
@@ -299,27 +409,14 @@ fn update_at_after_anchor(
         ),
     };
 
-    // 3. Refresh the stable copy from the running image, so the anchor about
-    // to be made (step 7/8) is genuinely the hub that is running — not
-    // whatever `bin/tfsapp-hub` happened to hold last. `ensure_current_at`
-    // directly against `appimage_target` rather than `hub_bin::ensure_current`:
-    // that one re-reads `$APPIMAGE` from the real process environment, and
-    // this pipeline already resolved it once (step 1) — one read, threaded
-    // through, is both correct (no risk of the two disagreeing) and testable
-    // without touching global state (`hub_bin`'s own doc header, on why
-    // `current_exe` is injected rather than called directly, is the same
-    // reasoning).
-    hub_bin::ensure_current_at(&appimage_target, &paths.hub_executable_path())
-        .map_err(HubUpdateError::HubBin)?;
-
-    // 4. Confirm on the terminal (--yes to skip).
+    // 3. Confirm on the terminal (--yes to skip).
     announce(current, &version, &asset_name);
     if !prompt::confirmed(assume_yes) {
         println!("Aborted — nothing was changed.");
         return Ok(UpdateOutcome::Declined);
     }
 
-    // 5. Download the .AppImage to the hub's scratch directory, and its
+    // 4. Download the .AppImage to the hub's scratch directory, and its
     // SHA256SUMS.txt.
     fs::create_dir_all(scratch).map_err(|source| HubUpdateError::Io {
         path: scratch.to_path_buf(),
@@ -329,7 +426,7 @@ fn update_at_after_anchor(
     println!("Downloading {asset_name} …");
     release::download_to(&asset_url, &archive_path).map_err(HubUpdateError::Release)?;
 
-    // 6. Verify. Mismatch, missing entry, or unreadable sums → scratch
+    // 5. Verify. Mismatch, missing entry, or unreadable sums → scratch
     // removed by the caller, nothing on disk touched, exit non-zero.
     let checksums_text = release::fetch_text(&checksums_url).map_err(HubUpdateError::Release)?;
     let checksums = release::parse_sha256sums(&checksums_text);
@@ -348,13 +445,127 @@ fn update_at_after_anchor(
         }
     }
 
-    // 7. Snapshot registry.json beside the anchor, under the registry lock —
-    // before step 8's binary swap, per the Overview: a snapshot taken after
+    // 6. Exercise the downloaded image before any installed file or anchor
+    // is touched. Its checksum proves integrity; this proves it can start on
+    // this machine and reports the version promised by the release tag.
+    make_executable(&archive_path)?;
+    let probed = probe(&archive_path, expected_name, Duration::from_secs(60));
+    match probed {
+        Ok(found) if found == version => {}
+        Ok(found) => {
+            return Err(HubUpdateError::ReleaseMismatch {
+                expected: version,
+                detail: format!("reported version {found}"),
+            })
+        }
+        Err(ProbeError::NotTheHub(output)) => {
+            return Err(HubUpdateError::ReleaseMismatch {
+                expected: version,
+                detail: format!("reported {output:?}"),
+            })
+        }
+        Err(error) => {
+            return Err(HubUpdateError::ReleaseDoesNotRun {
+                version,
+                detail: probe_failure_detail(error),
+            })
+        }
+    }
+
+    finish_update(
+        paths,
+        &appimage_target,
+        &archive_path,
+        version,
+        after_anchor,
+    )
+}
+
+fn update_from_at(
+    paths: &Paths,
+    scratch: &Path,
+    appimage_env: Option<&str>,
+    current: &semver::Version,
+    expected_name: &str,
+    source: &Path,
+    assume_yes: bool,
+) -> Result<UpdateOutcome, HubUpdateError> {
+    let appimage_target =
+        resolve_appimage_target(appimage_env).ok_or(HubUpdateError::NotPackaged)?;
+    fs::create_dir_all(scratch).map_err(|source| HubUpdateError::Io {
+        path: scratch.to_path_buf(),
+        source,
+    })?;
+    let candidate = scratch.join("local.AppImage");
+    // The AppImage runtime changes cwd to its mount. OWD is the directory
+    // where the user invoked it, so relative --from paths must start there.
+    let process_cwd = std::env::current_dir().map_err(|error| HubUpdateError::Io {
+        path: source.to_path_buf(),
+        source: error,
+    })?;
+    let original_cwd = std::env::var_os("OWD").map(PathBuf::from);
+    let source_path = resolve_local_source(source, original_cwd.as_deref(), &process_cwd);
+    fs::copy(&source_path, &candidate).map_err(|error| HubUpdateError::Io {
+        path: source_path,
+        source: error,
+    })?;
+    make_executable(&candidate)?;
+    let version = match probe(&candidate, expected_name, Duration::from_secs(60)) {
+        Ok(version) => version,
+        Err(ProbeError::NotTheHub(output)) => {
+            return Err(HubUpdateError::LocalNotTheHub {
+                path: source.to_path_buf(),
+                output,
+            });
+        }
+        Err(error) => {
+            return Err(HubUpdateError::LocalDoesNotRun {
+                path: source.to_path_buf(),
+                detail: probe_failure_detail(error),
+            });
+        }
+    };
+    if version < *current {
+        return Err(HubUpdateError::LocalOlder {
+            current: current.clone(),
+            found: version,
+        });
+    }
+    announce(current, &version, &source.display().to_string());
+    if !prompt::confirmed(assume_yes) {
+        println!("Aborted — nothing was changed.");
+        return Ok(UpdateOutcome::Declined);
+    }
+    finish_update(paths, &appimage_target, &candidate, version, |_| {})
+}
+
+fn resolve_local_source(source: &Path, original_cwd: Option<&Path>, process_cwd: &Path) -> PathBuf {
+    if source.is_absolute() {
+        source.to_path_buf()
+    } else {
+        original_cwd.unwrap_or(process_cwd).join(source)
+    }
+}
+
+fn finish_update(
+    paths: &Paths,
+    appimage_target: &Path,
+    archive_path: &Path,
+    version: semver::Version,
+    after_anchor: impl FnOnce(&Paths),
+) -> Result<UpdateOutcome, HubUpdateError> {
+    // 7. Refresh the stable copy only now. A rejected release must not even
+    // repair a stale stable copy: "nothing changed" includes that file.
+    hub_bin::ensure_current_at(appimage_target, &paths.hub_executable_path())
+        .map_err(HubUpdateError::HubBin)?;
+
+    // 8. Snapshot registry.json beside the anchor, under the registry lock —
+    // before the binary swap, per the Overview: a snapshot taken after
     // could already describe a state the new hub had begun to change.
     registry::snapshot_to(paths, &hub_bin::anchor_registry_path(paths))
         .map_err(HubUpdateError::Registry)?;
 
-    // 8. Rename bin/tfsapp-hub → bin/tfsapp-hub.previous; move the verified
+    // 9. Rename bin/tfsapp-hub → bin/tfsapp-hub.previous; move the verified
     // download into bin/tfsapp-hub, chmod +x.
     let stable_path = paths.hub_executable_path();
     fs::rename(&stable_path, hub_bin::anchor_path(paths)).map_err(|source| HubUpdateError::Io {
@@ -362,7 +573,7 @@ fn update_at_after_anchor(
         source,
     })?;
     after_anchor(paths);
-    if let Err(source) = hub_bin::ensure_current_at(&archive_path, &stable_path) {
+    if let Err(source) = hub_bin::ensure_current_at(archive_path, &stable_path) {
         return match fs::rename(hub_bin::anchor_path(paths), &stable_path) {
             Ok(()) => {
                 let _ = fs::remove_file(hub_bin::anchor_registry_path(paths));
@@ -376,28 +587,51 @@ fn update_at_after_anchor(
         };
     }
 
-    // 9. Swap $APPIMAGE, unless it is the same file — reusing
+    // 10. Swap $APPIMAGE, unless it is the same file — reusing
     // `ensure_current_at`'s own canonicalize comparison (the "same file"
     // question this time is stable-copy-vs-$APPIMAGE, not source-vs-target,
     // but the mechanism — copy, chmod, atomic rename beside the target — is
     // identical either way, which is exactly why it is reused rather than
     // reimplemented). From here a failure is the plan's named partial
     // failure: the stable copy is already new.
-    hub_bin::ensure_current_at(&stable_path, &appimage_target).map_err(|error| {
+    hub_bin::ensure_current_at(&stable_path, appimage_target).map_err(|error| {
         HubUpdateError::AppimageSwapFailed {
-            appimage_path: appimage_target.clone(),
+            appimage_path: appimage_target.to_path_buf(),
             source: error,
         }
     })?;
 
-    // 10. Report the new version, the two paths written, that installed apps
+    // 11. Report the new version, the two paths written, that installed apps
     // will be revalidated on their next use, and that --rollback undoes it —
     // done by `run`, from this outcome.
     Ok(UpdateOutcome::Updated {
         version,
         stable_path,
-        appimage_path: appimage_target,
+        appimage_path: appimage_target.to_path_buf(),
     })
+}
+
+fn make_executable(path: &Path) -> Result<(), HubUpdateError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)
+        .map_err(|source| HubUpdateError::Io {
+            path: path.into(),
+            source,
+        })?
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    fs::set_permissions(path, permissions).map_err(|source| HubUpdateError::Io {
+        path: path.into(),
+        source,
+    })
+}
+
+fn probe_failure_detail(error: ProbeError) -> String {
+    match error {
+        ProbeError::DoesNotRun(detail) => detail,
+        ProbeError::TimedOut => "timed out after 60 seconds".into(),
+        ProbeError::NotTheHub(output) => format!("reported {output:?}"),
+    }
 }
 
 fn announce(current: &semver::Version, latest: &semver::Version, asset_name: &str) {
@@ -438,6 +672,26 @@ pub enum HubUpdateError {
     /// unparseable tag, or a release missing one of its two required assets.
     /// [`check`]'s own `Unavailable` reason, carried through unchanged.
     CheckFailed(String),
+    ReleaseDoesNotRun {
+        version: semver::Version,
+        detail: String,
+    },
+    ReleaseMismatch {
+        expected: semver::Version,
+        detail: String,
+    },
+    LocalDoesNotRun {
+        path: PathBuf,
+        detail: String,
+    },
+    LocalNotTheHub {
+        path: PathBuf,
+        output: String,
+    },
+    LocalOlder {
+        current: semver::Version,
+        found: semver::Version,
+    },
     HubBin(HubBinError),
     Registry(RegistryError),
     ChecksumMismatch {
@@ -452,7 +706,7 @@ pub enum HubUpdateError {
         path: PathBuf,
         source: io::Error,
     },
-    /// The stable copy was already replaced (step 8 succeeded) but writing
+    /// The stable copy was already replaced, but writing
     /// the new binary over `$APPIMAGE` failed — the Overview's named
     /// partial failure: every generated launcher already runs the new hub,
     /// only this one downloaded file is stale.
@@ -480,6 +734,28 @@ impl fmt::Display for HubUpdateError {
             ),
             Self::Release(error) => write!(formatter, "{error}"),
             Self::CheckFailed(reason) => write!(formatter, "{reason}"),
+            Self::ReleaseDoesNotRun { version, detail } => write!(
+                formatter,
+                "the official AppImage v{version} does not run on this machine ({detail}); nothing was changed. Rebuild it (README: It does not start), then run `tfsapp-hub --update --from <rebuilt AppImage>`."
+            ),
+            Self::ReleaseMismatch { expected, detail } => write!(
+                formatter,
+                "the official AppImage for v{expected} does not match its release tag ({detail}); nothing was changed."
+            ),
+            Self::LocalDoesNotRun { path, detail } => write!(
+                formatter,
+                "{} does not run on this machine ({detail}); nothing was changed.",
+                path.display()
+            ),
+            Self::LocalNotTheHub { path, output } => write!(
+                formatter,
+                "{} is not this hub (reported {output:?}); nothing was changed.",
+                path.display()
+            ),
+            Self::LocalOlder { current, found } => write!(
+                formatter,
+                "local AppImage v{found} is older than the running hub v{current}; use `tfsapp-hub --rollback` to go back. Nothing was changed."
+            ),
             Self::HubBin(error) => write!(formatter, "{error}"),
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::ChecksumMismatch {

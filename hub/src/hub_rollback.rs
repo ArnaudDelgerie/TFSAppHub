@@ -59,7 +59,7 @@ pub fn run(assume_yes: bool) -> i32 {
 /// `hub_rollback_tests.rs` uses to run a whole `--rollback` against a
 /// throwaway root, matching `hub_update::update`'s own shape. Its outcome
 /// records whether the user declined and which entries the locked merge kept.
-fn rollback(
+pub(crate) fn rollback(
     paths: &Paths,
     appimage_env: Option<&str>,
     assume_yes: bool,
@@ -137,7 +137,7 @@ fn rollback_after_binary(
 }
 
 #[derive(Debug, PartialEq)]
-struct RollbackResult {
+pub(crate) struct RollbackResult {
     completed: bool,
     kept_entries: Vec<String>,
 }

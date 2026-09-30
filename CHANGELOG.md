@@ -2,6 +2,13 @@
 
 ## 0.4.0
 
+Hub self-update now checks that the downloaded AppImage runs on this machine
+and reports the version promised by the release tag before replacing either
+copy. An incompatible release is refused without changing the installed hub.
+`--update --from <AppImage>` installs a local rebuild of the current or a
+newer version through the same swap and rollback path; older versions are
+refused with a pointer to `--rollback`.
+
 Official releases now build in Docker on Ubuntu 22.04, the oldest Ubuntu LTS
 still in standard support. The AppImage's measured glibc floor is 2.35, so
 it can run on Ubuntu 22.04, Debian 12, Mint 21 and compatible newer systems

@@ -23,7 +23,7 @@
 //! own line out of it. A subcommand cannot therefore be added to the grammar
 //! and forgotten in the help text.
 
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 /// The command ran and did what it said.
 pub const EXIT_OK: i32 = 0;
@@ -106,7 +106,7 @@ pub const SURFACE: &[Spec] = &[
     },
     Spec {
         name: "--update",
-        form: "--update [--yes]",
+        form: "--update [--from <path>] [--yes]",
         summary: "Update the hub itself to the latest release.",
         level: Level::Hub,
         availability: Availability::Implemented,
@@ -319,6 +319,7 @@ pub enum Command {
     Version,
     Help,
     HubUpdate {
+        from: Option<PathBuf>,
         assume_yes: bool,
     },
     HubRollback {
@@ -567,9 +568,14 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             no_arguments("--version", rest)?;
             Ok(Command::Version)
         }
-        "--update" => Ok(Command::HubUpdate {
-            assume_yes: assume_yes("--update", rest)?,
-        }),
+        "--update" => {
+            let options = options("--update", rest, &["--from"], &["--yes", "-y"])?;
+            options.no_positionals("--update")?;
+            Ok(Command::HubUpdate {
+                from: options.value("--from").map(PathBuf::from),
+                assume_yes: options.assume_yes(),
+            })
+        }
         "--rollback" => Ok(Command::HubRollback {
             assume_yes: assume_yes("--rollback", rest)?,
         }),
