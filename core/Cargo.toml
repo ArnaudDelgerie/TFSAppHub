@@ -2,6 +2,7 @@
 name = "tfsapp-core"
 version = "0.1.0"
 description = "Identity-agnostic half of the hub: process supervision, ports, health, logs, sidecar spawning."
+license = "MIT"
 authors = ["TFSAppHub"]
 edition = "2021"
 
