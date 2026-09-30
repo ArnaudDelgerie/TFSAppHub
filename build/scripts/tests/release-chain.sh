@@ -392,6 +392,42 @@ case_release_refuses_branch_without_upstream() {
   case_result "release refuses a HEAD without an upstream"
 }
 
+case_release_refuses_repo_mismatch() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  printf 'other/TFSAppHub\n' >"$TREE/build/releases-repo"
+  git -C "$TREE" commit -q -am "retarget build/releases-repo"
+  git -C "$TREE" push -q origin main
+  if run_release $'y\n'; then
+    echo "  assertion failed: release.sh published while build/releases-repo named another repo" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names the build/releases-repo value" \
+      'other/TFSAppHub' "$CASE_DIR/run.err"
+    assert_match "the refusal names the remote's value" \
+      'owner/TFSAppHub' "$CASE_DIR/run.err"
+    assert_match "the refusal names the fix" 'build/releases-repo' "$CASE_DIR/run.err"
+    assert_no_match "no gh call" '^gh ' "$LOG"
+    assert_no_match "no cargo call" '^cargo ' "$LOG"
+    assert_no_match "no docker call" '^docker ' "$LOG"
+  fi
+  # A fork that changes both passes: the same retargeted file, with the
+  # upstream remote retargeted to match it.
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  printf 'other/TFSAppHub\n' >"$TREE/build/releases-repo"
+  git -C "$TREE" commit -q -am "retarget build/releases-repo"
+  git -C "$TREE" push -q origin main
+  git -C "$TREE" remote set-url origin https://github.com/other/TFSAppHub.git
+  git -C "$TREE" config "url.$ORIGIN.insteadOf" https://github.com/other/TFSAppHub.git
+  if run_release $'y\n'; then
+    assert_match "the release was created on the retargeted repo" \
+      'release create .*--repo other/TFSAppHub' "$LOG"
+  else
+    echo "  assertion failed: a fork that changes both build/releases-repo and the remote was refused" >&2
+    CASE_STATUS=1
+  fi
+  case_result "a build/releases-repo differing from the upstream remote is refused; one that changes both passes"
+}
+
 case_release_refuses_unavailable_docker() {
   new_tree "0.3.0" "[0.3.0] - 2026-09-28"
   FAKE_DOCKER_MISSING=1
@@ -700,6 +736,7 @@ main() {
   case_release_refuses_dirty_tree
   case_release_refuses_unpushed_commit
   case_release_refuses_branch_without_upstream
+  case_release_refuses_repo_mismatch
   case_release_refuses_unavailable_docker
   case_release_refuses_missing_repo
   case_release_refuses_private_repo
