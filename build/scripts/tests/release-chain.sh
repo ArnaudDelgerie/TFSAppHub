@@ -5,7 +5,7 @@ set -euo pipefail
 # against a fake `cargo`, a fake `docker`, a fake `gh` and a stub
 # fix-appimage-bundle.sh, each
 # case in its own throwaway git repository. `make check`'s fifth gate; nothing
-# here touches the network, the real releases repo, or this checkout's own
+# here touches the network, the real source repo, or this checkout's own
 # working tree.
 #
 # Every case builds a fresh tree under `mktemp -d` (removed on exit):
@@ -25,7 +25,9 @@ set -euo pipefail
 #     `tauri build`, writes the version's AppImage under the workspace-shared
 #     bundle directory (its cwd is hub/, the workspace root one level up);
 #     `docker` accepts `compose version` and runs the tree's build-hub.sh for
-#     `compose run --rm build`; `gh` satisfies `auth status` and `repo view`, answers `release view`
+#     `compose run --rm build`; `gh` satisfies `auth status`, answers
+#     `repo view` with the repo's visibility (PUBLIC, overridable, or a
+#     not-found failure), answers `release view`
 #     with "no such release", and on `release create` logs its arguments and
 #     copies the notes file. Every call lands in the case's log.
 #
@@ -165,7 +167,7 @@ Nothing yet.
 Notes body for $version.
 EOF
 
-  printf 'owner/TFSAppHub-releases\n' >"$TREE/build/releases-repo"
+  printf 'owner/TFSAppHub\n' >"$TREE/build/releases-repo"
   printf 'target/\nhub/resources/\n' >"$TREE/.gitignore"
 
   cat >"$FAKEBIN/cargo" <<'EOF'
@@ -195,7 +197,14 @@ set -u
 echo "gh $*" >>"$FAKE_BIN_LOG"
 cmd="${1:-}" sub="${2:-}"
 if [[ "$cmd" == "auth" && "$sub" == "status" ]]; then exit 0; fi
-if [[ "$cmd" == "repo" && "$sub" == "view" ]]; then exit 0; fi
+if [[ "$cmd" == "repo" && "$sub" == "view" ]]; then
+  if [[ "${FAKE_GH_REPO_MISSING:-}" == "1" ]]; then
+    echo "fake gh: Repository not found" >&2
+    exit 1
+  fi
+  echo "${FAKE_GH_VISIBILITY:-PUBLIC}"
+  exit 0
+fi
 if [[ "$cmd" == "release" ]]; then
   if [[ "$sub" == "view" ]]; then
     echo "release not found" >&2
@@ -274,6 +283,8 @@ run_release() { # run_release <stdin> — release.sh inside the tree
     printf '%s' "$1" \
       | env FAKE_BIN_LOG="$LOG" FAKE_CARGO_MOVE="${FAKE_CARGO_MOVE:-}" \
           FAKE_DOCKER_MISSING="${FAKE_DOCKER_MISSING:-}" \
+          FAKE_GH_REPO_MISSING="${FAKE_GH_REPO_MISSING:-}" \
+          FAKE_GH_VISIBILITY="${FAKE_GH_VISIBILITY:-}" \
           PATH="$FAKEBIN:$PATH" ./build/scripts/release.sh
   ) >"$CASE_DIR/run.out" 2>"$CASE_DIR/run.err"
 }
@@ -394,6 +405,38 @@ case_release_refuses_unavailable_docker() {
   fi
   FAKE_DOCKER_MISSING=
   case_result "release refuses unavailable Docker Compose before any gh call"
+}
+
+case_release_refuses_missing_repo() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  FAKE_GH_REPO_MISSING=1
+  if run_release $'y\n'; then
+    echo "  assertion failed: release.sh succeeded with a missing source repo" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names the repo" 'owner/TFSAppHub' "$CASE_DIR/run.err"
+    assert_match "the refusal names build/releases-repo" 'build/releases-repo' "$CASE_DIR/run.err"
+    assert_no_match "no cargo call" '^cargo ' "$LOG"
+    assert_no_match "no release create" 'release create' "$LOG"
+  fi
+  FAKE_GH_REPO_MISSING=
+  case_result "release refuses a missing source repo before anything is written"
+}
+
+case_release_refuses_private_repo() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  FAKE_GH_VISIBILITY=PRIVATE
+  if run_release $'y\n'; then
+    echo "  assertion failed: release.sh succeeded with a private source repo" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names the repo" 'owner/TFSAppHub' "$CASE_DIR/run.err"
+    assert_match "the refusal names the fix (make it public)" 'make the repository public' "$CASE_DIR/run.err"
+    assert_no_match "no cargo call" '^cargo ' "$LOG"
+    assert_no_match "no release create" 'release create' "$LOG"
+  fi
+  FAKE_GH_VISIBILITY=
+  case_result "release refuses a private source repo before anything is written"
 }
 
 case_fresh_release_builds_in_docker() {
@@ -536,6 +579,8 @@ case_release_attaches_three_assets() {
   if run_release $'y\n'; then
     assert_match "release create attaches AppImage, .versions.txt and sums" \
       'release create .*TFSAppHub_0\.3\.0_amd64\.AppImage .*TFSAppHub_0\.3\.0_amd64\.versions\.txt .*SHA256SUMS\.txt' "$LOG"
+    assert_match "the tag targets the pinned SHA" \
+      "--target $(tree_head)" "$LOG"
   else
     echo "  assertion failed: release.sh exited non-zero" >&2
     CASE_STATUS=1
@@ -656,6 +701,8 @@ main() {
   case_release_refuses_unpushed_commit
   case_release_refuses_branch_without_upstream
   case_release_refuses_unavailable_docker
+  case_release_refuses_missing_repo
+  case_release_refuses_private_repo
   case_fresh_release_builds_in_docker
   case_release_notes_name_the_revision
   case_reuse_when_record_matches_head

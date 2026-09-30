@@ -364,7 +364,7 @@ fn temp_paths() -> (tempfile::TempDir, Paths) {
 /// makes — `RELEASES_REPO`'s `releases/latest`, the `.AppImage` asset, and
 /// `SHA256SUMS.txt` — in whatever order they arrive, then stops. Mirrors
 /// `install_tests.rs`'s own `stub_release`, adapted to the hub's fixed
-/// releases repo and a single `.AppImage` asset rather than a `.tar.gz`.
+/// source repo's releases and a single `.AppImage` asset rather than a `.tar.gz`.
 /// `sums_body`, not just the asset bytes, is a parameter so the
 /// checksum-mismatch test can serve one that does not match.
 fn stub_hub_release(

@@ -66,7 +66,7 @@ build:
 	build/scripts/build-hub.sh
 
 # Build (or reuse a build recorded from this exact HEAD) the AppImage, then
-# publish it, its .versions.txt and its SHA256SUMS.txt to the releases repo as
+# publish it, its .versions.txt and its SHA256SUMS.txt on the source repo as
 # GitHub release assets. Requires a clean tree pushed to its upstream — the
 # released HEAD is pinned, re-checked before publishing, and named in the
 # notes' Built from line — plus `gh auth login` and a "## <version>" section

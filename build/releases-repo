@@ -1,5 +1,9 @@
-# The hub's own releases repo. Read by build/scripts/release.sh (publishing)
-# and by hub/build.rs, which bakes it into the binary as TFSAPP_RELEASES_REPO
-# for release.rs's hub self-update check — one file, not two copies of the
-# same value.
-ArnaudDelgerie/TFSAppHub-releases
+# The repository the hub's own releases live on — the source repository
+# itself, not a separate releases repo: the update check is anonymous (no
+# token), so the repo must be public for an installed hub to see new
+# releases, and the source repo being public for 0.1.0 removes the only
+# reason the two were split. Read by build/scripts/release.sh (publishing)
+# and by hub/build.rs, which bakes it into the binary as
+# TFSAPP_RELEASES_REPO for release.rs's hub self-update check — one file,
+# not two copies of the same value.
+ArnaudDelgerie/TFSAppHub

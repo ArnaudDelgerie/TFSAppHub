@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Small-scale, artisanal release flow — the unsigned alternative to
 # tauri-plugin-updater + signing. One command builds the hub's own AppImage
-# and publishes it to a public releases repo as GitHub release assets. Ported
+# and publishes it on the source repo's GitHub releases. Ported
 # from TFSAppWorkstation's script of the same name; two things do not come
 # across, both properties of an *app* being released rather than of the hub
 # itself: the per-project `releases_repo` resolution/write-back (the hub has
@@ -15,45 +15,52 @@ set -euo pipefail
 #      the branch's upstream; that HEAD is pinned as the revision this release
 #      is of. A dirty tree, an unpushed or detached HEAD is refused with the
 #      fix named — local and cheapest first, before any gh call.
-#   2. Version guard: tag = v<hub version>; stop if that release exists.
-#   3. Changelog gate: CHANGELOG.md must exist at the repo root with one of
+#   2. Repo gate: the source repo named by build/releases-repo must exist
+#      and be public — the anonymous update check carries no token, so a
+#      missing or private repo is a refusal, never something this script
+#      creates. The first GitHub read after gh auth status, which runs
+#      after every local check.
+#   3. Version guard: tag = v<hub version>; stop if that release exists.
+#   4. Changelog gate: CHANGELOG.md must exist at the repo root with one of
 #      three spellings — "## <version>", "## v<version>", "## [<version>]" —
 #      each optionally followed by anything from a space on (a date, a link);
 #      no other spelling is accepted. That section becomes the release notes,
 #      nothing more, and the notes end with "Built from <repo>@<sha>": the
 #      provenance of the binary, not an authenticity claim (decision 004).
-#   4. Build in Docker (`docker compose run --rm build` from build/) on the
+#   5. Build in Docker (`docker compose run --rm build` from build/) on the
 #      official Ubuntu LTS base (plan 074), or reuse an AppImage already under
 #      target/release/bundle/appimage/ — offered only when its
 #      .source-commit reads exactly the pinned HEAD; prompted once, default
 #      rebuild. A build from any other revision is rebuilt without prompting.
-#   5. Verify the chosen image was built on the official Dockerfile base,
+#   6. Verify the chosen image was built on the official Dockerfile base,
 #      then write SHA256SUMS.txt for the AppImage and its .versions.txt.
-#   6. Re-check: the tree must still be clean, HEAD still the pinned revision,
+#   7. Re-check: the tree must still be clean, HEAD still the pinned revision,
 #      and the chosen build's .source-commit must still read it — otherwise
 #      refuse, publish nothing.
-#   7. Publish: create the releases repo if it does not exist, then
-#      gh release create with the .AppImage, its .versions.txt and
-#      the checksums as assets (GitHub object storage, never committed — the
-#      repo clone stays light). Every gh call that writes comes after every
-#      refusal. A fresh build (not a reused one) is then
-#      offered for cleanup — keep on disk by default, or discard all four
-#      files.
+#   8. Publish: gh release create on the source repo, --target the pinned
+#      revision so the tag names the commit whose .source-commit was checked,
+#      with the .AppImage, its .versions.txt and the checksums as assets
+#      (GitHub object storage, never committed — the repo clone stays light).
+#      Every gh call that writes comes after every refusal. A fresh build
+#      (not a reused one) is then offered for cleanup — keep on disk by
+#      default, or discard all four files.
 #
 # Unlike the station, and unlike this script's own per-*app* release.sh
 # ancestor: the version comes from hub/Cargo.toml, the hub's own version —
 # there is no tfsapp.config.json here, the hub is not an app.
 #
-# The releases repo is fixed by build/releases-repo, not prompted for: the hub
+# The repo releases are published to is fixed by build/releases-repo — the
+# source repository itself, not prompted for: the hub
 # is one project with one release stream. A fork edits that file, which is
 # the shared source of truth read here
 # and by hub/build.rs (TFSAPP_RELEASES_REPO, for hub self-update in
 # release.rs) — resolved relative to this script's own directory so it works
 # from anywhere it's invoked from.
 #
-# Requires: gh, authenticated (`gh auth login`). Public releases repo only:
-# the eventual anonymous in-app update check carries no token, so a private
-# repo is out of scope.
+# Requires: gh, authenticated (`gh auth login`), and the source repo named by
+# build/releases-repo to exist and be public: the eventual anonymous in-app
+# update check carries no token, so a private repo can serve no updates, and
+# this script never creates the repo it publishes to.
 #
 # Usage: build/scripts/release.sh
 
@@ -120,7 +127,19 @@ gh auth status >/dev/null 2>&1 \
 
 REPO="$RELEASES_REPO"
 
-# --- Step 2: version guard --------------------------------------------------
+# --- Step 2: repo gate — exists and public, never created --------------------
+# The first GitHub read after gh auth status, which runs above. Releases
+# live on the source repo, which this script never creates: a missing repo
+# is a misconfigured build/releases-repo, and a private one cannot serve
+# the anonymous update check (no token). Both are refusals before anything
+# is written outside this machine.
+VISIBILITY="$(gh repo view "$REPO" --json visibility --jq .visibility 2>/dev/null)" \
+  || die "$REPO does not exist or is unreachable — fix build/releases-repo."
+if [[ "$VISIBILITY" != "PUBLIC" ]]; then
+  die "$REPO is not public — make the repository public, or fix build/releases-repo."
+fi
+
+# --- Step 3: version guard ---------------------------------------------------
 TAG="v$APP_VERSION"
 
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
@@ -128,7 +147,7 @@ if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
 fi
 echo "Releasing $TAG"
 
-# --- Step 3: changelog gate --------------------------------------------------
+# --- Step 4: changelog gate --------------------------------------------------
 # Hard prerequisite: CHANGELOG.md must exist at the repo root and carry a
 # level-2 heading for $APP_VERSION. The version has to come from a known,
 # predictable place — but not in one single spelling: "## 1.2.0", "## v1.2.0"
@@ -170,13 +189,13 @@ awk -v heading_re="$HEADING_RE" '
   found { print }
 ' "$CHANGELOG_FILE" >"$NOTES_FILE"
 
-# Provenance in the notes: which repository, which revision — the link a
-# release in a separate repo has to the source that produced it. Integrity,
+# Provenance in the notes: which repository, which revision — the link
+# between a published binary and the source that produced it. Integrity,
 # not authenticity (decision 004): the line names where the binary came
 # from; it signs nothing.
 printf '\nBuilt from %s@%s\n' "$REPO_SLUG" "$SHA" >>"$NOTES_FILE"
 
-# --- Step 4: build (or reuse) ------------------------------------------------
+# --- Step 5: build (or reuse) ------------------------------------------------
 OUTPUT_DIR="$ROOT_DIR/target/release/bundle/appimage"
 shopt -s nullglob
 existing=("$OUTPUT_DIR/TFSAppHub_${APP_VERSION}_"*.AppImage)
@@ -215,7 +234,7 @@ if [[ -z "${APPIMAGE:-}" ]]; then
   APPIMAGE="${appimage[0]}"
 fi
 
-# --- Step 5: checksums ------------------------------------------------------
+# --- Step 6: checksums ------------------------------------------------------
 # The compatibility record the build wrote beside the AppImage — the file a
 # user downloads from the same release to read its glibc floor (see README
 # "It does not start"). A release without it is undiagnosable, so a missing
@@ -259,7 +278,7 @@ SUMS="$OUTPUT_DIR/SHA256SUMS.txt"
 echo "Checksums:"
 cat "$SUMS"
 
-# --- Step 6: re-check before publishing --------------------------------------
+# --- Step 7: re-check before publishing --------------------------------------
 # The build ran with the tree live on disk; nothing may have moved it between
 # the provenance gate and now. Anything that did means the artifact no longer
 # corresponds to $SHA — refuse rather than publish.
@@ -275,24 +294,15 @@ if [[ "$recorded_chosen" != "$SHA" ]]; then
   die "the tree moved during the build — nothing published."
 fi
 
-# --- Step 7: publish --------------------------------------------------------
+# --- Step 8: publish --------------------------------------------------------
 # Every refusal is now behind us; from here on the script writes outside this
-# machine. The releases repo is created only now — creating it before a later
-# refusal would leave an empty repo behind a failed release.
-if gh repo view "$REPO" >/dev/null 2>&1; then
-  echo "Releases repo: $REPO (exists)"
-else
-  echo "Creating public releases repo $REPO ..."
-  gh repo create "$REPO" --public --add-readme \
-    --description "Downloads and release notes for TFSAppHub." \
-    || die "failed to create $REPO"
-fi
-
-# Release notes are exactly the section extracted by the changelog gate
-# (step 3) — --generate-notes can't work cross-repo, the releases repo has
-# none of this repo's commits.
+# machine. --target pins the tag to the revision the provenance gates checked:
+# without it, gh would tag the default branch's head, which only equals $SHA
+# because the gates require a pushed, in-sync HEAD.
+# Release notes are exactly the section extracted by the changelog gate.
 gh release create "$TAG" \
   --repo "$REPO" \
+  --target "$SHA" \
   --title "$TAG" \
   --notes-file "$NOTES_FILE" \
   "$APPIMAGE" "$VERSIONS" "$SUMS"
