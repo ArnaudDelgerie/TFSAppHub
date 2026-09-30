@@ -43,13 +43,13 @@ fn invoking_dir() -> Option<PathBuf> {
 /// safe here: nothing else in the test binary runs concurrently, and the
 /// fixture owns the whole window.
 #[cfg(test)]
-struct RedirectedOwd {
+pub(crate) struct RedirectedOwd {
     previous: Option<std::ffi::OsString>,
 }
 
 #[cfg(test)]
 impl RedirectedOwd {
-    fn point_at(path: &Path) -> Self {
+    pub(crate) fn point_at(path: &Path) -> Self {
         let previous = env::var_os("OWD");
         env::set_var("OWD", path);
         Self { previous }
