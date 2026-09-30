@@ -221,6 +221,18 @@ highest_glibc_requirement() {
   done < <(find "$root" -type f -print0) | sed 's/^GLIBC_//' | sort -Vu | tail -1
 }
 
+# The highest GLIBCXX version imported by bundled ELFs. Scan CXXABI versions
+# too, since they belong to the same host-provided libstdc++.so.6 ABI, but
+# report the GLIBCXX floor used in loader errors and compatibility checks.
+highest_glibcxx_requirement() {
+  local root="$1" file
+  while IFS= read -r -d '' file; do
+    file -b "$file" 2>/dev/null | grep -q ELF || continue
+    # Many ELFs use glibc but have no C++ imports; that is expected.
+    readelf -V "$file" 2>/dev/null | grep -oE '(GLIBCXX|CXXABI)_[0-9.]+' || true
+  done < <(find "$root" -type f -print0) | sed -n 's/^GLIBCXX_//p' | sort -Vu | tail -1
+}
+
 # Captured once, up front: piping a live `ldconfig -p` straight into an awk
 # that `exit`s on its first match closes the pipe while ldconfig is still
 # writing, which SIGPIPEs it — fatal under this script's `pipefail`. Reusing
@@ -413,6 +425,11 @@ for appimage in "${appimages[@]}"; do
     echo "No GLIBC_x.y symbol version found in any bundled ELF in $appimage — cannot record its glibc floor." >&2
     exit 1
   fi
+  glibcxx_floor="$(highest_glibcxx_requirement "$verify_root")"
+  if [[ -z "$glibcxx_floor" ]]; then
+    echo "No GLIBCXX symbol version found in any bundled ELF in $appimage — cannot record its C++ floor." >&2
+    exit 1
+  fi
   build_host_glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $NF}')"
   if [[ -z "$build_host_glibc" ]]; then
     echo "getconf GNU_LIBC_VERSION gave no version on the build host — cannot record it." >&2
@@ -432,6 +449,9 @@ for appimage in "${appimages[@]}"; do
     # it, every binary here fails in the dynamic loader before any of the
     # hub's own error handling can run.
     echo "glibc_floor=$glibc_floor"
+    # The lowest GLIBCXX symbol version the machine's libstdc++.so.6 must
+    # provide; an older copy fails in the loader before the hub starts.
+    echo "glibcxx_floor=$glibcxx_floor"
     for soname in "${FROZEN_SONAMES[@]}"; do
       resolve_library_version "$soname" "$verify_root"
     done
