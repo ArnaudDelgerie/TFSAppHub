@@ -376,6 +376,31 @@ fn a_directory_named_like_an_archive_is_refused_the_same_way() {
 }
 
 #[test]
+fn a_relative_directory_is_refused_at_the_invoking_directory() {
+    // Under the AppImage the process's cwd is the image's mount, where the
+    // typed `mydir` does not exist — `is_dir` read there answers the wrong
+    // question, so the directory check runs against the invoking directory
+    // (`owd`), and the refusal names the anchored path it found.
+    let root = tempfile::tempdir().expect("a temp dir");
+    project(&root.path().join("mydir"));
+    let scratch = tempfile::tempdir().expect("a scratch dir");
+    let _guard = crate::owd::RedirectedOwd::point_at(root.path());
+
+    let error = resolve(&classify("mydir"), None, scratch.path(), UNUSED_BASE_URL)
+        .expect_err("a directory typed relative to the invoking directory");
+
+    assert!(
+        matches!(error, SourceError::DirectoryNotASource { .. }),
+        "{error}"
+    );
+    let anchored = root.path().join("mydir");
+    assert!(
+        error.to_string().contains(&anchored.display().to_string()),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_source_that_cannot_be_installed_says_which_kind_of_problem_it_is() {
     let root = tempfile::tempdir().expect("a temp dir");
     project(root.path());

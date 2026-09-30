@@ -497,14 +497,10 @@ fn update_from_at(
         source,
     })?;
     let candidate = scratch.join("local.AppImage");
-    // The AppImage runtime changes cwd to its mount. OWD is the directory
-    // where the user invoked it, so relative --from paths must start there.
-    let process_cwd = std::env::current_dir().map_err(|error| HubUpdateError::Io {
-        path: source.to_path_buf(),
-        source: error,
-    })?;
-    let original_cwd = std::env::var_os("OWD").map(PathBuf::from);
-    let source_path = resolve_local_source(source, original_cwd.as_deref(), &process_cwd);
+    // Anchored at the invoking directory (`owd`) — the same rule as every
+    // other user-typed path: under the AppImage the process's cwd is the
+    // image's mount, so a relative `--from` path must start at `OWD`.
+    let source_path = crate::owd::resolve_argument(source);
     fs::copy(&source_path, &candidate).map_err(|error| HubUpdateError::Io {
         path: source_path,
         source: error,
@@ -537,14 +533,6 @@ fn update_from_at(
         return Ok(UpdateOutcome::Declined);
     }
     finish_update(paths, &appimage_target, &candidate, version, |_| {})
-}
-
-fn resolve_local_source(source: &Path, original_cwd: Option<&Path>, process_cwd: &Path) -> PathBuf {
-    if source.is_absolute() {
-        source.to_path_buf()
-    } else {
-        original_cwd.unwrap_or(process_cwd).join(source)
-    }
 }
 
 fn finish_update(

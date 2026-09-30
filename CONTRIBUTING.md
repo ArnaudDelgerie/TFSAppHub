@@ -117,7 +117,8 @@ release unprovenanced:
 - `gh auth login` — the release is published as GitHub release assets on the
   source repository itself; `build/releases-repo` names that repository and is
   the single source for both the upload destination and the repository baked
-  into the hub for its self-updates — **a fork edits that file**;
+  into the hub for its self-updates — **a fork edits that file**, which must
+  name the same repository as the branch's upstream remote;
 - a `## <version>` section in `CHANGELOG.md` matching `hub/Cargo.toml`'s
   version — the notes are taken from it and end with a
   `Built from <repo>@<sha>` line. That line is provenance, not authenticity:

@@ -208,6 +208,13 @@ pub fn resolve(
             resolve_local_archive(&crate::owd::resolve_argument(path), reference, scratch)
         }
         Origin::Unrecognised(path) => {
+            // Anchored here for the same reason as the LocalArchive arm
+            // above: under the AppImage the process's cwd is the image's
+            // mount, where a relative directory the user typed from the
+            // invoking directory does not exist — `is_dir` there would
+            // answer the wrong question and bury the `publish --local`
+            // hint under `UnrecognisedSource`.
+            let path = &crate::owd::resolve_argument(path);
             if path.is_dir() {
                 return Err(SourceError::DirectoryNotASource { path: path.clone() });
             }

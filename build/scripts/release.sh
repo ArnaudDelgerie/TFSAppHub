@@ -15,11 +15,14 @@ set -euo pipefail
 #      the branch's upstream; that HEAD is pinned as the revision this release
 #      is of. A dirty tree, an unpushed or detached HEAD is refused with the
 #      fix named — local and cheapest first, before any gh call.
-#   2. Repo gate: the source repo named by build/releases-repo must exist
-#      and be public — the anonymous update check carries no token, so a
-#      missing or private repo is a refusal, never something this script
-#      creates. The first GitHub read after gh auth status, which runs
-#      after every local check.
+#   2. Repo gate: build/releases-repo must name the upstream remote's
+#      owner/name — checked locally, with step 1's gates and before any gh
+#      call, because a mismatch would land the tag and the assets on a
+#      repository other than the one the commit was pushed to. The source
+#      repo it names must then exist and be public — the anonymous update
+#      check carries no token, so a missing or private repo is a refusal,
+#      never something this script creates. The first GitHub read after
+#      gh auth status, which runs after every local check.
 #   3. Version guard: tag = v<hub version>; stop if that release exists.
 #   4. Changelog gate: CHANGELOG.md must exist at the repo root with one of
 #      three spellings — "## <version>", "## v<version>", "## [<version>]" —
@@ -117,6 +120,18 @@ case "$REPO_URL" in
     ;;
 esac
 
+# --- Step 1b: the release repo is the source repo -----------------------------
+# Releases live on the source repo (plan 076): the tag and the assets must
+# land on the repository the pinned HEAD was pushed to, and a
+# build/releases-repo naming anywhere else would send them elsewhere.
+# Local, like step 1's gates, so it refuses before any gh call or build. A
+# fork that retargets both the file and its remote passes; only a mismatch
+# does not. Case-insensitive, the way GitHub itself treats owner names —
+# what matters is which repository, not its spelling.
+if [[ "${RELEASES_REPO,,}" != "${REPO_SLUG,,}" ]]; then
+  die "build/releases-repo names '$RELEASES_REPO', but the upstream remote '$UPSTREAM_REMOTE' is '$REPO_SLUG' — the release would land on a repository other than the one this commit is pushed to. Fix build/releases-repo or the remote, then release."
+fi
+
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
   die "Docker Compose is unavailable — install Docker with the Compose plugin and start the Docker service, then release."
 fi
@@ -128,7 +143,9 @@ gh auth status >/dev/null 2>&1 \
 REPO="$RELEASES_REPO"
 
 # --- Step 2: repo gate — exists and public, never created --------------------
-# The first GitHub read after gh auth status, which runs above. Releases
+# The first GitHub read after gh auth status, which runs above; the gate's
+# local half (build/releases-repo naming the upstream remote) already ran at
+# step 1b. Releases
 # live on the source repo, which this script never creates: a missing repo
 # is a misconfigured build/releases-repo, and a private one cannot serve
 # the anonymous update check (no token). Both are refusals before anything
