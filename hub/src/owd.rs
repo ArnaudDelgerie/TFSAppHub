@@ -8,8 +8,10 @@
 //! changing it, so that is where a user's relative path starts. A dev build
 //! has no `OWD` and its cwd is the user's own, so falling back to the
 //! process's cwd keeps the same behaviour outside an AppImage.
-//! `--update --from` (`hub_update.rs`) established the move; this module is
-//! the same rule for every other argument path.
+//!
+//! Every user-typed path resolves through [`resolve_argument`] — `--update
+//! --from` included, which read `OWD` on its own before this module existed:
+//! one rule, stated once here instead of a per-caller copy that could drift.
 
 use std::{
     env,
