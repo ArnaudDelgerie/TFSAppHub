@@ -27,8 +27,8 @@ set -euo pipefail
 #      target/release/bundle/appimage/ — offered only when its
 #      .source-commit reads exactly the pinned HEAD; prompted once, default
 #      rebuild. A build from any other revision is rebuilt without prompting.
-#   5. Checksums: SHA256SUMS.txt (integrity for the unsigned flow), covering
-#      the AppImage and its .versions.txt.
+#   5. Verify the chosen image was built on the official Dockerfile base,
+#      then write SHA256SUMS.txt for the AppImage and its .versions.txt.
 #   6. Re-check: the tree must still be clean, HEAD still the pinned revision,
 #      and the chosen build's .source-commit must still read it — otherwise
 #      refuse, publish nothing.
@@ -223,6 +223,22 @@ fi
 VERSIONS="${APPIMAGE%.AppImage}.versions.txt"
 [[ -f "$VERSIONS" ]] \
   || die "no $(basename "$VERSIONS") beside $(basename "$APPIMAGE") — build this version first (\`cd build && docker compose run --rm build\`), which writes the record, then release."
+
+# A matching .source-commit proves the revision, not the build environment:
+# a local `make build` can carry the same SHA and a newer glibc floor. Read
+# the official base from the Dockerfile so the April 2027 switch has one
+# source of truth. This checks build provenance at release time; it is not a
+# general GLIBC/GLIBCXX floor gate inside the build.
+BASE_IMAGE_DEFAULT="$(sed -nE 's/^ARG BASE_IMAGE=([^[:space:]]+)[[:space:]]*$/\1/p' "$ROOT_DIR/build/Dockerfile")"
+if [[ ! "$BASE_IMAGE_DEFAULT" =~ ^ubuntu:([0-9]{2}\.[0-9]{2})$ ]]; then
+  die "build/Dockerfile must have exactly one ARG BASE_IMAGE=ubuntu:YY.MM default for the official release."
+fi
+EXPECTED_BUILD_HOST_OS="Ubuntu ${BASH_REMATCH[1]}"
+BUILD_HOST_OS="$(sed -n 's/^build_host_os=//p' "$VERSIONS")"
+case "$BUILD_HOST_OS" in
+  "$EXPECTED_BUILD_HOST_OS"|"$EXPECTED_BUILD_HOST_OS".*|"$EXPECTED_BUILD_HOST_OS "*) ;;
+  *) die "AppImage build_host_os='${BUILD_HOST_OS:-<missing>}' differs from official base '$EXPECTED_BUILD_HOST_OS' ($BASE_IMAGE_DEFAULT). Rebuild with cd build && docker compose run --rm build; if the host built into the shared target/, run rm -rf target from the repo root first." ;;
+esac
 
 # Generated from inside target/release/bundle/appimage/ so the file records a
 # bare filename and not this machine's absolute path. Both assets are listed:

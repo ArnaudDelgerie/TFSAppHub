@@ -130,13 +130,15 @@ new_tree() {
 
   cp "$SCRIPTS_DIR/release.sh" "$TREE/build/scripts/release.sh"
   cp "$SCRIPTS_DIR/build-hub.sh" "$TREE/build/scripts/build-hub.sh"
+  cp "$SCRIPTS_DIR/../Dockerfile" "$TREE/build/Dockerfile"
 
   cat >"$TREE/build/scripts/fix-appimage-bundle.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 echo "fix-appimage-bundle $*" >>"$FAKE_BIN_LOG"
 for appimage in "$@"; do
-  printf 'glibc_floor=stub\n' >"${appimage%.AppImage}.versions.txt"
+  printf 'build_host_os=Ubuntu 22.04.5 LTS\nglibc_floor=stub\n' \
+    >"${appimage%.AppImage}.versions.txt"
 done
 EOF
   chmod +x "$TREE/build/scripts/release.sh" "$TREE/build/scripts/build-hub.sh" \
@@ -249,7 +251,7 @@ write_record() { # write_record <version> <revision> — a planted .source-commi
 }
 
 plant_versions() { # plant_versions <version> — a planted .versions.txt
-  printf 'glibc_floor=stub\n' \
+  printf 'build_host_os=Ubuntu 22.04.5 LTS\nglibc_floor=stub\n' \
     >"$TREE/target/release/bundle/appimage/TFSAppHub_${1}_amd64.versions.txt"
 }
 
@@ -437,6 +439,28 @@ case_reuse_when_record_matches_head() {
   case_result "a build recorded from HEAD is offered for reuse (y: no rebuild)"
 }
 
+case_reuse_refuses_non_official_build_base() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  plant_appimage "0.3.0" "host build"
+  plant_versions "0.3.0"
+  sed -i 's/^build_host_os=.*/build_host_os=Ubuntu 24.04.5 LTS/' \
+    "$TREE/target/release/bundle/appimage/TFSAppHub_0.3.0_amd64.versions.txt"
+  write_record "0.3.0" "$(tree_head)"
+  if run_release $'y\n'; then
+    echo "  assertion failed: release.sh published a reused host build" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names the actual and official bases" \
+      "build_host_os='Ubuntu 24\\.04\\.5 LTS'.*'Ubuntu 22\\.04'" "$CASE_DIR/run.err"
+    assert_match "the refusal names the Docker rebuild" \
+      'cd build && docker compose run --rm build' "$CASE_DIR/run.err"
+    assert_match "the refusal names the shared target cleanup" \
+      'rm -rf target' "$CASE_DIR/run.err"
+    assert_no_match "no release create" '^gh release create ' "$LOG"
+  fi
+  case_result "a reused AppImage from a non-official base is refused before publishing"
+}
+
 case_rebuild_when_record_differs_or_missing() {
   new_tree "0.3.0" "[0.3.0] - 2026-09-28"
   plant_appimage "0.3.0" "existing build"
@@ -615,6 +639,7 @@ main() {
   case_fresh_release_builds_in_docker
   case_release_notes_name_the_revision
   case_reuse_when_record_matches_head
+  case_reuse_refuses_non_official_build_base
   case_rebuild_when_record_differs_or_missing
   case_release_refuses_tree_moved_during_build
   case_release_attaches_three_assets
