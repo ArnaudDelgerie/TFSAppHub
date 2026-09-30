@@ -58,8 +58,9 @@ behind aside as a named rescue dump; `--update` checks the latest hub release's
 checksum and runs its AppImage with `--version` before replacing anything. A
 release that cannot run on this machine is refused with nothing changed.
 `--update --from <AppImage>` installs a local rebuild of the same or a newer
-version through that same swap, and revalidates any installed app whose PHP
-moved under it the next time it is used; `--rollback` undoes either kind of
+version through that same swap. After either one, any installed app whose PHP
+moved under the hub is revalidated the next time it is used; `--rollback`
+undoes either kind of
 hub update — the previous hub binary and the registry it recorded, both back
 exactly as they were, offline, in under a second. An app
 declaring `file_associations` appears in the file manager's "Open with" menu
