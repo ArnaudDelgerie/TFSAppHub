@@ -11,3 +11,6 @@ hub/resources/
 
 # Node
 node_modules/
+
+# Claude Code's local settings (not shared with contributors)
+.claude/
