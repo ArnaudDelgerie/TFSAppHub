@@ -53,11 +53,12 @@ const GITHUB_USER_AGENT: &str = "TFSAppHub-release-resolver";
 /// `release_tests.rs`, extended one layer up.
 pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// The hub's own releases repo — the value `build/releases-repo` publishes,
-/// baked in by `hub/build.rs` as `TFSAPP_RELEASES_REPO` so `release.sh`
-/// (publishing) and this constant (the hub's own `--update`, `../plan/020-
-/// hub-self-update-and-revalidation.md`) read one shared source of truth
-/// rather than two copies of the same string.
+/// The repo the hub's releases are read from — the source repository
+/// itself, named by `build/releases-repo` and baked in by `hub/build.rs` as
+/// `TFSAPP_RELEASES_REPO` so `release.sh` (publishing) and this constant
+/// (the hub's own `--update`, `../plan/020-hub-self-update-and-
+/// revalidation.md`) read one shared source of truth rather than two
+/// copies of the same string.
 pub const RELEASES_REPO: &str = env!("TFSAPP_RELEASES_REPO");
 
 /// Timeouts for a `releases/latest` or `releases/tags/<tag>` call — small

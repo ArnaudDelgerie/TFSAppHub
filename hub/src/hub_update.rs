@@ -386,7 +386,7 @@ fn update_at_after_anchor(
     let appimage_target =
         resolve_appimage_target(appimage_env).ok_or(HubUpdateError::NotPackaged)?;
 
-    // 2. Resolve latest from the releases repo; not newer → say so and exit 0.
+    // 2. Resolve latest from the source repo's releases; not newer → say so and exit 0.
     let release = release::fetch_latest_release_at(base_url, release::RELEASES_REPO)
         .map_err(HubUpdateError::Release)?;
     let (version, asset_name, asset_url, checksums_url) = match check(current, &release) {

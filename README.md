@@ -11,8 +11,8 @@ the hub and a Symfony project.
 
 ## Install
 
-Download the latest `TFSAppHub_<version>_amd64.AppImage` from the
-[releases repo](https://github.com/ArnaudDelgerie/TFSAppHub-releases/releases),
+Download the latest `TFSAppHub_<version>_amd64.AppImage` from this
+repository's [releases](https://github.com/ArnaudDelgerie/TFSAppHub/releases),
 make it executable, and use it — nothing else to install first:
 
 ```sh
@@ -102,9 +102,10 @@ built from — or, when reused, recorded from — exactly that revision, and the
 release notes end with a `Built from <repo>@<sha>` line naming it. That line is
 provenance, not authenticity: it says where the binary came from, and signs
 nothing. A fresh release build runs through Docker Compose on the official
-base; a same-commit AppImage can still be reused. A fork sets its public
-release repository in `build/releases-repo`, the single source for both the
-upload destination and the repository baked into the hub for self-updates.
+base; a same-commit AppImage can still be reused. Releases live on this
+repository itself, not a separate downloads repo: `build/releases-repo`
+names it, the single source for both the upload destination and the
+repository baked into the hub for self-updates. A fork edits that file.
 
 ### Prerequisites
 
@@ -148,7 +149,7 @@ than the version required by the release.
 
 Every release's floor is recorded beside it: download the matching
 `TFSAppHub_<version>_amd64.versions.txt` from the same
-[release](https://github.com/ArnaudDelgerie/TFSAppHub-releases/releases) and
+[release](https://github.com/ArnaudDelgerie/TFSAppHub/releases) and
 read its `glibc_floor` and `glibcxx_floor` lines. They are the lowest glibc
 version and `GLIBCXX` symbol version the machine's `libstdc++.so.6` must
 provide. Compare glibc with `ldd --version` (the number on its first line)
