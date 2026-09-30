@@ -75,16 +75,24 @@ fn probe(
     expected_name: &str,
     timeout: Duration,
 ) -> Result<semver::Version, ProbeError> {
+    // Anonymous files rather than pipes: nothing reads a pipe while the loop
+    // below waits, so a chatty image would block on a full one and pass for a
+    // timeout, and a grandchild keeping a pipe open (the AppImage runtime's
+    // FUSE daemon) would hold a read past the timeout.
+    let does_not_run = |error: io::Error| ProbeError::DoesNotRun(error.to_string());
+    let mut stdout_file = tempfile::tempfile().map_err(does_not_run)?;
+    let mut stderr_file = tempfile::tempfile().map_err(does_not_run)?;
     let mut child = Command::new(path)
         .arg("--version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .stdout(stdout_file.try_clone().map_err(does_not_run)?)
+        .stderr(stderr_file.try_clone().map_err(does_not_run)?)
         .spawn()
-        .map_err(|error| ProbeError::DoesNotRun(error.to_string()))?;
+        .map_err(does_not_run)?;
     let started = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -94,24 +102,30 @@ fn probe(
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(ProbeError::DoesNotRun(error.to_string()));
+                return Err(does_not_run(error));
             }
         }
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| ProbeError::DoesNotRun(error.to_string()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    };
+    let read_capped = |file: &mut fs::File| -> io::Result<Vec<u8>> {
+        use std::io::{Read, Seek};
+        file.rewind()?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    let stdout_bytes = read_capped(&mut stdout_file).map_err(does_not_run)?;
+    if !status.success() {
+        let stderr_bytes = read_capped(&mut stderr_file).map_err(does_not_run)?;
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         let detail = stderr.lines().take(3).collect::<Vec<_>>().join("; ");
         return Err(ProbeError::DoesNotRun(if detail.is_empty() {
-            output.status.to_string()
+            status.to_string()
         } else {
             detail
         }));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     let line = stdout.trim();
     let Some(version) = line
         .strip_prefix(expected_name)
@@ -333,7 +347,7 @@ pub(crate) fn update(
 /// deferred until the candidate has run, so probe failure changes no installed
 /// file. The registry snapshot lands before the binary swap, so a failure
 /// mid-swap never anchors a registry the new hub had
-/// already begun to rewrite; `$APPIMAGE` (9) is swapped last because a
+/// already begun to rewrite; `$APPIMAGE` (10) is swapped last because a
 /// launcher pointing at the stale `bin/tfsapp-hub` is the worse of the two
 /// possible partial failures (the plan's "Two files, not one").
 fn update_at(

@@ -92,6 +92,33 @@ fn probe_kills_a_slow_image() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn probe_keeps_the_error_of_a_chatty_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = stub_executable(
+        dir.path(),
+        "echo 'loader: missing library' >&2; head -c 200000 /dev/zero | tr '\\0' x >&2; exit 127",
+    );
+    assert!(matches!(
+        probe(&path, "TFSAppHub", Duration::from_secs(5)),
+        Err(ProbeError::DoesNotRun(detail)) if detail.starts_with("loader: missing library")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_does_not_wait_for_a_grandchild_holding_its_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = stub_executable(dir.path(), "(sleep 5 &); echo 'TFSAppHub 1.2.3'");
+    let started = std::time::Instant::now();
+    assert_eq!(
+        probe(&path, "TFSAppHub", Duration::from_secs(3)),
+        Ok(semver::Version::new(1, 2, 3))
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
 /// Start a `tiny_http` server that answers exactly one request with a JSON
 /// `releases/latest` body, then stops — mirrors `release_tests.rs`'s own
 /// `stub_once`, kept local rather than shared across two test modules for one
