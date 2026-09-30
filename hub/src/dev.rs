@@ -132,7 +132,10 @@ pub fn run(path: &str) -> i32 {
 /// required layout, so the first refusal to fire is the first thing a reader
 /// of that section would check too.
 pub fn resolve(project_path: &str) -> Result<LaunchSpec, DevError> {
-    let project_path = PathBuf::from(project_path);
+    // Anchored at the invoking directory (`owd`): under the AppImage the
+    // process's cwd is the image's own mount, so a relative `dev .` read
+    // against it would look for the project inside the AppImage.
+    let project_path = crate::owd::resolve_argument(&PathBuf::from(project_path));
     if !project_path.is_dir() {
         return Err(DevError::NotADirectory { path: project_path });
     }
