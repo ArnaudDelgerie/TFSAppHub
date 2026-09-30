@@ -54,11 +54,14 @@ local release explicitly, and replaces the installed version with it,
 snapshotting the database first and reverting code and database together if
 anything fails; `rollback <id>` undoes a successful update afterwards,
 putting the previous source and database back and setting the one being left
-behind aside as a named rescue dump; `--update` replaces the hub itself with
-its own latest release, verified against the release's checksums, and
-revalidates any installed app whose PHP moved under it the next time it is
-used; `--rollback` undoes that — the previous hub binary and the registry it
-recorded, both back exactly as they were, offline, in under a second. An app
+behind aside as a named rescue dump; `--update` checks the latest hub release's
+checksum and runs its AppImage with `--version` before replacing anything. A
+release that cannot run on this machine is refused with nothing changed.
+`--update --from <AppImage>` installs a local rebuild of the same or a newer
+version through that same swap, and revalidates any installed app whose PHP
+moved under it the next time it is used; `--rollback` undoes either kind of
+hub update — the previous hub binary and the registry it recorded, both back
+exactly as they were, offline, in under a second. An app
 declaring `file_associations` appears in the file manager's "Open with" menu
 for the types it names — including `inode/directory`, with the receiver's
 `directories` opt-in — and `open <id> -- <path>...` hands local paths to a
@@ -176,6 +179,16 @@ unsupported. `debian:12` is no longer suggested: its WebKitGTK is marked
 end-of-life with limited support in bookworm. From April 2027 the official
 base moves to `ubuntu:24.04`; rebuilding on Jammy after its standard support
 ends would freeze a WebKitGTK that no longer receives those fixes.
+
+Install the rebuilt AppImage with
+`tfsapp-hub --update --from <rebuilt AppImage>` (or run that command through
+your current AppImage). This also
+updates the copy used by desktop launchers and leaves an anchor for
+`--rollback`; replacing the downloaded file by hand does neither.
+
+If the hub starts but shows a blank or broken window after an update, run
+`tfsapp-hub --rollback` from a terminal. To check whether GPU rendering is
+involved, retry with `WEBKIT_DISABLE_DMABUF_RENDERER=1` in the environment.
 
 If the hub starts but microphone capture fails, check the installed app's
 `log/hub.log` for GStreamer element or plugin loading errors. The AppImage
