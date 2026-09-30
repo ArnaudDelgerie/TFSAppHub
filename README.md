@@ -99,9 +99,8 @@ release notes end with a `Built from <repo>@<sha>` line naming it. That line is
 provenance, not authenticity: it says where the binary came from, and signs
 nothing. A fresh release build runs through Docker Compose on the official
 base; a same-commit AppImage can still be reused. A fork sets its public
-release repository in `build/releases-repo`: `RELEASES_REPO` no longer
-overrides that file, so the upload destination agrees with the repository
-baked into the hub for self-updates.
+release repository in `build/releases-repo`, the single source for both the
+upload destination and the repository baked into the hub for self-updates.
 
 ### Prerequisites
 
