@@ -19,6 +19,8 @@
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -62,6 +64,70 @@ pub enum HubUpdateCheck<'a> {
 /// read.md`) reuses this rather than growing a second one.
 pub(crate) fn parse_tag_version(tag: &str) -> Result<semver::Version, semver::Error> {
     semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag))
+}
+
+/// Run an AppImage far enough to exercise its loader and all of its direct
+/// dependencies. The expected name comes from the running Tauri package info,
+/// which is also the source of our own `--version` output.
+#[allow(dead_code)] // Wired into the release pipeline in plan 075, step 2.
+fn probe(
+    path: &Path,
+    expected_name: &str,
+    timeout: Duration,
+) -> Result<semver::Version, ProbeError> {
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| ProbeError::DoesNotRun(error.to_string()))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProbeError::TimedOut);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProbeError::DoesNotRun(error.to_string()));
+            }
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| ProbeError::DoesNotRun(error.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().take(3).collect::<Vec<_>>().join("; ");
+        return Err(ProbeError::DoesNotRun(if detail.is_empty() {
+            output.status.to_string()
+        } else {
+            detail
+        }));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.trim();
+    let Some(version) = line
+        .strip_prefix(expected_name)
+        .and_then(|rest| rest.strip_prefix(' '))
+    else {
+        return Err(ProbeError::NotTheHub(line.to_string()));
+    };
+    semver::Version::parse(version).map_err(|_| ProbeError::NotTheHub(line.to_string()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Wired into the release pipeline in plan 075, step 2.
+enum ProbeError {
+    DoesNotRun(String),
+    TimedOut,
+    NotTheHub(String),
 }
 
 /// Compare `current` — the running hub's own version — against `release`,

@@ -1,14 +1,75 @@
-use std::fs;
+use std::{fs, path::Path, time::Duration};
 
 use super::{
-    anchor_state, check, resolve_appimage_target, update_at, update_at_after_anchor,
-    HubUpdateCheck, HubUpdateError, MissingAnchorHalf, UpdateOutcome,
+    anchor_state, check, probe, resolve_appimage_target, update_at, update_at_after_anchor,
+    HubUpdateCheck, HubUpdateError, MissingAnchorHalf, ProbeError, UpdateOutcome,
 };
 use crate::{
     hub_bin,
     paths::Paths,
     release::{fetch_latest_release_at, RELEASES_REPO},
 };
+
+#[cfg(unix)]
+fn stub_executable(dir: &Path, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("stub.AppImage");
+    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_reads_the_hub_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = stub_executable(dir.path(), "echo 'TFSAppHub 1.2.3'");
+    assert_eq!(
+        probe(&path, "TFSAppHub", Duration::from_secs(1)),
+        Ok(semver::Version::new(1, 2, 3))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_reports_loader_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = stub_executable(
+        dir.path(),
+        "echo \"version 'GLIBC_2.39' not found\" >&2; exit 127",
+    );
+    assert!(matches!(
+        probe(&path, "TFSAppHub", Duration::from_secs(1)),
+        Err(ProbeError::DoesNotRun(detail)) if detail.contains("GLIBC_2.39")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_rejects_another_name_and_a_missing_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = stub_executable(dir.path(), "echo 'AnotherHub 1.2.3'");
+    assert_eq!(
+        probe(&path, "TFSAppHub", Duration::from_secs(1)),
+        Err(ProbeError::NotTheHub("AnotherHub 1.2.3".into()))
+    );
+    let path = stub_executable(dir.path(), "echo 'TFSAppHub'");
+    assert_eq!(
+        probe(&path, "TFSAppHub", Duration::from_secs(1)),
+        Err(ProbeError::NotTheHub("TFSAppHub".into()))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_kills_a_slow_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = stub_executable(dir.path(), "sleep 2; echo 'TFSAppHub 1.2.3'");
+    assert_eq!(
+        probe(&path, "TFSAppHub", Duration::from_millis(30)),
+        Err(ProbeError::TimedOut)
+    );
+}
 
 /// Start a `tiny_http` server that answers exactly one request with a JSON
 /// `releases/latest` body, then stops — mirrors `release_tests.rs`'s own
