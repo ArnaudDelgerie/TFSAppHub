@@ -137,7 +137,7 @@ new_tree() {
 set -euo pipefail
 echo "fix-appimage-bundle $*" >>"$FAKE_BIN_LOG"
 for appimage in "$@"; do
-  printf 'build_host_os=Ubuntu 22.04.5 LTS\nglibc_floor=stub\n' \
+  printf 'build_host_os=Ubuntu 22.04.5 LTS\nbuild_host_glibc=2.35\nglibc_floor=2.35\n' \
     >"${appimage%.AppImage}.versions.txt"
 done
 EOF
@@ -251,7 +251,7 @@ write_record() { # write_record <version> <revision> — a planted .source-commi
 }
 
 plant_versions() { # plant_versions <version> — a planted .versions.txt
-  printf 'build_host_os=Ubuntu 22.04.5 LTS\nglibc_floor=stub\n' \
+  printf 'build_host_os=Ubuntu 22.04.5 LTS\nbuild_host_glibc=2.35\nglibc_floor=2.35\n' \
     >"$TREE/target/release/bundle/appimage/TFSAppHub_${1}_amd64.versions.txt"
 }
 
@@ -461,6 +461,26 @@ case_reuse_refuses_non_official_build_base() {
   case_result "a reused AppImage from a non-official base is refused before publishing"
 }
 
+case_reuse_refuses_floor_above_build_host() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  plant_appimage "0.3.0" "mixed build"
+  plant_versions "0.3.0"
+  sed -i 's/^glibc_floor=.*/glibc_floor=2.39/' \
+    "$TREE/target/release/bundle/appimage/TFSAppHub_0.3.0_amd64.versions.txt"
+  write_record "0.3.0" "$(tree_head)"
+  if run_release $'y\n'; then
+    echo "  assertion failed: release.sh published an image with host-built objects" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names both glibc values" \
+      "build_host_glibc='2\\.35'.*glibc_floor='2\\.39'" "$CASE_DIR/run.err"
+    assert_match "the refusal names target cleanup and the Docker rebuild" \
+      'rm -rf target, then cd build && docker compose run --rm build' "$CASE_DIR/run.err"
+    assert_no_match "no release create" '^gh release create ' "$LOG"
+  fi
+  case_result "an image requiring newer glibc than its build host is refused"
+}
+
 case_rebuild_when_record_differs_or_missing() {
   new_tree "0.3.0" "[0.3.0] - 2026-09-28"
   plant_appimage "0.3.0" "existing build"
@@ -640,6 +660,7 @@ main() {
   case_release_notes_name_the_revision
   case_reuse_when_record_matches_head
   case_reuse_refuses_non_official_build_base
+  case_reuse_refuses_floor_above_build_host
   case_rebuild_when_record_differs_or_missing
   case_release_refuses_tree_moved_during_build
   case_release_attaches_three_assets

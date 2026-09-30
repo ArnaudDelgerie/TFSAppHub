@@ -240,6 +240,17 @@ case "$BUILD_HOST_OS" in
   *) die "AppImage build_host_os='${BUILD_HOST_OS:-<missing>}' differs from official base '$EXPECTED_BUILD_HOST_OS' ($BASE_IMAGE_DEFAULT). Rebuild with cd build && docker compose run --rm build; if the host built into the shared target/, run rm -rf target from the repo root first." ;;
 esac
 
+# The container's OS record alone cannot reveal object files Cargo reused
+# from a host build in the shared target/. Such an image can require newer
+# glibc symbols than the container itself provides.
+BUILD_HOST_GLIBC="$(sed -n 's/^build_host_glibc=//p' "$VERSIONS")"
+GLIBC_FLOOR="$(sed -n 's/^glibc_floor=//p' "$VERSIONS")"
+if [[ -z "$BUILD_HOST_GLIBC" || -z "$GLIBC_FLOOR" ]] \
+   || { [[ "$GLIBC_FLOOR" != "$BUILD_HOST_GLIBC" ]] \
+        && [[ "$(printf '%s\n' "$BUILD_HOST_GLIBC" "$GLIBC_FLOOR" | sort -V | tail -n1)" == "$GLIBC_FLOOR" ]]; }; then
+  die "AppImage build_host_glibc='${BUILD_HOST_GLIBC:-<missing>}' and glibc_floor='${GLIBC_FLOOR:-<missing>}' are inconsistent with a build on that host. From the repo root run rm -rf target, then cd build && docker compose run --rm build."
+fi
+
 # Generated from inside target/release/bundle/appimage/ so the file records a
 # bare filename and not this machine's absolute path. Both assets are listed:
 # the record is downloaded and checked against the same sums as the AppImage.
