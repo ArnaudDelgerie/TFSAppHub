@@ -18,7 +18,8 @@ set -euo pipefail
 #   2. Repo gate: the source repo named by build/releases-repo must exist
 #      and be public — the anonymous update check carries no token, so a
 #      missing or private repo is a refusal, never something this script
-#      creates. The first gh call, after every local check.
+#      creates. The first GitHub read after gh auth status, which runs
+#      after every local check.
 #   3. Version guard: tag = v<hub version>; stop if that release exists.
 #   4. Changelog gate: CHANGELOG.md must exist at the repo root with one of
 #      three spellings — "## <version>", "## v<version>", "## [<version>]" —
@@ -127,11 +128,11 @@ gh auth status >/dev/null 2>&1 \
 REPO="$RELEASES_REPO"
 
 # --- Step 2: repo gate — exists and public, never created --------------------
-# The first gh call, after every local check. Releases live on the source
-# repo, which this script never creates: a missing repo is a misconfigured
-# build/releases-repo, and a private one cannot serve the anonymous update
-# check (no token). Both are refusals before anything is written outside
-# this machine.
+# The first GitHub read after gh auth status, which runs above. Releases
+# live on the source repo, which this script never creates: a missing repo
+# is a misconfigured build/releases-repo, and a private one cannot serve
+# the anonymous update check (no token). Both are refusals before anything
+# is written outside this machine.
 VISIBILITY="$(gh repo view "$REPO" --json visibility --jq .visibility 2>/dev/null)" \
   || die "$REPO does not exist or is unreachable — fix build/releases-repo."
 if [[ "$VISIBILITY" != "PUBLIC" ]]; then
