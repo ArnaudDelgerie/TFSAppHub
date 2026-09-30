@@ -72,9 +72,11 @@ pretended. The design record and the plan queue live under the git-ignored
 
 ## Build
 
-Building the hub yourself — as opposed to downloading it, see "Install" above
-— is only for contributing to the hub itself, or for producing an AppImage
-against a lower glibc floor than the published release (see "It does not
+Official releases are built by `make release` in Docker on the oldest Ubuntu
+LTS still in standard support: `ubuntu:22.04` now, then `ubuntu:24.04` from
+April 2027. This pins the release's native ABI floor to a supported base.
+Local development builds can use the host toolchain; a user who needs to
+rebuild the release can use the Docker command below (see "It does not
 start").
 
 ```sh
@@ -90,19 +92,20 @@ and nothing works without them. (`make sidecar` and `make composer` fetch one
 half each, if you want them separately.) `make build` refuses up front if
 `make resources` has not run.
 
-Releasing the hub (`build/scripts/release.sh`, see the Makefile) accepts only a
+Releasing the hub (`make release`, see `build/scripts/release.sh`) accepts only a
 clean tree whose `HEAD` is pushed to its upstream: the released AppImage is
 built from — or, when reused, recorded from — exactly that revision, and the
 release notes end with a `Built from <repo>@<sha>` line naming it. That line is
 provenance, not authenticity: it says where the binary came from, and signs
-nothing.
+nothing. A fresh release build runs through Docker Compose on the official
+base; a same-commit AppImage can still be reused.
 
 ### Prerequisites
 
 **To *use* the hub: nothing** — see "Install" above. Everything below is only
 for building it.
 
-- **A local toolchain, the primary and fully-supported path:**
+- **A local toolchain for development builds:**
   - **Rust** + the Tauri CLI (`cargo install tauri-cli`, or `cargo tauri` v2).
   - Linux build deps for Tauri v2 / WebKitGTK (`libwebkit2gtk-4.1-dev`,
     `libgtk-3-dev`, `libdbus-1-dev`, `librsvg2-dev`, `build-essential`, `curl`,
@@ -121,49 +124,54 @@ for building it.
     never contacts a Secret Service. `make keyring-integration` starts an
     *ephemeral*, throwaway provider, never your real login keyring. Neither is
     the GNOME desktop, and neither is a runtime dependency of the packaged hub.
-- **Or, a second door onto the exact same build: only Docker.**
+- **Docker for official releases and self-builds without a local toolchain.**
   `cd build && docker compose run --rm build` installs everything above
   inside a container and runs `make build` there — nothing in the recipe
-  is container-only, and nothing under `build/scripts/` or in Rust knows the
-  container exists. `docker compose run --rm check` runs `make check` the
-  same way. See `build/compose.yaml`'s own header for the uid/gid, FUSE and
-  caching details, and "It does not start" for `BASE_IMAGE`, the one
-  container-only knob.
+  is container-only inside the build itself. `BASE_IMAGE` defaults to the
+  official `ubuntu:22.04` base. `docker compose run --rm check` runs
+  `make check` the same way. See `build/compose.yaml`'s own header for the
+  uid/gid, FUSE and caching details.
 
 ## It does not start
 
 You downloaded the AppImage, made it executable, and running it does
-nothing — or the terminal prints something about a version of `GLIBC` it
-cannot find. That is the dynamic loader failing before a single line of the
-hub's own code runs, so there is no error message for the hub to improve:
-the release was linked against a glibc newer than the one on your machine.
+nothing — or the terminal prints something about a version of `GLIBC`,
+`GLIBCXX`, or `CXXABI` it cannot find. That is the dynamic loader failing
+before a single line of the hub's own code runs: a system library is older
+than the version required by the release.
 
 Every release's floor is recorded beside it: download the matching
 `TFSAppHub_<version>_amd64.versions.txt` from the same
 [release](https://github.com/ArnaudDelgerie/TFSAppHub-releases/releases) and
-read its `glibc_floor` line — the lowest glibc that build can possibly run
-on. Compare it against your own with `ldd --version` (the number on its first
-line) or `getconf GNU_LIBC_VERSION`. If yours is lower, that AppImage will
-never start on your machine, whatever else you try.
+read its `glibc_floor` and `glibcxx_floor` lines. They are the lowest glibc
+version and `GLIBCXX` symbol version the machine's `libstdc++.so.6` must
+provide. Compare glibc with `ldd --version` (the number on its first line)
+or `getconf GNU_LIBC_VERSION`. A machine below either floor cannot start that
+AppImage. `CXXABI` symbols are provided by the same C++ runtime.
 
-The fix is one command, with only Docker installed — no Rust, no Tauri CLI,
-nothing this repo's own build normally needs:
+To replace an older AppImage built on a newer host, rebuild on the official
+base with Git and Docker installed — no local Rust or Tauri CLI is needed:
 
 ```sh
 git clone https://github.com/ArnaudDelgerie/TFSAppHub.git
 cd TFSAppHub/build
-BASE_IMAGE=debian:12 docker compose run --rm build
+docker compose run --rm build
 ```
 
-`BASE_IMAGE` is a plain Docker image reference — pick one whose own glibc is
-at or below yours. `debian:12` (glibc 2.36) and `ubuntu:24.04` (glibc 2.39,
-this project's own default) are the two bases this repo has actually built
-against; either is a safe starting guess older than most machines still in
-use. The result lands at
+The default `BASE_IMAGE=ubuntu:22.04` is the official release base, whatever
+your distribution. It is the oldest base that provides `webkit2gtk-4.1`;
+its measured floors are glibc 2.35 and `GLIBCXX_3.4.30`. The result lands at
 `TFSAppHub/target/release/bundle/appimage/TFSAppHub_<version>_amd64.AppImage`,
-with its own `.versions.txt` recording the lower floor it now needs — chasing
-the *lowest possible* base is deliberately not this project's job (see
-`ARCHITECTURE.md`'s "Packaging"); one older base, chosen by you, is.
+with its own `.versions.txt`. A machine below either Jammy floor needs newer
+system libraries; rebuilding on the same base cannot lower those floors.
+The project pins this base by its support rule
+instead of chasing the lowest possible ABI on every build. Custom
+`BASE_IMAGE` values must be Debian/Ubuntu family images: the build uses
+`apt-get` and records package versions with `dpkg`. Non-Debian bases are
+unsupported. `debian:12` is no longer suggested: its WebKitGTK is marked
+end-of-life with limited support in bookworm. From April 2027 the official
+base moves to `ubuntu:24.04`; rebuilding on Jammy after its standard support
+ends would freeze a WebKitGTK that no longer receives those fixes.
 
 If the hub starts but microphone capture fails, check the installed app's
 `log/hub.log` for GStreamer element or plugin loading errors. The AppImage

@@ -2,12 +2,22 @@
 
 ## 0.4.0
 
+Official releases now build in Docker on Ubuntu 22.04, the oldest Ubuntu LTS
+still in standard support. The AppImage's measured glibc floor is 2.35, so
+it can run on Ubuntu 22.04, Debian 12, Mint 21 and compatible newer systems
+whose C++ runtime also provides its required symbols. The adjacent
+`.versions.txt` now records `glibcxx_floor=3.4.30` alongside `glibc_floor`,
+making the libstdc++ requirement visible. The repair pass leaves graphics
+driver libraries to the host. The official base moves to Ubuntu 24.04 when
+Jammy's standard support ends in April 2027.
+
 The AppImage now bundles the build host's GStreamer plugins and helpers, so
 apps that declare microphone access can record inside the AppImage. The build
 refuses an image missing a capture plugin and records its frozen GStreamer
 version beside the artifact. Bundling raised the initial image size by
 86,482,944 bytes against the 0.4.0 candidate measured before this change;
-the final repaired image is 226,601,464 bytes.
+the local Ubuntu 24.04 image was 226,601,464 bytes. The official Jammy
+image is 151,558,648 bytes with 103 plugins.
 
 An app's frontend build output now ships in its release archive without being
 committed: `"build_outputs": ["public/build"]` in `tfsapp.config.json` names
