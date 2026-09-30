@@ -2,6 +2,7 @@
 name = "tfsapp-hub"
 version = "0.4.0"
 description = "One binary that installs and runs several Symfony desktop apps from their installed source."
+license = "MIT"
 authors = ["TFSAppHub"]
 edition = "2021"
 

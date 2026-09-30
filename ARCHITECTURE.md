@@ -1,6 +1,9 @@
 # Architecture
 
-How TFSAppHub is built, and why it is built that way. The companion document is
+How TFSAppHub is built, and why it is built that way. This document is for
+**contributors to the hub itself**: if you are writing an app for the hub,
+[`CONTRACT.md`](CONTRACT.md) is your document, and if you are installing and
+running apps, [`README.md`](README.md) is. The companion document is
 [`CONTRACT.md`](CONTRACT.md), which states what the hub and an app promise each
 other; nothing here is a promise to an app, and anything an app could depend on
 belongs there instead.
@@ -74,9 +77,9 @@ deferred rather than pretended away.
 
 ## Open questions
 
-The queued design work lives in `.project/plan/000-index.md` rather than here, so
-that one list stays authoritative. The structural decisions that outrank
-everything else are in `.project/decision/`.
+Queued design work and the structural decisions that outrank everything here
+live in this project's local design notes rather than in this document, so this
+file stays a snapshot of what is built, not a backlog.
 
 The one worth naming here, because it shapes what is above rather than extending
 it: the hub is a single point of failure for every installed app, and nothing in

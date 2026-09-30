@@ -1,143 +1,94 @@
 # TFSAppHub
 
-One AppImage that installs, updates and runs **several** Symfony desktop apps
-from their source, using its own bundled FrankenPHP as the PHP interpreter.
+One program installs, updates and runs several Symfony desktop apps on your
+machine: **one host runs every app.** `TFSAppHub` is a single AppImage that
+carries its own PHP interpreter (FrankenPHP) and its own Composer; an app is
+just a Symfony project. `tfsapp-hub install github:owner/repo` installs one,
+and `tfsapp-hub open myapp` gives it a real window of its own, with its own
+data directory and its own cookie store — two apps open side by side stay
+isolated.
 
-Since **2026-08-08 it is the only host**. `TFSAppWorkstation`, which used to build
-one standalone AppImage per app and to host the dev loop, is archived; the dev loop
-moved here (`tfsapp-hub dev <path>`). The point of that move: writing
-a TFSApp will need no Rust toolchain, no Tauri CLI and no GTK dev libraries — just
-the hub and a Symfony project.
+The fragile native half — interpreter, webview, the glibc floor — is built
+once, here. Everything an app adds afterwards is pure PHP with no ABI surface:
+writing one needs no Rust toolchain, no Tauri CLI and no GTK development
+libraries, just the hub and a Symfony project. See
+["Make your first app"](#make-your-first-app).
 
 ## Install
 
 Download the latest `TFSAppHub_<version>_amd64.AppImage` from this
 repository's [releases](https://github.com/ArnaudDelgerie/TFSAppHub/releases),
-make it executable, and use it — nothing else to install first:
+make it executable, and run it:
 
 ```sh
-chmod +x TFSAppHub_*.AppImage
-./TFSAppHub_*.AppImage install github:owner/repo
-# or, for a project you have locally:
-./TFSAppHub_*.AppImage publish path/to/project --local out/
-./TFSAppHub_*.AppImage install out/<name>-<version>/<name>-<version>.tar.gz
-./TFSAppHub_*.AppImage open myapp
+chmod +x TFSAppHub_*_amd64.AppImage
+./TFSAppHub_*_amd64.AppImage --version
 ```
 
 That is the whole prerequisite list: no Rust, no PHP, no Tauri CLI, no GTK
 development libraries. The AppImage carries its own FrankenPHP and its own
 Composer, and installs and runs every app with them — see "Trust posture"
 below for what that means. If it does not start on your machine, see
-"It does not start".
+["It does not start"](#it-does-not-start).
 
-The fragile native half (FrankenPHP, WebKitGTK, the glibc floor) is built once;
-everything added afterwards is pure PHP and has no ABI surface. N binaries
-collapse to 1, `composer install` *is* the compatibility manifest — it runs with
-the very interpreter that will later serve the app — and per-app update
-resolves a new release without rebuilding the native half.
-
-Status: **it is packaged, and it installs, and it opens.** `make build`
-produces a self-contained AppImage from a machine with nothing else built —
-`install` installs a release, from a forge or from a local archive
-`publish --local` wrote, resolves its dependencies with the
-bundled PHP, runs its lifecycle commands, registers it and — by default —
-writes it a `.desktop` entry, so it opens from the shell's own grid and
-search under its own name and icon, with no terminal and the hub not
-otherwise running; `open` gives that app a real window on its own FrankenPHP,
-with its own data directory and its own cookie store, so two apps open side
-by side stay isolated; `list` and `remove` close the loop, the latter taking
-the entry with it; `run <id> <alias>` runs one of an app's own declared
-`bin/console` commands in the foreground, alongside `run --stop`/
-`run --replace` to release one without a manual `kill`; `update <id>`
-re-resolves an app's own source, or `update <id> <archive.tar.gz>` supplies a
-local release explicitly, and replaces the installed version with it,
-snapshotting the database first and reverting code and database together if
-anything fails; `rollback <id>` undoes a successful update afterwards,
-putting the previous source and database back and setting the one being left
-behind aside as a named rescue dump; `--update` checks the latest hub release's
-checksum and runs its AppImage with `--version` before replacing anything. A
-release that cannot run on this machine is refused with nothing changed.
-`--update --from <AppImage>` installs a local rebuild of the same or a newer
-version through that same swap. After either one, any installed app whose PHP
-moved under the hub is revalidated the next time it is used; `--rollback`
-undoes either kind of
-hub update — the previous hub binary and the registry it recorded, both back
-exactly as they were, offline, in under a second. An app
-declaring `file_associations` appears in the file manager's "Open with" menu
-for the types it names — including `inode/directory`, with the receiver's
-`directories` opt-in — and `open <id> -- <path>...` hands local paths to a
-declared receiver, files for any receiver and directories for one that opted
-in: a queue in the hub process, a targeted notification, an
-explicit acknowledgement; replayable until acknowledged, never durable
-across a crash. Git
-sources are recognised and refused with a message saying so, rather than
-pretended. The design record and the plan queue live under the git-ignored
-`.project/`.
-
-## Build
-
-Official releases are built by `make release` in Docker on the oldest Ubuntu
-LTS still in standard support: `ubuntu:22.04` now, then `ubuntu:24.04` from
-April 2027. This pins the release's native ABI floor to a supported base.
-Local development builds can use the host toolchain; a user who needs to
-rebuild the release can use the Docker command below (see "It does not
-start").
+The commands below assume it is reachable as `tfsapp-hub` — rename the file,
+or symlink it:
 
 ```sh
-make resources # fetch the pinned FrankenPHP and composer.phar into hub/resources (once)
-make check     # cargo fmt --check, clippy -D warnings, unit tests, shellcheck, release-chain test
-make keyring-integration # explicit production Secret Service smoke; needs dbus + gnome-keyring
-make build     # the hub's own AppImage, target/release/bundle/appimage/
+ln -s "$(pwd)/TFSAppHub_"*"_amd64.AppImage" ~/.local/bin/tfsapp-hub
 ```
 
-`make resources` is not only a packaging step: the hub installs *and* runs every
-app with that interpreter and that Composer, so no system-wide PHP is required —
-and nothing works without them. (`make sidecar` and `make composer` fetch one
-half each, if you want them separately.) `make build` refuses up front if
-`make resources` has not run.
+## Use
 
-Releasing the hub (`make release`, see `build/scripts/release.sh`) accepts only a
-clean tree whose `HEAD` is pushed to its upstream: the released AppImage is
-built from — or, when reused, recorded from — exactly that revision, and the
-release notes end with a `Built from <repo>@<sha>` line naming it. That line is
-provenance, not authenticity: it says where the binary came from, and signs
-nothing. A fresh release build runs through Docker Compose on the official
-base; a same-commit AppImage can still be reused. Releases live on this
-repository itself, not a separate downloads repo: `build/releases-repo`
-names it, the single source for both the upload destination and the
-repository baked into the hub for self-updates. A fork edits that file.
+`tfsapp-hub --help` prints every command, with its options. The everyday
+shape:
 
-### Prerequisites
+**Install an app**, from a forge release or from a local archive:
 
-**To *use* the hub: nothing** — see "Install" above. Everything below is only
-for building it.
+```sh
+tfsapp-hub install github:owner/repo
+tfsapp-hub publish path/to/project --local out/     # write a release archive locally (out/ must exist)
+tfsapp-hub install out/<name>-<version>/<name>-<version>.tar.gz
+```
 
-- **A local toolchain for development builds:**
-  - **Rust** + the Tauri CLI (`cargo install tauri-cli`, or `cargo tauri` v2).
-  - Linux build deps for Tauri v2 / WebKitGTK (`libwebkit2gtk-4.1-dev`,
-    `libgtk-3-dev`, `libdbus-1-dev`, `librsvg2-dev`, `build-essential`, `curl`,
-    `pkg-config`, `git`, `patchelf`, and `file` — `appimagetool` shells out to
-    it, and so does this repo's own `fix-appimage-bundle.sh`).
-  - GStreamer plugins from the build host: `gstreamer1.0-plugins-base`,
-    `gstreamer1.0-plugins-good`, and either `gstreamer1.0-pipewire` or
-    `gstreamer1.0-pulseaudio`. The AppImage freezes the installed plugins.
-  - **curl** (to fetch the FrankenPHP sidecar and composer.phar).
-  - **rustfmt** and **clippy** (`rustup component add rustfmt clippy`) and
-    **shellcheck** — needed for `make check`. A missing Rust component fails
-    with rustup's own `rustup component add …` message.
-  - **`gnome-keyring`** (the `gnome-keyring-daemon` binary) and **`dbus`**
-    (`dbus-run-session`) — **test-only**, needed only for the explicit
-    production-backend integration check. `make check` needs neither one and
-    never contacts a Secret Service. `make keyring-integration` starts an
-    *ephemeral*, throwaway provider, never your real login keyring. Neither is
-    the GNOME desktop, and neither is a runtime dependency of the packaged hub.
-- **Docker for official releases and self-builds without a local toolchain.**
-  `cd build && docker compose run --rm build` installs everything above
-  inside a container and runs `make build` there — nothing in the recipe
-  is container-only inside the build itself. `BASE_IMAGE` defaults to the
-  official `ubuntu:22.04` base. `docker compose run --rm check` runs
-  `make check` the same way. See `build/compose.yaml`'s own header for the
-  uid/gid, FUSE and caching details.
+Install is a snapshot of one release: nothing edits the installed tree until an
+explicit `update`, which is what makes `composer install`, migrations and a
+warm persistent cache meaningful. By default the hub also writes the app a
+`.desktop` entry (`--no-desktop-entry` opts out), so it opens from your
+shell's grid and search under its own name and icon — no terminal, the hub not
+otherwise running. A plain `git:` source is recognised and refused with a
+message saying so, rather than pretended.
+
+**Apps:**
+
+- `list` — the installed apps.
+- `open <id>` — open an installed app's window; `open <id> -- <path>...`
+  hands local paths to an app that declared a receiver. An app declaring
+  `file_associations` also appears in the file manager's "Open with" menu for
+  the types it names.
+- `update <id>` — re-resolve the app's source and replace the installed
+  version; `update <id> <archive.tar.gz>` supplies a local release instead.
+  The database is snapshotted first, and code and database revert together if
+  anything fails. `rollback <id>` undoes a successful update afterwards,
+  putting the previous source and database back and setting the version left
+  aside as a named rescue dump.
+- `run <id> <alias>` — run one of the app's own declared commands in the
+  foreground; `run --stop` / `run --replace` release it without a manual kill.
+- `export <id> <path>` / `import <id> <path>` — an app's data to and from a
+  `.tar.gz`, between machines.
+- `remove <id>` — uninstall, desktop entry with it; `--purge` (or
+  `purge <identifier>` later, on leftover data) also drops its data.
+
+**The hub itself:**
+
+- `--update` — update the hub to the latest release. The release's checksum is
+  checked and the new AppImage is run with `--version` before anything is
+  replaced; a release that cannot run on this machine is refused with nothing
+  changed. `--update --from <AppImage>` installs a local rebuild of the same
+  or a newer version through the same swap.
+- `--rollback` — undo the last hub update: the previous hub binary and the
+  registry it recorded, both back exactly as they were, offline, in under a
+  second.
 
 ## It does not start
 
@@ -199,43 +150,6 @@ audio libraries and the audio server come from your machine. A Docker build
 on an older compatible base can avoid newer symbol requirements; it cannot
 provide a missing host audio service or device.
 
-## Writing an app for it
-
-An app is a Symfony project with three files and one route: `bin/console`,
-`public/index.php`, a `tfsapp.config.json` manifest, and `GET /healthz` → `200`.
-No Rust, no Tauri CLI, no GTK development libraries, no base class to extend.
-
-[**`CONTRACT.md`**](CONTRACT.md) is what the hub and an app promise each other,
-and it is canonical — there is no second host to keep it in step with. Apps use
-the [TFSAppBundle](https://github.com/ArnaudDelgerie/TFSAppBundle) Symfony bundle
-for the PHP side of it.
-
-[**`ARCHITECTURE.md`**](ARCHITECTURE.md) is how the hub itself works: the crate
-boundary, runtime identity, the install pipeline, the launch sequence, the
-bundled interpreter.
-
-Install here is a **snapshot of a release**: nothing edits the installed tree
-until an explicit `update`, which is what makes `composer install`, migrations
-and a warm persistent cache meaningful — and exactly what makes it useless as a
-dev loop. The dev loop is its own mode (`dev <path>`), and it serves
-live source **in place**: it watches nothing, compiles nothing and builds no
-assets. Your build tool already has a `--watch`.
-
-### Where the station went
-
-[TFSAppWorkstation](https://github.com/ArnaudDelgerie/TFSAppWorkstation) built
-one standalone AppImage per app and hosted the dev loop. It was archived on
-2026-08-08 and this repo took both jobs. The reasoning is written once, in
-`.project/decisions/001-single-host.md`; the short version is that a second host
-cost a permanent parity tax and its own compatibility problem per app, while the
-thing it was protecting — a single double-clickable file — is recoverable as a
-*packaging mode* of the hub rather than as a second program.
-
-This repo is a fresh start, not a fork: the reusable Rust modules were copied
-over and adapted. The modules that diverge — identity resolution above all —
-could not serve both identity models (baked at build vs resolved at runtime) in
-one tree.
-
 ## Trust posture
 
 Installing an app runs a third party's PHP, Composer scripts included, with the
@@ -249,8 +163,7 @@ For a developer audience this is exactly `composer require`, and pretending
 otherwise would be worse than saying it.
 
 Checking `SHA256SUMS.txt` establishes download integrity, not publisher
-authenticity; choosing which source or repository to trust remains the user's
-call ([decision 004](.project/decision/004-integrity-not-authenticity.md)).
+authenticity; which source or repository to trust remains your call.
 
 ### Stored secrets are namespaced, not isolated
 
@@ -276,8 +189,7 @@ would not close this gap either: an installed app already runs with the
 user's full rights and can reach a microphone through a subprocess with
 nothing declared anywhere, the same trust decision the AppImage comparison
 above already makes. The declared route is the auditable one, not the only
-one — see [decision 007](.project/decision/007-the-microphone-is-a-declared-capability.md)
-for the reasoning and what is honestly still missing.
+one.
 
 ### Declared user directories are a legible line, not a filesystem boundary
 
@@ -287,6 +199,101 @@ would otherwise have to guess at — never a sandbox: PHP runs with the user's
 full rights regardless, exactly like `save_path` and the microphone above. A
 declared member GLib cannot resolve reports as an absent variable rather than
 a guessed `$HOME`-based path, and `$HOME` itself is deliberately not a ninth
-member — it already reaches PHP through the ordinary process environment. See
-[decision 008](.project/decision/008-user-directories-are-a-declared-capability.md)
-for the reasoning and what is left open.
+member — it already reaches PHP through the ordinary process environment.
+
+## Make your first app
+
+An app is a Symfony project. You need PHP and Composer on your machine —
+nothing else: no Rust, no Tauri CLI, no GTK development libraries.
+
+```sh
+composer create-project symfony/skeleton myapp
+cd myapp
+composer require arnauddelgerie/tfs-app-bundle
+bin/console tfsapp:init
+```
+
+`tfsapp:init` generates the app's `tfsapp.config.json` at the project root —
+it prompts for four identity fields (`project_name`, `product_name`,
+`identifier`, `app_version`), each with a sensible derived default, then one
+yes/no `workers` question; Enter accepts the default each time — plus a
+starter `CHANGELOG.md`. The bundle registers `/healthz` on its own; no route
+to declare.
+
+A fresh skeleton has no route in production, and an installed app runs in
+production — give the app one page of its own:
+
+```php
+<?php
+// src/Controller/HomeController.php
+namespace App\Controller;
+
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\Routing\Attribute\Route;
+
+class HomeController
+{
+    #[Route('/')]
+    public function home(): Response
+    {
+        return new Response('It runs.');
+    }
+}
+```
+
+Run it under the hub, live:
+
+```sh
+tfsapp-hub dev .
+```
+
+A window opens on your app, served from this directory as it is. `dev` serves
+live source **in place**: it watches nothing, compiles nothing and builds no
+assets — your build tool already has a `--watch`; the hub serves and
+restarts. Ctrl-C stops the session.
+
+Then see it the way your users will, as an installed app:
+
+```sh
+git init && git add -A && git commit -m "First app"   # a release pins a commit
+cd ..
+mkdir -p out
+tfsapp-hub publish myapp --local out/
+```
+
+`publish` prints the exact `tfsapp-hub install` command for the archive it
+wrote — run it:
+
+```sh
+tfsapp-hub install out/myapp-0.1.0/myapp-0.1.0.tar.gz
+tfsapp-hub list
+tfsapp-hub open myapp
+```
+
+After `install` the app shows in `list`, opens with `open myapp`, and appears
+under its own name in your shell's grid — with a generic icon until its
+manifest declares an `icon_path`
+([§2](contract/2-tfsapp-config-json.md)).
+
+Where to go from here:
+
+- the [TFSAppBundle README](https://github.com/ArnaudDelgerie/TFSAppBundle) —
+  the PHP-side reference: what the bundle you just required does, its
+  configuration, its commands.
+- the contract's [what an app must provide](contract/1-what-an-app-must-provide.md)
+  — the rest of the three files and one route, and every optional field of
+  the manifest.
+
+## Where to read next
+
+- [**TFSAppBundle**](https://github.com/ArnaudDelgerie/TFSAppBundle) — the
+  Symfony bundle an app uses; its README is the PHP-side reference.
+- [**`CONTRACT.md`**](CONTRACT.md) — what the hub and an app promise each
+  other. Written for app authors: read it alone and you know exactly what to
+  build.
+- [**`ARCHITECTURE.md`**](ARCHITECTURE.md) — how the hub itself works: the
+  crate boundary, runtime identity, the install pipeline, the launch
+  sequence, the bundled interpreter. Written for contributors.
+- [**`CONTRIBUTING.md`**](CONTRIBUTING.md) — building the hub, its checks,
+  its release process.
+- [**`CHANGELOG.md`**](CHANGELOG.md) — what changed, release by release.
