@@ -381,6 +381,10 @@ fn sha256sums_line(name: &str, bytes: &[u8]) -> String {
     format!("{:x}  {name}\n", hasher.finalize())
 }
 
+fn image_bytes(version: &str) -> Vec<u8> {
+    format!("#!/bin/sh\necho 'TFSAppHub {version}'\n").into_bytes()
+}
+
 #[test]
 fn the_whole_flow_swaps_both_files_snapshots_the_registry_and_anchors_the_old_binary() {
     let (_base, paths) = temp_paths();
@@ -389,7 +393,7 @@ fn the_whole_flow_swaps_both_files_snapshots_the_registry_and_anchors_the_old_bi
     fs::write(&appimage_path, b"hub v1 bytes").expect("the running image fixture");
 
     let asset_name = "TFSAppHub_0.2.0_amd64.AppImage";
-    let asset_bytes = b"hub v2 bytes".to_vec();
+    let asset_bytes = image_bytes("0.2.0");
     let sums = sha256sums_line(asset_name, &asset_bytes);
     let (base_url, handle) = stub_hub_release("v0.2.0", asset_name, asset_bytes.clone(), sums);
 
@@ -402,6 +406,7 @@ fn the_whole_flow_swaps_both_files_snapshots_the_registry_and_anchors_the_old_bi
         &base_url,
         Some(appimage_path.to_str().unwrap()),
         &current,
+        "TFSAppHub",
         true,
     )
     .expect("the update succeeds");
@@ -453,12 +458,12 @@ fn a_step_eight_install_failure_is_undone_in_place() {
     let appimage = downloads.path().join("hub.AppImage");
     fs::write(&appimage, b"hub v1").unwrap();
     let asset_name = "hub.AppImage";
-    let bytes = b"hub v2".to_vec();
+    let bytes = image_bytes("0.2.0");
     let (base, handle) = stub_hub_release(
         "v0.2.0",
         asset_name,
         bytes,
-        sha256sums_line(asset_name, b"hub v2"),
+        sha256sums_line(asset_name, &image_bytes("0.2.0")),
     );
     let scratch = tempfile::tempdir().unwrap();
 
@@ -468,6 +473,7 @@ fn a_step_eight_install_failure_is_undone_in_place() {
         &base,
         Some(appimage.to_str().unwrap()),
         &semver::Version::parse("0.1.0").unwrap(),
+        "TFSAppHub",
         true,
         |_| {
             fs::remove_file(scratch.path().join(asset_name)).unwrap();
@@ -490,12 +496,12 @@ fn a_step_eight_failure_that_cannot_be_undone_names_the_broken_launchers() {
     let appimage = downloads.path().join("hub.AppImage");
     fs::write(&appimage, b"hub v1").unwrap();
     let asset_name = "hub.AppImage";
-    let bytes = b"hub v2".to_vec();
+    let bytes = image_bytes("0.2.0");
     let (base, handle) = stub_hub_release(
         "v0.2.0",
         asset_name,
         bytes,
-        sha256sums_line(asset_name, b"hub v2"),
+        sha256sums_line(asset_name, &image_bytes("0.2.0")),
     );
     let scratch = tempfile::tempdir().unwrap();
 
@@ -505,6 +511,7 @@ fn a_step_eight_failure_that_cannot_be_undone_names_the_broken_launchers() {
         &base,
         Some(appimage.to_str().unwrap()),
         &semver::Version::parse("0.1.0").unwrap(),
+        "TFSAppHub",
         true,
         |paths| {
             fs::create_dir(paths.hub_executable_path()).unwrap();
@@ -530,7 +537,7 @@ fn appimage_already_the_stable_copy_gets_one_swap_not_two() {
     fs::write(&stable_path, b"hub v1 bytes").expect("the running image fixture");
 
     let asset_name = "TFSAppHub_0.2.0_amd64.AppImage";
-    let asset_bytes = b"hub v2 bytes".to_vec();
+    let asset_bytes = image_bytes("0.2.0");
     let sums = sha256sums_line(asset_name, &asset_bytes);
     let (base_url, handle) = stub_hub_release("v0.2.0", asset_name, asset_bytes.clone(), sums);
 
@@ -543,6 +550,7 @@ fn appimage_already_the_stable_copy_gets_one_swap_not_two() {
         &base_url,
         Some(stable_path.to_str().unwrap()),
         &current,
+        "TFSAppHub",
         true,
     )
     .expect("the update succeeds");
@@ -563,7 +571,7 @@ fn a_checksum_mismatch_moves_nothing() {
     fs::write(&appimage_path, b"hub v1 bytes").expect("the running image fixture");
 
     let asset_name = "TFSAppHub_0.2.0_amd64.AppImage";
-    let asset_bytes = b"hub v2 bytes".to_vec();
+    let asset_bytes = image_bytes("0.2.0");
     // A checksum line for the right name but the wrong content.
     let bad_sums = sha256sums_line(asset_name, b"not the real bytes");
     let (base_url, handle) = stub_hub_release("v0.2.0", asset_name, asset_bytes.clone(), bad_sums);
@@ -577,6 +585,7 @@ fn a_checksum_mismatch_moves_nothing() {
         &base_url,
         Some(appimage_path.to_str().unwrap()),
         &current,
+        "TFSAppHub",
         true,
     )
     .expect_err("a checksum mismatch refuses");
@@ -591,11 +600,71 @@ fn a_checksum_mismatch_moves_nothing() {
         fs::read(&appimage_path).expect("$APPIMAGE is untouched"),
         b"hub v1 bytes"
     );
-    // Step 3's refresh is idempotent maintenance, not part of "the change":
-    // the stable copy exists and matches the running image, never the
-    // rejected asset.
-    assert_eq!(
-        fs::read(paths.hub_executable_path()).expect("the stable copy was refreshed"),
-        b"hub v1 bytes"
-    );
+    assert!(!paths.hub_executable_path().exists());
+}
+
+#[test]
+fn a_release_that_does_not_run_changes_no_installed_file() {
+    let (_base, paths) = temp_paths();
+    let downloads = tempfile::tempdir().unwrap();
+    let appimage = downloads.path().join("running.AppImage");
+    fs::write(&appimage, b"running image").unwrap();
+    let stable = paths.hub_executable_path();
+    fs::create_dir_all(stable.parent().unwrap()).unwrap();
+    fs::write(&stable, b"stable image").unwrap();
+    fs::write(paths.registry_path(), b"registry before").unwrap();
+
+    let name = "TFSAppHub_0.2.0_amd64.AppImage";
+    let bytes = b"#!/bin/sh\necho \"version 'GLIBC_2.39' not found\" >&2\nexit 127\n".to_vec();
+    let (base, handle) =
+        stub_hub_release("v0.2.0", name, bytes.clone(), sha256sums_line(name, &bytes));
+    let scratch = tempfile::tempdir().unwrap();
+    let error = update_at(
+        &paths,
+        scratch.path(),
+        &base,
+        Some(appimage.to_str().unwrap()),
+        &semver::Version::new(0, 1, 0),
+        "TFSAppHub",
+        true,
+    )
+    .unwrap_err();
+    handle.join().unwrap();
+
+    assert!(matches!(error, HubUpdateError::ReleaseDoesNotRun { .. }));
+    assert!(error.to_string().contains("GLIBC_2.39"));
+    assert_eq!(fs::read(&appimage).unwrap(), b"running image");
+    assert_eq!(fs::read(&stable).unwrap(), b"stable image");
+    assert_eq!(fs::read(paths.registry_path()).unwrap(), b"registry before");
+    assert!(!hub_bin::anchor_path(&paths).exists());
+    assert!(!hub_bin::anchor_registry_path(&paths).exists());
+}
+
+#[test]
+fn a_release_reporting_a_different_version_is_refused() {
+    let (_base, paths) = temp_paths();
+    let downloads = tempfile::tempdir().unwrap();
+    let appimage = downloads.path().join("running.AppImage");
+    fs::write(&appimage, b"running image").unwrap();
+    let name = "TFSAppHub_0.2.0_amd64.AppImage";
+    let bytes = image_bytes("0.3.0");
+    let (base, handle) =
+        stub_hub_release("v0.2.0", name, bytes.clone(), sha256sums_line(name, &bytes));
+    let scratch = tempfile::tempdir().unwrap();
+    let error = update_at(
+        &paths,
+        scratch.path(),
+        &base,
+        Some(appimage.to_str().unwrap()),
+        &semver::Version::new(0, 1, 0),
+        "TFSAppHub",
+        true,
+    )
+    .unwrap_err();
+    handle.join().unwrap();
+
+    assert!(matches!(error, HubUpdateError::ReleaseMismatch { .. }));
+    assert_eq!(fs::read(&appimage).unwrap(), b"running image");
+    assert!(!paths.hub_executable_path().exists());
+    assert!(!hub_bin::anchor_path(&paths).exists());
 }
