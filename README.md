@@ -149,17 +149,19 @@ provide. Compare glibc with `ldd --version` (the number on its first line)
 or `getconf GNU_LIBC_VERSION`. A machine below either floor cannot start that
 AppImage. `CXXABI` symbols are provided by the same C++ runtime.
 
-To replace an older AppImage built on a newer host, rebuild on the official
-base with Git and Docker installed — no local Rust or Tauri CLI is needed:
+When the official release is built on a base newer than your machine can run
+(starting with the move to Ubuntu 24.04 in April 2027), you can rebuild on
+Jammy with Git and Docker installed — no local Rust or Tauri CLI is needed:
 
 ```sh
 git clone https://github.com/ArnaudDelgerie/TFSAppHub.git
 cd TFSAppHub/build
-docker compose run --rm build
+BASE_IMAGE=ubuntu:22.04 docker compose run --rm build
 ```
 
-The default `BASE_IMAGE=ubuntu:22.04` is the official release base, whatever
-your distribution. It is the oldest base that provides `webkit2gtk-4.1`;
+The explicit `BASE_IMAGE=ubuntu:22.04` keeps this rebuild on Jammy when the
+official default moves to 24.04, whatever your distribution. Jammy is the
+oldest base that provides `webkit2gtk-4.1`;
 its measured floors are glibc 2.35 and `GLIBCXX_3.4.30`. The result lands at
 `TFSAppHub/target/release/bundle/appimage/TFSAppHub_<version>_amd64.AppImage`,
 with its own `.versions.txt`. A machine below either Jammy floor needs newer
