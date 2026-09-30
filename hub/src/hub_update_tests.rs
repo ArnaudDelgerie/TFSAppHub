@@ -1,8 +1,9 @@
 use std::{fs, path::Path, time::Duration};
 
 use super::{
-    anchor_state, check, probe, resolve_appimage_target, update_at, update_at_after_anchor,
-    update_from_at, HubUpdateCheck, HubUpdateError, MissingAnchorHalf, ProbeError, UpdateOutcome,
+    anchor_state, check, probe, resolve_appimage_target, resolve_local_source, update_at,
+    update_at_after_anchor, update_from_at, HubUpdateCheck, HubUpdateError, MissingAnchorHalf,
+    ProbeError, UpdateOutcome,
 };
 use crate::{
     hub_bin, hub_rollback,
@@ -27,6 +28,26 @@ fn probe_reads_the_hub_version() {
     assert_eq!(
         probe(&path, "TFSAppHub", Duration::from_secs(1)),
         Ok(semver::Version::new(1, 2, 3))
+    );
+}
+
+#[test]
+fn local_source_is_relative_to_the_appimage_callers_directory() {
+    assert_eq!(
+        resolve_local_source(
+            Path::new("../rebuilt.AppImage"),
+            Some(Path::new("/home/user/downloads")),
+            Path::new("/tmp/.mount_hub"),
+        ),
+        Path::new("/home/user/downloads/../rebuilt.AppImage")
+    );
+    assert_eq!(
+        resolve_local_source(
+            Path::new("/tmp/rebuilt.AppImage"),
+            Some(Path::new("/home/user/downloads")),
+            Path::new("/tmp/.mount_hub"),
+        ),
+        Path::new("/tmp/rebuilt.AppImage")
     );
 }
 
