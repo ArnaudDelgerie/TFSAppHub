@@ -1,10 +1,14 @@
 # A second door onto exactly `make build` / `make check` — nothing this file
-# does is container-only. It installs what README.md's "Prerequisites"
+# does is container-only. It installs what CONTRIBUTING.md's "Prerequisites"
 # already lists for a local build, then hands off to the same Makefile
 # targets; every container-specific trick (the base image choice, the uid/gid
-# match, the mounted caches, FUSE) lives in compose.yaml instead. See
-# .project/plan/012-package-the-hub-as-an-appimage.md step 6 for why the
-# split is drawn there.
+# match, the mounted caches, FUSE) lives in compose.yaml instead. The split is
+# deliberate: the Dockerfile is the recipe — what a machine needs to run
+# `make build`, nothing more — while the tricks are choices a person changes
+# per machine (the base to try when the default fails, the uid/gid that keeps
+# `target/` from coming back root-owned, the caches whose downloads depend on
+# persisting, FUSE for `appimagetool`), and compose.yaml is the layer they
+# edit without rebuilding the image.
 
 # The default is the official release base: the oldest Ubuntu LTS still in
 # standard support (ubuntu:22.04 now, ubuntu:24.04 from April 2027).
@@ -13,7 +17,7 @@
 ARG BASE_IMAGE=ubuntu:22.04
 FROM ${BASE_IMAGE}
 
-# The same prerequisites README.md's "Build" section lists for building
+# The same prerequisites CONTRIBUTING.md's "Prerequisites" lists for building
 # outside a container: Tauri v2 / WebKitGTK's Linux deps, curl (to fetch the
 # FrankenPHP sidecar and composer.phar), shellcheck (`make check`), and
 # dbus + gnome-keyring (test-only — the ephemeral Secret Service

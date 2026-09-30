@@ -55,7 +55,16 @@ set -euo pipefail
 #    PipeWire client libraries. Those speak to the running session's audio
 #    server, and PipeWire loads SPA modules from the host's own paths, so leave
 #    these client libraries to the session instead. Capture-critical plugins
-#    are verified in the final artifact below.
+#    are verified in the final artifact below. The plugin paths the generated
+#    GStreamer hook exports point inside the AppImage, so the registry cache
+#    they build must be this image's own too: left at the system's
+#    `~/.cache/gstreamer-1.0/registry.*.bin`, whichever side rewrote it last
+#    leaves the other rescanning under the wrong plugin set. The hook gains a
+#    `GST_REGISTRY_1_0` export pointing under TFSApp's cache directory
+#    (GStreamer creates the parent directory when it writes the file, so
+#    nothing needs to exist beforehand). The per-launch rescan under FUSE
+#    stays: the mount path changes each launch, and ≈1.5 s at web-process
+#    start is the price of plugins frozen next to their core library.
 #
 # 6. Graphics dispatch and driver libraries belong to the host GPU stack
 #    (GLVND, Mesa, NVIDIA). Bundling one generation beside the host's libEGL
@@ -80,6 +89,23 @@ HOOK_REL="apprun-hooks/linuxdeploy-plugin-gtk.sh"
 HOOK_ORIGINAL_RE='^export GDK_BACKEND=x11([[:space:]]|$)'
 # shellcheck disable=SC2016  # literal text written into the hook, not expanded here
 HOOK_PATCHED_LINE='export GDK_BACKEND="${GDK_BACKEND:-wayland,x11}"'
+
+GST_HOOK_REL="apprun-hooks/linuxdeploy-plugin-gstreamer.sh"
+# The registry line we append to the generated GStreamer hook (defect 5). The
+# architecture is spelled out in the filename the same way GStreamer itself
+# spells it in its default `~/.cache/gstreamer-1.0/registry.<arch>.bin`.
+# shellcheck disable=SC2016  # literal text written into the hook, not expanded here
+GST_REGISTRY_LINE='export GST_REGISTRY_1_0="${XDG_CACHE_HOME:-$HOME/.cache}/TFSApp/hub/gstreamer-1.0/registry.x86_64.bin"'
+GST_REGISTRY_BLOCK="$(cat <<EOF
+# Patched by TFSAppHub (build/scripts/fix-appimage-bundle.sh).
+# The plugin paths above point inside this AppImage, so the registry this
+# image builds must not be the system's own \`~/.cache/gstreamer-1.0/\` cache:
+# whichever side rewrote it last would leave the other rescanning under the
+# wrong plugin set. A registry under TFSApp's cache directory is this image's
+# own; GStreamer creates its parent directory when it writes the file.
+$GST_REGISTRY_LINE
+EOF
+)"
 HOOK_PATCH="$(cat <<EOF
 # Patched by TFSAppHub (build/scripts/fix-appimage-bundle.sh).
 # linuxdeploy-plugin-gtk hard-codes \`export GDK_BACKEND=x11\` here, which puts
@@ -137,6 +163,18 @@ hook_state() {
     echo "unpatched hook: the app would silently run on XWayland again." >&2
     return 1
   fi
+}
+
+# True (exit 0) when the GStreamer hook exists and already carries our
+# registry line. A missing hook is fatal for the same reason a stale GTK hook
+# is: the media framework is not optional in this image.
+gst_registry_ok() {
+  local hook="$1"
+  if [[ ! -f "$hook" ]]; then
+    echo "Expected GStreamer hook missing from the AppImage: $GST_HOOK_REL" >&2
+    return 1
+  fi
+  grep -Fxq "$GST_REGISTRY_LINE" "$hook"
 }
 
 # True (exit 0) when the symlink at $1 exists, is not dangling, and resolves
@@ -301,6 +339,9 @@ for appimage in "${appimages[@]}"; do
 
   hook="$workdir/squashfs-root/$HOOK_REL"
   hook_state="$(hook_state "$hook")"
+  gst_hook="$workdir/squashfs-root/$GST_HOOK_REL"
+  gst_registry_state=true
+  gst_registry_ok "$gst_hook" || gst_registry_state=false
 
   dir_icon="$workdir/squashfs-root/.DirIcon"
   dir_icon_ok=true
@@ -316,8 +357,8 @@ for appimage in "${appimages[@]}"; do
   # Repack only when something actually needs fixing — but "already fixed" has
   # to mean every repair, otherwise an already-pristine sidecar would
   # short-circuit the pass and quietly drop one of the others.
-  if cmp -s "${bundled[0]}" "$PRISTINE" && [[ "$hook_state" != "stale" ]] && [[ "$dir_icon_ok" == true ]] && [[ "$wayland_ok" == true ]] && [[ "$audio_clients_ok" == true ]] && [[ "$graphics_driver_ok" == true ]]; then
-    echo "$(basename "$appimage"): sidecar, GTK hook, .DirIcon and session-owned libraries already correct, skipping."
+  if cmp -s "${bundled[0]}" "$PRISTINE" && [[ "$hook_state" != "stale" ]] && [[ "$gst_registry_state" == true ]] && [[ "$dir_icon_ok" == true ]] && [[ "$wayland_ok" == true ]] && [[ "$audio_clients_ok" == true ]] && [[ "$graphics_driver_ok" == true ]]; then
+    echo "$(basename "$appimage"): sidecar, GTK hook, GStreamer registry, .DirIcon and session-owned libraries already correct, skipping."
   else
     cp "$PRISTINE" "${bundled[0]}"
     chmod 755 "${bundled[0]}"
@@ -330,6 +371,14 @@ for appimage in "${appimages[@]}"; do
         "$hook" >"$hook.tmp"
       mv "$hook.tmp" "$hook"
       chmod 755 "$hook"
+    fi
+    if [[ "$gst_registry_state" == false ]]; then
+      # Append at the end of the generated hook: everything above our block
+      # is linuxdeploy-plugin-gstreamer's own content, regenerated on every
+      # build, so nothing of ours rewrites any of its lines. The hook is
+      # sourced by AppRun, not executed, so it needs no executable bit.
+      [[ -z "$(tail -c 1 "$gst_hook")" ]] || echo >>"$gst_hook"
+      printf '%s\n' "$GST_REGISTRY_BLOCK" >>"$gst_hook"
     fi
     if [[ "$dir_icon_ok" == false ]]; then
       # Pick the icon by the AppImage's own .desktop Icon= line, not by
@@ -385,6 +434,8 @@ for appimage in "${appimages[@]}"; do
   verified_hook_state="$(hook_state "$verify_root/$HOOK_REL")"
   [[ "$verified_hook_state" != "stale" ]] \
     || { echo "Verification failed: $HOOK_REL in $appimage still forces GDK_BACKEND." >&2; exit 1; }
+  gst_registry_ok "$verify_root/$GST_HOOK_REL" \
+    || { echo "Verification failed: $GST_HOOK_REL in $appimage does not isolate GST_REGISTRY_1_0." >&2; exit 1; }
   case "$(readlink "$verify_root/.DirIcon")" in
     /*) echo "Verification failed: .DirIcon in $appimage is still an absolute symlink." >&2; exit 1 ;;
   esac
@@ -457,7 +508,7 @@ for appimage in "${appimages[@]}"; do
     done
   } >"$version_record.tmp"
   mv "$version_record.tmp" "$version_record"
-  echo "$(basename "$appimage"): sidecar verified pristine, GTK hook defers to the session backend, .DirIcon is relative, no session-owned client libraries bundled, GStreamer capture plugins present, frozen versions recorded to $(basename "$version_record")."
+  echo "$(basename "$appimage"): sidecar verified pristine, GTK hook defers to the session backend, GStreamer registry is the image's own, .DirIcon is relative, no session-owned client libraries bundled, GStreamer capture plugins present, frozen versions recorded to $(basename "$version_record")."
   rm -rf "$workdir"
   trap - EXIT
 done

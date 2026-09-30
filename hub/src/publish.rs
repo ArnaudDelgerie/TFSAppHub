@@ -730,8 +730,12 @@ fn excluded_from_archive(path: &Path) -> bool {
 pub fn run(project_path: &str, repo: Option<&str>, local: Option<&str>, assume_yes: bool) -> i32 {
     if let Some(out_dir) = local {
         return match publish_local(
-            Path::new(project_path),
-            Path::new(out_dir),
+            // Both anchored at the invoking directory (`owd`): under the
+            // AppImage the process's cwd is the image's own mount, so a
+            // relative `publish myapp --local out/` read against it would
+            // look inside the AppImage.
+            &crate::owd::resolve_argument(Path::new(project_path)),
+            &crate::owd::resolve_argument(Path::new(out_dir)),
             assume_yes,
             &Git::new(),
         ) {
@@ -753,7 +757,8 @@ pub fn run(project_path: &str, repo: Option<&str>, local: Option<&str>, assume_y
 
     match publish(
         &paths,
-        Path::new(project_path),
+        // Same anchor as the `--local` branch above.
+        &crate::owd::resolve_argument(Path::new(project_path)),
         repo,
         assume_yes,
         &Git::new(),

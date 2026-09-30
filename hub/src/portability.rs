@@ -1,6 +1,5 @@
 //! `export <id> <path>` / `import <id> <path> [--force] [--yes]` — moving one
-//! installed app's data between machines (`../.project/plan/022-export-and-
-//! import.md`).
+//! installed app's data between machines (plan 022).
 //!
 //! This module holds what needs no I/O and is worth getting right in
 //! isolation before the two commands built on it: [`Manifest`], the archive's
@@ -202,7 +201,7 @@ pub fn export(id: &str, path: &str) -> i32 {
         }
     };
 
-    match run_export(&paths, id, Path::new(path)) {
+    match run_export(&paths, id, &crate::owd::resolve_argument(Path::new(path))) {
         Ok(()) => EXIT_OK,
         Err(error) => {
             eprintln!("tfsapp-hub: {error}");
@@ -606,7 +605,13 @@ pub fn import(id: &str, path: &str, force: bool, assume_yes: bool) -> i32 {
         }
     };
 
-    match run_import(&paths, id, Path::new(path), force, assume_yes) {
+    match run_import(
+        &paths,
+        id,
+        &crate::owd::resolve_argument(Path::new(path)),
+        force,
+        assume_yes,
+    ) {
         Ok(true) => EXIT_OK,
         // Declining is not a failure of the command, but nothing changed
         // either — a script reading 0 would conclude it did.

@@ -267,7 +267,7 @@ an update:
 | Key | Type | Meaning |
 | --- | --- | --- |
 | `command` | string, required | A `bin/console` argument string, split on whitespace and passed as `argv` directly — same no-shell-interpretation rule as `commands` (§6). |
-| `concurrent` | boolean, optional | Default `false`. Whether this alias tolerates siblings — other instances of itself, other active `run` commands, an already-open window — in any arrival order, rather than requiring to run alone. See "Running a declared command" (§6) for the full gating, and `.project/decision/005-concurrency-belongs-to-the-alias.md` for why. |
+| `concurrent` | boolean, optional | Default `false`. Whether this alias tolerates siblings — other instances of itself, other active `run` commands, an already-open window — in any arrival order, rather than requiring to run alone. Whether an alias tolerates siblings is the app author's to declare: only the author knows whether two instances may overlap, and the hub takes the declaration at face value, exactly as it takes every other manifest promise. See "Running a declared command" (§6) for the full gating. |
 
 Each top-level key is the alias name a user types. `tfsapp-hub run <id>` with
 no alias lists them back, naming each one's command and whether it is

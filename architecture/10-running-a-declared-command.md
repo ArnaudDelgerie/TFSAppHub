@@ -47,7 +47,10 @@ anything to run at all? The scan is resolved against the manifest and
 combined with the version guard's own verdict (`crate::run::launch_verdict`)
 — a launch with nothing to run opens beside every `concurrent` command, one
 with a lifecycle event to perform or a non-`concurrent` holder refuses either
-way. See `.project/decision/005-concurrency-belongs-to-the-alias.md` for why.
+way. The exclusivity that actually protects the app's data is the mutation of
+the app layer itself, which never happens while any command is live; and
+whether an alias tolerates siblings is the app author's to know and declare —
+nothing the hub can observe decides it.
 
 `runs/` separates the two questions per entry: each entry's flock answers
 whether its launcher still lives, while its durable record — `<alias>`, then
@@ -85,8 +88,7 @@ handlers up once; `spawn_signal_forwarder` is what reacts to a caught signal,
 terminating the child through it. Plan 047 deleted the coexistence watchdog
 that used to share this mechanism for a second reason (a window's owner
 dropping) — a `run` command's lifetime belongs to whoever started it, not to
-a window that happened to be open at the time
-(`.project/decision/005-concurrency-belongs-to-the-alias.md`, point 4).
+a window that happened to be open at the time.
 
 ### Hub-side, and never `tauri`
 

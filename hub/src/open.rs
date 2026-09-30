@@ -16,9 +16,7 @@
 //! attached for the child's whole life, and inheritance is still right there.
 //!
 //! It is not one process serving N apps, and that was decided rather than
-//! defaulted (see `.project/plan/007-open-an-installed-app.md`'s Overview, which
-//! also records why a single shared FrankenPHP was rejected). Three reasons, in
-//! the order they bite:
+//! defaulted, for three reasons, in the order they bite:
 //!
 //! - every isolation guarantee of CONTRACT.md §5 holds verbatim, because it is
 //!   the same shape the station already has: one process, one identifier, one
@@ -240,21 +238,23 @@ pub fn child_args(spec: &LaunchSpec, files: &[String]) -> Vec<String> {
 }
 
 /// The batch as the child must see it: every path absolute. A relative path
-/// is read against the *originating caller's* working directory — here, in
-/// the parent, before the child is detached into a context where that cwd no
-/// longer names the person who typed the command. Made absolute, never
+/// is read against the *originating caller's* directory (`owd` — the
+/// process's own cwd under an AppImage is the image's mount) — here, in the
+/// parent, before the child is detached into a context where that directory
+/// no longer names the person who typed the command. Made absolute, never
 /// canonicalized: the request names what the caller named, symlink and `..`
 /// included.
 fn absolute_paths(files: &[String]) -> Result<Vec<String>, OpenError> {
-    let cwd = std::env::current_dir().map_err(OpenError::NoWorkingDirectory)?;
+    // Anchored at the invoking directory (`owd`) rather than the process's
+    // own cwd: under the AppImage the runtime has already `cd`d into the
+    // image's mount, and a relative path read against it would name a file
+    // inside the AppImage instead of the person's file.
     Ok(files
         .iter()
         .map(|file| {
-            if std::path::Path::new(file).is_absolute() {
-                file.clone()
-            } else {
-                cwd.join(file).display().to_string()
-            }
+            crate::owd::resolve_argument(std::path::Path::new(file))
+                .display()
+                .to_string()
         })
         .collect())
 }
@@ -409,10 +409,6 @@ pub enum OpenError {
     NoReceiver {
         id: String,
     },
-    /// The originating caller's working directory could not be read, so a
-    /// relative path cannot be made absolute without inventing where it
-    /// came from.
-    NoWorkingDirectory(io::Error),
     /// A batch that failed whole-batch validation, carrying the diagnostic
     /// that names the first offending path.
     InvalidBatch(String),
@@ -463,10 +459,6 @@ impl fmt::Display for OpenError {
                  manifest), so the hub cannot hand it files. Open it without `-- <file>...`, \
                  or have its manifest declare the receiver and reinstall it."
             ),
-            Self::NoWorkingDirectory(source) => write!(
-                formatter,
-                "cannot read the working directory to resolve a relative path against: {source}"
-            ),
             Self::InvalidBatch(diagnostic) => write!(formatter, "{diagnostic}"),
             Self::NoExecutable(source) => write!(
                 formatter,
@@ -485,7 +477,6 @@ impl std::error::Error for OpenError {
             Self::Registry(error) => Some(error),
             Self::Manifest(error) => Some(error),
             Self::Paths(error) => Some(error),
-            Self::NoWorkingDirectory(source) => Some(source),
             Self::NoExecutable(source) => Some(source),
             Self::Unstartable { source, .. } => Some(source),
             _ => None,

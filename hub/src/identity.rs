@@ -11,9 +11,8 @@
 //! config when `Builder::run(context)` starts GTK, so mutating
 //! `Context::config_mut().identifier` beforehand moves all of them at once.
 //! Measured rather than assumed — the station's identity spike
-//! (`../TFSAppWorkstation/.project/hub/001-identity-spike.md`, verdict GO,
-//! 2026-08-07) launched two identities of one binary side by side on Wayland
-//! and X11 and found two owned bus names, two window classes and two separate
+//! (verdict GO, 2026-08-07) launched two identities of one binary side by side
+//! on Wayland and X11 and found two owned bus names, two window classes and two separate
 //! `~/.local/share/<identifier>/` trees, with no cookie crossing in either
 //! direction despite both windows sharing the `127.0.0.1` cookie origin.
 //!

@@ -28,8 +28,7 @@ app's own authorization, exactly like any other route. `Content-Disposition:
 attachment` is the default worth reaching for on that route: `default-src
 'self'` above permits everything the app serves, so an uploaded file handed
 back inline is same-origin content with the same reach as the app's own
-scripts. See `.project/decision/006-durable-files-live-in-the-data-directory.md`
-for why this was decided rather than defaulted.
+scripts.
 
 What the window does with such a response is a guarantee: the file is saved
 straight into the OS download directory, under the name the response gives it

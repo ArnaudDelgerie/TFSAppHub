@@ -200,7 +200,13 @@ pub fn resolve(
     base_url: &str,
 ) -> Result<Resolved, SourceError> {
     match origin {
-        Origin::LocalArchive(path) => resolve_local_archive(path, reference, scratch),
+        // Anchored here rather than at every caller: install's argv, update's
+        // archive argument and a re-resolve all pass through this arm, and a
+        // location recorded by an earlier install is already absolute, so the
+        // anchor leaves it alone.
+        Origin::LocalArchive(path) => {
+            resolve_local_archive(&crate::owd::resolve_argument(path), reference, scratch)
+        }
         Origin::Unrecognised(path) => {
             if path.is_dir() {
                 return Err(SourceError::DirectoryNotASource { path: path.clone() });

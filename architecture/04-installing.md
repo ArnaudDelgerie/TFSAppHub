@@ -113,7 +113,7 @@ guarantee:
 2. **Verify** it against the `SHA256SUMS.txt` asset beside it, hashed the same
    way. A missing line for the archive's own name is a failure, never a pass
    by absence. This establishes integrity, not publisher authenticity; the
-   user chooses which source to trust ([decision 004](.project/decision/004-integrity-not-authenticity.md)).
+   user chooses which source to trust.
 3. **Extract**, only once the checksum has matched. A read-only pre-pass
    rejects unsafe paths, unsupported entry types (including hard links,
    devices, fifos and sparse entries), and a regular-file payload larger

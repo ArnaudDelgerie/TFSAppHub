@@ -2,8 +2,10 @@
 //!
 //! The counterpart to `open::resolve`: where that one reads an installed
 //! snapshot from the registry, this one reads a project directory straight
-//! from the filesystem, live, never snapshotted (`.project/plan/009-dev-local-
-//! source.md`). Both are pure resolve functions — no sidecar, no window, no
+//! from the filesystem, live, never snapshotted — the developer's own
+//! toolchain does the building, and the watch belongs to the build tool
+//! that already has one, so the hub only serves and relaunches (plan 009).
+//! Both are pure resolve functions — no sidecar, no window, no
 //! guard — and both exist to let a mistyped path or a missing file fail at a
 //! terminal instead of inside a half-open window.
 //!
@@ -35,7 +37,7 @@ pub const DEV_IDENTIFIER_PREFIX: &str = "dev.";
 /// spawns, and hands the prompt back. `dev` is a loop the developer is
 /// watching, and `Ctrl-C` has to stop it — so this parent stays up, forwards
 /// `SIGINT`/`SIGTERM` to the child, waits on it, and exits with its status
-/// (`.project/plan/009-dev-local-source.md` step 4).
+/// (plan 009, step 4).
 ///
 /// The child cannot use `spawn_signal_forwarder` as it stands: that helper
 /// gates on `TFS_APP_IDENTIFIER` in the target's `/proc/<pid>/environ`, which
@@ -130,7 +132,10 @@ pub fn run(path: &str) -> i32 {
 /// required layout, so the first refusal to fire is the first thing a reader
 /// of that section would check too.
 pub fn resolve(project_path: &str) -> Result<LaunchSpec, DevError> {
-    let project_path = PathBuf::from(project_path);
+    // Anchored at the invoking directory (`owd`): under the AppImage the
+    // process's cwd is the image's own mount, so a relative `dev .` read
+    // against it would look for the project inside the AppImage.
+    let project_path = crate::owd::resolve_argument(&PathBuf::from(project_path));
     if !project_path.is_dir() {
         return Err(DevError::NotADirectory { path: project_path });
     }

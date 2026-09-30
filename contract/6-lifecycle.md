@@ -241,9 +241,15 @@ commands at once costs nothing either way —
 app. `run --stop <id>` stops every active command for that app; `run --stop
 <id> <alias>` narrows it to that alias's instances. `run --stop`/
 `run --replace` with no id list every active command across
-every installed app. See `.project/decision/005-concurrency-belongs-to-the-alias.md`
-for why the exclusivity moved from the command to the app layer's own
-mutation.
+every installed app. The exclusivity sits on the app layer's own mutation
+rather than on the command because the single lock between commands never
+protected the data: what it bought was the hub's own bookkeeping — one
+record, one pid, one `--stop` with no argument to resolve — and the price
+landed on `run`'s flagship use case, a long-lived alias such as an MCP
+server that a second session could not join and that `--replace` answered
+by killing the first. The mutation of the app layer is the real invariant,
+and rule 1, the maintenance lease and rule 3's launch gate enforce it
+without any lock between peers.
 
 **Rule 3 — the window's refusal is narrowed to its motive.** A `run` command
 does not by itself keep a window from opening: a launch refuses over active

@@ -204,7 +204,7 @@ impl Paths {
     ///
     /// Named after `identifier` rather than the hub-local `id`: it is the
     /// filename GNOME matches first against `_GTK_APPLICATION_ID`
-    /// (`.project/plan/003-runtime-identity.md` step 5), and a
+    /// (plan 003, step 5), and a
     /// `tfsapp-`-prefixed name would miss that key entirely.
     pub fn desktop_entry_path(&self, identifier: &str) -> Result<PathBuf, PathsError> {
         Ok(self.applications_dir().join(format!(

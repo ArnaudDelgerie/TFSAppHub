@@ -1,5 +1,5 @@
 //! `actions.media`: the microphone reached through the ordinary web platform
-//! (CONTRACT.md §7, `.project/decision/007-the-microphone-is-a-declared-capability.md`).
+//! (CONTRACT.md §7, decision 007).
 //!
 //! Unlike every other capability group, this one grants nothing to
 //! `invoke()` and starts no bridge route — an app that declares
