@@ -1,5 +1,5 @@
 # A second door onto exactly `make build` / `make check` — nothing this file
-# does is container-only. It installs what README.md's "Prerequisites"
+# does is container-only. It installs what CONTRIBUTING.md's "Prerequisites"
 # already lists for a local build, then hands off to the same Makefile
 # targets; every container-specific trick (the base image choice, the uid/gid
 # match, the mounted caches, FUSE) lives in compose.yaml instead. The split is
@@ -17,7 +17,7 @@
 ARG BASE_IMAGE=ubuntu:22.04
 FROM ${BASE_IMAGE}
 
-# The same prerequisites README.md's "Build" section lists for building
+# The same prerequisites CONTRIBUTING.md's "Prerequisites" lists for building
 # outside a container: Tauri v2 / WebKitGTK's Linux deps, curl (to fetch the
 # FrankenPHP sidecar and composer.phar), shellcheck (`make check`), and
 # dbus + gnome-keyring (test-only — the ephemeral Secret Service

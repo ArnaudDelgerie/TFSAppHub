@@ -15,12 +15,12 @@ set -euo pipefail
 # the test is ever allowed to touch.
 
 if ! command -v dbus-run-session >/dev/null; then
-  echo "make keyring-integration: 'dbus-run-session' not found on PATH — install 'dbus' (see README Prerequisites). It stands up the private bus the ephemeral Secret Service answers on for this check; it is not a runtime dependency of the packaged app." >&2
+  echo "make keyring-integration: 'dbus-run-session' not found on PATH — install 'dbus' (see CONTRIBUTING Prerequisites). It stands up the private bus the ephemeral Secret Service answers on for this check; it is not a runtime dependency of the packaged app." >&2
   exit 1
 fi
 
 if ! command -v gnome-keyring-daemon >/dev/null; then
-  echo "make keyring-integration: 'gnome-keyring-daemon' not found on PATH — install 'gnome-keyring' (see README Prerequisites). It provides an ephemeral, throwaway Secret Service for this check; it is not a runtime dependency of the packaged app and is unrelated to the GNOME desktop." >&2
+  echo "make keyring-integration: 'gnome-keyring-daemon' not found on PATH — install 'gnome-keyring' (see CONTRIBUTING Prerequisites). It provides an ephemeral, throwaway Secret Service for this check; it is not a runtime dependency of the packaged app and is unrelated to the GNOME desktop." >&2
   exit 1
 fi
 

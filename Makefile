@@ -60,7 +60,7 @@ keyring-integration:
 # The hub's own TFSAppHub_<version>_amd64.AppImage under
 # target/release/bundle/appimage/ (the workspace's shared target/, not
 # hub/target/). Requires `make resources` first — see build-hub.sh's own
-# up-front check — and the local Tauri/AppImage toolchain (see README.md
+# up-front check — and the local Tauri/AppImage toolchain (see CONTRIBUTING.md
 # Prerequisites).
 build:
 	build/scripts/build-hub.sh
