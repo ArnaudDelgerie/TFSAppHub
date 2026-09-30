@@ -47,7 +47,7 @@ shape:
 
 ```sh
 tfsapp-hub install github:owner/repo
-tfsapp-hub publish path/to/project --local out/     # write a release archive locally
+tfsapp-hub publish path/to/project --local out/     # write a release archive locally (out/ must exist)
 tfsapp-hub install out/<name>-<version>/<name>-<version>.tar.gz
 ```
 
@@ -215,9 +215,31 @@ bin/console tfsapp:init
 
 `tfsapp:init` generates the app's `tfsapp.config.json` at the project root —
 it prompts for four identity fields (`project_name`, `product_name`,
-`identifier`, `app_version`), each with a sensible derived default, and Enter
-accepts the default — plus a starter `CHANGELOG.md`. The bundle registers
-`/healthz` on its own; no route to declare.
+`identifier`, `app_version`), each with a sensible derived default, then one
+yes/no `workers` question; Enter accepts the default each time — plus a
+starter `CHANGELOG.md`. The bundle registers `/healthz` on its own; no route
+to declare.
+
+A fresh skeleton has no route in production, and an installed app runs in
+production — give the app one page of its own:
+
+```php
+<?php
+// src/Controller/HomeController.php
+namespace App\Controller;
+
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\Routing\Attribute\Route;
+
+class HomeController
+{
+    #[Route('/')]
+    public function home(): Response
+    {
+        return new Response('It runs.');
+    }
+}
+```
 
 Run it under the hub, live:
 
@@ -233,18 +255,25 @@ restarts. Ctrl-C stops the session.
 Then see it the way your users will, as an installed app:
 
 ```sh
-git init && git add -A && git commit -m "First app"
+git init && git add -A && git commit -m "First app"   # a release pins a commit
 cd ..
+mkdir -p out
 tfsapp-hub publish myapp --local out/
-tfsapp-hub install out/<name>-<version>/<name>-<version>.tar.gz
-tfsapp-hub list
-tfsapp-hub open <id>
 ```
 
-A release is pinned to a git commit — that is what the `git init` line is
-for; `publish` prints the archive's path when it is written. After `install`
-the app shows in `list`, opens with `open <id>`, and appears under its own
-name and icon in your shell's grid.
+`publish` prints the exact `tfsapp-hub install` command for the archive it
+wrote — run it:
+
+```sh
+tfsapp-hub install out/myapp-0.1.0/myapp-0.1.0.tar.gz
+tfsapp-hub list
+tfsapp-hub open myapp
+```
+
+After `install` the app shows in `list`, opens with `open myapp`, and appears
+under its own name in your shell's grid — with a generic icon until its
+manifest declares an `icon_path`
+([§2](contract/2-tfsapp-config-json.md)).
 
 Where to go from here:
 
