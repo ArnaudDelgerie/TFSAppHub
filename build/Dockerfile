@@ -6,12 +6,11 @@
 # .project/plan/012-package-the-hub-as-an-appimage.md step 6 for why the
 # split is drawn there.
 
-# The base image is a parameter, not a truth: a sensible default (matching
-# this project's own release floor), changed by whoever the released
-# AppImage does not run on. Nothing below reads BASE_IMAGE beyond `FROM` —
-# no branch anywhere in this file, or in any script it calls, cares which
-# base it is; only apt's package resolution does.
-ARG BASE_IMAGE=ubuntu:24.04
+# The default is the official release base: the oldest Ubuntu LTS still in
+# standard support (ubuntu:22.04 now, ubuntu:24.04 from April 2027).
+# A custom base must be Debian or Ubuntu: apt-get below and dpkg in
+# fix-appimage-bundle.sh require Debian-family package tools.
+ARG BASE_IMAGE=ubuntu:22.04
 FROM ${BASE_IMAGE}
 
 # The same prerequisites README.md's "Build" section lists for building
