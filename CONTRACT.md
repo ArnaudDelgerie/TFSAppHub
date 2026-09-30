@@ -3,6 +3,8 @@
 This document defines what **TFSAppHub** (the hub) and a **Symfony application**
 promise each other. An app that honours it can be installed by the hub and
 opened as a desktop window, with no fork of the hub and no per-app build step.
+It is written for **app authors**: contributors to the hub itself start from
+[`ARCHITECTURE.md`](ARCHITECTURE.md), and users from the [README](README.md).
 
 It is written from two sides and only those two:
 

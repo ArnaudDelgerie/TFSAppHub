@@ -24,8 +24,9 @@ one parent directory:
 | `TFSAppTest` | a real Symfony project, the fixture app the hub's checks run against. |
 
 [TFSAppTest](https://github.com/ArnaudDelgerie/TFSAppTest)'s README holds the
-day-to-day procedure for trying an install, an update or a rollback against a
-local hub checkout; this file does not restate it.
+detail — running it under `dev` and installing it, what each probe page
+covers, and how to work against a local `TFSAppBundle` checkout; this file
+does not restate it.
 
 ## Prerequisites
 
