@@ -7,8 +7,8 @@
 # `desktop/src-tauri/resources/Caddyfile.desktop`, held at equality because the
 # two repos shipped separately and neither host could deliver §4 more weakly
 # than the other. That parity ended with the station's archival on 2026-08-08
-# (`.project/decisions/001-single-host.md`): there is one host, this file is
-# its own, and it diverged first on 2026-08-09 with `grace_period` below.
+# (decision 001): there is one host, this file is its own, and it diverged
+# first on 2026-08-09 with `grace_period` below.
 #
 # Nothing in it is per-app. Document root and port come from the environment the
 # hub injects (§3, see `app_env.rs`), which is exactly what lets one file serve

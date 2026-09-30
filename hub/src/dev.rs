@@ -2,8 +2,10 @@
 //!
 //! The counterpart to `open::resolve`: where that one reads an installed
 //! snapshot from the registry, this one reads a project directory straight
-//! from the filesystem, live, never snapshotted (`.project/plan/009-dev-local-
-//! source.md`). Both are pure resolve functions — no sidecar, no window, no
+//! from the filesystem, live, never snapshotted — the developer's own
+//! toolchain does the building, and the watch belongs to the build tool
+//! that already has one, so the hub only serves and relaunches (plan 009).
+//! Both are pure resolve functions — no sidecar, no window, no
 //! guard — and both exist to let a mistyped path or a missing file fail at a
 //! terminal instead of inside a half-open window.
 //!
@@ -35,7 +37,7 @@ pub const DEV_IDENTIFIER_PREFIX: &str = "dev.";
 /// spawns, and hands the prompt back. `dev` is a loop the developer is
 /// watching, and `Ctrl-C` has to stop it — so this parent stays up, forwards
 /// `SIGINT`/`SIGTERM` to the child, waits on it, and exits with its status
-/// (`.project/plan/009-dev-local-source.md` step 4).
+/// (plan 009, step 4).
 ///
 /// The child cannot use `spawn_signal_forwarder` as it stands: that helper
 /// gates on `TFS_APP_IDENTIFIER` in the target's `/proc/<pid>/environ`, which

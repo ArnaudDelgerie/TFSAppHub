@@ -443,9 +443,11 @@ cold-start page can never receive it, whatever window it happens to be
 painted in. Whether the camera and screen or display capture ever become
 members of this group is not decided — the group is named `media` precisely
 so they could fit later without a shape change, but nothing about them is
-settled here — see
-`.project/decision/007-the-microphone-is-a-declared-capability.md` for why,
-kept there rather than restated here.
+settled here. The group's shape is the point: a flat
+`actions.microphone` boolean would have needed a sibling boolean per device,
+and §7's all-or-nothing-per-group rule would then read across unrelated keys;
+one group with named members absorbs a future camera or screen capture
+without a shape change, and keeps the rule stated once.
 
 **Recording the granted track is not this host's to guarantee.** The hub adds
 no codec, no format and no audio stack (decision 007) — whether
@@ -489,9 +491,11 @@ A declared member is resolved through GLib's own reading of
 (§3) — `downloads` → `TFS_USER_DOWNLOADS_DIR`. Declaring buys a legible line in
 the manifest, not a filesystem grant or a sandbox boundary: PHP runs with the
 user's full rights regardless, exactly as `save_path` (above) already
-disclaims. See
-`.project/decision/008-user-directories-are-a-declared-capability.md` for the
-whole why.
+disclaims. The guess this removes is silent when it breaks: a hardcoded
+`$HOME/Downloads` is simply wrong the moment `~/.config/user-dirs.dirs` has
+moved the directory — a non-English locale, a manually customised layout —
+and GLib's own reading of that file is the same resolution an app workaround
+would otherwise have to shell out to `xdg-user-dir` to get.
 
 ### `close_guard`
 

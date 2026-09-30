@@ -16,9 +16,7 @@
 //! attached for the child's whole life, and inheritance is still right there.
 //!
 //! It is not one process serving N apps, and that was decided rather than
-//! defaulted (see `.project/plan/007-open-an-installed-app.md`'s Overview, which
-//! also records why a single shared FrankenPHP was rejected). Three reasons, in
-//! the order they bite:
+//! defaulted, for three reasons, in the order they bite:
 //!
 //! - every isolation guarantee of CONTRACT.md §5 holds verbatim, because it is
 //!   the same shape the station already has: one process, one identifier, one

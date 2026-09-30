@@ -150,9 +150,7 @@ string, never a guessed `$HOME`-based fallback. `$HOME` is deliberately not a
 ninth member: it already reaches PHP through the ordinary process
 environment. No filesystem grant and no existence guarantee either — PHP's
 rights are unchanged, and a resolved path may name a directory deleted a
-moment ago; see
-[decision 008](.project/decision/008-user-directories-are-a-declared-capability.md)
-for the full reasoning.
+moment ago.
 
 An app can now declare `actions.media.microphone` and reach the microphone
 through the ordinary web platform — `getUserMedia({audio: true})` on its own

@@ -128,7 +128,7 @@ pub struct AppEnvironment {
 /// that spells `workers` directly gets the bare DSN, so each transport's own
 /// `queue_name` reaches Doctrine instead of being overridden by
 /// `Connection::buildConfiguration()`'s left-hand array merge (this plan's
-/// design decision, `.project/plan/045-declared-workers-and-ordered-transports.md`).
+/// design decision, plan 045).
 fn messenger_transport_dsn(manifest: &Manifest) -> String {
     if manifest.workers.is_empty() {
         "sync://".to_string()

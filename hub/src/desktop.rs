@@ -7,7 +7,7 @@
 //! **The filename is `<identifier>.desktop`**, resolved by
 //! [`crate::paths::Paths::desktop_entry_path`]: it is the file GNOME matches
 //! first against `_GTK_APPLICATION_ID`
-//! (`.project/plan/003-runtime-identity.md` step 5), and a `tfsapp-`-prefixed
+//! (plan 003, step 5), and a `tfsapp-`-prefixed
 //! name would miss that key entirely and leave matching on the
 //! `StartupWMClass` fallback alone.
 //!

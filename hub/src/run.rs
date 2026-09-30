@@ -10,8 +10,8 @@
 //! `set_own_process_group` — already lives in
 //! `tfsapp_core::process` (plan 002). What is genuinely new is one step in
 //! front of it — resolving *which* app — and the fact that the hub has two
-//! apps' worth of state to keep apart while doing it. `../TFSAppWorkstation/
-//! .project/hub/003-cli-surface.md` §4 already answers why two different apps
+//! apps' worth of state to keep apart while doing it. §4 of the station's
+//! archived CLI-surface note already answered why two different apps
 //! running commands at once costs zero design work: `runs/` is keyed on the
 //! app's own `identifier`, not on the hub-local `id`, so it is already
 //! per-app.

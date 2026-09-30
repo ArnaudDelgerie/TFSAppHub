@@ -59,8 +59,8 @@ inheriting its cause — installed apps run from a stable real path
 that unconditionally on every `open` meant every single launch of an
 installed app compiled the container from scratch,
 in a process with no terminal attached, while the user watched the cold-start
-splash — the dominant cost of a launch by far, confirmed by the measurement
-in `.project/plan/024-a-persistent-warm-symfony-cache.md`.
+splash — the dominant cost of a launch by far, measured at ≈3 s cold against
+≈1.3 s warm on the reference app, a ≈1.7 s delta per launch.
 
 The replacement moves the build to the moment that has a terminal and makes
 the invalidation explicit. `install` and `update` each run `bin/console

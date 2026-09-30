@@ -1,6 +1,5 @@
 //! `export <id> <path>` / `import <id> <path> [--force] [--yes]` — moving one
-//! installed app's data between machines (`../.project/plan/022-export-and-
-//! import.md`).
+//! installed app's data between machines (plan 022).
 //!
 //! This module holds what needs no I/O and is worth getting right in
 //! isolation before the two commands built on it: [`Manifest`], the archive's
