@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Isolated run of the hub's own release chain — build-hub.sh and release.sh
-# against a fake `cargo`, a fake `gh` and a stub fix-appimage-bundle.sh, each
+# against a fake `cargo`, a fake `docker`, a fake `gh` and a stub
+# fix-appimage-bundle.sh, each
 # case in its own throwaway git repository. `make check`'s fifth gate; nothing
 # here touches the network, the real releases repo, or this checkout's own
 # working tree.
@@ -23,7 +24,8 @@ set -euo pipefail
 #   - a fake-bin directory first in PATH: `cargo` logs every call and, on
 #     `tauri build`, writes the version's AppImage under the workspace-shared
 #     bundle directory (its cwd is hub/, the workspace root one level up);
-#     `gh` satisfies `auth status` and `repo view`, answers `release view`
+#     `docker` accepts `compose version` and runs the tree's build-hub.sh for
+#     `compose run --rm build`; `gh` satisfies `auth status` and `repo view`, answers `release view`
 #     with "no such release", and on `release create` logs its arguments and
 #     copies the notes file. Every call lands in the case's log.
 #
@@ -128,13 +130,15 @@ new_tree() {
 
   cp "$SCRIPTS_DIR/release.sh" "$TREE/build/scripts/release.sh"
   cp "$SCRIPTS_DIR/build-hub.sh" "$TREE/build/scripts/build-hub.sh"
+  cp "$SCRIPTS_DIR/../Dockerfile" "$TREE/build/Dockerfile"
 
   cat >"$TREE/build/scripts/fix-appimage-bundle.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 echo "fix-appimage-bundle $*" >>"$FAKE_BIN_LOG"
 for appimage in "$@"; do
-  printf 'glibc_floor=stub\n' >"${appimage%.AppImage}.versions.txt"
+  printf 'build_host_os=Ubuntu 22.04.5 LTS\nbuild_host_glibc=2.35\nglibc_floor=2.35\n' \
+    >"${appimage%.AppImage}.versions.txt"
 done
 EOF
   chmod +x "$TREE/build/scripts/release.sh" "$TREE/build/scripts/build-hub.sh" \
@@ -210,7 +214,22 @@ fi
 echo "fake gh: unexpected invocation: $*" >&2
 exit 1
 EOF
-  chmod +x "$FAKEBIN/cargo" "$FAKEBIN/gh"
+
+  cat >"$FAKEBIN/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "docker $*" >>"$FAKE_BIN_LOG"
+if [[ "${FAKE_DOCKER_MISSING:-}" == "1" ]]; then exit 127; fi
+if [[ "$*" == "compose version" ]]; then exit 0; fi
+if [[ "$*" == "compose run --rm build" ]]; then
+  [[ "$(basename "$PWD")" == "build" ]] || exit 1
+  "$PWD/scripts/build-hub.sh"
+  exit 0
+fi
+echo "fake docker: unexpected invocation: $*" >&2
+exit 1
+EOF
+  chmod +x "$FAKEBIN/cargo" "$FAKEBIN/gh" "$FAKEBIN/docker"
 
   git init -q -b main "$TREE"
   git init -q --bare "$ORIGIN"
@@ -232,7 +251,7 @@ write_record() { # write_record <version> <revision> — a planted .source-commi
 }
 
 plant_versions() { # plant_versions <version> — a planted .versions.txt
-  printf 'glibc_floor=stub\n' \
+  printf 'build_host_os=Ubuntu 22.04.5 LTS\nbuild_host_glibc=2.35\nglibc_floor=2.35\n' \
     >"$TREE/target/release/bundle/appimage/TFSAppHub_${1}_amd64.versions.txt"
 }
 
@@ -254,6 +273,7 @@ run_release() { # run_release <stdin> — release.sh inside the tree
     cd "$TREE"
     printf '%s' "$1" \
       | env FAKE_BIN_LOG="$LOG" FAKE_CARGO_MOVE="${FAKE_CARGO_MOVE:-}" \
+          FAKE_DOCKER_MISSING="${FAKE_DOCKER_MISSING:-}" \
           PATH="$FAKEBIN:$PATH" ./build/scripts/release.sh
   ) >"$CASE_DIR/run.out" 2>"$CASE_DIR/run.err"
 }
@@ -361,6 +381,34 @@ case_release_refuses_branch_without_upstream() {
   case_result "release refuses a HEAD without an upstream"
 }
 
+case_release_refuses_unavailable_docker() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  FAKE_DOCKER_MISSING=1
+  if run_release ""; then
+    echo "  assertion failed: release.sh succeeded without working Docker Compose" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names Docker Compose" 'Docker Compose is unavailable' "$CASE_DIR/run.err"
+    assert_no_match "no gh call" '^gh ' "$LOG"
+    assert_no_match "no cargo call" '^cargo ' "$LOG"
+  fi
+  FAKE_DOCKER_MISSING=
+  case_result "release refuses unavailable Docker Compose before any gh call"
+}
+
+case_fresh_release_builds_in_docker() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  if run_release $'y\n'; then
+    assert_match "Docker Compose availability was checked" '^docker compose version$' "$LOG"
+    assert_match "fresh build runs through Compose" '^docker compose run --rm build$' "$LOG"
+    assert_match "the release was created" '^gh release create ' "$LOG"
+  else
+    echo "  assertion failed: release.sh exited non-zero on a fresh Docker build" >&2
+    CASE_STATUS=1
+  fi
+  case_result "a fresh release builds through Docker Compose"
+}
+
 case_release_notes_name_the_revision() {
   new_tree "0.3.0" "[0.3.0] - 2026-09-28"
   if run_release $'y\n'; then
@@ -389,6 +437,48 @@ case_reuse_when_record_matches_head() {
     CASE_STATUS=1
   fi
   case_result "a build recorded from HEAD is offered for reuse (y: no rebuild)"
+}
+
+case_reuse_refuses_non_official_build_base() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  plant_appimage "0.3.0" "host build"
+  plant_versions "0.3.0"
+  sed -i 's/^build_host_os=.*/build_host_os=Ubuntu 24.04.5 LTS/' \
+    "$TREE/target/release/bundle/appimage/TFSAppHub_0.3.0_amd64.versions.txt"
+  write_record "0.3.0" "$(tree_head)"
+  if run_release $'y\n'; then
+    echo "  assertion failed: release.sh published a reused host build" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names the actual and official bases" \
+      "build_host_os='Ubuntu 24\\.04\\.5 LTS'.*'Ubuntu 22\\.04'" "$CASE_DIR/run.err"
+    assert_match "the refusal names the Docker rebuild" \
+      'cd build && docker compose run --rm build' "$CASE_DIR/run.err"
+    assert_match "the refusal names the shared target cleanup" \
+      'rm -rf target' "$CASE_DIR/run.err"
+    assert_no_match "no release create" '^gh release create ' "$LOG"
+  fi
+  case_result "a reused AppImage from a non-official base is refused before publishing"
+}
+
+case_reuse_refuses_floor_above_build_host() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  plant_appimage "0.3.0" "mixed build"
+  plant_versions "0.3.0"
+  sed -i 's/^glibc_floor=.*/glibc_floor=2.39/' \
+    "$TREE/target/release/bundle/appimage/TFSAppHub_0.3.0_amd64.versions.txt"
+  write_record "0.3.0" "$(tree_head)"
+  if run_release $'y\n'; then
+    echo "  assertion failed: release.sh published an image with host-built objects" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names both glibc values" \
+      "build_host_glibc='2\\.35'.*glibc_floor='2\\.39'" "$CASE_DIR/run.err"
+    assert_match "the refusal names target cleanup and the Docker rebuild" \
+      'rm -rf target, then cd build && docker compose run --rm build' "$CASE_DIR/run.err"
+    assert_no_match "no release create" '^gh release create ' "$LOG"
+  fi
+  case_result "an image requiring newer glibc than its build host is refused"
 }
 
 case_rebuild_when_record_differs_or_missing() {
@@ -565,8 +655,12 @@ main() {
   case_release_refuses_dirty_tree
   case_release_refuses_unpushed_commit
   case_release_refuses_branch_without_upstream
+  case_release_refuses_unavailable_docker
+  case_fresh_release_builds_in_docker
   case_release_notes_name_the_revision
   case_reuse_when_record_matches_head
+  case_reuse_refuses_non_official_build_base
+  case_reuse_refuses_floor_above_build_host
   case_rebuild_when_record_differs_or_missing
   case_release_refuses_tree_moved_during_build
   case_release_attaches_three_assets

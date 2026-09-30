@@ -8,7 +8,7 @@
 # Usage (from this directory, build/):
 #   docker compose run --rm build
 #   docker compose run --rm check
-#   BASE_IMAGE=debian:12 docker compose run --rm build       # a lower floor
+#   BASE_IMAGE=ubuntu:24.04 docker compose run --rm build    # a custom base
 #   UID=$(id -u) GID=$(id -g) docker compose run --rm build  # see below
 #
 # Switching BASE_IMAGE against an already-populated target/ (mounted below,
@@ -35,19 +35,16 @@
 # involved here (linuxdeploy itself, its gtk plugin, and this repo's own
 # fix-appimage-bundle.sh) already understands `APPIMAGE_EXTRACT_AND_RUN=1`,
 # which unsquashes instead of mounting. Set once below, for both services.
-# Bases known to carry libwebkit2gtk-4.1-dev and libgtk-3-dev out of the box
-# (checked 2026-08-09, see the Dockerfile for the rest of the package list):
-# ubuntu:24.04 (glibc 2.39 — this default, matching this project's own release
-# floor) and debian:12 (glibc 2.36, both packages in the default main/bookworm
-# repos — no backports needed). A base missing either package is unusable
-# as-is, documented rather than worked around: this file makes no attempt to
-# add a repository or backport a package for a base that lacks one.
+# The default is the official release base: the oldest Ubuntu LTS still in
+# standard support (ubuntu:22.04 now, ubuntu:24.04 from April 2027).
+# A custom base must be Debian or Ubuntu: the Dockerfile uses apt-get and
+# fix-appimage-bundle.sh records packages with dpkg.
 x-service: &service
   build:
     context: ..
     dockerfile: build/Dockerfile
     args:
-      BASE_IMAGE: ${BASE_IMAGE:-ubuntu:24.04}
+      BASE_IMAGE: ${BASE_IMAGE:-ubuntu:22.04}
   working_dir: /workspace
   user: "${UID:-1000}:${GID:-1000}"
   environment:

@@ -2,22 +2,23 @@
 
 The hub is packaged once, as an AppImage, and that build decides the
 compatibility floor for the entire fleet — it is the only binary anyone links.
-An AppImage's portability starts with the glibc it was linked against and
-the WebKitGTK ABI it expects; both come from the builder's machine. Its
-GStreamer plugins also come from that machine and can require compatible
-graphics and audio libraries from the user's session. Rather than fighting
-that with a pinned build base of its own, the floor is simply **a property
-of whatever built the image**, measured and
-recorded beside the artifact in `.versions.txt` — the highest `GLIBC_x.y`
-symbol version any bundled ELF imports, the build host's own glibc, the OS,
-and the frozen versions of its WebKit/GTK/GLib and GStreamer libraries.
-No single release covers every distribution a user might be on; the answer
-offered to whoever it fails is `build/compose.yaml`'s `docker compose run --rm
-build`, with `BASE_IMAGE` set to a base older than the one that produced the
-release (see README.md's "It does not start"). The container is a wrapper
-around exactly `make build` / `make check` and nothing else knows it exists —
-no branch anywhere in `build/scripts/` or in Rust asks whether it is running
-inside one.
+An AppImage's portability starts with the glibc and libstdc++ it was linked
+against and the WebKitGTK ABI it expects. Its GStreamer plugins also come
+from the builder and can require compatible graphics and audio libraries
+from the user's session. `make release` invokes Docker Compose to build on
+the oldest Ubuntu LTS still in standard support: `ubuntu:22.04` now,
+`ubuntu:24.04` from April 2027, and `ubuntu:26.04` from April 2029. This
+pins the official ABI floor to a supported package set; Jammy is the oldest
+base with `webkit2gtk-4.1`. Debian 12's WebKitGTK is marked end-of-life with
+limited support, so a bookworm build would gain no useful support window.
+The build records the actual highest imported `GLIBC_*` and `GLIBCXX_*`
+versions as `glibc_floor` and `glibcxx_floor` in `.versions.txt`, along with
+the build host's OS/glibc and frozen WebKit/GTK/GLib/GStreamer packages.
+`CXXABI_*` comes from the same host libstdc++.so.6. A local `make build` still
+uses the host toolchain and records whatever floor it produces. Users can
+rebuild through `build/compose.yaml`'s `docker compose run --rm build` on the
+same official base (see README.md's "It does not start"). The build itself
+and Rust do not branch on whether they run in a container.
 
 **`cargo tauri build` gets three things wrong, repaired after the fact by
 `build/scripts/fix-appimage-bundle.sh`.** linuxdeploy runs `patchelf` (rpath →
@@ -35,6 +36,9 @@ unlike the WebKit/GTK stack, the Wayland *client* library is an ABI the
 running session owns, and freezing a copy older than the host's own
 Mesa/compositor is a known way to fail on a newer distribution — so the
 dynamic linker is left to fall through to the session's own copy instead.
+It likewise removes `libGL*`, `libEGL*`, `libGLESv2*`, `libGLX*`,
+`libOpenGL*`, `libGLdispatch*`, `libgbm*`, and `libdrm*`: graphics dispatch
+and driver libraries must match the host's GPU stack.
 Every repair is verified against the repacked artifact, not assumed from the
 input to the repack.
 
@@ -46,12 +50,13 @@ without `libgstapp.so`, `libgstcoreelements.so`, or an audio source plugin
 (`libgstpulseaudio.so` or `libgstpipewire.so`). The repair pass removes
 bundled `libpipewire-*` and `libpulse*` client libraries: their protocol and
 PipeWire SPA modules belong to the running audio session. `.versions.txt`
-records the frozen `libgstreamer-1.0.so.0` package version. The plugin set
-did not raise the measured glibc floor on Ubuntu 24.04 (2.39), and a real
-Debian 12 build recorded 2.36 and ran on Ubuntu 24.04. Optional plugins can
+records the frozen `libgstreamer-1.0.so.0` package version. The official
+Jammy build recorded glibc 2.35 and `GLIBCXX_3.4.30`, with 103 GStreamer
+plugins in a 151,558,648-byte AppImage; the previous local Ubuntu 24.04
+candidate had 274 plugins and was 226,601,464 bytes. Optional plugins can
 still depend on host graphics, X11/Wayland, ALSA, USB, or C++ libraries; a
-Docker build on an older base reduces symbol-version risk but cannot supply
-an absent host service or device.
+Docker build on the supported base reduces symbol-version risk but cannot
+supply an absent host service or device.
 
 ### Text rendering
 

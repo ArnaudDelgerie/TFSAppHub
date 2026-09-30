@@ -57,6 +57,12 @@ set -euo pipefail
 #    these client libraries to the session instead. Capture-critical plugins
 #    are verified in the final artifact below.
 #
+# 6. Graphics dispatch and driver libraries belong to the host GPU stack
+#    (GLVND, Mesa, NVIDIA). Bundling one generation beside the host's libEGL
+#    mixes two stacks; AppImage's excludelist leaves them to the host for the
+#    same reason. The host's libwebkit2gtk-4.1-0 depends on libgles2, so a
+#    desktop that can run WebKit already has the GLES dispatch library.
+#
 # Usage: build/scripts/fix-appimage-bundle.sh [appimage-path...]
 # Defaults to every *.AppImage under the hub's own bundle dir when no path is
 # given; a no-op when no AppImage is found there, or when the sidecar, the
@@ -165,6 +171,20 @@ no_bundled_audio_clients() {
   [[ -z "$(find "$1" \( -type f -o -type l \) \( -name 'libpipewire-*' -o -name 'libpulse*' \) -print -quit)" ]]
 }
 
+# Graphics dispatch and driver libraries must come from the host GPU stack.
+graphics_driver_files() {
+  local root="$1"
+  shift
+  find "$root" \( -type f -o -type l \) \( \
+    -name 'libGL.so*' -o -name 'libEGL*' -o -name 'libGLESv2*' -o \
+    -name 'libGLX*' -o -name 'libOpenGL*' -o -name 'libGLdispatch*' -o \
+    -name 'libgbm*' -o -name 'libdrm*' \) "$@"
+}
+
+no_bundled_graphics_driver() {
+  [[ -z "$(graphics_driver_files "$1" -print -quit)" ]]
+}
+
 # Refuse an image whose copied GStreamer set cannot supply the elements WebKit
 # needs for microphone capture. Name the build-host package to install.
 verify_capture_plugins() {
@@ -199,6 +219,18 @@ highest_glibc_requirement() {
     file -b "$file" 2>/dev/null | grep -q ELF || continue
     readelf -V "$file" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+'
   done < <(find "$root" -type f -print0) | sed 's/^GLIBC_//' | sort -Vu | tail -1
+}
+
+# The highest GLIBCXX version imported by bundled ELFs. Scan CXXABI versions
+# too, since they belong to the same host-provided libstdc++.so.6 ABI, but
+# report the GLIBCXX floor used in loader errors and compatibility checks.
+highest_glibcxx_requirement() {
+  local root="$1" file
+  while IFS= read -r -d '' file; do
+    file -b "$file" 2>/dev/null | grep -q ELF || continue
+    # Many ELFs use glibc but have no C++ imports; that is expected.
+    readelf -V "$file" 2>/dev/null | grep -oE '(GLIBCXX|CXXABI)_[0-9.]+' || true
+  done < <(find "$root" -type f -print0) | sed -n 's/^GLIBCXX_//p' | sort -Vu | tail -1
 }
 
 # Captured once, up front: piping a live `ldconfig -p` straight into an awk
@@ -278,11 +310,13 @@ for appimage in "${appimages[@]}"; do
   no_bundled_wayland "$workdir/squashfs-root" || wayland_ok=false
   audio_clients_ok=true
   no_bundled_audio_clients "$workdir/squashfs-root" || audio_clients_ok=false
+  graphics_driver_ok=true
+  no_bundled_graphics_driver "$workdir/squashfs-root" || graphics_driver_ok=false
 
   # Repack only when something actually needs fixing — but "already fixed" has
   # to mean every repair, otherwise an already-pristine sidecar would
   # short-circuit the pass and quietly drop one of the others.
-  if cmp -s "${bundled[0]}" "$PRISTINE" && [[ "$hook_state" != "stale" ]] && [[ "$dir_icon_ok" == true ]] && [[ "$wayland_ok" == true ]] && [[ "$audio_clients_ok" == true ]]; then
+  if cmp -s "${bundled[0]}" "$PRISTINE" && [[ "$hook_state" != "stale" ]] && [[ "$dir_icon_ok" == true ]] && [[ "$wayland_ok" == true ]] && [[ "$audio_clients_ok" == true ]] && [[ "$graphics_driver_ok" == true ]]; then
     echo "$(basename "$appimage"): sidecar, GTK hook, .DirIcon and session-owned libraries already correct, skipping."
   else
     cp "$PRISTINE" "${bundled[0]}"
@@ -328,6 +362,11 @@ for appimage in "${appimages[@]}"; do
         rm -f "$lib"
       done < <(find "$workdir/squashfs-root" \( -type f -o -type l \) \( -name 'libpipewire-*' -o -name 'libpulse*' \) -print0)
     fi
+    if [[ "$graphics_driver_ok" == false ]]; then
+      while IFS= read -r -d '' lib; do
+        rm -f "$lib"
+      done < <(graphics_driver_files "$workdir/squashfs-root" -print0)
+    fi
     OUTPUT="$workdir/fixed.AppImage" ARCH="$(uname -m)" APPIMAGE_EXTRACT_AND_RUN=1 \
       "$APPIMAGETOOL" --appdir "$workdir/squashfs-root" > "$workdir/repack.log" 2>&1 \
       || { echo "Repack failed for $appimage:" >&2; cat "$workdir/repack.log" >&2; exit 1; }
@@ -353,6 +392,8 @@ for appimage in "${appimages[@]}"; do
     || { echo "Verification failed: $appimage still bundles a libwayland-*." >&2; exit 1; }
   no_bundled_audio_clients "$verify_root" \
     || { echo "Verification failed: $appimage still bundles a libpipewire-* or libpulse* client library." >&2; exit 1; }
+  no_bundled_graphics_driver "$verify_root" \
+    || { echo "Verification failed: $appimage still bundles a graphics-driver library." >&2; exit 1; }
   verify_capture_plugins "$verify_root" || exit 1
 
   # Belt-and-braces beyond the three known defects above: nothing else
@@ -384,6 +425,11 @@ for appimage in "${appimages[@]}"; do
     echo "No GLIBC_x.y symbol version found in any bundled ELF in $appimage — cannot record its glibc floor." >&2
     exit 1
   fi
+  glibcxx_floor="$(highest_glibcxx_requirement "$verify_root")"
+  if [[ -z "$glibcxx_floor" ]]; then
+    echo "No GLIBCXX symbol version found in any bundled ELF in $appimage — cannot record its C++ floor." >&2
+    exit 1
+  fi
   build_host_glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $NF}')"
   if [[ -z "$build_host_glibc" ]]; then
     echo "getconf GNU_LIBC_VERSION gave no version on the build host — cannot record it." >&2
@@ -403,6 +449,9 @@ for appimage in "${appimages[@]}"; do
     # it, every binary here fails in the dynamic loader before any of the
     # hub's own error handling can run.
     echo "glibc_floor=$glibc_floor"
+    # The lowest GLIBCXX symbol version the machine's libstdc++.so.6 must
+    # provide; an older copy fails in the loader before the hub starts.
+    echo "glibcxx_floor=$glibcxx_floor"
     for soname in "${FROZEN_SONAMES[@]}"; do
       resolve_library_version "$soname" "$verify_root"
     done
