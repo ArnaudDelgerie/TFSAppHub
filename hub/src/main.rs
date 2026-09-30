@@ -187,9 +187,10 @@ fn dispatch(args: &[String], context: tauri::Context) -> i32 {
         // Same package info `--version` prints, passed by reference: `check`
         // (`hub_update.rs`) compares it against the release tag directly,
         // with no string round trip.
-        Command::HubUpdate { assume_yes } => hub_update::run(
+        Command::HubUpdate { from, assume_yes } => hub_update::run(
             &context.package_info().version,
             &context.package_info().name,
+            from.as_deref(),
             assume_yes,
         ),
         Command::HubRollback { assume_yes } => hub_rollback::run(assume_yes),

@@ -241,7 +241,12 @@ pub(crate) enum UpdateOutcome {
 
 /// `tfsapp-hub --update [--yes]` — resolve `Paths`, read `$APPIMAGE`, and turn
 /// the pipeline's outcome into an exit code.
-pub fn run(current: &semver::Version, expected_name: &str, assume_yes: bool) -> i32 {
+pub fn run(
+    current: &semver::Version,
+    expected_name: &str,
+    from: Option<&Path>,
+    assume_yes: bool,
+) -> i32 {
     let paths = match Paths::resolve() {
         Ok(paths) => paths,
         Err(error) => {
@@ -256,6 +261,7 @@ pub fn run(current: &semver::Version, expected_name: &str, assume_yes: bool) -> 
         appimage_env.as_deref(),
         current,
         expected_name,
+        from,
         assume_yes,
     ) {
         Ok(UpdateOutcome::UpToDate { current }) => {
@@ -289,18 +295,30 @@ pub(crate) fn update(
     appimage_env: Option<&str>,
     current: &semver::Version,
     expected_name: &str,
+    from: Option<&Path>,
     assume_yes: bool,
 ) -> Result<UpdateOutcome, HubUpdateError> {
     let scratch = paths.scratch_dir();
-    let result = update_at(
-        paths,
-        &scratch,
-        release::GITHUB_API_BASE,
-        appimage_env,
-        current,
-        expected_name,
-        assume_yes,
-    );
+    let result = match from {
+        Some(source) => update_from_at(
+            paths,
+            &scratch,
+            appimage_env,
+            current,
+            expected_name,
+            source,
+            assume_yes,
+        ),
+        None => update_at(
+            paths,
+            &scratch,
+            release::GITHUB_API_BASE,
+            appimage_env,
+            current,
+            expected_name,
+            assume_yes,
+        ),
+    };
     let _ = fs::remove_dir_all(&scratch);
     result
 }
@@ -440,9 +458,75 @@ fn update_at_after_anchor(
         }
     }
 
+    finish_update(
+        paths,
+        &appimage_target,
+        &archive_path,
+        version,
+        after_anchor,
+    )
+}
+
+fn update_from_at(
+    paths: &Paths,
+    scratch: &Path,
+    appimage_env: Option<&str>,
+    current: &semver::Version,
+    expected_name: &str,
+    source: &Path,
+    assume_yes: bool,
+) -> Result<UpdateOutcome, HubUpdateError> {
+    let appimage_target =
+        resolve_appimage_target(appimage_env).ok_or(HubUpdateError::NotPackaged)?;
+    fs::create_dir_all(scratch).map_err(|source| HubUpdateError::Io {
+        path: scratch.to_path_buf(),
+        source,
+    })?;
+    let candidate = scratch.join("local.AppImage");
+    fs::copy(source, &candidate).map_err(|error| HubUpdateError::Io {
+        path: source.to_path_buf(),
+        source: error,
+    })?;
+    make_executable(&candidate)?;
+    let version = match probe(&candidate, expected_name, Duration::from_secs(60)) {
+        Ok(version) => version,
+        Err(ProbeError::NotTheHub(output)) => {
+            return Err(HubUpdateError::LocalNotTheHub {
+                path: source.to_path_buf(),
+                output,
+            });
+        }
+        Err(error) => {
+            return Err(HubUpdateError::LocalDoesNotRun {
+                path: source.to_path_buf(),
+                detail: probe_failure_detail(error),
+            });
+        }
+    };
+    if version < *current {
+        return Err(HubUpdateError::LocalOlder {
+            current: current.clone(),
+            found: version,
+        });
+    }
+    announce(current, &version, &source.display().to_string());
+    if !prompt::confirmed(assume_yes) {
+        println!("Aborted — nothing was changed.");
+        return Ok(UpdateOutcome::Declined);
+    }
+    finish_update(paths, &appimage_target, &candidate, version, |_| {})
+}
+
+fn finish_update(
+    paths: &Paths,
+    appimage_target: &Path,
+    archive_path: &Path,
+    version: semver::Version,
+    after_anchor: impl FnOnce(&Paths),
+) -> Result<UpdateOutcome, HubUpdateError> {
     // 7. Refresh the stable copy only now. A rejected release must not even
     // repair a stale stable copy: "nothing changed" includes that file.
-    hub_bin::ensure_current_at(&appimage_target, &paths.hub_executable_path())
+    hub_bin::ensure_current_at(appimage_target, &paths.hub_executable_path())
         .map_err(HubUpdateError::HubBin)?;
 
     // 8. Snapshot registry.json beside the anchor, under the registry lock —
@@ -459,7 +543,7 @@ fn update_at_after_anchor(
         source,
     })?;
     after_anchor(paths);
-    if let Err(source) = hub_bin::ensure_current_at(&archive_path, &stable_path) {
+    if let Err(source) = hub_bin::ensure_current_at(archive_path, &stable_path) {
         return match fs::rename(hub_bin::anchor_path(paths), &stable_path) {
             Ok(()) => {
                 let _ = fs::remove_file(hub_bin::anchor_registry_path(paths));
@@ -480,9 +564,9 @@ fn update_at_after_anchor(
     // identical either way, which is exactly why it is reused rather than
     // reimplemented). From here a failure is the plan's named partial
     // failure: the stable copy is already new.
-    hub_bin::ensure_current_at(&stable_path, &appimage_target).map_err(|error| {
+    hub_bin::ensure_current_at(&stable_path, appimage_target).map_err(|error| {
         HubUpdateError::AppimageSwapFailed {
-            appimage_path: appimage_target.clone(),
+            appimage_path: appimage_target.to_path_buf(),
             source: error,
         }
     })?;
@@ -493,7 +577,7 @@ fn update_at_after_anchor(
     Ok(UpdateOutcome::Updated {
         version,
         stable_path,
-        appimage_path: appimage_target,
+        appimage_path: appimage_target.to_path_buf(),
     })
 }
 
@@ -566,6 +650,18 @@ pub enum HubUpdateError {
         expected: semver::Version,
         detail: String,
     },
+    LocalDoesNotRun {
+        path: PathBuf,
+        detail: String,
+    },
+    LocalNotTheHub {
+        path: PathBuf,
+        output: String,
+    },
+    LocalOlder {
+        current: semver::Version,
+        found: semver::Version,
+    },
     HubBin(HubBinError),
     Registry(RegistryError),
     ChecksumMismatch {
@@ -615,6 +711,20 @@ impl fmt::Display for HubUpdateError {
             Self::ReleaseMismatch { expected, detail } => write!(
                 formatter,
                 "the official AppImage for v{expected} does not match its release tag ({detail}); nothing was changed."
+            ),
+            Self::LocalDoesNotRun { path, detail } => write!(
+                formatter,
+                "{} does not run on this machine ({detail}); nothing was changed.",
+                path.display()
+            ),
+            Self::LocalNotTheHub { path, output } => write!(
+                formatter,
+                "{} is not this hub (reported {output:?}); nothing was changed.",
+                path.display()
+            ),
+            Self::LocalOlder { current, found } => write!(
+                formatter,
+                "local AppImage v{found} is older than the running hub v{current}; use `tfsapp-hub --rollback` to go back. Nothing was changed."
             ),
             Self::HubBin(error) => write!(formatter, "{error}"),
             Self::Registry(error) => write!(formatter, "{error}"),

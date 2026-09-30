@@ -2,10 +2,10 @@ use std::{fs, path::Path, time::Duration};
 
 use super::{
     anchor_state, check, probe, resolve_appimage_target, update_at, update_at_after_anchor,
-    HubUpdateCheck, HubUpdateError, MissingAnchorHalf, ProbeError, UpdateOutcome,
+    update_from_at, HubUpdateCheck, HubUpdateError, MissingAnchorHalf, ProbeError, UpdateOutcome,
 };
 use crate::{
-    hub_bin,
+    hub_bin, hub_rollback,
     paths::Paths,
     release::{fetch_latest_release_at, RELEASES_REPO},
 };
@@ -667,4 +667,105 @@ fn a_release_reporting_a_different_version_is_refused() {
     assert_eq!(fs::read(&appimage).unwrap(), b"running image");
     assert!(!paths.hub_executable_path().exists());
     assert!(!hub_bin::anchor_path(&paths).exists());
+}
+
+#[test]
+fn a_local_rebuild_of_the_same_version_swaps_and_rolls_back() {
+    let (_base, paths) = temp_paths();
+    let downloads = tempfile::tempdir().unwrap();
+    let appimage = downloads.path().join("running.AppImage");
+    fs::write(&appimage, b"old hub").unwrap();
+    let source = downloads.path().join("rebuilt.AppImage");
+    let bytes = image_bytes("0.4.0");
+    fs::write(&source, &bytes).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+
+    let outcome = update_from_at(
+        &paths,
+        scratch.path(),
+        Some(appimage.to_str().unwrap()),
+        &semver::Version::new(0, 4, 0),
+        "TFSAppHub",
+        &source,
+        true,
+    )
+    .unwrap();
+    assert!(matches!(outcome, UpdateOutcome::Updated { .. }));
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+    assert_eq!(fs::read(&appimage).unwrap(), bytes);
+    assert_eq!(fs::read(paths.hub_executable_path()).unwrap(), bytes);
+    assert_eq!(fs::read(hub_bin::anchor_path(&paths)).unwrap(), b"old hub");
+    let snapshot = fs::read(hub_bin::anchor_registry_path(&paths)).unwrap();
+
+    hub_rollback::rollback(&paths, Some(appimage.to_str().unwrap()), true).unwrap();
+    assert_eq!(fs::read(&appimage).unwrap(), b"old hub");
+    assert_eq!(fs::read(paths.hub_executable_path()).unwrap(), b"old hub");
+    assert_eq!(fs::read(paths.registry_path()).unwrap(), snapshot);
+    assert!(!hub_bin::anchor_path(&paths).exists());
+}
+
+#[test]
+fn a_newer_local_image_is_installed() {
+    let (_base, paths) = temp_paths();
+    let downloads = tempfile::tempdir().unwrap();
+    let appimage = downloads.path().join("running.AppImage");
+    fs::write(&appimage, b"old hub").unwrap();
+    let source = downloads.path().join("new.AppImage");
+    let bytes = image_bytes("0.5.0");
+    fs::write(&source, &bytes).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let outcome = update_from_at(
+        &paths,
+        scratch.path(),
+        Some(appimage.to_str().unwrap()),
+        &semver::Version::new(0, 4, 0),
+        "TFSAppHub",
+        &source,
+        true,
+    )
+    .unwrap();
+    assert!(
+        matches!(outcome, UpdateOutcome::Updated { version, .. } if version == semver::Version::new(0, 5, 0))
+    );
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+}
+
+#[test]
+fn an_older_or_broken_local_image_changes_nothing() {
+    let (_base, paths) = temp_paths();
+    let downloads = tempfile::tempdir().unwrap();
+    let appimage = downloads.path().join("running.AppImage");
+    fs::write(&appimage, b"old hub").unwrap();
+    let stable = paths.hub_executable_path();
+    fs::create_dir_all(stable.parent().unwrap()).unwrap();
+    fs::write(&stable, b"stable before").unwrap();
+    let source = downloads.path().join("candidate.AppImage");
+    let scratch = tempfile::tempdir().unwrap();
+
+    for (bytes, expected) in [
+        (image_bytes("0.3.0"), "older"),
+        (b"not an executable".to_vec(), "does not run"),
+        (
+            b"#!/bin/sh\necho 'OtherHub 0.4.0'\n".to_vec(),
+            "not this hub",
+        ),
+    ] {
+        fs::write(&source, &bytes).unwrap();
+        let error = update_from_at(
+            &paths,
+            scratch.path(),
+            Some(appimage.to_str().unwrap()),
+            &semver::Version::new(0, 4, 0),
+            "TFSAppHub",
+            &source,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert_eq!(fs::read(&appimage).unwrap(), b"old hub");
+        assert_eq!(fs::read(&stable).unwrap(), b"stable before");
+        assert!(!hub_bin::anchor_path(&paths).exists());
+        assert!(!hub_bin::anchor_registry_path(&paths).exists());
+    }
 }

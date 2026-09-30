@@ -27,16 +27,33 @@ fn hub_level_flags_route_to_the_hub() {
     assert_eq!(command("--help"), Command::Help);
     assert_eq!(
         command("--update"),
-        Command::HubUpdate { assume_yes: false }
+        Command::HubUpdate {
+            from: None,
+            assume_yes: false
+        }
     );
     assert_eq!(
         command("--update --yes"),
-        Command::HubUpdate { assume_yes: true }
+        Command::HubUpdate {
+            from: None,
+            assume_yes: true
+        }
     );
     assert_eq!(
         command("--update -y"),
-        Command::HubUpdate { assume_yes: true }
+        Command::HubUpdate {
+            from: None,
+            assume_yes: true
+        }
     );
+    assert_eq!(
+        command("--update --from /tmp/rebuilt.AppImage --yes"),
+        Command::HubUpdate {
+            from: Some("/tmp/rebuilt.AppImage".into()),
+            assume_yes: true,
+        }
+    );
+    assert!(refusal("--update --from").to_string().contains("--from"));
     assert_eq!(
         command("--rollback"),
         Command::HubRollback { assume_yes: false }
@@ -334,7 +351,7 @@ fn a_malformed_invocation_names_the_right_form() {
         ("run", "run <id>"),
         ("run --stop demo console extra", "run <id>"),
         ("run --stop --replace demo console", "run <id>"),
-        ("--update --now", "--update [--yes]"),
+        ("--update --now", "--update [--from <path>] [--yes]"),
         ("--version extra", "--version"),
     ];
 
