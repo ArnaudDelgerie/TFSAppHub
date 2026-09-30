@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Isolated run of the hub's own release chain — build-hub.sh and release.sh
-# against a fake `cargo`, a fake `gh` and a stub fix-appimage-bundle.sh, each
+# against a fake `cargo`, a fake `docker`, a fake `gh` and a stub
+# fix-appimage-bundle.sh, each
 # case in its own throwaway git repository. `make check`'s fifth gate; nothing
 # here touches the network, the real releases repo, or this checkout's own
 # working tree.
@@ -23,7 +24,8 @@ set -euo pipefail
 #   - a fake-bin directory first in PATH: `cargo` logs every call and, on
 #     `tauri build`, writes the version's AppImage under the workspace-shared
 #     bundle directory (its cwd is hub/, the workspace root one level up);
-#     `gh` satisfies `auth status` and `repo view`, answers `release view`
+#     `docker` accepts `compose version` and runs the tree's build-hub.sh for
+#     `compose run --rm build`; `gh` satisfies `auth status` and `repo view`, answers `release view`
 #     with "no such release", and on `release create` logs its arguments and
 #     copies the notes file. Every call lands in the case's log.
 #
@@ -210,7 +212,22 @@ fi
 echo "fake gh: unexpected invocation: $*" >&2
 exit 1
 EOF
-  chmod +x "$FAKEBIN/cargo" "$FAKEBIN/gh"
+
+  cat >"$FAKEBIN/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "docker $*" >>"$FAKE_BIN_LOG"
+if [[ "${FAKE_DOCKER_MISSING:-}" == "1" ]]; then exit 127; fi
+if [[ "$*" == "compose version" ]]; then exit 0; fi
+if [[ "$*" == "compose run --rm build" ]]; then
+  [[ "$(basename "$PWD")" == "build" ]] || exit 1
+  "$PWD/scripts/build-hub.sh"
+  exit 0
+fi
+echo "fake docker: unexpected invocation: $*" >&2
+exit 1
+EOF
+  chmod +x "$FAKEBIN/cargo" "$FAKEBIN/gh" "$FAKEBIN/docker"
 
   git init -q -b main "$TREE"
   git init -q --bare "$ORIGIN"
@@ -254,6 +271,7 @@ run_release() { # run_release <stdin> — release.sh inside the tree
     cd "$TREE"
     printf '%s' "$1" \
       | env FAKE_BIN_LOG="$LOG" FAKE_CARGO_MOVE="${FAKE_CARGO_MOVE:-}" \
+          FAKE_DOCKER_MISSING="${FAKE_DOCKER_MISSING:-}" \
           PATH="$FAKEBIN:$PATH" ./build/scripts/release.sh
   ) >"$CASE_DIR/run.out" 2>"$CASE_DIR/run.err"
 }
@@ -359,6 +377,34 @@ case_release_refuses_branch_without_upstream() {
     assert_no_match "no release create" 'release create' "$LOG"
   fi
   case_result "release refuses a HEAD without an upstream"
+}
+
+case_release_refuses_unavailable_docker() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  FAKE_DOCKER_MISSING=1
+  if run_release ""; then
+    echo "  assertion failed: release.sh succeeded without working Docker Compose" >&2
+    CASE_STATUS=1
+  else
+    assert_match "the refusal names Docker Compose" 'Docker Compose is unavailable' "$CASE_DIR/run.err"
+    assert_no_match "no gh call" '^gh ' "$LOG"
+    assert_no_match "no cargo call" '^cargo ' "$LOG"
+  fi
+  FAKE_DOCKER_MISSING=
+  case_result "release refuses unavailable Docker Compose before any gh call"
+}
+
+case_fresh_release_builds_in_docker() {
+  new_tree "0.3.0" "[0.3.0] - 2026-09-28"
+  if run_release $'y\n'; then
+    assert_match "Docker Compose availability was checked" '^docker compose version$' "$LOG"
+    assert_match "fresh build runs through Compose" '^docker compose run --rm build$' "$LOG"
+    assert_match "the release was created" '^gh release create ' "$LOG"
+  else
+    echo "  assertion failed: release.sh exited non-zero on a fresh Docker build" >&2
+    CASE_STATUS=1
+  fi
+  case_result "a fresh release builds through Docker Compose"
 }
 
 case_release_notes_name_the_revision() {
@@ -565,6 +611,8 @@ main() {
   case_release_refuses_dirty_tree
   case_release_refuses_unpushed_commit
   case_release_refuses_branch_without_upstream
+  case_release_refuses_unavailable_docker
+  case_fresh_release_builds_in_docker
   case_release_notes_name_the_revision
   case_reuse_when_record_matches_head
   case_rebuild_when_record_differs_or_missing
