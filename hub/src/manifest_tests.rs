@@ -44,7 +44,7 @@ const FULL: &str = r#"{
     "pre-build": ["composer install --no-dev"],
     "post-build": ["composer install"]
   },
-  "releases_repo": "ArnaudDelgerie/TFSAppTest-releases",
+  "releases_repo": "owner/repo",
   "run": {
     "mcp-serve": { "command": "app:run:mcp-serve", "concurrent": true },
     "cleanup": { "command": "app:run:cleanup" }
