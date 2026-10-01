@@ -56,11 +56,16 @@
 http://127.0.0.1:{$APP_PORT} {
     root * "{$APP_PUBLIC_DIR}"
 
-    header {
-        Cache-Control "no-store"
-        Pragma "no-cache"
-        Expires "0"
-    }
+    # The caching default (CONTRACT.md §4), a `?` like the hardening defaults
+    # below and for the same reason: an app that sends its own Cache-Control
+    # keeps it. A plain `header` here was applied before the app answered,
+    # so an app's own value arrived as a second Cache-Control beside
+    # `no-store`, and `no-store` won. Symfony answers every response with a
+    # Cache-Control of its own (`no-cache, private` unless the app says
+    # otherwise), so this default reaches static files under public/ and
+    # non-Symfony responses. No Pragma/Expires: HTTP/1.0 spellings a client
+    # ignores whenever Cache-Control is present.
+    header ?Cache-Control "no-store"
 
     # Hardening defaults for the loopback origin (CONTRACT.md §4, plan 034).
     # The `?` form only sets a field the response doesn't already carry, so a
@@ -107,13 +112,12 @@ http://127.0.0.1:{$APP_PORT} {
     # Symfony's AssetMapper (and Encore) serve static assets under /assets/
     # with content-hashed filenames, so caching them is always safe — a
     # content change is a different URL. Override the no-store default above
-    # for that path only; everything else (HTML, API responses) stays
-    # uncached.
+    # for that path only, deferred to the moment the response is written so
+    # it replaces whatever was set before it.
     @assets path /assets/*
     header @assets {
+        defer
         Cache-Control "public, max-age=31536000, immutable"
-        -Pragma
-        -Expires
     }
 
     # Classic mode: one Symfony boot per request. Symfony worker mode is a
