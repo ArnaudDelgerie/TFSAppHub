@@ -160,9 +160,10 @@ does `uploads/`; nothing else in the data directory does.**
 
 `cache/`, `build/`, `log/`, `sessions/` do not travel — each is either
 machine-specific or gets regenerated on the destination's next launch anyway.
-Neither does `secrets.json`, the plaintext keyring fallback: it holds
-`APP_SECRET` and every `actions.secrets` value in the clear, and shipping it
-in a file people copy around would turn a convenience into a disclosure. An
+Neither do `app.secret` and `secrets.json`, the plaintext keyring fallbacks:
+they hold `APP_SECRET` and every `actions.secrets` value in the clear, and
+shipping them in a file people copy around would turn a convenience into a
+disclosure. An
 app must not treat anything outside its own database and `uploads/` as
 portable state — a value stashed in `cache/` or read back from a file it wrote
 beside the database is not carried by an export, whatever survives a
