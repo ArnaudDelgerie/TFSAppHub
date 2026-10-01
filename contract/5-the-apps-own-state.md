@@ -215,33 +215,31 @@ is treated as a leftover from a failed export and must be removed by hand,
 never silently clobbered. A failed export best-effort removes only the temp it
 created itself.
 
-**A forced import rescues the database before writing the archive.** Each
-database file being replaced is copied atomically into a newly created rescue
-file named
-`<name>.rescue-<YYYYMMDDTHHMMSSZ>` (with a numeric suffix for a same-second
-collision); the primary database's `app.db.rescue-*` path is printed.
-The name is reserved with exclusive creation while the copy is made, so a
-pre-existing or simultaneous candidate advances to the next suffix and
-consecutive forced imports never overwrite an earlier rescue. The live `app.db`, `app.db-wal` and
-`app.db-shm` are removed after that rescue and before extraction, so an archive
-that carries only `app.db` cannot inherit a stale WAL from the data it
-replaced.
+**An import stages first, and touches nothing live until the archive is
+whole.** The archive's database and `uploads/` are extracted into a staging
+directory inside the data directory; a failed extraction leaves the
+installation exactly as it was.
 
-**A non-empty `uploads/` is rescued too, by rename rather than by copy.** The
-same naming and collision rule applies — `uploads.rescue-<YYYYMMDDTHHMMSSZ>`,
-its path printed beside `app.db.rescue-*` — but the directory is moved aside
-instead of copied: nothing afterwards needs the source gone the way the
-database's own removal does, and a directory of uploads can be gigabytes,
-which a copy would make every forced import pay for regardless of whether
-anything is even wrong.
+**A forced import keeps what it replaces, by rename.** Each database file
+being replaced — `app.db`, and `app.db-wal`/`app.db-shm` when present — is
+moved aside as `<name>.rescue-<YYYYMMDDTHHMMSSZ>` (with a numeric suffix for a
+same-second collision), and a non-empty `uploads/` as
+`uploads.rescue-<YYYYMMDDTHHMMSSZ>`; only then do the staged files take their
+places. The rescue names are reserved before anything moves, so consecutive
+forced imports never overwrite an earlier rescue, and the replaced data's WAL
+never survives beside an archive that carries only `app.db`. A successful
+import prints the database's rescue path and, when one was taken,
+`uploads/`'s.
 
-After extraction, import immediately records the archive's version in
-`data/config.json` before any forward migration runs. If the import fails
-after the rescue point, its error retains the underlying reason and names the
-data directory's resulting state (partially extracted, unmigrated, or
-otherwise unable to proceed) together with both rescue paths — the database's
-and, when one was taken, `uploads/`'s. In particular, a failed forward
-migration leaves the archive's older version on disk; the next `open`
-recognises it as an unfinished update and refuses it rather than serving an
-unmigrated database.
+**An archive older than the installed app is migrated forward inside the
+import**: the installed version's `pre-update` then `post-update` (§6) run
+over the imported database, and the version record ends on the installed
+version. An archive newer than the installed app is refused.
+
+**A failed import changes nothing.** If the switch, the version record or the
+forward migration fails, the import moves everything back — database,
+`uploads/`, version record — and says that nothing was changed. If the hub is
+stopped partway instead, every command for that app refuses until
+`tfsapp-hub repair <id>` puts the replaced data back, or finishes an import
+that had already committed (§6).
 
