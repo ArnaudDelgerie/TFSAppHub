@@ -155,7 +155,7 @@ provide a missing host audio service or device.
 Installing an app runs a third party's PHP, Composer scripts included, with the
 user's full rights. So does downloading an unsigned AppImage — the trust decision
 is the same one, and the hub is the more auditable of the two (a repo at a pinned
-tag can be read and diffed; a ~130 MB binary cannot). What genuinely differs is
+tag can be read and diffed; a ~150 MB binary cannot). What genuinely differs is
 friction and co-residency, not the kind of risk.
 
 No sandbox is claimed. Sources default to a pinned tag or commit, never a branch.

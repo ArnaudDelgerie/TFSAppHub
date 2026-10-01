@@ -174,7 +174,7 @@ beside the target, then renamed over it. Two apps sharing this one file is the
 ordinary case, not an edge case — one may be open from it while a second
 install refreshes it for a newer hub — and a rename swaps the whole inode
 atomically, so a process already running the old copy keeps running the
-generation it started with instead of meeting a half-written 170 MB binary or
+generation it started with instead of meeting a half-written 150 MB binary or
 an `ETXTBSY`. It is also what `--update` (`hub_update.rs`) replaces this same
 file with, which is the other reason it lives under the hub's own root
 rather than beside a per-app path.
