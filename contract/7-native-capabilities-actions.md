@@ -28,6 +28,23 @@ deliberately IPC-only; `media` and `paths` use neither:
 | `ipc` | the webview's own JS, through the host's IPC channel |
 | `bridge` | PHP, through a loopback HTTP server — see "The bridge wire contract" below |
 
+**Where `invoke()` comes from.** Every `invoke(...)` in this section is
+Tauri's own, which the hub exposes to the app's pages as a global — no
+package to install, no build step:
+
+```js
+const invoke = window.__TAURI__?.core?.invoke;
+// undefined outside the hub (a plain browser on the same port, a test
+// runner): treat every ipc capability as unavailable, per the standing rules.
+```
+
+It returns a promise that resolves to the command's answer, or rejects —
+with the command's error code, a string, when the command itself refused;
+with Tauri's own message when the group is not declared and the call never
+reached it. The same global carries the window API
+the `open_files` receiver below listens on:
+`window.__TAURI__.webviewWindow.getCurrentWebviewWindow()`.
+
 Granularity is **group × available transport, all or nothing per group**; there
 is no per-command configuration. `picker` has only the IPC transport, so a
 `bridge` member there is refused rather than held as a future permission.
