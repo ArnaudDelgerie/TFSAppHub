@@ -59,9 +59,9 @@ pub enum GateError {
         operation: Option<String>,
     },
     /// The identifier's data directory holds an interrupted-operation record
-    /// that only `repair` resolves — the update journal (see
-    /// `contract/6-lifecycle.md`, "An interrupted update requires an explicit
-    /// repair") or an import intent. `id` is the registry's answer for who
+    /// that only `repair` resolves — the update journal or an import intent
+    /// (see `contract/6-lifecycle.md`, "An interrupted update or import
+    /// requires an explicit repair"). `id` is the registry's answer for who
     /// owns that record, resolved best-effort: the refusal needs nothing but
     /// the record's presence, the id only makes the message actionable.
     RepairRequired {
