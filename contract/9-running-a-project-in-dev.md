@@ -61,8 +61,8 @@ recorded — an author is free to edit it while iterating.
 The hub serves the project's source **in place** and never modifies it — the
 same guarantee §1 states for what installing does to a source tree, read from
 the running-from-source side instead. The one directory the hub writes into is
-`var/`, which the app's own `TFSAppKernel` already points its cache, build,
-log and session directories at (§1); nothing outside it is ever touched.
+`var/`, where the §3 paths above root the app's cache, build, log and session
+directories (its kernel honours them, §1); nothing outside it is ever touched.
 
 ### The guardrail
 

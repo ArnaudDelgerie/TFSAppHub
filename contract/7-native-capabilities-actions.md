@@ -28,6 +28,23 @@ deliberately IPC-only; `media` and `paths` use neither:
 | `ipc` | the webview's own JS, through the host's IPC channel |
 | `bridge` | PHP, through a loopback HTTP server — see "The bridge wire contract" below |
 
+**Where `invoke()` comes from.** Every `invoke(...)` in this section is
+Tauri's own, which the hub exposes to the app's pages as a global — no
+package to install, no build step:
+
+```js
+const invoke = window.__TAURI__?.core?.invoke;
+// undefined outside the hub (a plain browser on the same port, a test
+// runner): treat every ipc capability as unavailable, per the standing rules.
+```
+
+It returns a promise that resolves to the command's answer, or rejects —
+with the command's error code, a string, when the command itself refused;
+with Tauri's own message when the group is not declared and the call never
+reached it. The same global carries the window API
+the `open_files` receiver below listens on:
+`window.__TAURI__.webviewWindow.getCurrentWebviewWindow()`.
+
 Granularity is **group × available transport, all or nothing per group**; there
 is no per-command configuration. `picker` has only the IPC transport, so a
 `bridge` member there is refused rather than held as a future permission.
@@ -76,6 +93,23 @@ size checks, so an app can tell "not set" from "could not be reached". The
 hub's own log carries one warning line per failure naming the cause, never the
 key or the value.
 
+**The IPC commands** — five, each answering for the calling window's own
+app only:
+
+```js
+await invoke("secret_list");                                    // → [{ "key": "openai", "set": true }, …], declared order
+await invoke("secret_has",    { key: "openai" });               // → true or false
+await invoke("secret_get",    { key: "openai" });               // → "sk-…", or null when never set
+await invoke("secret_set",    { key: "openai", value: "sk-…" }); // → null
+await invoke("secret_delete", { key: "openai" });               // → true when a value existed, else false
+```
+
+A refused call rejects with one of these codes: `key_not_declared`
+(reserved, or not in `keys`), `value_too_large` (`secret_set` only),
+`storage_failed`, and `unavailable` when no store backs the calling window
+at all. The bridge offers the same five operations as routes — see "The
+bridge wire contract" below.
+
 **Neither transport is safer; the choice is a real trade-off.**
 
 | | protects | exposes |
@@ -101,6 +135,10 @@ applied belongs to the host.
 ```json
 {"status": "unavailable", "reason": "local_source"}
 ```
+
+Over IPC the question is `await invoke("update_check")`, which takes no
+argument and resolves to one of the two shapes above; over the bridge it is
+`GET /update/check`. Neither ever fails for a network reason (see below).
 
 `update_available` compares semver: a published version older than *or equal to*
 the running one is `false`, and so is a running version newer than anything

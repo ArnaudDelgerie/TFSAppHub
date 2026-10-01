@@ -20,7 +20,7 @@ one parent directory:
 | repository | what it is |
 |---|---|
 | `TFSAppHub` | this repository: the host — installs, runs, updates the apps, and serves the dev loop. |
-| `TFSAppBundle` | the Symfony bundle an app uses on its PHP side (`TFSAppKernel`, `/healthz`, `tfsapp:init`, `tfsapp:doctor`). |
+| `TFSAppBundle` | the Symfony bundle an app uses on its PHP side (`/healthz`, `tfsapp:init`, `tfsapp:doctor`, the bridge services). |
 | `TFSAppTest` | a real Symfony project, the fixture app the hub's checks run against. |
 
 [TFSAppTest](https://github.com/ArnaudDelgerie/TFSAppTest)'s README holds the

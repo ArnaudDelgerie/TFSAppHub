@@ -153,7 +153,7 @@ set out to run: whether at least one declaration survives to launch, and
 which transports each contributes after fallbacks. They are computed once,
 at start, from the manifest, and never change afterwards — they are not a
 live report. A slot's later fate — a restart, or a give-up after five
-consecutive failed starts (§6's supervisor) — reaches no environment
+consecutive failed starts (§2's supervisor) — reaches no environment
 variable: it is written to that slot's own `worker-<n>.log` under
 `APP_LOG_DIR`, where an app or its author can read it. The rule that binds
 any future change to either variable: they mirror **what is actually set

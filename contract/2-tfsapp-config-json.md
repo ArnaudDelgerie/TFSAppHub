@@ -166,6 +166,19 @@ migrates to `workers` at its own pace rather than under it. A manifest
 spelling both keys is refused: two spellings of one thing, where guessing
 which wins is worse than asking the author to pick one.
 
+**What the host runs, and how it supervises it.** Each copy is one
+`bin/console messenger:consume <transports…> --time-limit=3600
+--memory-limit=256M`, started with the app's window and stopped with it. The
+two limits make a consumer recycle at least every hour and whenever it passes
+256 MB, so a handler must not count on state living in the consumer process.
+A copy that exits after at least 10 seconds is treated as a recycle and
+restarted at once. One that exits sooner is a failed start: it is restarted
+after 1, 2, 4, then 8 seconds, and the fifth consecutive failed start gives
+that copy up for the rest of the launch. Every other copy carries on. Each
+copy writes to its own `worker-<n>.log` (§5), restarts and give-up included,
+and the user is told once per launch which transports stopped being
+consumed.
+
 Two things about this declaration are deliberate and will not change even as
 its shape does.
 

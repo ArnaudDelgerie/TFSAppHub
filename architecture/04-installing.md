@@ -28,7 +28,7 @@ open. In order:
    The `id` and port gates here are only a *first* answer: the maintenance
    lease an install holds is keyed on `identifier`, so a second source
    installing under a different one shares no lease with this one, and both
-   can pass these checks on a registry neither has written to yet. Step 9
+   can pass these checks on a registry neither has written to yet. Step 11
    re-checks both under the registry's own lock — that is the answer that
    counts.
 4. Decide which lifecycle event (`CONTRACT.md` §6) this install may run,
@@ -51,25 +51,26 @@ open. In order:
    failure — **only** when step 4 decided this is a first install. A record
    equal to the app's own version (the reinstall-after-`remove` path) runs
    neither.
-9. Record the app in the registry, with the platform fingerprint of the hub that
-   installed it, re-checking `id` and port inside `registry::update`'s own
-   lock — an `id` or a pinned port that appeared since step 3 is a refusal,
-   never a replacement of the entry that claimed it. A refusal there removes
-   the copied tree (as a failed `prepare` already does) but keeps the data
-   directory, as a plain `remove` does: a later install of the same app finds
-   a matching version record and takes the reinstall path.
-10. Write the version record into the data directory — **only** once every
-    step above has succeeded, and every event, including an equal record
-    rewriting itself.
-11. Run `bin/console cache:warmup` through the same toolchain the lifecycle
+9. Write the version record into the data directory — **only** once every
+   step above has succeeded, and every event, including an equal record
+   rewriting itself.
+10. Run `bin/console cache:warmup` through the same toolchain the lifecycle
     commands just ran with, and, only if it succeeds, write the cache stamp
     (plan 024 — "Opening an app", below, has the full mechanism). A failure
     here is a warning, not an install failure: the cache is a derived
     artefact, and the next launch rebuilds it the slow way instead.
+11. Record the app in the registry, with the platform fingerprint of the hub
+    that installed it, re-checking `id` and port inside `registry::update`'s
+    own lock — an `id` or a pinned port that appeared since step 3 is a
+    refusal, never a replacement of the entry that claimed it. A refusal
+    there removes the copied tree (as a failure in steps 7–10 already does)
+    but keeps the data directory, as a plain `remove` does: a later install
+    of the same app finds the version record step 9 wrote and takes the
+    reinstall path.
 12. Refresh the stable copy of the hub itself, and write the app's `.desktop`
     entry — best-effort, and skipped together by `--no-desktop-entry`.
 
-Step 10 is the one worth defending. The record is what decides whether a later
+Step 9 is the one worth defending. The record is what decides whether a later
 moment is an install, an update, or a downgrade to refuse, and writing it
 speculatively would make a failed install look like a completed one. A failure
 leaves the directory undated, so the next attempt replays the whole event rather
@@ -84,12 +85,15 @@ an update must never leave the app's database between two versions. `update
 <id>` is the command that owns it (see "Updating", below), and `install`
 refuses instead, naming it.
 
-Step 11 runs **last**, after the app is registered and ready, for the same
-reason registration itself runs last: an entry advertising an app whose
-`composer install` failed would sit in the user's application grid pointing at
-nothing. The app is usable from the CLI before it is advertised anywhere else.
-A failure here — the copy or the entry — is a warning naming the path and the
-cause, never a reason to undo an install that has already succeeded.
+Step 11 comes after everything that runs the app's own PHP because the
+registry has no state for "installed, but do not run it": an entry written
+any earlier would name a `ready` app whose dependencies had not resolved yet.
+Step 12 comes after it for the same reason one level out: an entry
+advertising an app the registry does not know would sit in the user's
+application grid pointing at nothing. The app is usable from the CLI before it
+is advertised anywhere else. A failure in step 12 — the copy or the entry — is
+a warning naming the path and the cause, never a reason to undo an install
+that has already succeeded.
 
 ### Resolving a release
 
@@ -170,7 +174,7 @@ beside the target, then renamed over it. Two apps sharing this one file is the
 ordinary case, not an edge case — one may be open from it while a second
 install refreshes it for a newer hub — and a rename swaps the whole inode
 atomically, so a process already running the old copy keeps running the
-generation it started with instead of meeting a half-written 170 MB binary or
+generation it started with instead of meeting a half-written 150 MB binary or
 an `ETXTBSY`. It is also what `--update` (`hub_update.rs`) replaces this same
 file with, which is the other reason it lives under the hub's own root
 rather than beside a per-app path.

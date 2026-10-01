@@ -53,15 +53,23 @@ Content-Security-Policy: default-src 'self'; connect-src 'self' ipc: http://ipc.
                          base-uri 'self'; frame-ancestors 'none'; form-action 'self'
 ```
 
-Each of the last four is a **default, not a mandate**: a response that already
-carries one of those field names keeps its own, and the host's version does not
-appear at all. One header, the app's. There is no second policy layered on top
-and none silently overriding it.
+Each one is a **default, not a mandate**: a response that already carries one
+of those field names keeps its own, and the host's version does not appear at
+all. One header, the app's. There is no second policy layered on top and none
+silently overriding it.
 
-`/assets/*` is exempted from `no-store` and cached aggressively instead, because
-AssetMapper and Encore both serve content-hashed filenames there — a change is a
-different URL, so caching is always safe. Serving non-hashed content under
-`/assets/` is the one way to get this wrong.
+In practice `Cache-Control: no-store` reaches static files under `public/`
+and whatever else answers without one: Symfony sets its own `Cache-Control`
+on every response it sends (`no-cache, private` unless the app says
+otherwise), so a page the app renders keeps Symfony's value, and an app
+that wants a response cached says so the usual Symfony way.
+
+`/assets/*` is the one exception to the override rule: every response under
+it is sent `Cache-Control: public, max-age=31536000, immutable`, replacing
+whatever the app set, because AssetMapper and Encore both serve
+content-hashed filenames there — a change is a different URL, so caching is
+always safe. Serving non-hashed content under `/assets/` is the one way to
+get this wrong.
 
 ### Nothing the page loads may come from off-origin
 
