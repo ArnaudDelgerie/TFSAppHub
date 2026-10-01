@@ -19,20 +19,17 @@ installing does not modify the source it was pointed at.
 **Plus one obligation in the app's kernel.** Symfony decides where its cache,
 its build artefacts and its logs go, and it decides it *inside the project* by
 default — which is the installed snapshot, replaced on the next update. So the
-app must honour three of §3's variables in its kernel:
+app's kernel must honour three of §3's variables: `APP_CACHE_DIR`,
+`APP_BUILD_DIR` and `APP_LOG_DIR`.
 
-```php
-public function getCacheDir(): string { return $_SERVER['APP_CACHE_DIR'] ?? parent::getCacheDir(); }
-public function getBuildDir(): string { return $_SERVER['APP_BUILD_DIR'] ?? parent::getBuildDir(); }
-public function getLogDir(): string   { return $_SERVER['APP_LOG_DIR']   ?? parent::getLogDir(); }
-```
-
-Extending `ArnaudDelgerie\TFSAppBundle\Kernel\TFSAppKernel` is the supported way
-to get exactly that, and what the reference app does. Writing the three overrides
-by hand satisfies the requirement just as well — the contract binds the
-behaviour, not the class. What it does not tolerate is neither: the host would
-inject the three variables and the app would silently ignore them, writing into
-a directory an update replaces.
+Symfony's own kernel already does: `MicroKernelTrait` reads all three on every
+Symfony version the bundle supports (^7.4), so the `src/Kernel.php` that
+`symfony/skeleton` generates needs no change, and is what the reference app
+uses. The obligation only bites an app that overrides `getCacheDir()`,
+`getBuildDir()` or `getLogDir()` itself: the override must keep honouring the
+variable. What the contract does not tolerate is a kernel that ignores them:
+the host would inject the three variables and the app would silently write
+into a directory an update replaces.
 
 **The manifest is read by the hub, never by PHP.** The app learns its own
 identity from the environment (§3), not by parsing its own
