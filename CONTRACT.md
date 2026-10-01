@@ -75,7 +75,7 @@ configure the infrastructure.**
 - [§4 — The HTTP contract](contract/4-the-http-contract.md) — headers, `/healthz`, the CSP, Mercure authorization, graceful shutdown.
 - [§5 — The app's own state, and what it is isolated from](contract/5-the-apps-own-state.md) — the data directory, `APP_SECRET`, sessions, isolation, export/import.
 - [§6 — Lifecycle](contract/6-lifecycle.md) — the install/update lifecycle commands, the no-overlap guarantee, `run`.
-- [§7 — Native capabilities: `actions`](contract/7-native-capabilities-actions.md) — `secrets`, `update`, `picker`, `open_files`, `close_guard`, and the bridge wire contract.
+- [§7 — Native capabilities: `actions`](contract/7-native-capabilities-actions.md) — `secrets`, `update`, `picker`, `open_files`, `media`, `paths`, `close_guard`, and the bridge wire contract.
 - [§8 — What a host cannot honour, and how you find out](contract/8-what-a-host-cannot-honour.md) — what falls back, and how the app is told.
 - [§9 — Running a project in dev](contract/9-running-a-project-in-dev.md) — `tfsapp-hub dev`: live source, its own identity, its own data.
 
