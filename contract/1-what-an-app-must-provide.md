@@ -105,6 +105,8 @@ Forge publishing needs `git` installed and `gh` installed and authenticated
 on the **author's own machine** — the one command where the hub runs `git`,
 and only there (decision 003, "the hub publishes apps"). The project must be
 committed and pushed; `publish` proves it rather than trusting an asserted
-tag, and the release lands on whichever repository that pushed commit's own
-remote names. Local publishing needs `git` and a clean committed tree, but no
-push or forge authentication.
+tag, and the release lands on the GitHub repository the branch's upstream
+remote names — or on the one `--repo owner/repo` names instead. Either way the
+release is tagged on that pushed commit, so the repository it lands on has to
+hold it. Local publishing needs `git` and a clean committed tree, but no push
+or forge authentication.
