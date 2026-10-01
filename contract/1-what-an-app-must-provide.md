@@ -93,11 +93,18 @@ directories appended beside it, before `sha256sum` names the result.
 `tfsapp-hub publish path/to/project` automates exactly this sequence and is the
 convenience, never the requirement.
 
+One of `publish`'s gates asks rather than checks: when the manifest turns on
+`actions.secrets.ipc`, it says that the declared secrets become reachable
+from the app's own JavaScript — an XSS in the app can read or overwrite them
+(§7) — and waits for an explicit yes at a terminal. `--yes` does not answer
+it, and a run with no terminal is refused: the release ships that setting to
+everyone who installs it, so its author confirms it in person, every release.
+
 For a release without a forge, `tfsapp-hub publish path/to/project --local <dir>`
 writes `<dir>/<project_name>-<app_version>/` with the archive,
 `SHA256SUMS.txt` and `NOTES.md`. The destination directory must exist. This
-mode keeps the manifest, canonical version, clean Git tree, changelog and
-secrets confirmation gates; it does not require an upstream, remote, `gh` or
+mode keeps the manifest, canonical version, clean Git tree and changelog
+gates, and the `secrets.ipc` confirmation above; it does not require an upstream, remote, `gh` or
 an unused forge tag. See decision 009 for the distinction. The release folder
 must not already exist.
 
