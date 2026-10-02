@@ -11,8 +11,10 @@ isolated.
 The fragile native half — interpreter, webview, the glibc floor — is built
 once, here. Everything an app adds afterwards is pure PHP with no ABI surface:
 writing one needs no Rust toolchain, no Tauri CLI and no GTK development
-libraries, just the hub and a Symfony project. See
-["Make your first app"](#make-your-first-app).
+libraries, just the hub and a Symfony project. Writing an app starts from the
+[TFSAppBundle README](https://github.com/ArnaudDelgerie/TFSAppBundle); the
+hub's [`CONTRACT.md`](CONTRACT.md) is the canonical reference for what the hub
+and an app promise each other.
 
 ## Install
 
@@ -38,17 +40,25 @@ or symlink it:
 ln -s "$(pwd)/TFSAppHub_"*"_amd64.AppImage" ~/.local/bin/tfsapp-hub
 ```
 
+What each release changed is in the [CHANGELOG](CHANGELOG.md).
+
 ## Use
 
 `tfsapp-hub --help` prints every command, with its options. The everyday
 shape:
 
-**Install an app**, from a forge release or from a local archive:
+**Install an app**, from a forge release or from a local archive. The line
+below installs [Papermark](https://github.com/ArnaudDelgerie/Papermark), an
+app built for the hub:
 
 ```sh
-tfsapp-hub install github:owner/repo
-tfsapp-hub publish path/to/project --local out/     # write a release archive locally (out/ must exist)
-tfsapp-hub install out/<name>-<version>/<name>-<version>.tar.gz
+tfsapp-hub install github:ArnaudDelgerie/Papermark
+```
+
+Or install a local archive someone gave you:
+
+```sh
+tfsapp-hub install path/to/<name>-<version>.tar.gz
 ```
 
 Install is a snapshot of one release: nothing edits the installed tree until an
@@ -201,99 +211,10 @@ declared member GLib cannot resolve reports as an absent variable rather than
 a guessed `$HOME`-based path, and `$HOME` itself is deliberately not a ninth
 member — it already reaches PHP through the ordinary process environment.
 
-## Make your first app
+## Contributing
 
-An app is a Symfony project. You need PHP and Composer on your machine —
-nothing else: no Rust, no Tauri CLI, no GTK development libraries.
-
-```sh
-composer create-project symfony/skeleton myapp
-cd myapp
-composer require arnauddelgerie/tfs-app-bundle
-bin/console tfsapp:init
-```
-
-`tfsapp:init` generates the app's `tfsapp.config.json` at the project root —
-it prompts for four identity fields (`project_name`, `product_name`,
-`identifier`, `app_version`), each with a sensible derived default, then one
-yes/no `workers` question; Enter accepts the default each time — plus a
-starter `CHANGELOG.md`. The bundle registers `/healthz` on its own; no route
-to declare.
-
-A fresh skeleton has no route in production, and an installed app runs in
-production — give the app one page of its own:
-
-```php
-<?php
-// src/Controller/HomeController.php
-namespace App\Controller;
-
-use Symfony\Component\HttpFoundation\Response;
-use Symfony\Component\Routing\Attribute\Route;
-
-class HomeController
-{
-    #[Route('/')]
-    public function home(): Response
-    {
-        return new Response('It runs.');
-    }
-}
-```
-
-Run it under the hub, live:
-
-```sh
-tfsapp-hub dev .
-```
-
-A window opens on your app, served from this directory as it is. `dev` serves
-live source **in place**: it watches nothing, compiles nothing and builds no
-assets — your build tool already has a `--watch`; the hub serves and
-restarts. Ctrl-C stops the session.
-
-Then see it the way your users will, as an installed app:
-
-```sh
-git init && git add -A && git commit -m "First app"   # a release pins a commit
-cd ..
-mkdir -p out
-tfsapp-hub publish myapp --local out/
-```
-
-`publish` prints the exact `tfsapp-hub install` command for the archive it
-wrote — run it:
-
-```sh
-tfsapp-hub install out/myapp-0.1.0/myapp-0.1.0.tar.gz
-tfsapp-hub list
-tfsapp-hub open myapp
-```
-
-After `install` the app shows in `list`, opens with `open myapp`, and appears
-under its own name in your shell's grid — with a generic icon until its
-manifest declares an `icon_path`
-([§2](contract/2-tfsapp-config-json.md)).
-
-Where to go from here:
-
-- the [TFSAppBundle README](https://github.com/ArnaudDelgerie/TFSAppBundle) —
-  the PHP-side reference: what the bundle you just required does, its
-  configuration, its commands.
-- the contract's [what an app must provide](contract/1-what-an-app-must-provide.md)
-  — the rest of the three files and one route, and every optional field of
-  the manifest.
-
-## Where to read next
-
-- [**TFSAppBundle**](https://github.com/ArnaudDelgerie/TFSAppBundle) — the
-  Symfony bundle an app uses; its README is the PHP-side reference.
-- [**`CONTRACT.md`**](CONTRACT.md) — what the hub and an app promise each
-  other. Written for app authors: read it alone and you know exactly what to
-  build.
+- [**`CONTRIBUTING.md`**](CONTRIBUTING.md) — how to build the hub, check your
+  work, and release it.
 - [**`ARCHITECTURE.md`**](ARCHITECTURE.md) — how the hub itself works: the
-  crate boundary, runtime identity, the install pipeline, the launch
-  sequence, the bundled interpreter. Written for contributors.
-- [**`CONTRIBUTING.md`**](CONTRIBUTING.md) — building the hub, its checks,
-  its release process.
-- [**`CHANGELOG.md`**](CHANGELOG.md) — what changed, release by release.
+  crate boundary, runtime identity, the install pipeline, the launch sequence,
+  the bundled interpreter.

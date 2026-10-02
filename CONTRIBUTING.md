@@ -1,9 +1,10 @@
 # Contributing to TFSAppHub
 
 This is the contributor's document: how to build the hub, how to check your
-work, how it is released. If you want to *use* the hub or write an app for it,
-start from the [README](README.md). If you want to change how the hub itself
-works, the reading starts here:
+work, how it is released. If you want to *use* the hub, start from the
+[README](README.md); if you want to *write an app* for it, start from the
+[TFSAppBundle README](https://github.com/ArnaudDelgerie/TFSAppBundle). If you
+want to change how the hub itself works, the reading starts here:
 
 - [**`ARCHITECTURE.md`**](ARCHITECTURE.md) — how the hub works: the crate
   boundary, runtime identity, the install pipeline, the launch sequence, the
