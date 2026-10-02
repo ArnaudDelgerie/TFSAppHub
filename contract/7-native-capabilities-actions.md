@@ -114,7 +114,7 @@ bridge wire contract" below.
 
 | | protects | exposes |
 | --- | --- | --- |
-| IPC | confidentiality in transit — the value never touches the PHP process | integrity: an XSS in the app can overwrite a declared key |
+| IPC | confidentiality in transit — the value never touches the PHP process | the app's own JavaScript: an XSS in the app can read (`secret_get`, `secret_list`) or overwrite a declared key |
 | Bridge | integrity — a bearer token only PHP holds | confidentiality to PHP and anything that logs it: request body, profiler, server logs |
 
 An app building an API-key entry form has a legitimate reason to want `ipc`.
