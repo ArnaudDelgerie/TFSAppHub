@@ -446,9 +446,9 @@ fn the_extracted_section_stops_at_the_next_heading() {
 
 #[test]
 fn ipc_on_and_undeclinable_in_a_test_refuses_the_gate() {
-    // Tests never run with a terminal on stdin, so `prompt::confirmed(false)`
-    // always refuses here — which is exactly gate 8's point: there is no
-    // `--yes` to make this pass non-interactively.
+    // Tests never run with a terminal on stdin, so
+    // `prompt::confirmed_at_terminal` always refuses here — which is exactly
+    // gate 8's point: there is no `--yes` to make this pass non-interactively.
     let project = tempfile::tempdir().expect("a temp project dir");
     write_manifest(
         project.path(),
