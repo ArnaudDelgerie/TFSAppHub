@@ -1093,7 +1093,8 @@ fn changelog_section(contents: &str, version: &str) -> Option<String> {
 /// Gate 8: `actions.secrets.ipc` off is silent. On, it blocks on a
 /// confirmation whose wording is carried over from the station's
 /// `release.sh` — and, deliberately, has no `--yes` escape: a release ships
-/// this setting to every user who installs it.
+/// this setting to every user who installs it, so away from a terminal the
+/// gate's own refusal says the confirmation is only given at a terminal.
 fn confirm_ipc_secrets(manifest: &Manifest) -> Result<(), PublishError> {
     if !manifest.actions.secrets.ipc {
         return Ok(());
@@ -1104,7 +1105,7 @@ fn confirm_ipc_secrets(manifest: &Manifest) -> Result<(), PublishError> {
          JS runtime, so an XSS in the app can read or overwrite them. IPC remains the only \
          transport where a secret's value never transits the PHP process."
     );
-    match prompt::confirmed(false) {
+    match prompt::confirmed_at_terminal() {
         true => Ok(()),
         false => Err(PublishError::IpcNotConfirmed),
     }
@@ -1143,7 +1144,8 @@ pub enum PublishError {
         version: String,
     },
     /// The `actions.secrets.ipc` confirmation was declined, or could not be
-    /// asked (see `prompt::confirmed`'s own non-terminal refusal).
+    /// asked (see `prompt::confirmed_at_terminal`'s own non-terminal
+    /// refusal).
     IpcNotConfirmed,
     /// A symlink in the project tree points outside it — the same lexical
     /// rule `archive::extract` applies at the other end

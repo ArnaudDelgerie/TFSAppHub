@@ -1,9 +1,13 @@
 //! The one question the hub asks before touching a machine.
 //!
-//! Two commands change something a user cannot undo by retyping — `install`
-//! runs third-party PHP, `remove --purge` deletes their data — and both print
-//! what they are about to do and wait. The wording lives here rather than in
-//! each of them so the answer means the same thing whichever one asked.
+//! The commands that ask it change something a user cannot undo by
+//! retyping, so each prints what it is about to do and waits first. The
+//! wording lives here rather than in each of them so the answer means the
+//! same thing whichever one asked.
+//!
+//! `publish`'s `actions.secrets.ipc` gate asks the same question through
+//! [`confirmed_at_terminal`], but no flag can stand in for its author: the
+//! setting ships to everyone who installs the release.
 //!
 //! The non-terminal case is the one worth stating: a piped or scripted
 //! invocation with no `--yes` is **refused**, never assumed. Reading a closed
@@ -22,11 +26,28 @@ pub fn confirmed(assume_yes: bool) -> bool {
         return true;
     }
 
+    ask_or_refuse(
+        "tfsapp-hub: stdin is not a terminal — refusing to guess. Pass --yes to \
+         confirm non-interactively.",
+    )
+}
+
+/// The one question no flag can answer: `publish`'s `actions.secrets.ipc` gate
+/// ships its setting to every user who installs the release, so its author
+/// confirms in person. The refusal says the confirmation is only given at a
+/// terminal instead of pointing at a flag that does nothing here.
+pub fn confirmed_at_terminal() -> bool {
+    ask_or_refuse(
+        "tfsapp-hub: stdin is not a terminal — this confirmation is only given \
+         at a terminal; no flag answers it.",
+    )
+}
+
+/// The shared half: refuse away from a terminal with the caller's wording,
+/// ask the same `[y/N]` question at one.
+fn ask_or_refuse(refusal: &str) -> bool {
     if !io::stdin().is_terminal() {
-        eprintln!(
-            "tfsapp-hub: stdin is not a terminal — refusing to guess. Pass --yes to \
-             confirm non-interactively."
-        );
+        eprintln!("{refusal}");
         return false;
     }
 
