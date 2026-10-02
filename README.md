@@ -55,7 +55,8 @@ app built for the hub:
 tfsapp-hub install github:ArnaudDelgerie/Papermark
 ```
 
-Or install a local archive someone gave you:
+Or install a local release someone gave you — the archive with its
+`SHA256SUMS.txt` beside it:
 
 ```sh
 tfsapp-hub install path/to/<name>-<version>.tar.gz
