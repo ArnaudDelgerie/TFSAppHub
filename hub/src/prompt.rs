@@ -1,9 +1,9 @@
 //! The one question the hub asks before touching a machine.
 //!
-//! Two commands change something a user cannot undo by retyping — `install`
-//! runs third-party PHP, `remove --purge` deletes their data — and both print
-//! what they are about to do and wait. The wording lives here rather than in
-//! each of them so the answer means the same thing whichever one asked.
+//! The commands that ask it change something a user cannot undo by
+//! retyping, so each prints what it is about to do and waits first. The
+//! wording lives here rather than in each of them so the answer means the
+//! same thing whichever one asked.
 //!
 //! `publish`'s `actions.secrets.ipc` gate asks the same question through
 //! [`confirmed_at_terminal`], but no flag can stand in for its author: the
